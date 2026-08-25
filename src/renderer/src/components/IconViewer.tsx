@@ -1,7 +1,15 @@
 import { useRef, useState } from "react";
-import type { IconDto, EditableIconDto, GraphicTransform } from "../../../shared/modelicaGraphics";
+import type {
+  IconDto,
+  EditableIconDto,
+  GraphicTransform,
+} from "../../../shared/modelicaGraphics";
 import { GraphicItem } from "./GraphicItem";
-import { toSvgTransform, boundsOf, applyTransform } from "../../editor/Transform";
+import {
+  toSvgTransform,
+  boundsOf,
+  applyTransform,
+} from "../../editor/Transform";
 import { clientToModelica } from "../../editor/DragController";
 import { useSelection } from "../../editor/Selection";
 import type { SelectionState } from "../../editor/Selection";
@@ -22,7 +30,9 @@ interface DragSession {
 export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [drag, setDrag] = useState<DragSession | null>(null);
-  const [previewTransforms, setPreviewTransforms] = useState<Map<string, GraphicTransform>>(new Map());
+  const [previewTransforms, setPreviewTransforms] = useState<
+    Map<string, GraphicTransform>
+  >(new Map());
   const sel: SelectionState = useSelection();
 
   void modelName;
@@ -43,7 +53,13 @@ export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
     const preview = previewTransforms.get(id);
     if (preview) return preview;
     const ed = editables.find((e) => e.id === id);
-    return ed?.transform ?? { translate: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotate: 0 };
+    return (
+      ed?.transform ?? {
+        translate: { x: 0, y: 0 },
+        scale: { x: 1, y: 1 },
+        rotate: 0,
+      }
+    );
   };
 
   const handlePointerDown = (e: React.PointerEvent, id: string) => {
@@ -57,7 +73,11 @@ export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
     setDrag({
       id,
       pointerStart: pt,
-      transformStart: ed?.transform ?? { translate: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotate: 0 },
+      transformStart: ed?.transform ?? {
+        translate: { x: 0, y: 0 },
+        scale: { x: 1, y: 1 },
+        rotate: 0,
+      },
     });
   };
 
@@ -73,7 +93,10 @@ export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
       x: snapped(drag.transformStart.translate.x + rawDx),
       y: snapped(drag.transformStart.translate.y + rawDy),
     };
-    const newTransform: GraphicTransform = { ...drag.transformStart, translate };
+    const newTransform: GraphicTransform = {
+      ...drag.transformStart,
+      translate,
+    };
     setPreviewTransforms((prev) => {
       const m = new Map(prev);
       m.set(drag.id, newTransform);
@@ -100,15 +123,30 @@ export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
         if (src.originRange && (ed.graphic as any).origin) {
           const o = (ed.graphic as any).origin as { x: number; y: number };
           const replacement = `{${formatNum(o.x + snappedDx)},${formatNum(o.y + snappedDy)}}`;
-          onEdit({ start: src.originRange.start, end: src.originRange.end, replacement });
+          onEdit({
+            start: src.originRange.start,
+            end: src.originRange.end,
+            replacement,
+          });
         } else if (src.extentRange) {
-          const ext = (ed.graphic as any).extent as { p1: { x: number; y: number }; p2: { x: number; y: number } };
+          const ext = (ed.graphic as any).extent as {
+            p1: { x: number; y: number };
+            p2: { x: number; y: number };
+          };
           const replacement = `{{${formatNum(ext.p1.x + snappedDx)},${formatNum(ext.p1.y + snappedDy)}},{${formatNum(ext.p2.x + snappedDx)},${formatNum(ext.p2.y + snappedDy)}}}`;
-          onEdit({ start: src.extentRange.start, end: src.extentRange.end, replacement });
+          onEdit({
+            start: src.extentRange.start,
+            end: src.extentRange.end,
+            replacement,
+          });
         } else if (src.pointsRange) {
           const pts = (ed.graphic as any).points as { x: number; y: number }[];
           const replacement = `{${pts.map((p) => `{${formatNum(p.x + snappedDx)},${formatNum(p.y + snappedDy)}}`).join(",")}}`;
-          onEdit({ start: src.pointsRange.start, end: src.pointsRange.end, replacement });
+          onEdit({
+            start: src.pointsRange.start,
+            end: src.pointsRange.end,
+            replacement,
+          });
         }
       }
     }
@@ -117,7 +155,11 @@ export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
   };
 
   return (
-    <div className="icon-viewer" onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}>
+    <div
+      className="icon-viewer"
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+    >
       <svg
         ref={svgRef}
         viewBox={viewBox}

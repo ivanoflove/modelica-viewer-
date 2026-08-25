@@ -1,4 +1,7 @@
-import type { EditableGraphic, GraphicTransform } from "../../shared/modelicaGraphics.js";
+import type {
+  EditableGraphic,
+  GraphicTransform,
+} from "../../shared/modelicaGraphics.js";
 import { snap } from "./Transform.js";
 
 export interface DragInfo {
