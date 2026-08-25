@@ -1,4 +1,9 @@
-import type { LoadPackageResult, ReadSourceResult } from "./modelica.js";
+import type {
+  GetIconResult,
+  LoadPackageResult,
+  ReadSourceResult,
+  SourceRangeDto,
+} from "./modelica.js";
 
 export interface DirectoryDialogResult {
   canceled: boolean;
@@ -12,6 +17,11 @@ export interface WindowApi {
     openAndLoad: () => Promise<LoadPackageResult>;
     loadDirectory: (dirPath: string) => Promise<LoadPackageResult>;
     readSource: (filePath: string) => Promise<ReadSourceResult>;
+    getIcon: (
+      filePath: string,
+      sourceRange: SourceRangeDto | null,
+      modelName: string,
+    ) => Promise<GetIconResult>;
     reveal: (filePath: string) => Promise<void>;
   };
 }

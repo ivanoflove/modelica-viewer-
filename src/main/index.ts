@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import { PackageLoader } from "./modelica/loader.js";
+import { extractIconFromSlice } from "./modelica/iconResolver.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -80,6 +81,28 @@ function registerIpcHandlers(): void {
       return { error: (e as Error).message };
     }
   });
+
+  ipcMain.handle(
+    "modelica:getIcon",
+    async (
+      _event,
+      filePath: string,
+      sourceRange: { start: number; end: number } | null,
+      modelName: string,
+    ) => {
+      try {
+        if (!filePath) return { error: "No file path provided" };
+        const content = await readFile(filePath, "utf-8");
+        const slice = sourceRange
+          ? content.slice(sourceRange.start, sourceRange.end)
+          : content;
+        const icon = extractIconFromSlice(slice, modelName ?? "");
+        return { icon };
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
+    },
+  );
 }
 
 app.whenReady().then(() => {

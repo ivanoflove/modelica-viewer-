@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { PackageNodeDto } from "../../shared/modelica";
+import type { IconDto } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
+import { IconViewer } from "./components/IconViewer";
+
+type ViewMode = "source" | "icon" | "diagram";
 
 function App(): JSX.Element {
   const [ipcStatus, setIpcStatus] = useState("checking…");
@@ -9,11 +13,16 @@ function App(): JSX.Element {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Selection | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("source");
 
   const [source, setSource] = useState("");
   const [sourceLoading, setSourceLoading] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
   const sourceEditorRef = useRef<HTMLDivElement>(null);
+
+  const [icon, setIcon] = useState<IconDto | null>(null);
+  const [iconLoading, setIconLoading] = useState(false);
+  const [iconError, setIconError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!window.api) {
@@ -30,6 +39,8 @@ function App(): JSX.Element {
     if (!selected || !window.api) {
       setSource("");
       setSourceError(null);
+      setIcon(null);
+      setIconError(null);
       return;
     }
     const loadSource = async () => {
@@ -63,12 +74,41 @@ function App(): JSX.Element {
         setSourceLoading(false);
       }
     };
+    const loadIcon = async () => {
+      setIconLoading(true);
+      setIconError(null);
+      try {
+        if (selected.kind === "package") {
+          setIcon(null);
+          setIconLoading(false);
+          return;
+        }
+        const range = (selected.node as { sourceRange?: { start: number; end: number } }).sourceRange ?? null;
+        const result = await window.api.modelica.getIcon(
+          selected.node.sourceFile,
+          range,
+          selected.node.name,
+        );
+        if ("error" in result) {
+          setIconError(result.error);
+          setIcon(null);
+          return;
+        }
+        setIcon(result.icon);
+      } catch (e) {
+        setIconError((e as Error).message);
+        setIcon(null);
+      } finally {
+        setIconLoading(false);
+      }
+    };
     void loadSource();
+    void loadIcon();
   }, [selected]);
 
   useEffect(() => {
     sourceEditorRef.current?.scrollTo({ top: 0, left: 0 });
-  }, [selected]);
+  }, [selected, viewMode]);
 
   const handleOpen = async () => {
     if (!window.api) {
@@ -112,7 +152,7 @@ function App(): JSX.Element {
       <header className="app-header">
         <div className="header-left">
           <span className="eyebrow">
-            MODELICA LIBRARY VIEWER — M1 · M2 Source Viewer
+            MODELICA LIBRARY VIEWER — M1 · M2 Source Viewer · M3 Icon
           </span>
           <h1>Package Browser</h1>
           <p className="ipc-status">IPC: {ipcStatus}</p>
@@ -176,17 +216,58 @@ function App(): JSX.Element {
                     在文件夹中显示
                   </button>
                 </div>
-                <div ref={sourceEditorRef} className="source-editor">
-                  {sourceLoading ? (
-                    <div className="source-status">加载中…</div>
-                  ) : sourceError ? (
-                    <div className="source-error">{sourceError}</div>
-                  ) : (
-                    <pre>
-                      <code>{source}</code>
-                    </pre>
-                  )}
+                <div className="viewer-tabs">
+                  <button
+                    className={viewMode === "source" ? "active" : ""}
+                    onClick={() => setViewMode("source")}
+                  >
+                    Source
+                  </button>
+                  <button
+                    className={viewMode === "icon" ? "active" : ""}
+                    onClick={() => setViewMode("icon")}
+                  >
+                    Icon
+                  </button>
+                  <button
+                    className={viewMode === "diagram" ? "active" : ""}
+                    onClick={() => setViewMode("diagram")}
+                  >
+                    Diagram
+                  </button>
                 </div>
+                {viewMode === "source" && (
+                  <div ref={sourceEditorRef} className="source-editor">
+                    {sourceLoading ? (
+                      <div className="source-status">加载中…</div>
+                    ) : sourceError ? (
+                      <div className="source-error">{sourceError}</div>
+                    ) : (
+                      <pre>
+                        <code>{source}</code>
+                      </pre>
+                    )}
+                  </div>
+                )}
+                {viewMode === "icon" && (
+                  <div className="source-editor icon-tab">
+                    {iconLoading ? (
+                      <div className="source-status">加载中…</div>
+                    ) : iconError ? (
+                      <div className="source-error">{iconError}</div>
+                    ) : (
+                      <IconViewer
+                        icon={icon}
+                        modelName={selected.node.name}
+                      />
+                    )}
+                  </div>
+                )}
+                {viewMode === "diagram" && (
+                  <div className="source-editor">
+                    <div className="no-icon">Diagram 暂未实现</div>
+                  </div>
+                )}
               </>
             ) : (
               <div className="empty-detail">选择左侧节点查看源码</div>

@@ -346,6 +346,57 @@ h1 {
   background: #fff3f3;
 }
 
+.viewer-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid rgba(49, 57, 251, 0.12);
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.viewer-tabs button {
+  padding: 6px 14px;
+  border: 1px solid rgba(49, 57, 251, 0.2);
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.viewer-tabs button.active {
+  background: #3139fb;
+  color: #fffcec;
+  border-color: #3139fb;
+}
+
+.icon-viewer {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: #fff;
+  overflow: auto;
+}
+
+.modelica-icon {
+  width: min(420px, 90%);
+  height: min(420px, 90%);
+  border: 1px solid rgba(49, 57, 251, 0.12);
+  background: #fff;
+}
+
+.no-icon {
+  padding: 24px;
+  color: rgba(49, 57, 251, 0.6);
+  text-align: center;
+}
+
+.icon-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .empty-detail {
   color: rgba(49, 57, 251, 0.5);
   padding: 40px;

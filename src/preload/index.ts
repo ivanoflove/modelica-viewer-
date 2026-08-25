@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { DirectoryDialogResult, WindowApi } from "../shared/api";
-import type { LoadPackageResult, ReadSourceResult } from "../shared/modelica";
+import type {
+  GetIconResult,
+  LoadPackageResult,
+  ReadSourceResult,
+  SourceRangeDto,
+} from "../shared/modelica";
 
 const api: WindowApi = {
   ping: () => ipcRenderer.invoke("ping") as Promise<string>,
@@ -21,6 +26,13 @@ const api: WindowApi = {
         "modelica:readSource",
         filePath,
       ) as Promise<ReadSourceResult>,
+    getIcon: (filePath: string, sourceRange: SourceRangeDto | null, modelName: string) =>
+      ipcRenderer.invoke(
+        "modelica:getIcon",
+        filePath,
+        sourceRange,
+        modelName,
+      ) as Promise<GetIconResult>,
     reveal: (filePath: string) =>
       ipcRenderer.invoke("modelica:reveal", filePath) as Promise<void>,
   },

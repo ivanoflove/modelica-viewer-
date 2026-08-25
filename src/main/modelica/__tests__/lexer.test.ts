@@ -59,7 +59,9 @@ describe("lexer", () => {
         expect(t.start).toBe(src.length);
         expect(t.end).toBe(src.length);
       } else {
-        expect(src.slice(t.start, t.end)).toBe(t.value === ";" || t.value === "." ? t.value : t.value);
+        expect(src.slice(t.start, t.end)).toBe(
+          t.value === ";" || t.value === "." ? t.value : t.value,
+        );
       }
     }
     const pkg = toks.find((t) => t.value === "package")!;

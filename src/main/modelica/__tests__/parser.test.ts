@@ -93,22 +93,35 @@ describe("parser", () => {
   it("should include partial/encapsulated in sourceRange start", () => {
     const src = `partial model A end A; encapsulated package B end B; partial encapsulated block C end C;`;
     const file = parseModelicaFile(src, "test.mo");
-    expect(src.slice(file.classes[0]!.sourceRange.start, file.classes[0]!.sourceRange.end)).toBe(
-      "partial model A end A;",
-    );
-    expect(src.slice(file.classes[1]!.sourceRange.start, file.classes[1]!.sourceRange.end)).toBe(
-      "encapsulated package B end B;",
-    );
-    expect(src.slice(file.classes[2]!.sourceRange.start, file.classes[2]!.sourceRange.end)).toBe(
-      "partial encapsulated block C end C;",
-    );
+    expect(
+      src.slice(
+        file.classes[0]!.sourceRange.start,
+        file.classes[0]!.sourceRange.end,
+      ),
+    ).toBe("partial model A end A;");
+    expect(
+      src.slice(
+        file.classes[1]!.sourceRange.start,
+        file.classes[1]!.sourceRange.end,
+      ),
+    ).toBe("encapsulated package B end B;");
+    expect(
+      src.slice(
+        file.classes[2]!.sourceRange.start,
+        file.classes[2]!.sourceRange.end,
+      ),
+    ).toBe("partial encapsulated block C end C;");
   });
 
   it("should not include trailing content after end;", () => {
     const src = `package P model A end A; model B end B; end P;`;
     const file = parseModelicaFile(src, "test.mo");
     const A = file.classes[0]!.children[0]!;
-    expect(src.slice(A.sourceRange.start, A.sourceRange.end)).toBe("model A end A;");
-    expect(src.slice(A.sourceRange.start, A.sourceRange.end).includes("model B")).toBe(false);
+    expect(src.slice(A.sourceRange.start, A.sourceRange.end)).toBe(
+      "model A end A;",
+    );
+    expect(
+      src.slice(A.sourceRange.start, A.sourceRange.end).includes("model B"),
+    ).toBe(false);
   });
 });

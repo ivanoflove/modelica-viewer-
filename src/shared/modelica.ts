@@ -1,3 +1,5 @@
+import type { IconDto } from "./modelicaGraphics.js";
+
 export type ClassKind =
   | "package"
   | "model"
@@ -42,3 +44,5 @@ export type LoadPackageResult =
 export type ReadSourceResult =
   | { content: string; filePath: string }
   | { error: string };
+
+export type GetIconResult = { icon: IconDto | null } | { error: string };
