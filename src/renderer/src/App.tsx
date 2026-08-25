@@ -129,6 +129,33 @@ function App(): JSX.Element {
     sourceEditorRef.current?.scrollTo({ top: 0, left: 0 });
   }, [selected, viewMode]);
 
+  const loadDirectoryIntoView = async (dirPath: string) => {
+    if (!window.api) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await window.api.modelica.loadDirectory(dirPath);
+      if ("error" in result) {
+        setError(result.error);
+        return;
+      }
+      if (result.canceled) return;
+      setRoot(result.root);
+      setCurrentPath(result.root.sourceFile);
+      setSelected({ kind: "package", node: result.root });
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!window.api?.onAutoOpen) return;
+    window.api.onAutoOpen((dirPath) => void loadDirectoryIntoView(dirPath));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleOpen = async () => {
     if (!window.api) {
       setError("preload 未加载：window.api 为空，请重新构建");
@@ -174,41 +201,34 @@ function App(): JSX.Element {
         setIconError(res.error);
         return;
       }
-      // refresh source and icon after write (re-parse)
-      const range =
-        (selected.node as { sourceRange?: { start: number; end: number } })
-          .sourceRange ?? null;
+      // refresh source and icon after write: re-parse current class for fresh range
+      const freshRangeRes = await window.api.modelica.reloadClassRange(
+        selected.node.sourceFile,
+        selected.node.qualifiedName,
+      );
+      const freshRange =
+        !("error" in freshRangeRes) && freshRangeRes.sourceRange
+          ? freshRangeRes.sourceRange
+          : null;
       const [srcRes, iconRes, editableRes] = await Promise.all([
         window.api.modelica.readSource(selected.node.sourceFile),
         window.api.modelica.getIcon(
           selected.node.sourceFile,
-          range,
+          freshRange,
           selected.node.name,
         ),
         window.api.modelica.getEditableIcon(
           selected.node.sourceFile,
-          range,
+          freshRange,
           selected.node.name,
         ),
       ]);
       if ("error" in srcRes) {
         setSourceError(srcRes.error);
+      } else if (selected.kind !== "package" && freshRange) {
+        setSource(srcRes.content.slice(freshRange.start, freshRange.end));
       } else {
-        if (
-          selected.kind !== "package" &&
-          (selected.node as { sourceRange?: { start: number; end: number } })
-            .sourceRange
-        ) {
-          // after edit, sourceRange is stale; reload whole file content for now
-          // For MVP, just show full updated file
-          setSource(srcRes.content.slice(0, 5000));
-        } else {
-          setSource("error" in srcRes ? "" : srcRes.content);
-        }
-        // actually show sliced again with updated range? need fresh parse of class range
-        // For now, re-read with new range from editableRes if available
-        // If editable, its icon's source ranges are fresh, but class range still stale
-        // We will just show full file after edit for MVP
+        setSource(srcRes.content);
       }
       if ("error" in iconRes) setIconError(iconRes.error);
       else setIcon(iconRes.icon);

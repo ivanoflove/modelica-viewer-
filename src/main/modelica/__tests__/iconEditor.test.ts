@@ -1,6 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { parseAnnotationSlice, findIconCall, getArgWithRange } from "../annotation.js";
-import { resolveEditableIcon, serializeExtent, serializePoints, serializeOrigin, extractEditableIconFromSlice } from "../iconResolver.js";
+import {
+  parseAnnotationSlice,
+  findIconCall,
+  getArgWithRange,
+} from "../annotation.js";
+import {
+  resolveEditableIcon,
+  serializeExtent,
+  serializePoints,
+  serializeOrigin,
+  extractEditableIconFromSlice,
+} from "../iconResolver.js";
 
 function editableFrom(src: string, modelName = "MyModel") {
   const anno = parseAnnotationSlice(src)!;
@@ -16,9 +26,15 @@ describe("iconEditor: editable ranges", () => {
     const e = ed.editables[0]!;
     expect(e.source.itemRange).toBeDefined();
     expect(e.source.extentRange).toBeDefined();
-    const extentText = src.slice(e.source.extentRange!.start, e.source.extentRange!.end);
+    const extentText = src.slice(
+      e.source.extentRange!.start,
+      e.source.extentRange!.end,
+    );
     expect(extentText).toBe("{{-80,-50},{80,50}}");
-    const itemText = src.slice(e.source.itemRange.start, e.source.itemRange.end);
+    const itemText = src.slice(
+      e.source.itemRange.start,
+      e.source.itemRange.end,
+    );
     expect(itemText).toContain("Rectangle");
   });
 
@@ -27,7 +43,10 @@ describe("iconEditor: editable ranges", () => {
     const ed = editableFrom(src);
     const e = ed.editables[0]!;
     expect(e.source.pointsRange).toBeDefined();
-    const ptsText = src.slice(e.source.pointsRange!.start, e.source.pointsRange!.end);
+    const ptsText = src.slice(
+      e.source.pointsRange!.start,
+      e.source.pointsRange!.end,
+    );
     expect(ptsText).toBe("{{-80,0},{0,50},{80,0}}");
   });
 
@@ -36,19 +55,27 @@ describe("iconEditor: editable ranges", () => {
     const ed = editableFrom(src);
     const e = ed.editables[0]!;
     expect(e.source.originRange).toBeDefined();
-    expect(src.slice(e.source.originRange!.start, e.source.originRange!.end)).toBe("{20,10}");
+    expect(
+      src.slice(e.source.originRange!.start, e.source.originRange!.end),
+    ).toBe("{20,10}");
   });
 });
 
 describe("iconEditor: serialization", () => {
   it("serializeExtent produces Modelica array", () => {
-    expect(serializeExtent({ p1: { x: -80, y: -40 }, p2: { x: 80, y: 40 } }))
-      .toBe("{{-80,-40},{80,40}}");
+    expect(
+      serializeExtent({ p1: { x: -80, y: -40 }, p2: { x: 80, y: 40 } }),
+    ).toBe("{{-80,-40},{80,40}}");
   });
 
   it("serializePoints produces Modelica points", () => {
-    expect(serializePoints([{ x: -80, y: 0 }, { x: 0, y: 50 }, { x: 80, y: 0 }]))
-      .toBe("{{-80,0},{0,50},{80,0}}");
+    expect(
+      serializePoints([
+        { x: -80, y: 0 },
+        { x: 0, y: 50 },
+        { x: 80, y: 0 },
+      ]),
+    ).toBe("{{-80,0},{0,50},{80,0}}");
   });
 
   it("serializeOrigin produces Modelica origin", () => {
@@ -56,7 +83,10 @@ describe("iconEditor: serialization", () => {
   });
 
   it("normalizes floats (no 19.9999999)", () => {
-    const e = serializeExtent({ p1: { x: -79.9999999997, y: -39.9999999997 }, p2: { x: 80.0000000001, y: 40 } });
+    const e = serializeExtent({
+      p1: { x: -79.9999999997, y: -39.9999999997 },
+      p2: { x: 80.0000000001, y: 40 },
+    });
     expect(e).not.toContain("9999999");
     expect(e).toBe("{{-80,-40},{80,40}}");
   });
@@ -65,7 +95,10 @@ describe("iconEditor: serialization", () => {
 describe("iconEditor: source patch semantics", () => {
   it("applying a patch to extent range only changes that region", () => {
     const full = `within X; model M\n  annotation(Icon(graphics={\n    Rectangle(extent={{-80,-50},{80,50}}, lineColor={0,0,255})\n  }));\nend M;`;
-    const ed = extractEditableIconFromSlice(full.slice(full.indexOf("annotation")), "M")!;
+    const ed = extractEditableIconFromSlice(
+      full.slice(full.indexOf("annotation")),
+      "M",
+    )!;
     const e = ed.editables[0]!;
     const range = e.source.extentRange!;
     const baseOffset = full.indexOf("annotation");
@@ -88,12 +121,21 @@ describe("iconEditor: source patch semantics", () => {
     const first = extractEditableIconFromSlice(full.slice(annoOffset), "M")!;
     const e0 = first.editables[0]!;
     const r = e0.source.extentRange!;
-    const updated = full.slice(0, annoOffset + r.start) + "{{0,0},{10,10}}" + full.slice(annoOffset + r.end);
+    const updated =
+      full.slice(0, annoOffset + r.start) +
+      "{{0,0},{10,10}}" +
+      full.slice(annoOffset + r.end);
     // re-parse
-    const second = extractEditableIconFromSlice(updated.slice(updated.indexOf("annotation")), "M")!;
+    const second = extractEditableIconFromSlice(
+      updated.slice(updated.indexOf("annotation")),
+      "M",
+    )!;
     const e1 = second.editables[0]!;
     expect(e1.source.extentRange).toBeDefined();
-    const text = updated.slice(updated.indexOf("annotation") + e1.source.extentRange!.start, updated.indexOf("annotation") + e1.source.extentRange!.end);
+    const text = updated.slice(
+      updated.indexOf("annotation") + e1.source.extentRange!.start,
+      updated.indexOf("annotation") + e1.source.extentRange!.end,
+    );
     expect(text).toBe("{{0,0},{10,10}}");
     expect(second.icon.graphics[0]!.type).toBe("Rectangle");
   });

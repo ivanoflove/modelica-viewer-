@@ -320,7 +320,7 @@ export function resolveEditableIcon(
   // need to map graphics items to their source ranges
   const graphicsArg = getArgWithRange(iconCall, "graphics");
   let graphicsItems: AnnotationValue[] | undefined;
-  let graphicsRangeMap = new Map<number, { start: number; end: number }>();
+  const graphicsRangeMap = new Map<number, { start: number; end: number }>();
   if (graphicsArg && graphicsArg.value.type === "array") {
     graphicsItems = graphicsArg.value.items;
     // map each call's range
@@ -396,4 +396,44 @@ export function extractEditableIconFromSlice(
   } catch {
     return null;
   }
+}
+
+// Convert editable source ranges (relative to the annotation slice) into
+// absolute file offsets. sliceBase = start of the class slice in the file,
+// annotationIdx = index of "annotation" within that slice.
+export function toAbsoluteEditableRanges(
+  editable: EditableIconDto,
+  sliceBase: number,
+  annotationIdx: number,
+): EditableIconDto {
+  const shift = sliceBase + annotationIdx;
+  const editables = editable.editables.map((e) => {
+    const shiftRange = (r?: { start: number; end: number }) =>
+      r ? { start: r.start + shift, end: r.end + shift } : undefined;
+    return {
+      ...e,
+      source: {
+        itemRange: shiftRange(e.source.itemRange)!,
+        extentRange: shiftRange(e.source.extentRange),
+        pointsRange: shiftRange(e.source.pointsRange),
+        originRange: shiftRange(e.source.originRange),
+      },
+    };
+  });
+  return { icon: editable.icon, editables };
+}
+
+// Recursively locate a class by its qualified name inside parsed classes.
+import type { ClassNode } from "./types.js";
+
+export function findClassByQualifiedName(
+  classes: ClassNode[],
+  qualifiedName: string,
+): ClassNode | null {
+  for (const c of classes) {
+    if (c.qualifiedName === qualifiedName) return c;
+    const found = findClassByQualifiedName(c.children, qualifiedName);
+    if (found) return found;
+  }
+  return null;
 }

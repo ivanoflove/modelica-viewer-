@@ -4,6 +4,7 @@ import type {
   GetIconResult,
   LoadPackageResult,
   ReadSourceResult,
+  ReloadClassRangeResult,
   SourceEdit,
   SourceRangeDto,
 } from "./modelica.js";
@@ -34,6 +35,11 @@ export interface WindowApi {
       filePath: string,
       edit: SourceEdit,
     ) => Promise<ApplySourceEditResult>;
+    reloadClassRange: (
+      filePath: string,
+      qualifiedName: string,
+    ) => Promise<ReloadClassRangeResult>;
     reveal: (filePath: string) => Promise<void>;
   };
+  onAutoOpen: (callback: (dirPath: string) => void) => void;
 }

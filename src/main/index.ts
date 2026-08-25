@@ -6,9 +6,21 @@ import { PackageLoader } from "./modelica/loader.js";
 import {
   extractIconFromSlice,
   extractEditableIconFromSlice,
+  toAbsoluteEditableRanges,
+  findClassByQualifiedName,
 } from "./modelica/iconResolver.js";
+import { parseModelicaFile } from "./modelica/parser.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
+
+function cliOpenPath(): string | null {
+  const idx = process.argv.indexOf("--open");
+  if (idx === -1) return null;
+  const p = process.argv[idx + 1];
+  return p || null;
+}
+
+const AUTO_OPEN_PATH = cliOpenPath();
 
 function createWindow(): void {
   const window = new BrowserWindow({
@@ -26,6 +38,12 @@ function createWindow(): void {
     void window.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
     void window.loadFile(join(__dirname, "../renderer/index.html"));
+  }
+
+  if (AUTO_OPEN_PATH) {
+    window.webContents.on("did-finish-load", () => {
+      window.webContents.send("modelica:auto-open", AUTO_OPEN_PATH);
+    });
   }
 }
 
@@ -121,8 +139,34 @@ function registerIpcHandlers(): void {
         const slice = sourceRange
           ? content.slice(sourceRange.start, sourceRange.end)
           : content;
+        const sliceBase = sourceRange ? sourceRange.start : 0;
+        const annotationIdx = slice.indexOf("annotation");
         const editable = extractEditableIconFromSlice(slice, modelName ?? "");
+        if (editable && annotationIdx >= 0) {
+          return {
+            editable: toAbsoluteEditableRanges(
+              editable,
+              sliceBase,
+              annotationIdx,
+            ),
+          };
+        }
         return { editable };
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelica:reloadClassRange",
+    async (_event, filePath: string, qualifiedName: string) => {
+      try {
+        if (!filePath || !qualifiedName) return { error: "Missing args" };
+        const content = await readFile(filePath, "utf-8");
+        const parsed = parseModelicaFile(content, filePath);
+        const found = findClassByQualifiedName(parsed.classes, qualifiedName);
+        return { sourceRange: found ? found.sourceRange : null };
       } catch (e) {
         return { error: (e as Error).message };
       }

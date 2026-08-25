@@ -6,6 +6,7 @@ import type {
   GetIconResult,
   LoadPackageResult,
   ReadSourceResult,
+  ReloadClassRangeResult,
   SourceEdit,
   SourceRangeDto,
 } from "../shared/modelica";
@@ -57,8 +58,19 @@ const api: WindowApi = {
         filePath,
         edit,
       ) as Promise<ApplySourceEditResult>,
+    reloadClassRange: (filePath: string, qualifiedName: string) =>
+      ipcRenderer.invoke(
+        "modelica:reloadClassRange",
+        filePath,
+        qualifiedName,
+      ) as Promise<ReloadClassRangeResult>,
     reveal: (filePath: string) =>
       ipcRenderer.invoke("modelica:reveal", filePath) as Promise<void>,
+  },
+  onAutoOpen: (callback: (dirPath: string) => void) => {
+    ipcRenderer.on("modelica:auto-open", (_e, dirPath: string) =>
+      callback(dirPath),
+    );
   },
 };
 

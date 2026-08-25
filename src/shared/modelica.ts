@@ -58,3 +58,7 @@ export interface SourceEdit {
 }
 
 export type ApplySourceEditResult = { ok: true } | { error: string };
+
+export type ReloadClassRangeResult =
+  | { sourceRange: SourceRangeDto | null }
+  | { error: string };
