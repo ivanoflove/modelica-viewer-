@@ -1,7 +1,10 @@
 import type {
+  ApplySourceEditResult,
+  GetEditableIconResult,
   GetIconResult,
   LoadPackageResult,
   ReadSourceResult,
+  SourceEdit,
   SourceRangeDto,
 } from "./modelica.js";
 
@@ -22,6 +25,15 @@ export interface WindowApi {
       sourceRange: SourceRangeDto | null,
       modelName: string,
     ) => Promise<GetIconResult>;
+    getEditableIcon: (
+      filePath: string,
+      sourceRange: SourceRangeDto | null,
+      modelName: string,
+    ) => Promise<GetEditableIconResult>;
+    applySourceEdit: (
+      filePath: string,
+      edit: SourceEdit,
+    ) => Promise<ApplySourceEditResult>;
     reveal: (filePath: string) => Promise<void>;
   };
 }

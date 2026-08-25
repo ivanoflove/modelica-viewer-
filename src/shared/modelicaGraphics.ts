@@ -18,6 +18,22 @@ export interface IconDto {
   graphics: GraphicItemDto[];
 }
 
+export interface EditableGraphic {
+  id: string;
+  graphic: GraphicItemDto;
+  source: {
+    itemRange: { start: number; end: number };
+    extentRange?: { start: number; end: number };
+    pointsRange?: { start: number; end: number };
+    originRange?: { start: number; end: number };
+  };
+}
+
+export interface EditableIconDto {
+  icon: IconDto;
+  editables: EditableGraphic[];
+}
+
 export type GraphicItemDto =
   | RectangleDto
   | EllipseDto

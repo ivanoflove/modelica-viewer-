@@ -1,9 +1,12 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { PackageLoader } from "./modelica/loader.js";
-import { extractIconFromSlice } from "./modelica/iconResolver.js";
+import {
+  extractIconFromSlice,
+  extractEditableIconFromSlice,
+} from "./modelica/iconResolver.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -98,6 +101,57 @@ function registerIpcHandlers(): void {
           : content;
         const icon = extractIconFromSlice(slice, modelName ?? "");
         return { icon };
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelica:getEditableIcon",
+    async (
+      _event,
+      filePath: string,
+      sourceRange: { start: number; end: number } | null,
+      modelName: string,
+    ) => {
+      try {
+        if (!filePath) return { error: "No file path provided" };
+        const content = await readFile(filePath, "utf-8");
+        const slice = sourceRange
+          ? content.slice(sourceRange.start, sourceRange.end)
+          : content;
+        const editable = extractEditableIconFromSlice(slice, modelName ?? "");
+        return { editable };
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelica:applySourceEdit",
+    async (
+      _event,
+      filePath: string,
+      edit: { start: number; end: number; replacement: string },
+    ) => {
+      try {
+        if (!filePath || !edit) return { error: "Missing filePath or edit" };
+        const content = await readFile(filePath, "utf-8");
+        if (
+          edit.start < 0 ||
+          edit.end > content.length ||
+          edit.start > edit.end
+        ) {
+          return { error: "Invalid edit range" };
+        }
+        const updated =
+          content.slice(0, edit.start) +
+          edit.replacement +
+          content.slice(edit.end);
+        await writeFile(filePath, updated, "utf-8");
+        return { ok: true };
       } catch (e) {
         return { error: (e as Error).message };
       }

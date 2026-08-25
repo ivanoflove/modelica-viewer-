@@ -397,6 +397,15 @@ h1 {
   justify-content: center;
 }
 
+.selection-box {
+  fill: none;
+  stroke: #3139fb;
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
 .empty-detail {
   color: rgba(49, 57, 251, 0.5);
   padding: 40px;

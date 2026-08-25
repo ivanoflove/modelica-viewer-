@@ -1,4 +1,4 @@
-import type { IconDto } from "./modelicaGraphics.js";
+import type { IconDto, EditableIconDto } from "./modelicaGraphics.js";
 
 export type ClassKind =
   | "package"
@@ -46,3 +46,15 @@ export type ReadSourceResult =
   | { error: string };
 
 export type GetIconResult = { icon: IconDto | null } | { error: string };
+
+export type GetEditableIconResult =
+  | { editable: EditableIconDto | null }
+  | { error: string };
+
+export interface SourceEdit {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+export type ApplySourceEditResult = { ok: true } | { error: string };

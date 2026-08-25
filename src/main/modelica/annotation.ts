@@ -1,21 +1,33 @@
 import { tokenize, type Token } from "./lexer.js";
 
 export type AnnotationValue =
-  | { type: "number"; value: number }
-  | { type: "string"; value: string }
-  | { type: "boolean"; value: boolean }
-  | { type: "identifier"; name: string }
-  | { type: "array"; items: AnnotationValue[] }
-  | { type: "call"; call: AnnotationCall };
+  | { type: "number"; value: number; range: { start: number; end: number } }
+  | { type: "string"; value: string; range: { start: number; end: number } }
+  | { type: "boolean"; value: boolean; range: { start: number; end: number } }
+  | { type: "identifier"; name: string; range: { start: number; end: number } }
+  | {
+      type: "array";
+      items: AnnotationValue[];
+      range: { start: number; end: number };
+    }
+  | {
+      type: "call";
+      call: AnnotationCall;
+      range: { start: number; end: number };
+    };
 
 export interface AnnotationCall {
   name: string;
   arguments: AnnotationArgument[];
+  sourceRange: { start: number; end: number };
+  nameRange: { start: number; end: number };
 }
 
 export interface AnnotationArgument {
   name?: string;
   value: AnnotationValue;
+  sourceRange: { start: number; end: number };
+  nameRange?: { start: number; end: number };
 }
 
 class AnnotationParser {
@@ -50,45 +62,54 @@ class AnnotationParser {
     return this.peek().type === "EOF";
   }
 
-  // Entry: parse any value
   parseValue(): AnnotationValue {
     const tok = this.peek();
     if (tok.type === "NUMBER") {
       this.advance();
-      return { type: "number", value: Number(tok.value) };
+      return {
+        type: "number",
+        value: Number(tok.value),
+        range: { start: tok.start, end: tok.end },
+      };
     }
     if (tok.type === "STRING") {
       this.advance();
-      return { type: "string", value: tok.value };
+      return {
+        type: "string",
+        value: tok.value,
+        range: { start: tok.start, end: tok.end },
+      };
     }
     if (tok.type === "LBRACE") {
       return this.parseArray();
     }
-    // identifier or keyword that could be boolean or call or bare identifier
     if (tok.type === "IDENT" || tok.type === "KEYWORD") {
-      // check if next is LPAREN => call
       const next = this.tokens[this.pos + 1];
       if (next && next.type === "LPAREN") {
-        return { type: "call", call: this.parseCall() };
+        const call = this.parseCall();
+        return { type: "call", call, range: call.sourceRange };
       }
-      // boolean literals
       if (tok.value === "true" || tok.value === "false") {
         this.advance();
-        return { type: "boolean", value: tok.value === "true" };
+        return {
+          type: "boolean",
+          value: tok.value === "true",
+          range: { start: tok.start, end: tok.end },
+        };
       }
-      // bare identifier (e.g., FillPattern.Solid => we handle DOT later)
       this.advance();
       let name = tok.value;
-      // handle dotted qualified names like FillPattern.Solid
+      let end = tok.end;
       while (this.peek().type === "DOT") {
-        this.advance(); // dot
+        this.advance();
         const id = this.peek();
         if (id.type === "IDENT" || id.type === "KEYWORD") {
           this.advance();
           name += "." + id.value;
+          end = id.end;
         } else break;
       }
-      return { type: "identifier", name };
+      return { type: "identifier", name, range: { start: tok.start, end } };
     }
     throw new Error(
       `Unexpected token ${tok.type} ${tok.value} at ${tok.line}:${tok.col}`,
@@ -96,42 +117,47 @@ class AnnotationParser {
   }
 
   parseArray(): AnnotationValue {
-    this.expect("LBRACE");
+    const lbrace = this.expect("LBRACE");
     const items: AnnotationValue[] = [];
-    // handle empty array {}
     if (this.peek().type === "RBRACE") {
-      this.advance();
-      return { type: "array", items };
+      const rbrace = this.advance();
+      return {
+        type: "array",
+        items,
+        range: { start: lbrace.start, end: rbrace.end },
+      };
     }
     while (!this.isAtEnd() && this.peek().type !== "RBRACE") {
-      // Modelica allows array of arrays: {{-80,-50},{80,50}} and array of calls: { Rectangle(...), Ellipse(...) }
-      // Also points: {{-80,0},{0,50}} etc.
-      // Parse value
       const v = this.parseValue();
       items.push(v);
       if (this.peek().type === "COMMA") {
         this.advance();
-      } else {
-        // allow missing comma? break if RBRACE
-        if (this.peek().type === "RBRACE") break;
-      }
+      } else if (this.peek().type === "RBRACE") break;
     }
-    this.expect("RBRACE");
-    return { type: "array", items };
+    const rbrace = this.expect("RBRACE");
+    return {
+      type: "array",
+      items,
+      range: { start: lbrace.start, end: rbrace.end },
+    };
   }
 
   parseCall(): AnnotationCall {
-    const nameTok = this.advance(); // IDENT or KEYWORD
+    const nameTok = this.advance();
     const name = nameTok.value;
+    const nameRange = { start: nameTok.start, end: nameTok.end };
     this.expect("LPAREN");
     const args: AnnotationArgument[] = [];
     if (this.peek().type === "RPAREN") {
-      this.advance();
-      return { name, arguments: args };
+      const rparen = this.advance();
+      return {
+        name,
+        arguments: args,
+        sourceRange: { start: nameTok.start, end: rparen.end },
+        nameRange,
+      };
     }
     while (!this.isAtEnd() && this.peek().type !== "RPAREN") {
-      // check named arg: IDENT EQUALS value
-      // Lookahead: IDENT/KEYWORD EQUALS
       const p0 = this.peek();
       const p1 = this.tokens[this.pos + 1];
       if (
@@ -139,26 +165,35 @@ class AnnotationParser {
         p1 &&
         p1.type === "EQUALS"
       ) {
-        const argName = this.advance().value;
-        this.advance(); // EQUALS
+        const nameTok2 = this.advance();
+        this.advance();
         const val = this.parseValue();
-        args.push({ name: argName, value: val });
+        const argRange = { start: nameTok2.start, end: (val as any).range.end };
+        args.push({
+          name: nameTok2.value,
+          value: val,
+          sourceRange: argRange,
+          nameRange: { start: nameTok2.start, end: nameTok2.end },
+        });
       } else {
-        // positional arg (value)
         const val = this.parseValue();
-        args.push({ value: val });
+        const r = (val as any).range as { start: number; end: number };
+        args.push({ value: val, sourceRange: r });
       }
       if (this.peek().type === "COMMA") {
         this.advance();
       } else if (this.peek().type === "RPAREN") break;
     }
-    this.expect("RPAREN");
-    return { name, arguments: args };
+    const rparen = this.expect("RPAREN");
+    return {
+      name,
+      arguments: args,
+      sourceRange: { start: nameTok.start, end: rparen.end },
+      nameRange,
+    };
   }
 
-  // Parse top-level: expect annotation call, but we can parse any call
   parseTopCall(): AnnotationCall {
-    // skip leading annotation keyword if present: annotation( ... )
     return this.parseCall();
   }
 }
@@ -166,8 +201,6 @@ class AnnotationParser {
 export function parseAnnotationSlice(slice: string): AnnotationCall | null {
   try {
     const tokens = tokenize(slice);
-    // filter out SEMICOLON? Modelica annotation slice ends with maybe no semicolon, but we have tokens with SEMICOLON, we can ignore trailing semicolon by not expecting it
-    // Parser will stop at RPAREN, ignore trailing SEMICOLON/EOF
     const parser = new AnnotationParser(tokens);
     const call = parser.parseTopCall();
     return call;
@@ -176,7 +209,6 @@ export function parseAnnotationSlice(slice: string): AnnotationCall | null {
   }
 }
 
-// Helper to find Icon call inside annotation
 export function findIconCall(
   annotationCall: AnnotationCall,
 ): AnnotationCall | null {
@@ -185,19 +217,23 @@ export function findIconCall(
     if (arg.value.type === "call" && arg.value.call.name === "Icon") {
       return arg.value.call;
     }
-    // annotation may have named args? Usually annotation(Icon(...), Documentation(...))
-    // So positional args are calls
   }
   return null;
 }
 
-// Generic helpers for resolver
 export function getArg(
   call: AnnotationCall,
   name: string,
 ): AnnotationValue | undefined {
   const found = call.arguments.find((a) => a.name === name);
   return found?.value;
+}
+
+export function getArgWithRange(
+  call: AnnotationCall,
+  name: string,
+): AnnotationArgument | undefined {
+  return call.arguments.find((a) => a.name === name);
 }
 
 export function getPositionalArg(

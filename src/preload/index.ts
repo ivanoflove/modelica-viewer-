@@ -1,9 +1,12 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { DirectoryDialogResult, WindowApi } from "../shared/api";
 import type {
+  ApplySourceEditResult,
+  GetEditableIconResult,
   GetIconResult,
   LoadPackageResult,
   ReadSourceResult,
+  SourceEdit,
   SourceRangeDto,
 } from "../shared/modelica";
 
@@ -37,6 +40,23 @@ const api: WindowApi = {
         sourceRange,
         modelName,
       ) as Promise<GetIconResult>,
+    getEditableIcon: (
+      filePath: string,
+      sourceRange: SourceRangeDto | null,
+      modelName: string,
+    ) =>
+      ipcRenderer.invoke(
+        "modelica:getEditableIcon",
+        filePath,
+        sourceRange,
+        modelName,
+      ) as Promise<GetEditableIconResult>,
+    applySourceEdit: (filePath: string, edit: SourceEdit) =>
+      ipcRenderer.invoke(
+        "modelica:applySourceEdit",
+        filePath,
+        edit,
+      ) as Promise<ApplySourceEditResult>,
     reveal: (filePath: string) =>
       ipcRenderer.invoke("modelica:reveal", filePath) as Promise<void>,
   },

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PackageNodeDto } from "../../shared/modelica";
-import type { IconDto } from "../../shared/modelicaGraphics";
+import type { IconDto, EditableIconDto } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
 
@@ -23,6 +23,9 @@ function App(): JSX.Element {
   const [icon, setIcon] = useState<IconDto | null>(null);
   const [iconLoading, setIconLoading] = useState(false);
   const [iconError, setIconError] = useState<string | null>(null);
+  const [editableIcon, setEditableIcon] = useState<EditableIconDto | null>(
+    null,
+  );
 
   useEffect(() => {
     if (!window.api) {
@@ -80,26 +83,40 @@ function App(): JSX.Element {
       try {
         if (selected.kind === "package") {
           setIcon(null);
+          setEditableIcon(null);
           setIconLoading(false);
           return;
         }
         const range =
           (selected.node as { sourceRange?: { start: number; end: number } })
             .sourceRange ?? null;
-        const result = await window.api.modelica.getIcon(
-          selected.node.sourceFile,
-          range,
-          selected.node.name,
-        );
-        if ("error" in result) {
-          setIconError(result.error);
+        const [iconRes, editableRes] = await Promise.all([
+          window.api.modelica.getIcon(
+            selected.node.sourceFile,
+            range,
+            selected.node.name,
+          ),
+          window.api.modelica.getEditableIcon(
+            selected.node.sourceFile,
+            range,
+            selected.node.name,
+          ),
+        ]);
+        if ("error" in iconRes) {
+          setIconError(iconRes.error);
           setIcon(null);
-          return;
+        } else {
+          setIcon(iconRes.icon);
         }
-        setIcon(result.icon);
+        if ("error" in editableRes) {
+          setEditableIcon(null);
+        } else {
+          setEditableIcon(editableRes.editable);
+        }
       } catch (e) {
         setIconError((e as Error).message);
         setIcon(null);
+        setEditableIcon(null);
       } finally {
         setIconLoading(false);
       }
@@ -140,6 +157,66 @@ function App(): JSX.Element {
     if (!selected || !window.api) return;
     const path = selected.node.sourceFile;
     await window.api.modelica.reveal(path);
+  };
+
+  const handleIconEdit = async (edit: {
+    start: number;
+    end: number;
+    replacement: string;
+  }) => {
+    if (!selected || !window.api) return;
+    try {
+      const res = await window.api.modelica.applySourceEdit(
+        selected.node.sourceFile,
+        edit,
+      );
+      if ("error" in res) {
+        setIconError(res.error);
+        return;
+      }
+      // refresh source and icon after write (re-parse)
+      const range =
+        (selected.node as { sourceRange?: { start: number; end: number } })
+          .sourceRange ?? null;
+      const [srcRes, iconRes, editableRes] = await Promise.all([
+        window.api.modelica.readSource(selected.node.sourceFile),
+        window.api.modelica.getIcon(
+          selected.node.sourceFile,
+          range,
+          selected.node.name,
+        ),
+        window.api.modelica.getEditableIcon(
+          selected.node.sourceFile,
+          range,
+          selected.node.name,
+        ),
+      ]);
+      if ("error" in srcRes) {
+        setSourceError(srcRes.error);
+      } else {
+        if (
+          selected.kind !== "package" &&
+          (selected.node as { sourceRange?: { start: number; end: number } })
+            .sourceRange
+        ) {
+          // after edit, sourceRange is stale; reload whole file content for now
+          // For MVP, just show full updated file
+          setSource(srcRes.content.slice(0, 5000));
+        } else {
+          setSource("error" in srcRes ? "" : srcRes.content);
+        }
+        // actually show sliced again with updated range? need fresh parse of class range
+        // For now, re-read with new range from editableRes if available
+        // If editable, its icon's source ranges are fresh, but class range still stale
+        // We will just show full file after edit for MVP
+      }
+      if ("error" in iconRes) setIconError(iconRes.error);
+      else setIcon(iconRes.icon);
+      if ("error" in editableRes) setEditableIcon(null);
+      else setEditableIcon(editableRes.editable);
+    } catch (e) {
+      setIconError((e as Error).message);
+    }
   };
 
   const treeCount = (node: PackageNodeDto | null): number => {
@@ -258,7 +335,12 @@ function App(): JSX.Element {
                     ) : iconError ? (
                       <div className="source-error">{iconError}</div>
                     ) : (
-                      <IconViewer icon={icon} modelName={selected.node.name} />
+                      <IconViewer
+                        icon={icon}
+                        editable={editableIcon}
+                        modelName={selected.node.name}
+                        onEdit={handleIconEdit}
+                      />
                     )}
                   </div>
                 )}

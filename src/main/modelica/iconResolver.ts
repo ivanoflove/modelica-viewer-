@@ -1,5 +1,10 @@
 import type { AnnotationCall, AnnotationValue } from "./annotation.js";
-import { getArg, parseAnnotationSlice, findIconCall } from "./annotation.js";
+import {
+  getArg,
+  getArgWithRange,
+  parseAnnotationSlice,
+  findIconCall,
+} from "./annotation.js";
 import type {
   IconDto,
   CoordinateSystemDto,
@@ -266,12 +271,6 @@ export function extractIconFromSlice(
   slice: string,
   modelName: string,
 ): IconDto | null {
-  // We need to find annotation( ... Icon(...) ... )
-  // Simple approach: tokenize slice, find annotation call, then Icon inside
-  // But reuse annotation parser: parse whole slice as Modelica class? Simpler: find annotation substring via slice search
-  // For now, try to parse first annotation occurrence in slice
-  // We'll scan for "annotation" keyword in tokens and parse from there
-  // To keep simple, try to find "annotation(" in slice and parse that call
   const idx = slice.indexOf("annotation");
   if (idx === -1) return null;
   const sub = slice.slice(idx);
@@ -281,6 +280,119 @@ export function extractIconFromSlice(
     const iconCall = findIconCall(anno);
     if (!iconCall) return null;
     return resolveIcon(iconCall, modelName);
+  } catch {
+    return null;
+  }
+}
+
+// Editable helpers
+function formatNumber(n: number): string {
+  // avoid 19.9999999, normalize to 6 decimals and trim
+  if (Number.isInteger(n)) return String(n);
+  const fixed = Number(n.toFixed(6));
+  return String(fixed);
+}
+
+export function serializeExtent(extent: Extent): string {
+  return `{{${formatNumber(extent.p1.x)},${formatNumber(extent.p1.y)}},{${formatNumber(extent.p2.x)},${formatNumber(extent.p2.y)}}}`;
+}
+
+export function serializePoints(points: Point[]): string {
+  return `{${points.map((p) => `{${formatNumber(p.x)},${formatNumber(p.y)}}`).join(",")}}`;
+}
+
+export function serializeOrigin(origin: Point): string {
+  return `{${formatNumber(origin.x)},${formatNumber(origin.y)}}`;
+}
+
+import type {
+  EditableGraphic,
+  EditableIconDto,
+} from "../../shared/modelicaGraphics.js";
+
+export function resolveEditableIcon(
+  iconCall: AnnotationCall,
+  modelName: string,
+): EditableIconDto | null {
+  const base = resolveIcon(iconCall, modelName);
+  if (!base) return null;
+  const editables: EditableGraphic[] = [];
+  // need to map graphics items to their source ranges
+  const graphicsArg = getArgWithRange(iconCall, "graphics");
+  let graphicsItems: AnnotationValue[] | undefined;
+  let graphicsRangeMap = new Map<number, { start: number; end: number }>();
+  if (graphicsArg && graphicsArg.value.type === "array") {
+    graphicsItems = graphicsArg.value.items;
+    // map each call's range
+    graphicsArg.value.items.forEach((item, idx) => {
+      if (item.type === "call") {
+        graphicsRangeMap.set(idx, item.range);
+      }
+    });
+  } else {
+    // positional fallback
+    for (const arg of iconCall.arguments) {
+      if (!arg.name && arg.value.type === "array") {
+        const hasGraphics = arg.value.items.some((i) => i.type === "call");
+        if (hasGraphics) {
+          graphicsItems = arg.value.items;
+          arg.value.items.forEach((item, idx) => {
+            if (item.type === "call") graphicsRangeMap.set(idx, item.range);
+          });
+          break;
+        }
+      }
+    }
+  }
+  if (!graphicsItems) return { icon: base, editables };
+  let callIdx = 0;
+  for (const item of graphicsItems) {
+    if (item.type !== "call") continue;
+    const graphic = resolveGraphic(item.call, modelName);
+    if (!graphic) {
+      callIdx++;
+      continue;
+    }
+    const itemRange = (item as { range: { start: number; end: number } }).range;
+    // find extent/points/origin ranges inside call
+    let extentRange: { start: number; end: number } | undefined;
+    let pointsRange: { start: number; end: number } | undefined;
+    let originRange: { start: number; end: number } | undefined;
+    const extentArg = getArgWithRange(item.call, "extent");
+    if (extentArg) extentRange = (extentArg.value as any).range;
+    const pointsArg = getArgWithRange(item.call, "points");
+    if (pointsArg) pointsRange = (pointsArg.value as any).range;
+    const originArg = getArgWithRange(item.call, "origin");
+    if (originArg) originRange = (originArg.value as any).range;
+    const id = `${modelName}:${itemRange.start}`;
+    editables.push({
+      id,
+      graphic,
+      source: {
+        itemRange,
+        extentRange,
+        pointsRange,
+        originRange,
+      },
+    });
+    callIdx++;
+  }
+  return { icon: base, editables };
+}
+
+export function extractEditableIconFromSlice(
+  slice: string,
+  modelName: string,
+): EditableIconDto | null {
+  const idx = slice.indexOf("annotation");
+  if (idx === -1) return null;
+  const sub = slice.slice(idx);
+  try {
+    const anno = parseAnnotationSlice(sub);
+    if (!anno) return null;
+    const iconCall = findIconCall(anno);
+    if (!iconCall) return null;
+    return resolveEditableIcon(iconCall, modelName);
   } catch {
     return null;
   }
