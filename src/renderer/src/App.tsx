@@ -95,7 +95,9 @@ function App(): JSX.Element {
     <div className="app-layout">
       <header className="app-header">
         <div className="header-left">
-          <span className="eyebrow">MODELICA LIBRARY VIEWER — M1 · M2 Source Viewer</span>
+          <span className="eyebrow">
+            MODELICA LIBRARY VIEWER — M1 · M2 Source Viewer
+          </span>
           <h1>Package Browser</h1>
           <p className="ipc-status">IPC: {ipcStatus}</p>
         </div>
