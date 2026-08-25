@@ -27,7 +27,9 @@ class AnnotationParser {
   }
 
   private peek(offset = 0): Token {
-    return this.tokens[this.pos + offset] ?? this.tokens[this.tokens.length - 1]!;
+    return (
+      this.tokens[this.pos + offset] ?? this.tokens[this.tokens.length - 1]!
+    );
   }
 
   private advance(): Token {
@@ -88,7 +90,9 @@ class AnnotationParser {
       }
       return { type: "identifier", name };
     }
-    throw new Error(`Unexpected token ${tok.type} ${tok.value} at ${tok.line}:${tok.col}`);
+    throw new Error(
+      `Unexpected token ${tok.type} ${tok.value} at ${tok.line}:${tok.col}`,
+    );
   }
 
   parseArray(): AnnotationValue {
@@ -130,7 +134,11 @@ class AnnotationParser {
       // Lookahead: IDENT/KEYWORD EQUALS
       const p0 = this.peek();
       const p1 = this.tokens[this.pos + 1];
-      if ((p0.type === "IDENT" || p0.type === "KEYWORD") && p1 && p1.type === "EQUALS") {
+      if (
+        (p0.type === "IDENT" || p0.type === "KEYWORD") &&
+        p1 &&
+        p1.type === "EQUALS"
+      ) {
         const argName = this.advance().value;
         this.advance(); // EQUALS
         const val = this.parseValue();
@@ -169,7 +177,9 @@ export function parseAnnotationSlice(slice: string): AnnotationCall | null {
 }
 
 // Helper to find Icon call inside annotation
-export function findIconCall(annotationCall: AnnotationCall): AnnotationCall | null {
+export function findIconCall(
+  annotationCall: AnnotationCall,
+): AnnotationCall | null {
   if (annotationCall.name !== "annotation") return null;
   for (const arg of annotationCall.arguments) {
     if (arg.value.type === "call" && arg.value.call.name === "Icon") {
@@ -182,12 +192,18 @@ export function findIconCall(annotationCall: AnnotationCall): AnnotationCall | n
 }
 
 // Generic helpers for resolver
-export function getArg(call: AnnotationCall, name: string): AnnotationValue | undefined {
+export function getArg(
+  call: AnnotationCall,
+  name: string,
+): AnnotationValue | undefined {
   const found = call.arguments.find((a) => a.name === name);
   return found?.value;
 }
 
-export function getPositionalArg(call: AnnotationCall, index: number): AnnotationValue | undefined {
+export function getPositionalArg(
+  call: AnnotationCall,
+  index: number,
+): AnnotationValue | undefined {
   const positional = call.arguments.filter((a) => !a.name);
   return positional[index]?.value;
 }

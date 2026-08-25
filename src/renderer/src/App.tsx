@@ -83,7 +83,9 @@ function App(): JSX.Element {
           setIconLoading(false);
           return;
         }
-        const range = (selected.node as { sourceRange?: { start: number; end: number } }).sourceRange ?? null;
+        const range =
+          (selected.node as { sourceRange?: { start: number; end: number } })
+            .sourceRange ?? null;
         const result = await window.api.modelica.getIcon(
           selected.node.sourceFile,
           range,
@@ -256,10 +258,7 @@ function App(): JSX.Element {
                     ) : iconError ? (
                       <div className="source-error">{iconError}</div>
                     ) : (
-                      <IconViewer
-                        icon={icon}
-                        modelName={selected.node.name}
-                      />
+                      <IconViewer icon={icon} modelName={selected.node.name} />
                     )}
                   </div>
                 )}

@@ -1,12 +1,5 @@
-import type {
-  AnnotationCall,
-  AnnotationValue,
-} from "./annotation.js";
-import {
-  getArg,
-  parseAnnotationSlice,
-  findIconCall,
-} from "./annotation.js";
+import type { AnnotationCall, AnnotationValue } from "./annotation.js";
+import { getArg, parseAnnotationSlice, findIconCall } from "./annotation.js";
 import type {
   IconDto,
   CoordinateSystemDto,
@@ -30,12 +23,12 @@ function asString(v: AnnotationValue | undefined): string | undefined {
   return undefined;
 }
 
-function asArray(v: AnnotationValue | undefined): AnnotationValue[] | undefined {
+function asArray(
+  v: AnnotationValue | undefined,
+): AnnotationValue[] | undefined {
   if (v && v.type === "array") return v.items;
   return undefined;
 }
-
-
 
 function parsePoint(value: AnnotationValue): Point | null {
   // points can be {x, y} as array of two numbers, or possibly as array with identifier?
@@ -71,7 +64,9 @@ function parsePoints(value: AnnotationValue | undefined): Point[] | null {
   return points.length > 0 ? points : null;
 }
 
-function parseColor(value: AnnotationValue | undefined): [number, number, number] | undefined {
+function parseColor(
+  value: AnnotationValue | undefined,
+): [number, number, number] | undefined {
   if (!value) return undefined;
   const arr = asArray(value);
   if (!arr || arr.length !== 3) return undefined;
@@ -114,8 +109,12 @@ function resolveLine(call: AnnotationCall): LineDto | null {
   return {
     type: "Line",
     points,
-    color: parseColor(getArg(call, "color")) ?? parseColor(getArg(call, "lineColor")),
-    thickness: asNumber(getArg(call, "thickness")) ?? asNumber(getArg(call, "lineThickness")),
+    color:
+      parseColor(getArg(call, "color")) ??
+      parseColor(getArg(call, "lineColor")),
+    thickness:
+      asNumber(getArg(call, "thickness")) ??
+      asNumber(getArg(call, "lineThickness")),
   };
 }
 
@@ -139,12 +138,17 @@ function resolveText(call: AnnotationCall, modelName: string): TextDto | null {
     type: "Text",
     extent,
     textString,
-    textColor: parseColor(getArg(call, "textColor")) ?? parseColor(getArg(call, "lineColor")),
+    textColor:
+      parseColor(getArg(call, "textColor")) ??
+      parseColor(getArg(call, "lineColor")),
     fontSize: asNumber(getArg(call, "fontSize")),
   };
 }
 
-function resolveGraphic(call: AnnotationCall, modelName: string): GraphicItemDto | null {
+function resolveGraphic(
+  call: AnnotationCall,
+  modelName: string,
+): GraphicItemDto | null {
   switch (call.name) {
     case "Rectangle":
       return resolveRectangle(call);
@@ -161,13 +165,19 @@ function resolveGraphic(call: AnnotationCall, modelName: string): GraphicItemDto
   }
 }
 
-function parseCoordinateSystem(call: AnnotationCall | undefined): CoordinateSystemDto {
-  const defaultExtent: Extent = { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } };
+function parseCoordinateSystem(
+  call: AnnotationCall | undefined,
+): CoordinateSystemDto {
+  const defaultExtent: Extent = {
+    p1: { x: -100, y: -100 },
+    p2: { x: 100, y: 100 },
+  };
   if (!call) return { extent: defaultExtent };
   const extent = parseExtent(getArg(call, "extent")) ?? defaultExtent;
   const preserveArg = getArg(call, "preserveAspectRatio");
   let preserveAspectRatio: boolean | undefined;
-  if (preserveArg && preserveArg.type === "boolean") preserveAspectRatio = preserveArg.value;
+  if (preserveArg && preserveArg.type === "boolean")
+    preserveAspectRatio = preserveArg.value;
   // Modelica Boolean may also be identifier true/false
   if (preserveArg && preserveArg.type === "identifier") {
     if (preserveArg.name === "true") preserveAspectRatio = true;
@@ -176,7 +186,10 @@ function parseCoordinateSystem(call: AnnotationCall | undefined): CoordinateSyst
   return { extent, preserveAspectRatio };
 }
 
-export function resolveIcon(iconCall: AnnotationCall, modelName: string): IconDto | null {
+export function resolveIcon(
+  iconCall: AnnotationCall,
+  modelName: string,
+): IconDto | null {
   // iconCall is Icon( coordinateSystem(...), graphics={...} )
   // coordinateSystem may be named arg or positional? Usually Icon(coordinateSystem(...), graphics={...})
   // Also Icon(extent=..., graphics=...) variant? Handle both.
@@ -190,7 +203,11 @@ export function resolveIcon(iconCall: AnnotationCall, modelName: string): IconDt
   } else {
     // Check positional first arg that is coordinateSystem call
     for (const arg of iconCall.arguments) {
-      if (!arg.name && arg.value.type === "call" && arg.value.call.name === "coordinateSystem") {
+      if (
+        !arg.name &&
+        arg.value.type === "call" &&
+        arg.value.call.name === "coordinateSystem"
+      ) {
         coordinateSystem = parseCoordinateSystem(arg.value.call);
         break;
       }
@@ -235,14 +252,20 @@ export function resolveIcon(iconCall: AnnotationCall, modelName: string): IconDt
     // fallback to extent directly on Icon: Icon(extent={{...}})
     const extentDirect = parseExtent(getArg(iconCall, "extent"));
     if (extentDirect) coordinateSystem = { extent: extentDirect };
-    else coordinateSystem = { extent: { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } } };
+    else
+      coordinateSystem = {
+        extent: { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } },
+      };
   }
 
   return { coordinateSystem, graphics };
 }
 
 // Top-level helper: extract annotation string slice -> IconDto
-export function extractIconFromSlice(slice: string, modelName: string): IconDto | null {
+export function extractIconFromSlice(
+  slice: string,
+  modelName: string,
+): IconDto | null {
   // We need to find annotation( ... Icon(...) ... )
   // Simple approach: tokenize slice, find annotation call, then Icon inside
   // But reuse annotation parser: parse whole slice as Modelica class? Simpler: find annotation substring via slice search

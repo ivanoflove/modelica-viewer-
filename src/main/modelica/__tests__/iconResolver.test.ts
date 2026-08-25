@@ -2,7 +2,10 @@ import { describe, it, expect } from "vitest";
 import { parseAnnotationSlice, findIconCall } from "../annotation.js";
 import { resolveIcon } from "../iconResolver.js";
 
-function resolveIconFromAnnotation(src: string, modelName = "MyModel"): ReturnType<typeof resolveIcon> {
+function resolveIconFromAnnotation(
+  src: string,
+  modelName = "MyModel",
+): ReturnType<typeof resolveIcon> {
   const anno = parseAnnotationSlice(src)!;
   const iconCall = findIconCall(anno)!;
   return resolveIcon(iconCall, modelName);
@@ -31,7 +34,11 @@ describe("iconResolver", () => {
     const icon = resolveIconFromAnnotation(src)!;
     expect(icon.graphics[0]?.type).toBe("Line");
     const line = icon.graphics[0] as any;
-    expect(line.points).toEqual([{ x: -80, y: 0 }, { x: 0, y: 50 }, { x: 80, y: 0 }]);
+    expect(line.points).toEqual([
+      { x: -80, y: 0 },
+      { x: 0, y: 50 },
+      { x: 80, y: 0 },
+    ]);
     expect(line.color).toEqual([0, 0, 255]);
   });
 
@@ -70,7 +77,11 @@ describe("iconResolver", () => {
     const src = `annotation(Icon(graphics={Rectangle(extent={{-80,-50},{80,50}}), Ellipse(extent={{-30,-30},{30,30}}), Text(extent={{-80,60},{80,90}}, textString="hello")}))`;
     const icon = resolveIconFromAnnotation(src)!;
     expect(icon.graphics.length).toBe(3);
-    expect(icon.graphics.map((g) => g.type)).toEqual(["Rectangle", "Ellipse", "Text"]);
+    expect(icon.graphics.map((g) => g.type)).toEqual([
+      "Rectangle",
+      "Ellipse",
+      "Text",
+    ]);
   });
 
   it("should return null for missing Icon", () => {
@@ -83,7 +94,10 @@ describe("iconResolver", () => {
   it("should handle coordinateSystem extent", () => {
     const src = `annotation(Icon(coordinateSystem(extent={{-50,-50},{50,50}}, preserveAspectRatio=true), graphics={Rectangle(extent={{0,0},{10,10}})}))`;
     const icon = resolveIconFromAnnotation(src)!;
-    expect(icon.coordinateSystem.extent).toEqual({ p1: { x: -50, y: -50 }, p2: { x: 50, y: 50 } });
+    expect(icon.coordinateSystem.extent).toEqual({
+      p1: { x: -50, y: -50 },
+      p2: { x: 50, y: 50 },
+    });
     expect(icon.coordinateSystem.preserveAspectRatio).toBe(true);
   });
 });

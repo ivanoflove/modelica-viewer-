@@ -26,7 +26,11 @@ const api: WindowApi = {
         "modelica:readSource",
         filePath,
       ) as Promise<ReadSourceResult>,
-    getIcon: (filePath: string, sourceRange: SourceRangeDto | null, modelName: string) =>
+    getIcon: (
+      filePath: string,
+      sourceRange: SourceRangeDto | null,
+      modelName: string,
+    ) =>
       ipcRenderer.invoke(
         "modelica:getIcon",
         filePath,

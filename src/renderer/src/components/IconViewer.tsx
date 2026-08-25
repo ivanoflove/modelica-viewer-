@@ -27,7 +27,11 @@ export function IconViewer({ icon, modelName }: Props) {
 
   return (
     <div className="icon-viewer">
-      <svg viewBox={viewBox} className="modelica-icon" preserveAspectRatio="xMidYMid meet">
+      <svg
+        viewBox={viewBox}
+        className="modelica-icon"
+        preserveAspectRatio="xMidYMid meet"
+      >
         {/* Flip Y: Modelica Y up, SVG Y down */}
         <g transform="scale(1,-1)">
           {icon.graphics.map((item, idx) => (

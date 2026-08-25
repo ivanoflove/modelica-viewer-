@@ -135,7 +135,14 @@ export function tokenize(input: string): Token[] {
       const startLine = line;
       const startCol = col;
       advance();
-      tokens.push({ type: "DOT", value: ".", line: startLine, col: startCol, start, end: i });
+      tokens.push({
+        type: "DOT",
+        value: ".",
+        line: startLine,
+        col: startCol,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === ";") {
@@ -143,56 +150,116 @@ export function tokenize(input: string): Token[] {
       const startLine = line;
       const startCol = col;
       advance();
-      tokens.push({ type: "SEMICOLON", value: ";", line: startLine, col: startCol, start, end: i });
+      tokens.push({
+        type: "SEMICOLON",
+        value: ";",
+        line: startLine,
+        col: startCol,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === "(") {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       advance();
-      tokens.push({ type: "LPAREN", value: "(", line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "LPAREN",
+        value: "(",
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === ")") {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       advance();
-      tokens.push({ type: "RPAREN", value: ")", line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "RPAREN",
+        value: ")",
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === "{") {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       advance();
-      tokens.push({ type: "LBRACE", value: "{", line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "LBRACE",
+        value: "{",
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === "}") {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       advance();
-      tokens.push({ type: "RBRACE", value: "}", line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "RBRACE",
+        value: "}",
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === ",") {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       advance();
-      tokens.push({ type: "COMMA", value: ",", line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "COMMA",
+        value: ",",
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
     if (ch === "=") {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       advance();
-      tokens.push({ type: "EQUALS", value: "=", line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "EQUALS",
+        value: "=",
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
 
     // number: optional sign, digits, optional dot, optional exponent
-    if (/[0-9]/.test(ch) || (ch === "-" && /[0-9.]/.test(peek(1))) || (ch === "." && /[0-9]/.test(peek(1)))) {
+    if (
+      /[0-9]/.test(ch) ||
+      (ch === "-" && /[0-9.]/.test(peek(1))) ||
+      (ch === "." && /[0-9]/.test(peek(1)))
+    ) {
       const start = i;
-      const sL = line; const sC = col;
+      const sL = line;
+      const sC = col;
       let num = "";
       if (ch === "-") {
         num += "-";
@@ -215,7 +282,11 @@ export function tokenize(input: string): Token[] {
         // trailing dot not part of number, leave it for DOT token
       }
       // exponent
-      if ((input[i] === "e" || input[i] === "E") && (/[0-9]/.test(peek(1)) || ((peek(1) === "+" || peek(1) === "-") && /[0-9]/.test(peek(2))))) {
+      if (
+        (input[i] === "e" || input[i] === "E") &&
+        (/[0-9]/.test(peek(1)) ||
+          ((peek(1) === "+" || peek(1) === "-") && /[0-9]/.test(peek(2))))
+      ) {
         num += input[i];
         advance();
         if (input[i] === "+" || input[i] === "-") {
@@ -232,7 +303,14 @@ export function tokenize(input: string): Token[] {
         // not a valid number, treat as skip and continue
         continue;
       }
-      tokens.push({ type: "NUMBER", value: num, line: sL, col: sC, start, end: i });
+      tokens.push({
+        type: "NUMBER",
+        value: num,
+        line: sL,
+        col: sC,
+        start,
+        end: i,
+      });
       continue;
     }
 
