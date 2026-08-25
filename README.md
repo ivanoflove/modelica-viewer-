@@ -13,15 +13,14 @@ Electron + React + TypeScript 的 Modelica 包浏览器。**M1 仅实现「正�
 ## Requirements
 
 - Node.js 26+ / npm 10+
-- 系统代理 `http://127.0.0.1:7892`（mihomo/clash）可选，用于 Electron 二进制与后续库下载
+- 如需代理，可通过 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量配置，用于 Electron 二进制与后续库下载
 
-## Install（走代理）
+## Install
 
 ```bash
-# 7892 代理（mihomo 默认）
-export HTTP_PROXY=http://127.0.0.1:7892
-export HTTPS_PROXY=http://127.0.0.1:7892
-export ALL_PROXY=http://127.0.0.1:7892
+# 如需代理（示例）
+export HTTP_PROXY=http://<proxy-host>:<port>
+export HTTPS_PROXY=http://<proxy-host>:<port>
 
 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
 ```
@@ -47,10 +46,10 @@ npm test             # vitest run (lexer/parser/loader)
 
 ## 代理与后续下载预留（M2）
 
-- 本机代理固定 `127.0.0.1:7892`，已验证 `http_proxy/https_proxy` 环境变量。未来下载 Modelica Standard Library zip 时：
+- 可通过 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量配置代理。未来下载 Modelica Standard Library zip 时：
 
   ```ts
-  const proxy = process.env.HTTP_PROXY ?? 'http://127.0.0.1:7892'
+  const proxy = process.env.HTTP_PROXY
   // fetch(url, { dispatcher: new ProxyAgent(proxy) }) // undici
   ```
 
