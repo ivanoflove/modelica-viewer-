@@ -16,7 +16,10 @@ import type {
   LineDto,
   PolygonDto,
   TextDto,
+  EditableGraphic,
+  EditableIconDto,
 } from "../../shared/modelicaGraphics.js";
+import { identityTransform } from "../../shared/modelicaGraphics.js";
 
 function asNumber(v: AnnotationValue | undefined): number | undefined {
   if (v && v.type === "number") return v.value;
@@ -305,11 +308,6 @@ export function serializeOrigin(origin: Point): string {
   return `{${formatNumber(origin.x)},${formatNumber(origin.y)}}`;
 }
 
-import type {
-  EditableGraphic,
-  EditableIconDto,
-} from "../../shared/modelicaGraphics.js";
-
 export function resolveEditableIcon(
   iconCall: AnnotationCall,
   modelName: string,
@@ -368,6 +366,8 @@ export function resolveEditableIcon(
     editables.push({
       id,
       graphic,
+      selected: false,
+      transform: identityTransform,
       source: {
         itemRange,
         extentRange,

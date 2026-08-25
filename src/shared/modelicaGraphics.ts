@@ -18,9 +18,23 @@ export interface IconDto {
   graphics: GraphicItemDto[];
 }
 
+export interface GraphicTransform {
+  translate: { x: number; y: number };
+  scale: { x: number; y: number };
+  rotate: number;
+}
+
+export const identityTransform: GraphicTransform = {
+  translate: { x: 0, y: 0 },
+  scale: { x: 1, y: 1 },
+  rotate: 0,
+};
+
 export interface EditableGraphic {
   id: string;
   graphic: GraphicItemDto;
+  selected: boolean;
+  transform: GraphicTransform;
   source: {
     itemRange: { start: number; end: number };
     extentRange?: { start: number; end: number };

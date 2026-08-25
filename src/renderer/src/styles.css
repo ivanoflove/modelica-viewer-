@@ -406,6 +406,14 @@ h1 {
   pointer-events: none;
 }
 
+.hover-outline {
+  fill: none;
+  stroke: #4a90e2;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
 .empty-detail {
   color: rgba(49, 57, 251, 0.5);
   padding: 40px;
