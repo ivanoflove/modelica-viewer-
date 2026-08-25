@@ -1,0 +1,37 @@
+{
+  "name": "modelica-library-viewer",
+  "version": "0.1.0",
+  "description": "Electron scaffold for a Modelica library viewer",
+  "main": "./out/main/index.js",
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "dev:safe": "electron-vite dev -- --no-sandbox --disable-gpu --disable-software-rasterizer",
+    "start": "electron --no-sandbox --disable-gpu out/main/index.js",
+    "build": "electron-vite build",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^36.4.0",
+    "electron-vite": "^3.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.7",
+    "tsx": "^4.23.12",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.3",
+    "vitest": "^4.1.11"
+  },
+  "allowScripts": {
+    "electron@36.9.5": true
+  }
+}
