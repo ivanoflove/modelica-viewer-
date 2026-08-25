@@ -18,11 +18,17 @@ export interface PackageNodeDto {
   loadErrors?: string[];
 }
 
+export interface SourceRangeDto {
+  start: number;
+  end: number;
+}
+
 export interface ClassNodeDto {
   kind: ClassKind;
   name: string;
   qualifiedName: string;
   sourceFile: string;
+  sourceRange: SourceRangeDto;
   isPartial: boolean;
   isEncapsulated: boolean;
   children: ClassNodeDto[];

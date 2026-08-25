@@ -1,16 +1,12 @@
-export type TokenType =
-  | "IDENT"
-  | "DOT"
-  | "SEMICOLON"
-  | "STRING"
-  | "KEYWORD"
-  | "EOF";
+export type TokenType = "IDENT" | "DOT" | "SEMICOLON" | "STRING" | "KEYWORD" | "EOF";
 
 export interface Token {
   type: TokenType;
   value: string;
   line: number;
   col: number;
+  start: number;
+  end: number;
 }
 
 const KEYWORDS = new Set([
@@ -91,6 +87,7 @@ export function tokenize(input: string): Token[] {
 
     // string literal " ... "  Modelica uses "" as escaped quote inside string
     if (ch === '"') {
+      const start = i;
       const startLine = line;
       const startCol = col;
       advance(); // opening "
@@ -98,7 +95,6 @@ export function tokenize(input: string): Token[] {
       while (i < input.length) {
         if (input[i] === '"') {
           if (peek(1) === '"') {
-            // escaped quote
             str += '"';
             advance(2);
             continue;
@@ -106,11 +102,7 @@ export function tokenize(input: string): Token[] {
           advance(); // closing "
           break;
         }
-        if (input[i] === "\n") {
-          str += input[i];
-        } else {
-          str += input[i];
-        }
+        str += input[i];
         advance();
       }
       tokens.push({
@@ -118,24 +110,33 @@ export function tokenize(input: string): Token[] {
         value: str,
         line: startLine,
         col: startCol,
+        start,
+        end: i,
       });
       continue;
     }
 
-    // dot and semicolon
+    // dot and semicolon - capture start before advance for correct line/col
     if (ch === ".") {
-      tokens.push({ type: "DOT", value: ".", line, col });
+      const start = i;
+      const startLine = line;
+      const startCol = col;
       advance();
+      tokens.push({ type: "DOT", value: ".", line: startLine, col: startCol, start, end: i });
       continue;
     }
     if (ch === ";") {
-      tokens.push({ type: "SEMICOLON", value: ";", line, col });
+      const start = i;
+      const startLine = line;
+      const startCol = col;
       advance();
+      tokens.push({ type: "SEMICOLON", value: ";", line: startLine, col: startCol, start, end: i });
       continue;
     }
 
     // identifier / keyword
     if (/[A-Za-z_]/.test(ch)) {
+      const start = i;
       const startLine = line;
       const startCol = col;
       let word = "";
@@ -149,6 +150,8 @@ export function tokenize(input: string): Token[] {
           value: word,
           line: startLine,
           col: startCol,
+          start,
+          end: i,
         });
       } else {
         tokens.push({
@@ -156,6 +159,8 @@ export function tokenize(input: string): Token[] {
           value: word,
           line: startLine,
           col: startCol,
+          start,
+          end: i,
         });
       }
       continue;
@@ -165,6 +170,6 @@ export function tokenize(input: string): Token[] {
     advance();
   }
 
-  tokens.push({ type: "EOF", value: "", line, col });
+  tokens.push({ type: "EOF", value: "", line, col, start: i, end: i });
   return tokens;
 }

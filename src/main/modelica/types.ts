@@ -18,11 +18,17 @@ export interface PackageNode {
   loadErrors?: string[];
 }
 
+export interface SourceRange {
+  start: number;
+  end: number;
+}
+
 export interface ClassNode {
   kind: ClassKind;
   name: string;
   qualifiedName: string;
   sourceFile: string;
+  sourceRange: SourceRange;
   isPartial: boolean;
   isEncapsulated: boolean;
   children: ClassNode[];

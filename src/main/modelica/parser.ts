@@ -34,14 +34,6 @@ class Parser {
     return t;
   }
 
-  private match(value: string): boolean {
-    if (this.peek().value === value) {
-      this.advance();
-      return true;
-    }
-    return false;
-  }
-
   private expectIdent(): string {
     const t = this.peek();
     if (t.type === "IDENT") {
@@ -143,6 +135,7 @@ class Parser {
     }
     const isPartial = start.modifiers.partial;
     const isEncapsulated = start.modifiers.encapsulated;
+    const sourceStart = this.tokens[this.pos]!.start;
 
     // consume modifiers
     if (
@@ -169,6 +162,7 @@ class Parser {
       name,
       qualifiedName,
       sourceFile: this.sourceFile,
+      sourceRange: { start: sourceStart, end: sourceStart },
       isPartial,
       isEncapsulated,
       children: [],
@@ -196,10 +190,14 @@ class Parser {
         const next = this.tokens[this.pos + 1];
         if (next && next.type === "IDENT") {
           if (next.value === name) {
-            // consume end <name> ;
             this.advance(); // end
-            this.advance(); // name
-            if (this.peek().type === "SEMICOLON") this.advance();
+            const nameToken = this.advance(); // name
+            let endOffset = nameToken.end;
+            if (this.peek().type === "SEMICOLON") {
+              const semi = this.advance();
+              endOffset = semi.end;
+            }
+            node.sourceRange.end = endOffset;
             break;
           }
           // end <other>; e.g., end if; end for; — not our terminator

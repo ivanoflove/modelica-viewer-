@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PackageNodeDto } from "../../shared/modelica";
 import { PackageTree, type Selection } from "./components/PackageTree";
 
@@ -13,6 +13,7 @@ function App(): JSX.Element {
   const [source, setSource] = useState("");
   const [sourceLoading, setSourceLoading] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
+  const sourceEditorRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!window.api) {
@@ -43,7 +44,18 @@ function App(): JSX.Element {
           setSource("");
           return;
         }
-        setSource(result.content);
+        if (
+          selected.kind !== "package" &&
+          (selected.node as { sourceRange?: { start: number; end: number } })
+            .sourceRange
+        ) {
+          const range = (
+            selected.node as { sourceRange: { start: number; end: number } }
+          ).sourceRange;
+          setSource(result.content.slice(range.start, range.end));
+        } else {
+          setSource(result.content);
+        }
       } catch (e) {
         setSourceError((e as Error).message);
         setSource("");
@@ -52,6 +64,10 @@ function App(): JSX.Element {
       }
     };
     void loadSource();
+  }, [selected]);
+
+  useEffect(() => {
+    sourceEditorRef.current?.scrollTo({ top: 0, left: 0 });
   }, [selected]);
 
   const handleOpen = async () => {
@@ -160,7 +176,7 @@ function App(): JSX.Element {
                     在文件夹中显示
                   </button>
                 </div>
-                <div className="source-editor">
+                <div ref={sourceEditorRef} className="source-editor">
                   {sourceLoading ? (
                     <div className="source-status">加载中…</div>
                   ) : sourceError ? (

@@ -50,4 +50,25 @@ describe("lexer", () => {
     const idents = toks.filter((t) => t.type === "IDENT").map((t) => t.value);
     expect(idents).toEqual(["MyPkg", "MyModel", "MyModel", "MyPkg"]);
   });
+
+  it("should record start/end offsets slicing back to source", () => {
+    const src = `package A end A;`;
+    const toks = tokenize(src);
+    for (const t of toks) {
+      if (t.type === "EOF") {
+        expect(t.start).toBe(src.length);
+        expect(t.end).toBe(src.length);
+      } else {
+        expect(src.slice(t.start, t.end)).toBe(t.value === ";" || t.value === "." ? t.value : t.value);
+      }
+    }
+    const pkg = toks.find((t) => t.value === "package")!;
+    expect(src.slice(pkg.start, pkg.end)).toBe("package");
+    // string token should cover quotes
+    const src2 = `"hello ""world""" package P end P;`;
+    const toks2 = tokenize(src2);
+    const str = toks2.find((t) => t.type === "STRING")!;
+    expect(str.start).toBe(0);
+    expect(src2.slice(str.start, str.end)).toBe(`"hello ""world"""`);
+  });
 });

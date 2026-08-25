@@ -73,4 +73,42 @@ describe("parser", () => {
     expect(kinds).toEqual(["connector", "record", "function", "block"]);
     expect(file.classes[0]!.qualifiedName).toBe("Test.Pin");
   });
+
+  it("should set sourceRange and slice equals original class text", () => {
+    const src = `package P\n  model A\n    Real x;\n  end A;\n  model B\n    Real y;\n  end B;\nend P;`;
+    const file = parseModelicaFile(src, "test.mo");
+    const P = file.classes[0]!;
+    const A = P.children[0]!;
+    const B = P.children[1]!;
+    expect(src.slice(A.sourceRange.start, A.sourceRange.end)).toBe(
+      "model A\n    Real x;\n  end A;",
+    );
+    expect(src.slice(B.sourceRange.start, B.sourceRange.end)).toBe(
+      "model B\n    Real y;\n  end B;",
+    );
+    // P should cover from 'package P' to 'end P;'
+    expect(src.slice(P.sourceRange.start, P.sourceRange.end)).toBe(src);
+  });
+
+  it("should include partial/encapsulated in sourceRange start", () => {
+    const src = `partial model A end A; encapsulated package B end B; partial encapsulated block C end C;`;
+    const file = parseModelicaFile(src, "test.mo");
+    expect(src.slice(file.classes[0]!.sourceRange.start, file.classes[0]!.sourceRange.end)).toBe(
+      "partial model A end A;",
+    );
+    expect(src.slice(file.classes[1]!.sourceRange.start, file.classes[1]!.sourceRange.end)).toBe(
+      "encapsulated package B end B;",
+    );
+    expect(src.slice(file.classes[2]!.sourceRange.start, file.classes[2]!.sourceRange.end)).toBe(
+      "partial encapsulated block C end C;",
+    );
+  });
+
+  it("should not include trailing content after end;", () => {
+    const src = `package P model A end A; model B end B; end P;`;
+    const file = parseModelicaFile(src, "test.mo");
+    const A = file.classes[0]!.children[0]!;
+    expect(src.slice(A.sourceRange.start, A.sourceRange.end)).toBe("model A end A;");
+    expect(src.slice(A.sourceRange.start, A.sourceRange.end).includes("model B")).toBe(false);
+  });
 });
