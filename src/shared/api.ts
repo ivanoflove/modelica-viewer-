@@ -1,4 +1,4 @@
-import type { LoadPackageResult } from "./modelica.js";
+import type { LoadPackageResult, ReadSourceResult } from "./modelica.js";
 
 export interface DirectoryDialogResult {
   canceled: boolean;
@@ -11,6 +11,7 @@ export interface WindowApi {
   modelica: {
     openAndLoad: () => Promise<LoadPackageResult>;
     loadDirectory: (dirPath: string) => Promise<LoadPackageResult>;
+    readSource: (filePath: string) => Promise<ReadSourceResult>;
     reveal: (filePath: string) => Promise<void>;
   };
 }

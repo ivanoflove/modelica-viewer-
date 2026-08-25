@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { DirectoryDialogResult, WindowApi } from "../shared/api";
-import type { LoadPackageResult } from "../shared/modelica";
+import type { LoadPackageResult, ReadSourceResult } from "../shared/modelica";
 
 const api: WindowApi = {
   ping: () => ipcRenderer.invoke("ping") as Promise<string>,
@@ -16,6 +16,11 @@ const api: WindowApi = {
         "modelica:loadDirectory",
         dirPath,
       ) as Promise<LoadPackageResult>,
+    readSource: (filePath: string) =>
+      ipcRenderer.invoke(
+        "modelica:readSource",
+        filePath,
+      ) as Promise<ReadSourceResult>,
     reveal: (filePath: string) =>
       ipcRenderer.invoke("modelica:reveal", filePath) as Promise<void>,
   },

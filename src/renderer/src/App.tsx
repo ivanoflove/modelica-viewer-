@@ -10,6 +10,10 @@ function App(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Selection | null>(null);
 
+  const [source, setSource] = useState("");
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!window.api) {
       setIpcStatus("preload missing — 请重建后重启");
@@ -20,6 +24,35 @@ function App(): JSX.Element {
       .then((m) => setIpcStatus(m))
       .catch(() => setIpcStatus("unavailable"));
   }, []);
+
+  useEffect(() => {
+    if (!selected || !window.api) {
+      setSource("");
+      setSourceError(null);
+      return;
+    }
+    const loadSource = async () => {
+      setSourceLoading(true);
+      setSourceError(null);
+      try {
+        const result = await window.api.modelica.readSource(
+          selected.node.sourceFile,
+        );
+        if ("error" in result) {
+          setSourceError(result.error);
+          setSource("");
+          return;
+        }
+        setSource(result.content);
+      } catch (e) {
+        setSourceError((e as Error).message);
+        setSource("");
+      } finally {
+        setSourceLoading(false);
+      }
+    };
+    void loadSource();
+  }, [selected]);
 
   const handleOpen = async () => {
     if (!window.api) {
@@ -62,7 +95,7 @@ function App(): JSX.Element {
     <div className="app-layout">
       <header className="app-header">
         <div className="header-left">
-          <span className="eyebrow">MODELICA LIBRARY VIEWER — M1</span>
+          <span className="eyebrow">MODELICA LIBRARY VIEWER — M1 · M2 Source Viewer</span>
           <h1>Package Browser</h1>
           <p className="ipc-status">IPC: {ipcStatus}</p>
         </div>
@@ -110,57 +143,35 @@ function App(): JSX.Element {
 
           <section className="detail-pane">
             {selected ? (
-              <div className="detail-card">
-                <div className="detail-header">
-                  <span className="detail-icon">
-                    {selected.kind === "package" ? "📦" : "📘"}
-                  </span>
-                  <h3>{selected.node.name}</h3>
-                  <span className="badge">
-                    {selected.kind === "package"
-                      ? "package"
-                      : (selected.node as { kind: string }).kind}
-                  </span>
+              <>
+                <div className="source-toolbar">
+                  <div>
+                    <strong>{selected.node.qualifiedName}</strong>
+                    <span className="source-path">
+                      {selected.node.sourceFile}
+                    </span>
+                  </div>
+                  <button
+                    className="secondary-btn"
+                    onClick={() => void handleReveal()}
+                  >
+                    在文件夹中显示
+                  </button>
                 </div>
-                <dl className="detail-list">
-                  <dt>Qualified Name</dt>
-                  <dd>
-                    <code>{selected.node.qualifiedName}</code>
-                  </dd>
-                  {"within" in selected.node && selected.node.within && (
-                    <>
-                      <dt>within</dt>
-                      <dd>
-                        <code>{selected.node.within as string}</code>
-                      </dd>
-                    </>
+                <div className="source-editor">
+                  {sourceLoading ? (
+                    <div className="source-status">加载中…</div>
+                  ) : sourceError ? (
+                    <div className="source-error">{sourceError}</div>
+                  ) : (
+                    <pre>
+                      <code>{source}</code>
+                    </pre>
                   )}
-                  <dt>Kind</dt>
-                  <dd>
-                    {selected.kind === "package"
-                      ? "package"
-                      : (selected.node as { kind: string }).kind}
-                  </dd>
-                  <dt>Source File</dt>
-                  <dd className="mono" title={selected.node.sourceFile}>
-                    {selected.node.sourceFile}
-                  </dd>
-                </dl>
-                <button
-                  className="secondary-btn"
-                  onClick={() => void handleReveal()}
-                >
-                  在文件夹中显示
-                </button>
-
-                {selected.kind === "package" &&
-                  (selected.node as PackageNodeDto).children.length === 0 &&
-                  (selected.node as PackageNodeDto).classes.length === 0 && (
-                    <p className="empty-hint">该 package 无子成员</p>
-                  )}
-              </div>
+                </div>
+              </>
             ) : (
-              <div className="empty-detail">选择左侧节点查看详情</div>
+              <div className="empty-detail">选择左侧节点查看源码</div>
             )}
           </section>
         </div>
@@ -190,7 +201,8 @@ function App(): JSX.Element {
               打开目录
             </button>
             <p className="hint">
-              已内置 demo: <code>demo-modelica/MyLibrary</code>
+              已内置 demo: <code>demo-modelica/MyLibrary</code> /{" "}
+              <code>showcase</code>
             </p>
           </section>
         </main>

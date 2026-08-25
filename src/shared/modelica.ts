@@ -32,3 +32,7 @@ export type LoadPackageResult =
   | { canceled: true }
   | { canceled: false; root: PackageNodeDto }
   | { error: string };
+
+export type ReadSourceResult =
+  | { content: string; filePath: string }
+  | { error: string };

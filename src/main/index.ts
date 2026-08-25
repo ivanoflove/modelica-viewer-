@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 import { PackageLoader } from "./modelica/loader.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -68,6 +69,16 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("modelica:reveal", async (_event, filePath: string) => {
     if (filePath) shell.showItemInFolder(filePath);
+  });
+
+  ipcMain.handle("modelica:readSource", async (_event, filePath: string) => {
+    try {
+      if (!filePath) return { error: "No file path provided" };
+      const content = await readFile(filePath, "utf-8");
+      return { content, filePath };
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
   });
 }
 

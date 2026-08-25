@@ -267,8 +267,68 @@ h1 {
 }
 
 .detail-pane {
-  padding: 24px;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.source-toolbar {
+  min-height: 52px;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(49, 57, 251, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.source-toolbar strong {
+  font-size: 13px;
+}
+
+.source-path {
+  margin-left: 12px;
+  opacity: 0.6;
+  font-size: 11px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  word-break: break-all;
+}
+
+.source-toolbar .secondary-btn {
+  margin-top: 0;
+  flex-shrink: 0;
+}
+
+.source-editor {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
+  background: #fff;
+}
+
+.source-editor pre {
+  margin: 0;
+  padding: 18px 20px;
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 2;
+  color: #1e1e1e;
+}
+
+.source-status,
+.source-error {
+  padding: 24px;
+  font-size: 13px;
+}
+
+.source-error {
+  color: #b00020;
+  background: #fff3f3;
 }
 
 .empty-detail {
