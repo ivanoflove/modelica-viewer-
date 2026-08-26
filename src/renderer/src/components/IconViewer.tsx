@@ -5,6 +5,7 @@ import {
   useState,
   type MouseEvent,
   type PointerEvent,
+  type RefObject,
   type ReactNode,
 } from "react";
 import type {
@@ -140,7 +141,23 @@ export function IconViewer({
   const [propertiesGraphicId, setPropertiesGraphicId] = useState<string | null>(
     null,
   );
+  const [floatingPosition, setFloatingPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
+  const floatingWindowRef = useRef<HTMLElement>(null!);
+  const floatingDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
+  } | null>(null);
+  const floatingRafRef = useRef<number | null>(null);
+  const pendingFloatingPositionRef = useRef<{ x: number; y: number } | null>(
+    null,
+  );
   const [optimisticGraphics, setOptimisticGraphics] = useState<
     Map<string, EditableGraphic["graphic"]>
   >(new Map());
@@ -157,6 +174,7 @@ export function IconViewer({
     setHiddenGraphicIds(new Set());
     setContextMenu(null);
     setPropertiesGraphicId(null);
+    setFloatingPosition(null);
   }, [editable]);
 
   useEffect(() => {
@@ -165,6 +183,8 @@ export function IconViewer({
       cancelAnimationFrame(resizeRafRef.current);
     if (vertexRafRef.current !== null)
       cancelAnimationFrame(vertexRafRef.current);
+    if (floatingRafRef.current !== null)
+      cancelAnimationFrame(floatingRafRef.current);
     dragRef.current = null;
     resizeRef.current = null;
     vertexRef.current = null;
@@ -174,6 +194,8 @@ export function IconViewer({
     resizeRafRef.current = null;
     vertexRafRef.current = null;
     pendingVertexPointRef.current = null;
+    floatingRafRef.current = null;
+    pendingFloatingPositionRef.current = null;
     historyRef.current = new HistoryManager(100);
     setResizePreview(null);
     setVertexSelection(null);
@@ -495,6 +517,102 @@ export function IconViewer({
 
   const closeContextMenu = () => setContextMenu(null);
 
+  const clampFloatingPosition = (x: number, y: number) => {
+    const shell = shellRef.current;
+    const width = floatingWindowRef.current?.offsetWidth ?? 276;
+    const height = floatingWindowRef.current?.offsetHeight ?? 520;
+    const maxX = Math.max(12, (shell?.clientWidth ?? width + 24) - width - 12);
+    const maxY = Math.max(12, (shell?.clientHeight ?? height + 24) - height - 12);
+    return {
+      x: Math.min(Math.max(12, x), maxX),
+      y: Math.min(Math.max(12, y), maxY),
+    };
+  };
+
+  const applyFloatingPosition = (position: { x: number; y: number }) => {
+    floatingWindowRef.current?.style.setProperty(
+      "transform",
+      `translate3d(${position.x}px, ${position.y}px, 0)`,
+    );
+  };
+
+  const scheduleFloatingPosition = (position: { x: number; y: number }) => {
+    pendingFloatingPositionRef.current = clampFloatingPosition(
+      position.x,
+      position.y,
+    );
+    if (floatingRafRef.current !== null) return;
+    floatingRafRef.current = requestAnimationFrame(() => {
+      floatingRafRef.current = null;
+      const pending = pendingFloatingPositionRef.current;
+      if (pending) applyFloatingPosition(pending);
+    });
+  };
+
+  const handleFloatingPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const position = floatingPosition ?? { x: 12, y: 12 };
+    floatingDragRef.current = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startX: position.x,
+      startY: position.y,
+    };
+  };
+
+  const handleFloatingPointerMove = (e: React.PointerEvent) => {
+    const drag = floatingDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    scheduleFloatingPosition({
+      x: drag.startX + e.clientX - drag.startClientX,
+      y: drag.startY + e.clientY - drag.startClientY,
+    });
+  };
+
+  const endFloatingDrag = (e: React.PointerEvent) => {
+    const drag = floatingDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const finalPosition = clampFloatingPosition(
+      drag.startX + e.clientX - drag.startClientX,
+      drag.startY + e.clientY - drag.startClientY,
+    );
+    if (floatingRafRef.current !== null) {
+      cancelAnimationFrame(floatingRafRef.current);
+      floatingRafRef.current = null;
+    }
+    pendingFloatingPositionRef.current = null;
+    applyFloatingPosition(finalPosition);
+    setFloatingPosition(finalPosition);
+    floatingDragRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // Pointer capture may already be released during window teardown.
+    }
+  };
+
+  useEffect(() => {
+    if (floatingPosition) applyFloatingPosition(floatingPosition);
+  }, [floatingPosition]);
+
+  useEffect(() => {
+    const clampCurrent = () => {
+      setFloatingPosition((current) =>
+        current ? clampFloatingPosition(current.x, current.y) : current,
+      );
+    };
+    window.addEventListener("resize", clampCurrent);
+    return () => window.removeEventListener("resize", clampCurrent);
+  }, []);
+
   const handleDeleteGraphic = () => {
     const id = contextMenu?.graphicId;
     const ed = editables.find((item) => item.id === id);
@@ -555,6 +673,17 @@ export function IconViewer({
           `删除未保存：${error instanceof Error ? error.message : "未知错误"}`,
         );
       });
+  };
+
+  const openProperties = () => {
+    if (!contextMenu) return;
+    const requested = clampFloatingPosition(
+      contextMenu.x + 14,
+      contextMenu.y + 14,
+    );
+    setPropertiesGraphicId(contextMenu.graphicId);
+    setFloatingPosition((current) => current ?? requested);
+    closeContextMenu();
   };
 
   const handlePointerDown = (e: React.PointerEvent, ed: EditableGraphic) => {
@@ -1268,10 +1397,7 @@ export function IconViewer({
         >
           <button
             role="menuitem"
-            onClick={() => {
-              setPropertiesGraphicId(contextMenu.graphicId);
-              closeContextMenu();
-            }}
+            onClick={openProperties}
           >
             Properties…
           </button>
@@ -1293,6 +1419,11 @@ export function IconViewer({
           editable={inspectorEditable ?? null}
           onPropertyEdit={handlePropertyEdit}
           onClose={() => setPropertiesGraphicId(null)}
+          onHeaderPointerDown={handleFloatingPointerDown}
+          onHeaderPointerMove={handleFloatingPointerMove}
+          onHeaderPointerUp={endFloatingDrag}
+          onHeaderPointerCancel={endFloatingDrag}
+          floatingWindowRef={floatingWindowRef}
         />
       )}
       {interactionNotice && (
@@ -1636,10 +1767,20 @@ function GraphicProperties({
   editable,
   onPropertyEdit,
   onClose,
+  onHeaderPointerDown,
+  onHeaderPointerMove,
+  onHeaderPointerUp,
+  onHeaderPointerCancel,
+  floatingWindowRef,
 }: {
   editable: EditableGraphic | null;
   onPropertyEdit?: (edit: Edit, after: EditableGraphic["graphic"]) => void;
   onClose: () => void;
+  onHeaderPointerDown: (event: React.PointerEvent) => void;
+  onHeaderPointerMove: (event: React.PointerEvent) => void;
+  onHeaderPointerUp: (event: React.PointerEvent) => void;
+  onHeaderPointerCancel: (event: React.PointerEvent) => void;
+  floatingWindowRef: RefObject<HTMLElement>;
 }) {
   if (!editable || !onPropertyEdit) return null;
   const graphic = editable.graphic;
@@ -1686,8 +1827,22 @@ function GraphicProperties({
   const pattern = graphic.type === "Text" ? "LinePattern.Solid" : (graphic.pattern ?? "LinePattern.Solid");
   const fillPattern = "fillPattern" in graphic ? (graphic.fillPattern ?? "FillPattern.None") : "FillPattern.None";
   return (
-    <aside className="graphic-properties floating-inspector" data-graphic-properties>
-      <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><div className="properties-heading-actions"><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span><button className="properties-close" type="button" aria-label="Close properties" onClick={onClose}>×</button></div></div>
+    <aside
+      ref={floatingWindowRef}
+      className="graphic-properties floating-inspector"
+      data-graphic-properties
+      onPointerDown={(event) => event.stopPropagation()}
+      onWheel={(event) => event.stopPropagation()}
+    >
+      <div
+        className="properties-titlebar"
+        onPointerDown={onHeaderPointerDown}
+        onPointerMove={onHeaderPointerMove}
+        onPointerUp={onHeaderPointerUp}
+        onPointerCancel={onHeaderPointerCancel}
+      >
+        <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><div className="properties-heading-actions"><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span><button className="properties-close" type="button" aria-label="Close properties" onClick={onClose}>×</button></div></div>
+      </div>
       {readOnly && <p className="property-note">来自 {editable.ownerQualifiedName ?? "基类"}，当前类不可编辑。</p>}
       <PropertySection title="Geometry">
         <NumericProperty label={graphic.origin ? "Origin X" : "X"} value={position.x} disabled={readOnly || (!positionRange && !extentRange && !pointsRange)} onCommit={(value) => positionValue("x", value)} />
