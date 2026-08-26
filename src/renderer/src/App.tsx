@@ -8,6 +8,7 @@ import type { LibraryInfo } from "../../shared/api";
 import type { IconDto, EditableIconDto } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
+import { AppearancePopover } from "./components/AppearancePopover";
 
 type ViewMode = "source" | "icon" | "diagram";
 
@@ -21,6 +22,7 @@ function App(): JSX.Element {
   const [viewMode, setViewMode] = useState<ViewMode>("source");
   const [libraries, setLibraries] = useState<LibraryInfo[]>([]);
   const [showLibraries, setShowLibraries] = useState(false);
+  const [showAppearance, setShowAppearance] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
 
   const [source, setSource] = useState("");
@@ -102,6 +104,7 @@ function App(): JSX.Element {
       setIconWarning(null);
       return;
     }
+    let active = true;
     const loadSource = async () => {
       setSourceLoading(true);
       setSourceError(null);
@@ -109,6 +112,7 @@ function App(): JSX.Element {
         const result = await window.api.modelica.readSource(
           selected.node.sourceFile,
         );
+        if (!active) return;
         if ("error" in result) {
           setSourceError(result.error);
           setSource("");
@@ -121,10 +125,11 @@ function App(): JSX.Element {
           setSource(result.content);
         }
       } catch (e) {
+        if (!active) return;
         setSourceError((e as Error).message);
         setSource("");
       } finally {
-        setSourceLoading(false);
+        if (active) setSourceLoading(false);
       }
     };
     const loadIcon = async () => {
@@ -146,6 +151,7 @@ function App(): JSX.Element {
                 range,
                 selected.node.name,
               );
+        if (!active) return;
         if ("error" in iconRes) {
           setIconError(iconRes.error);
           setIcon(null);
@@ -159,16 +165,20 @@ function App(): JSX.Element {
           setEditableIcon(editableRes.editable);
         }
       } catch (e) {
+        if (!active) return;
         setIconError((e as Error).message);
         setIcon(null);
         setEditableIcon(null);
         setIconWarning(null);
       } finally {
-        setIconLoading(false);
+        if (active) setIconLoading(false);
       }
     };
     void loadSource();
     void loadIcon();
+    return () => {
+      active = false;
+    };
   }, [selected]);
 
   useEffect(() => {
@@ -245,12 +255,14 @@ function App(): JSX.Element {
     reason: SourceEditReason,
   ): Promise<boolean> => {
     if (!selected || !window.api) return false;
-    console.debug("[SOURCE_COMMIT]", {
-      reason,
-      targetQualifiedName: selected.node.qualifiedName,
-      start: edit.start,
-      end: edit.end,
-    });
+    console.debug(
+      "[SOURCE_COMMIT]",
+      JSON.stringify({
+        reason,
+        targetQualifiedName: selected.node.qualifiedName,
+        ...edit,
+      }),
+    );
     try {
       const transactionEdit = {
         ...edit,
@@ -326,8 +338,26 @@ function App(): JSX.Element {
 
   return (
     <div className="app-layout">
-      <header className="app-header compact-app-bar">
-        <div className="header-right">
+      <header className="app-header">
+        <div className="brand-lockup">
+          <div className="brand-mark" aria-hidden="true">∿</div>
+          <div>
+            <p className="eyebrow">MODELICA WORKSPACE</p>
+            <strong className="brand-title">Library Viewer</strong>
+          </div>
+        </div>
+        <div className="header-context">
+          <span className="connection-pill">
+            <span className={`status-dot ${ipcStatus === "pong" ? "is-live" : ""}`} />
+            {ipcStatus === "pong" ? "Ready" : ipcStatus}
+          </span>
+          {currentPath && (
+            <span className="current-path" title={currentPath}>
+              {currentPath}
+            </span>
+          )}
+        </div>
+        <div className="header-actions">
           <button
             className="primary-btn"
             onClick={() => void handleOpenFile()}
@@ -336,23 +366,29 @@ function App(): JSX.Element {
             {loading ? "加载中…" : "打开 .mo 文件"}
           </button>
           <button
-            className="secondary-btn"
+            className="ghost-btn"
             onClick={() => void handleOpen()}
             disabled={loading}
           >
             打开库目录
           </button>
           <button
-            className="secondary-btn"
+            className="ghost-btn"
             onClick={() => setShowLibraries((value) => !value)}
           >
-            Modelica 库路径
+            库路径
           </button>
-          {currentPath && (
-            <span className="current-path" title={currentPath}>
-              {currentPath}
-            </span>
-          )}
+          <div className="appearance-anchor">
+            <button
+              className={`icon-button ${showAppearance ? "is-active" : ""}`}
+              onClick={() => setShowAppearance((value) => !value)}
+              aria-label="Appearance settings"
+              aria-expanded={showAppearance}
+            >
+              ◐
+            </button>
+            {showAppearance && <AppearancePopover />}
+          </div>
         </div>
       </header>
 
@@ -362,13 +398,13 @@ function App(): JSX.Element {
             <strong>Modelica Library Paths</strong>
             <div>
               <button
-                className="secondary-btn"
+                className="ghost-btn"
                 onClick={() => void addLibrary()}
               >
                 添加库
               </button>
               <button
-                className="secondary-btn"
+                className="ghost-btn"
                 onClick={() => void rescanLibraries()}
               >
                 重新扫描
@@ -405,8 +441,11 @@ function App(): JSX.Element {
       {root ? (
         <div className="browser">
           <aside className="tree-pane">
-            <div className="pane-title">
-              <span>📦 {root.qualifiedName}</span>
+            <div className="sidebar-heading">
+              <div>
+                <p className="section-kicker">LIBRARY</p>
+                <strong>{root.qualifiedName}</strong>
+              </div>
               <span className="count">{treeCount(root)} 项</span>
             </div>
             <PackageTree
@@ -430,37 +469,41 @@ function App(): JSX.Element {
             {selected ? (
               <>
                 <div className="source-toolbar">
-                  <div>
+                  <div className="workspace-title">
+                    <span className="section-kicker">OPEN CLASS</span>
                     <strong>{selected.node.qualifiedName}</strong>
-                    <span className="source-path">
+                    <span className="source-path" title={selected.node.sourceFile}>
                       {selected.node.sourceFile}
                     </span>
                   </div>
-                  <button
-                    className="secondary-btn"
-                    onClick={() => void handleReveal()}
-                  >
-                    在文件夹中显示
+                  <button className="ghost-btn" onClick={() => void handleReveal()}>
+                    ↗ 在文件夹中显示
                   </button>
                 </div>
-                <div className="viewer-tabs">
+                <div className="viewer-tabs" role="tablist" aria-label="Viewer mode">
                   <button
                     className={viewMode === "source" ? "active" : ""}
                     onClick={() => setViewMode("source")}
+                    role="tab"
+                    aria-selected={viewMode === "source"}
                   >
-                    Source
+                    <span className="tab-glyph">{`{ }`}</span>Source
                   </button>
                   <button
                     className={viewMode === "icon" ? "active" : ""}
                     onClick={() => setViewMode("icon")}
+                    role="tab"
+                    aria-selected={viewMode === "icon"}
                   >
-                    Icon
+                    <span className="tab-glyph">◇</span>Icon
                   </button>
                   <button
                     className={viewMode === "diagram" ? "active" : ""}
                     onClick={() => setViewMode("diagram")}
+                    role="tab"
+                    aria-selected={viewMode === "diagram"}
                   >
-                    Diagram
+                    <span className="tab-glyph">⌘</span>Diagram
                   </button>
                 </div>
                 {viewMode === "source" && (
@@ -514,7 +557,8 @@ function App(): JSX.Element {
       ) : (
         <main className="shell">
           <section className="welcome-card">
-            <h2>打开 Modelica 文件或库目录</h2>
+            <p className="eyebrow">A CALM SPACE FOR COMPLEX MODELS</p>
+            <h1>打开 Modelica 文件或库目录</h1>
             <p className="description">
               单个顶层 package 文件（例如 <code>IEH_CPP.mo</code>
               ）可以直接打开； 标准目录式库请选择包含 <code>package.mo</code>{" "}
@@ -554,6 +598,12 @@ function App(): JSX.Element {
             </p>
           </section>
         </main>
+      )}
+      {root && (
+        <footer className="status-bar">
+          <span><span className="status-dot is-live" /> {selected?.node.qualifiedName ?? "No selection"}</span>
+          <span>Ready <span className="status-separator">·</span> Grid 10</span>
+        </footer>
       )}
     </div>
   );

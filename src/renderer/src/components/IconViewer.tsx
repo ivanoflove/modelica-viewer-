@@ -174,6 +174,42 @@ export function IconViewer({
     setResizePreview(null);
   };
 
+  // Capture on the stable SVG root instead of the transient graphic group.
+  // React may replace a graphic group while the async source edit is being
+  // committed; root capture keeps pointerup/cancel deterministic in that case.
+  const capturePointer = (pointerId: number) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    try {
+      svg.setPointerCapture(pointerId);
+    } catch {
+      // The pointer can already have been cancelled by the window manager.
+    }
+  };
+
+  const releasePointer = (pointerId: number) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    try {
+      if (svg.hasPointerCapture(pointerId)) svg.releasePointerCapture(pointerId);
+    } catch {
+      // Pointer capture is best-effort during teardown/blur.
+    }
+  };
+
+  useEffect(() => {
+    const cancelInteraction = () => {
+      const drag = dragRef.current;
+      const resize = resizeRef.current;
+      if (drag) releasePointer(drag.pointerId);
+      if (resize) releasePointer(resize.pointerId);
+      clearDrag();
+      clearResize();
+    };
+    window.addEventListener("blur", cancelInteraction);
+    return () => window.removeEventListener("blur", cancelInteraction);
+  });
+
   const commitGraphicChange = (
     ed: EditableGraphic,
     before: EditableGraphic["graphic"],
@@ -193,6 +229,7 @@ export function IconViewer({
           historyRef.current.push({ graphicId: ed.id, before, after });
           setHistoryVersion((version) => version + 1);
         } else {
+          setInteractionNotice("修改未保存：源文件内容已变化，请重新选择图元后重试");
           setOptimisticGraphics((previous) => {
             const next = new Map(previous);
             next.delete(ed.id);
@@ -200,7 +237,10 @@ export function IconViewer({
           });
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        setInteractionNotice(
+          `修改未保存：${error instanceof Error ? error.message : "未知错误"}`,
+        );
         setOptimisticGraphics((previous) => {
           const next = new Map(previous);
           next.delete(ed.id);
@@ -238,7 +278,7 @@ export function IconViewer({
     const inverse = svg.getScreenCTM()?.inverse();
     if (!inverse) return;
     const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
-    e.currentTarget.setPointerCapture(e.pointerId);
+    capturePointer(e.pointerId);
     const session: DragSession = {
       id: ed.id,
       pointerId: e.pointerId,
@@ -278,6 +318,7 @@ export function IconViewer({
   const handlePointerUp = (e: React.PointerEvent) => {
     const session = dragRef.current;
     if (!session || session.pointerId !== e.pointerId) {
+      releasePointer(e.pointerId);
       clearDrag();
       return;
     }
@@ -302,9 +343,7 @@ export function IconViewer({
           rotate: 0,
         });
         const edit = buildTranslateEdit(ed, session.originalGraphic, dx, dy);
-        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-          e.currentTarget.releasePointerCapture(e.pointerId);
-        }
+        releasePointer(e.pointerId);
         clearDrag();
         if (edit)
           commitGraphicChange(
@@ -317,6 +356,7 @@ export function IconViewer({
         return;
       }
     }
+    releasePointer(e.pointerId);
     clearDrag();
   };
 
@@ -364,7 +404,7 @@ export function IconViewer({
     const inverse = svg.getScreenCTM()?.inverse();
     if (!inverse) return;
     const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
-    e.currentTarget.setPointerCapture(e.pointerId);
+    capturePointer(e.pointerId);
     sel.setSelected(ed.id);
     setInteractionNotice(null);
     setResizePreview(null);
@@ -418,20 +458,20 @@ export function IconViewer({
       const committed = { ...before, extent } as EditableGraphic["graphic"];
       const edit = buildExtentEdit(ed, extent);
       if (edit) {
-        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-          e.currentTarget.releasePointerCapture(e.pointerId);
-        }
+        releasePointer(e.pointerId);
         clearResize();
         commitGraphicChange(ed, before, committed, edit, "resize");
         return;
       }
     }
+    releasePointer(e.pointerId);
     clearResize();
   };
 
   const handleResizeCancel = (e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    releasePointer(e.pointerId);
     clearResize();
   };
 
@@ -480,7 +520,9 @@ export function IconViewer({
   const handlePointerCancel = (e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    releasePointer(e.pointerId);
     clearDrag();
+    clearResize();
   };
 
   const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
@@ -635,15 +677,22 @@ function handlePosition(
   return { x, y };
 }
 
+function formatModelicaNumber(n: number): string {
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
+}
+
+/** Serialize a Modelica extent, including both the point and array braces. */
+export function formatModelicaExtent(extent: Extent): string {
+  return `{{${formatModelicaNumber(extent.p1.x)},${formatModelicaNumber(extent.p1.y)}},{${formatModelicaNumber(extent.p2.x)},${formatModelicaNumber(extent.p2.y)}}}`;
+}
+
 function buildExtentEdit(ed: EditableGraphic, extent: Extent): Edit | null {
   if (!ed.source.extentRange) return null;
-  const format = (n: number) =>
-    Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
   return {
     start: ed.source.extentRange.start,
     end: ed.source.extentRange.end,
     expectedText: ed.source.extentRange.expectedText,
-    replacement: `{{${format(extent.p1.x)},${format(extent.p1.y)}},{${format(extent.p2.x)},${format(extent.p2.y)}}`,
+    replacement: formatModelicaExtent(extent),
   };
 }
 
@@ -652,8 +701,7 @@ function buildGraphicEdit(
   graphic: EditableGraphic["graphic"],
 ): Edit | null {
   const g = graphic as any;
-  const format = (n: number) =>
-    Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
+  const format = formatModelicaNumber;
   if (ed.source.originRange && g.origin) {
     return {
       start: ed.source.originRange.start,
@@ -667,7 +715,7 @@ function buildGraphicEdit(
       start: ed.source.extentRange.start,
       end: ed.source.extentRange.end,
       expectedText: ed.source.extentRange.expectedText,
-      replacement: `{{${format(g.extent.p1.x)},${format(g.extent.p1.y)}},{${format(g.extent.p2.x)},${format(g.extent.p2.y)}}`,
+      replacement: formatModelicaExtent(g.extent),
     };
   }
   if (ed.source.pointsRange && g.points) {
@@ -689,8 +737,7 @@ function buildTranslateEdit(
 ): Edit | null {
   const source = ed.source;
   const g = graphic as any;
-  const format = (n: number) =>
-    Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
+  const format = formatModelicaNumber;
   if (source.originRange && g.origin) {
     return {
       start: source.originRange.start,
@@ -705,7 +752,10 @@ function buildTranslateEdit(
       start: source.extentRange.start,
       end: source.extentRange.end,
       expectedText: source.extentRange.expectedText,
-      replacement: `{{${format(e.p1.x + dx)},${format(e.p1.y + dy)}},{${format(e.p2.x + dx)},${format(e.p2.y + dy)}}`,
+      replacement: formatModelicaExtent({
+        p1: { x: e.p1.x + dx, y: e.p1.y + dy },
+        p2: { x: e.p2.x + dx, y: e.p2.y + dy },
+      }),
     };
   }
   if (source.pointsRange && g.points) {
