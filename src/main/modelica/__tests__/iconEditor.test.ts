@@ -26,6 +26,7 @@ describe("iconEditor: editable ranges", () => {
     const e = ed.editables[0]!;
     expect(e.source.itemRange).toBeDefined();
     expect(e.source.extentRange).toBeDefined();
+    expect(e.source.lineColorRange).toBeDefined();
     const extentText = src.slice(
       e.source.extentRange!.start,
       e.source.extentRange!.end,

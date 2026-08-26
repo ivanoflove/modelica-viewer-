@@ -387,18 +387,131 @@ h1 {
 
 .icon-viewer {
   flex: 1;
-  display: grid;
-  place-items: center;
-  padding: 24px;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
   background: #fff;
   overflow: auto;
 }
 
+.icon-editor-shell {
+  width: 100%;
+  min-height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 0;
+  background: #fff;
+}
+
+.icon-viewer-toolbar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(49, 57, 251, 0.12);
+  color: rgba(49, 57, 251, 0.7);
+  font-size: 12px;
+}
+
+.fit-toggle {
+  display: flex;
+  gap: 4px;
+}
+
+.fit-toggle button {
+  padding: 5px 8px;
+  border: 1px solid rgba(49, 57, 251, 0.18);
+  border-radius: 6px;
+  background: #fff;
+  color: #3139fb;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.fit-toggle button.active {
+  background: #3139fb;
+  color: #fffcec;
+}
+
+.icon-canvas-area {
+  min-width: 0;
+  min-height: 360px;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: #fdfdff;
+}
+
 .modelica-icon {
-  width: min(420px, 90%);
-  height: min(420px, 90%);
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
   border: 1px solid rgba(49, 57, 251, 0.12);
   background: #fff;
+}
+
+.graphic-properties {
+  min-width: 0;
+  padding: 14px 12px;
+  border-left: 1px solid rgba(49, 57, 251, 0.12);
+  background: rgba(255, 255, 255, 0.8);
+  font-size: 12px;
+}
+
+.graphic-properties h3 {
+  margin: 0 0 14px;
+  font-size: 13px;
+}
+
+.graphic-properties label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0;
+  color: rgba(49, 57, 251, 0.65);
+}
+
+.graphic-properties select,
+.graphic-properties input[type="number"] {
+  min-width: 0;
+  width: 122px;
+  padding: 4px;
+  border: 1px solid rgba(49, 57, 251, 0.2);
+  border-radius: 5px;
+  background: #fff;
+  color: #3139fb;
+  font-size: 11px;
+}
+
+.graphic-properties input[type="color"] {
+  width: 38px;
+  height: 24px;
+  padding: 1px;
+  border: 1px solid rgba(49, 57, 251, 0.2);
+  border-radius: 5px;
+  background: #fff;
+}
+
+.empty-properties {
+  color: rgba(49, 57, 251, 0.5);
+  text-align: center;
+}
+
+.icon-editor-hint,
+.drag-status {
+  grid-column: 1 / -1;
+  padding: 6px 12px;
+  color: rgba(49, 57, 251, 0.5);
+  font-size: 11px;
+  text-align: center;
+}
+
+.drag-status {
+  color: #3139fb;
 }
 
 .no-icon {

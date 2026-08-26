@@ -133,6 +133,7 @@ function resolveEllipse(call: AnnotationCall): EllipseDto | null {
     extent,
     lineColor: parseColor(getArg(call, "lineColor")),
     fillColor: parseColor(getArg(call, "fillColor")),
+    lineThickness: asNumber(getArg(call, "lineThickness")),
     startAngle: asNumber(getArg(call, "startAngle")),
     endAngle: asNumber(getArg(call, "endAngle")),
     origin: parseOrigin(call),
@@ -167,6 +168,7 @@ function resolvePolygon(call: AnnotationCall): PolygonDto | null {
     points,
     lineColor: parseColor(getArg(call, "lineColor")),
     fillColor: parseColor(getArg(call, "fillColor")),
+    lineThickness: asNumber(getArg(call, "lineThickness")),
     origin: parseOrigin(call),
     fillPattern: parseFillPattern(call),
     pattern: asName(getArg(call, "pattern")),
@@ -542,6 +544,10 @@ export function resolveEditableIcon(
     if (pointsArg) pointsRange = (pointsArg.value as any).range;
     const originArg = getArgWithRange(item.call, "origin");
     if (originArg) originRange = (originArg.value as any).range;
+    const rangeOf = (name: string) =>
+      getArgWithRange(item.call, name)?.value.range as
+        | { start: number; end: number }
+        | undefined;
     const id = `${modelName}:${itemRange.start}`;
     editables.push({
       id,
@@ -553,6 +559,12 @@ export function resolveEditableIcon(
         extentRange,
         pointsRange,
         originRange,
+        lineColorRange: rangeOf("lineColor"),
+        fillColorRange: rangeOf("fillColor"),
+        lineThicknessRange: rangeOf("lineThickness"),
+        thicknessRange: rangeOf("thickness"),
+        patternRange: rangeOf("pattern"),
+        fillPatternRange: rangeOf("fillPattern"),
       },
     });
     callIdx++;
@@ -591,6 +603,12 @@ export function toAbsoluteEditableRanges(
         extentRange: shiftRange(e.source.extentRange),
         pointsRange: shiftRange(e.source.pointsRange),
         originRange: shiftRange(e.source.originRange),
+        lineColorRange: shiftRange(e.source.lineColorRange),
+        fillColorRange: shiftRange(e.source.fillColorRange),
+        lineThicknessRange: shiftRange(e.source.lineThicknessRange),
+        thicknessRange: shiftRange(e.source.thicknessRange),
+        patternRange: shiftRange(e.source.patternRange),
+        fillPatternRange: shiftRange(e.source.fillPatternRange),
       },
     };
   });

@@ -42,6 +42,12 @@ export interface EditableGraphic {
     extentRange?: { start: number; end: number };
     pointsRange?: { start: number; end: number };
     originRange?: { start: number; end: number };
+    lineColorRange?: { start: number; end: number };
+    fillColorRange?: { start: number; end: number };
+    lineThicknessRange?: { start: number; end: number };
+    thicknessRange?: { start: number; end: number };
+    patternRange?: { start: number; end: number };
+    fillPatternRange?: { start: number; end: number };
   };
 }
 
@@ -74,6 +80,7 @@ export interface EllipseDto {
   extent: Extent;
   lineColor?: [number, number, number];
   fillColor?: [number, number, number];
+  lineThickness?: number;
   startAngle?: number;
   endAngle?: number;
   origin?: Point;
@@ -96,6 +103,7 @@ export interface PolygonDto {
   points: Point[];
   lineColor?: [number, number, number];
   fillColor?: [number, number, number];
+  lineThickness?: number;
   origin?: Point;
   fillPattern?: string;
   pattern?: string;
