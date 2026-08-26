@@ -29,6 +29,7 @@ import { useSelection } from "../../editor/Selection";
 import type { SelectionState } from "../../editor/Selection";
 import { GraphicViewport } from "./GraphicViewport";
 import type { SourceEditReason } from "../../../shared/modelica";
+import { recordViewerPerformance } from "../performance";
 
 type Edit = {
   start: number;
@@ -527,6 +528,7 @@ export function IconViewer({
 
   const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
   const canRedo = historyVersion >= 0 && historyRef.current.canRedo;
+  recordViewerPerformance("graphicLayerRenders");
 
   return (
     <div className="icon-editor-shell">

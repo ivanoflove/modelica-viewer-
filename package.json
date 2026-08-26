@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "dev:safe": "electron-vite dev -- --no-sandbox --disable-gpu --disable-software-rasterizer",
-    "start": "electron --no-sandbox --disable-gpu out/main/index.js",
+    "start": "electron --no-sandbox out/main/index.js",
     "build": "electron-vite build",
     "typecheck": "tsc -b",
     "test": "vitest run",

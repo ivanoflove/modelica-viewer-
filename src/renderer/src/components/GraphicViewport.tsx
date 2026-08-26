@@ -8,12 +8,18 @@ import {
 } from "react";
 import type { IconDto } from "../../../shared/modelicaGraphics";
 import { boundsOf, type Bounds } from "../../editor/Transform";
+import { recordViewerPerformance } from "../performance";
 
 interface ViewBox {
   x: number;
   y: number;
   width: number;
   height: number;
+}
+
+interface ViewportState {
+  base: ViewBox;
+  viewBox: ViewBox;
 }
 
 interface Props {
@@ -60,6 +66,15 @@ export function contentViewBox(icon: IconDto): ViewBox {
 
 function toViewBoxString(viewBox: ViewBox): string {
   return `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`;
+}
+
+/** Map the stable SVG base viewBox to the current zoomed/panned view. */
+export function viewportGroupTransform(base: ViewBox, current: ViewBox): string {
+  const scaleX = base.width / Math.max(current.width, 1e-9);
+  const scaleY = base.height / Math.max(current.height, 1e-9);
+  const translateX = base.x - current.x * scaleX;
+  const translateY = base.y - current.y * scaleY;
+  return `matrix(${scaleX} 0 0 ${scaleY} ${translateX} ${translateY})`;
 }
 
 export function zoomViewBox(
@@ -121,6 +136,22 @@ function pointInSvg(
   return point.matrixTransform(inverse);
 }
 
+function pointInCurrentView(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  viewport: ViewportState,
+): { x: number; y: number } | null {
+  const basePoint = pointInSvg(svg, clientX, clientY);
+  if (!basePoint) return null;
+  const scaleX = viewport.base.width / Math.max(viewport.viewBox.width, 1e-9);
+  const scaleY = viewport.base.height / Math.max(viewport.viewBox.height, 1e-9);
+  return {
+    x: (basePoint.x - viewport.base.x + viewport.viewBox.x * scaleX) / scaleX,
+    y: (basePoint.y - viewport.base.y + viewport.viewBox.y * scaleY) / scaleY,
+  };
+}
+
 export function GraphicViewport({
   icon,
   resetKey,
@@ -136,67 +167,119 @@ export function GraphicViewport({
 }: Props) {
   const shellRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const viewportGroupRef = useRef<SVGGElement>(null);
   const spacePressed = useRef(false);
+  const renderRafRef = useRef<number | null>(null);
+  const stateSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [fitMode, setFitMode] = useState<"content" | "coordinateSystem">(
     "content",
   );
   const [viewBox, setViewBox] = useState<ViewBox>(() => contentViewBox(icon));
-  const viewBoxRef = useRef(viewBox);
-  viewBoxRef.current = viewBox;
-  const [pan, setPan] = useState<{
+  const [isPanning, setIsPanning] = useState(false);
+  const viewportRef = useRef<ViewportState>({
+    base: coordinateViewBox(icon),
+    viewBox: contentViewBox(icon),
+  });
+  const panRef = useRef<{
     startX: number;
     startY: number;
     viewBox: ViewBox;
   } | null>(null);
 
+  const applyViewportTransform = () => {
+    const group = viewportGroupRef.current;
+    if (!group) return;
+    const { base, viewBox: current } = viewportRef.current;
+    group.setAttribute("transform", viewportGroupTransform(base, current));
+  };
+
+  const scheduleViewportRender = () => {
+    if (renderRafRef.current !== null) return;
+    renderRafRef.current = requestAnimationFrame(() => {
+      renderRafRef.current = null;
+      recordViewerPerformance("viewportRafUpdates");
+      applyViewportTransform();
+    });
+  };
+
+  const scheduleStateSync = () => {
+    if (stateSyncTimerRef.current !== null) {
+      clearTimeout(stateSyncTimerRef.current);
+    }
+    stateSyncTimerRef.current = setTimeout(() => {
+      stateSyncTimerRef.current = null;
+      setViewBox({ ...viewportRef.current.viewBox });
+    }, 120);
+  };
+
+  const updateViewport = (next: ViewBox, syncState = true) => {
+    viewportRef.current.viewBox = next;
+    scheduleViewportRender();
+    if (syncState) scheduleStateSync();
+  };
+
   useEffect(() => {
+    const base = coordinateViewBox(icon);
+    const initial = contentViewBox(icon);
+    viewportRef.current = { base, viewBox: initial };
     setFitMode("content");
-    setViewBox(contentViewBox(icon));
+    setViewBox(initial);
+    scheduleViewportRender();
+  }, [resetKey]);
+
+  useEffect(() => {
+    applyViewportTransform();
+    return () => {
+      if (renderRafRef.current !== null) {
+        cancelAnimationFrame(renderRafRef.current);
+        renderRafRef.current = null;
+      }
+      if (stateSyncTimerRef.current !== null) {
+        clearTimeout(stateSyncTimerRef.current);
+        stateSyncTimerRef.current = null;
+      }
+    };
   }, [resetKey]);
 
   const fit = (mode = fitMode) => {
-    setViewBox(
-      mode === "content" ? contentViewBox(icon) : coordinateViewBox(icon),
-    );
+    updateViewport(mode === "content" ? contentViewBox(icon) : coordinateViewBox(icon));
+    setViewBox({
+      ...(mode === "content" ? contentViewBox(icon) : coordinateViewBox(icon)),
+    });
   };
 
   const zoomBy = (factor: number, anchor?: { x: number; y: number }) => {
-    setViewBox((current) => {
-      const fitView =
-        fitMode === "content" ? contentViewBox(icon) : coordinateViewBox(icon);
-      return zoomViewBox(current, fitView, factor, anchor);
-    });
+    const current = viewportRef.current.viewBox;
+    const fitView =
+      fitMode === "content" ? contentViewBox(icon) : coordinateViewBox(icon);
+    updateViewport(zoomViewBox(current, fitView, factor, anchor));
   };
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    // React's delegated wheel event can be passive in an Electron/Chromium
-    // host. Use a native non-passive listener so Ctrl+wheel is handled by the
-    // canvas without allowing the surrounding source pane to scroll.
     const handleWheel = (event: globalThis.WheelEvent) => {
-      // Deliberately require Ctrl: ordinary wheel scrolling should not change
-      // the viewport, matching the requested Windows interaction.
       const factor = wheelZoomFactor(event.deltaY, event.ctrlKey);
       if (factor === null) return;
+      recordViewerPerformance("wheelEvents");
       event.preventDefault();
       event.stopPropagation();
       const svg = svgRef.current;
       if (!svg) return;
-      const anchor = pointInSvg(svg, event.clientX, event.clientY);
-      const current = viewBoxRef.current;
+      const viewport = viewportRef.current;
+      const anchor = pointInCurrentView(
+        svg,
+        event.clientX,
+        event.clientY,
+        viewport,
+      );
       const fitView =
         fitMode === "content" ? contentViewBox(icon) : coordinateViewBox(icon);
-      const next = zoomViewBox(current, fitView, factor, anchor ?? undefined);
-      console.debug("[VIEWPORT_ZOOM]", {
-        from: current.width,
-        to: next.width,
-      });
-      setViewBox(next);
+      updateViewport(zoomViewBox(viewport.viewBox, fitView, factor, anchor ?? undefined));
     };
     canvas.addEventListener("wheel", handleWheel, { passive: false });
     return () => canvas.removeEventListener("wheel", handleWheel);
-  }, [fitMode, icon]);
+  }, [fitMode, icon, resetKey]);
 
   const startPan = (event: PointerEvent<SVGSVGElement>) => {
     const spacePan = event.button === 0 && spacePressed.current;
@@ -205,15 +288,21 @@ export function GraphicViewport({
     event.stopPropagation();
     shellRef.current?.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
-    setPan({ startX: event.clientX, startY: event.clientY, viewBox });
+    panRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      viewBox: { ...viewportRef.current.viewBox },
+    };
+    setIsPanning(true);
   };
 
   const handlePanMove = (event: PointerEvent<SVGSVGElement>) => {
+    const pan = panRef.current;
     if (!pan) return;
     event.preventDefault();
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
-    setViewBox(
+    updateViewport(
       panViewBox(
         pan.viewBox,
         event.clientX - pan.startX,
@@ -221,16 +310,19 @@ export function GraphicViewport({
         rect.width,
         rect.height,
       ),
+      false,
     );
   };
 
   const endPan = (event: PointerEvent<SVGSVGElement>) => {
-    if (!pan) return;
+    if (!panRef.current) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.currentTarget.hasPointerCapture(event.pointerId))
       event.currentTarget.releasePointerCapture(event.pointerId);
-    setPan(null);
+    panRef.current = null;
+    setIsPanning(false);
+    scheduleStateSync();
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -265,6 +357,10 @@ export function GraphicViewport({
     }
   };
 
+  const fitView = fitMode === "content" ? contentViewBox(icon) : coordinateViewBox(icon);
+  const zoomPercent = Math.round((fitView.width / viewBox.width) * 100);
+  const baseViewBox = viewportRef.current.base;
+
   return (
     <div
       ref={shellRef}
@@ -276,17 +372,7 @@ export function GraphicViewport({
       }}
     >
       <div className="icon-viewer-toolbar">
-        <span>
-          Icon 画布 ·{" "}
-          {Math.round(
-            ((fitMode === "content"
-              ? contentViewBox(icon).width
-              : coordinateViewBox(icon).width) /
-              viewBox.width) *
-              100,
-          )}
-          %
-        </span>
+        <span>Icon 画布 · {zoomPercent}%</span>
         <div className="fit-toggle">
           <button
             className={fitMode === "content" ? "active" : ""}
@@ -306,28 +392,20 @@ export function GraphicViewport({
           >
             Fit CoordinateSystem
           </button>
-          <button onClick={() => zoomBy(0.8)} aria-label="Zoom out">
-            −
-          </button>
-          <button onClick={() => zoomBy(1.25)} aria-label="Zoom in">
-            +
-          </button>
+          <button onClick={() => zoomBy(0.8)} aria-label="Zoom out">−</button>
+          <button onClick={() => zoomBy(1.25)} aria-label="Zoom in">+</button>
           <button onClick={() => fit()}>Fit</button>
-          <button onClick={onUndo} disabled={!canUndo} aria-label="Undo">
-            Undo
-          </button>
-          <button onClick={onRedo} disabled={!canRedo} aria-label="Redo">
-            Redo
-          </button>
+          <button onClick={onUndo} disabled={!canUndo} aria-label="Undo">Undo</button>
+          <button onClick={onRedo} disabled={!canRedo} aria-label="Redo">Redo</button>
         </div>
       </div>
       <div ref={canvasRef} className="icon-canvas-area">
         <svg
           ref={svgRef}
-          viewBox={toViewBoxString(viewBox)}
+          viewBox={toViewBoxString(baseViewBox)}
           className="modelica-icon"
           preserveAspectRatio="xMidYMid meet"
-          style={{ touchAction: "none", cursor: pan ? "grabbing" : "default" }}
+          style={{ touchAction: "none", cursor: isPanning ? "grabbing" : "default" }}
           onPointerDownCapture={startPan}
           onPointerMove={(event) => {
             handlePanMove(event);
@@ -346,7 +424,7 @@ export function GraphicViewport({
           }}
           onFocus={() => undefined}
         >
-          {children}
+          <g ref={viewportGroupRef}>{children}</g>
         </svg>
       </div>
       <span className="icon-editor-hint">

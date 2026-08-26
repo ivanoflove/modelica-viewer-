@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type {
     RectangleDto,
     EllipseDto,
@@ -6,6 +7,7 @@ import type {
     TextDto,
     GraphicItemDto,
 } from "../../../shared/modelicaGraphics";
+import { recordViewerPerformance } from "../performance";
 
 function toCssColor(color?: [number, number, number]): string {
     if (!color) return "none";
@@ -143,7 +145,8 @@ function renderText(item: TextDto) {
     </g>;
 }
 
-export function GraphicItem({ item, styleId = "graphic-style" }: { item: GraphicItemDto; styleId?: string }) {
+export const GraphicItem = memo(function GraphicItem({ item, styleId = "graphic-style" }: { item: GraphicItemDto; styleId?: string }) {
+    recordViewerPerformance("graphicItemRenders");
     const rendered = (() => {
         switch (item.type) {
             case "Rectangle": return renderRectangle(item, styleId);
@@ -156,4 +159,4 @@ export function GraphicItem({ item, styleId = "graphic-style" }: { item: Graphic
     const content = <>{styleDefinitions(item, styleId)}{rendered}</>;
     if (!item.origin) return content;
     return <g transform={`translate(${item.origin.x},${item.origin.y})`}>{content}</g>;
-}
+});

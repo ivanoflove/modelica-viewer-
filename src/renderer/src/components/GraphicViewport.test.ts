@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { contentViewBox, panViewBox, wheelZoomFactor, zoomViewBox } from "./GraphicViewport";
+import {
+  contentViewBox,
+  panViewBox,
+  viewportGroupTransform,
+  wheelZoomFactor,
+  zoomViewBox,
+} from "./GraphicViewport";
 import type { IconDto } from "../../../shared/modelicaGraphics";
 
 const icon: IconDto = {
@@ -37,5 +43,14 @@ describe("GraphicViewport math", () => {
   it("only enables wheel zoom when Ctrl is pressed", () => {
     expect(wheelZoomFactor(100, false)).toBeNull();
     expect(wheelZoomFactor(100, true)).toBeCloseTo(Math.exp(-0.15));
+  });
+
+  it("maps the stable base viewBox to a zoomed and panned group transform", () => {
+    expect(
+      viewportGroupTransform(
+        { x: -100, y: -100, width: 200, height: 200 },
+        { x: -40, y: -50, width: 100, height: 100 },
+      ),
+    ).toBe("matrix(2 0 0 2 -20 0)");
   });
 });
