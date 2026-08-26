@@ -3,9 +3,10 @@ import type { GraphicItemDto } from "../../../shared/modelicaGraphics.js";
 export interface GraphicEditCommand {
   graphicId: string;
   before: GraphicItemDto;
-  after: GraphicItemDto;
+  after: GraphicItemDto | null;
   sourceBefore?: string;
   sourceAfter?: string;
+  deletion?: { start: number; deletedText: string };
 }
 
 export class HistoryManager {

@@ -1,4 +1,12 @@
-import { memo, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 import type {
   IconDto,
   EditableIconDto,
@@ -46,11 +54,14 @@ type Edit = {
   replacement: string;
 };
 
+type DeleteEdit = Edit & { deletedText: string };
+
 interface Props {
   icon: IconDto | null;
   editable?: EditableIconDto | null;
   modelName: string;
   resetKey?: string;
+  sourceText?: string;
   onEdit?: (edit: Edit, reason: SourceEditReason) => Promise<boolean>;
 }
 
@@ -84,6 +95,7 @@ export function IconViewer({
   editable,
   modelName,
   resetKey = modelName,
+  sourceText = "",
   onEdit,
 }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -117,6 +129,15 @@ export function IconViewer({
     graphicId: string;
     vertexIndex: number;
   } | null>(null);
+  const [hiddenGraphicIds, setHiddenGraphicIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [contextMenu, setContextMenu] = useState<{
+    graphicId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
   const [optimisticGraphics, setOptimisticGraphics] = useState<
     Map<string, EditableGraphic["graphic"]>
   >(new Map());
@@ -130,6 +151,8 @@ export function IconViewer({
   // retain the optimistic graphic so pointerup cannot visibly snap backward.
   useEffect(() => {
     setOptimisticGraphics(new Map());
+    setHiddenGraphicIds(new Set());
+    setContextMenu(null);
   }, [editable]);
 
   useEffect(() => {
@@ -158,7 +181,29 @@ export function IconViewer({
     screenOverlayUpdateRef.current();
   }, [sel.selectedId, icon, editable, optimisticGraphics, resizePreview, resetKey]);
 
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [contextMenu]);
+
   if (!icon) return <div className="no-icon">No Icon annotation</div>;
+
+  const handleCanvasPointerDown = (e: PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0 || e.target !== e.currentTarget) return;
+    sel.setSelected(null);
+    setVertexSelection(null);
+    setInteractionNotice(null);
+    closeContextMenu();
+  };
 
   const editables = editable?.editables ?? [];
   const entries = icon.graphics.map((graphic, index) => {
@@ -173,7 +218,7 @@ export function IconViewer({
       graphic,
       editable: ed,
     };
-  });
+  }).filter(({ id }) => !hiddenGraphicIds.has(id));
 
   const transformFor = (id: string): GraphicTransform => {
     const base = editables.find((ed) => ed.id === id)?.transform ?? identity;
@@ -423,6 +468,85 @@ export function IconViewer({
     if (!ed) return;
     const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
     commitGraphicChange(ed, before, after, edit, "property");
+  };
+
+  const handleGraphicContextMenu = (
+    e: MouseEvent,
+    id: string,
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    sel.setSelected(id);
+    setVertexSelection(null);
+    const shell = shellRef.current?.getBoundingClientRect();
+    setContextMenu({
+      graphicId: id,
+      x: e.clientX - (shell?.left ?? 0),
+      y: e.clientY - (shell?.top ?? 0),
+    });
+  };
+
+  const closeContextMenu = () => setContextMenu(null);
+
+  const handleDeleteGraphic = () => {
+    const id = contextMenu?.graphicId;
+    const ed = editables.find((item) => item.id === id);
+    if (!id || !ed) {
+      setInteractionNotice("继承图形不能在当前类删除");
+      closeContextMenu();
+      return;
+    }
+    if (!onEdit) {
+      setInteractionNotice("当前文件不可编辑");
+      closeContextMenu();
+      return;
+    }
+    if (ed.inherited) {
+      setInteractionNotice(
+        `继承图形不能在当前类删除：${ed.ownerQualifiedName ?? "基类"}`,
+      );
+      closeContextMenu();
+      return;
+    }
+    const edit = buildDeleteEdit(ed, sourceText);
+    if (!edit) {
+      setInteractionNotice("无法安全定位该图元，已取消删除");
+      closeContextMenu();
+      return;
+    }
+    const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
+    setHiddenGraphicIds((current) => new Set(current).add(ed.id));
+    closeContextMenu();
+    void onEdit(edit, "delete")
+      .then((success) => {
+        if (!success) {
+          setHiddenGraphicIds((current) => {
+            const next = new Set(current);
+            next.delete(ed.id);
+            return next;
+          });
+          return;
+        }
+        historyRef.current.push({
+          graphicId: ed.id,
+          before,
+          after: null,
+          deletion: { start: edit.start, deletedText: edit.deletedText },
+        });
+        sel.setSelected(null);
+        setVertexSelection(null);
+        setHistoryVersion((version) => version + 1);
+      })
+      .catch((error: unknown) => {
+        setHiddenGraphicIds((current) => {
+          const next = new Set(current);
+          next.delete(ed.id);
+          return next;
+        });
+        setInteractionNotice(
+          `删除未保存：${error instanceof Error ? error.message : "未知错误"}`,
+        );
+      });
   };
 
   const handlePointerDown = (e: React.PointerEvent, ed: EditableGraphic) => {
@@ -723,9 +847,39 @@ export function IconViewer({
         ? historyRef.current.peekUndo()
         : historyRef.current.peekRedo();
     if (!command) return;
+    if (command.deletion) {
+      const { start, deletedText } = command.deletion;
+      const edit: Edit =
+        direction === "undo"
+          ? {
+              start,
+              end: start,
+              expectedText: "",
+              replacement: deletedText,
+            }
+          : {
+              start,
+              end: start + deletedText.length,
+              expectedText: deletedText,
+              replacement: "",
+            };
+      historyBusyRef.current = true;
+      try {
+        const success = await onEdit(edit, direction);
+        if (success) {
+          if (direction === "undo") historyRef.current.acceptUndo();
+          else historyRef.current.acceptRedo();
+          setHistoryVersion((version) => version + 1);
+        }
+      } finally {
+        historyBusyRef.current = false;
+      }
+      return;
+    }
     const ed = editables.find((item) => item.id === command.graphicId);
     if (!ed) return;
     const target = direction === "undo" ? command.before : command.after;
+    if (!target) return;
     const edit = buildGraphicEdit(ed, target);
     if (!edit) return;
     historyBusyRef.current = true;
@@ -769,8 +923,10 @@ export function IconViewer({
 
   const selectedEntry = entries.find(({ id }) => id === sel.selectedId);
   const selectedEditable = selectedEntry?.editable;
-  const selectedGraphic = selectedEditable
-    ? (optimisticGraphics.get(selectedEditable.id) ?? selectedEditable.graphic)
+  const selectedGraphic = selectedEntry
+    ? selectedEditable
+      ? (optimisticGraphics.get(selectedEditable.id) ?? selectedEditable.graphic)
+      : selectedEntry.graphic
     : null;
   const selectedBounds = selectedEditable && selectedGraphic
     ? boundsOf(applyTransform(selectedGraphic, transformFor(selectedEditable.id)))
@@ -895,9 +1051,22 @@ export function IconViewer({
 
   const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
   const canRedo = historyVersion >= 0 && historyRef.current.canRedo;
+  const inspectorEditable = selectedEntry && selectedGraphic
+    ? selectedEditable
+      ? { ...selectedEditable, graphic: selectedGraphic }
+      : {
+          id: selectedEntry.id,
+          graphic: selectedGraphic,
+          ownerQualifiedName: selectedGraphic.ownerQualifiedName,
+          inherited: true,
+          selected: true,
+          transform: identity,
+          source: { itemRange: { start: 0, end: 0 } },
+        }
+    : null;
 
   return (
-    <div className="icon-editor-shell">
+    <div ref={shellRef} className="icon-editor-shell">
       <GraphicViewport
         icon={icon}
         resetKey={resetKey}
@@ -906,6 +1075,11 @@ export function IconViewer({
         screenOverlayRef={screenOverlayRef}
         onViewportTransform={updateScreenOverlay}
         overlay={screenOverlay}
+        onCanvasPointerDown={handleCanvasPointerDown}
+        onCanvasContextMenu={(event) => {
+          event.preventDefault();
+          closeContextMenu();
+        }}
         onPointerMove={(event) => {
           handleVertexMove(event);
           handlePointerMove(event);
@@ -957,6 +1131,7 @@ export function IconViewer({
                   }
                   onPointerEnter={() => sel.setHover(id)}
                   onPointerLeave={() => sel.setHover(null)}
+                  onContextMenu={(e) => handleGraphicContextMenu(e, id)}
                   onPointerMove={ed ? handlePointerMove : undefined}
                   onPointerUp={ed ? handlePointerUp : undefined}
                   onPointerCancel={ed ? handlePointerCancel : undefined}
@@ -1008,6 +1183,7 @@ export function IconViewer({
                   }
                   onPointerEnter={() => sel.setHover(id)}
                   onPointerLeave={() => sel.setHover(null)}
+                  onContextMenu={(e) => handleGraphicContextMenu(e, id)}
                   style={ed ? { cursor: "pointer" } : undefined}
                 >
                   <g transform={ed ? toSvgTransform(transformFor(id)) : undefined}>
@@ -1064,9 +1240,35 @@ export function IconViewer({
           </g>
         </g>
       </GraphicViewport>
+      {contextMenu && (
+        <div
+          className="graphic-context-menu"
+          role="menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <button
+            role="menuitem"
+            onClick={() => closeContextMenu()}
+          >
+            Properties…
+          </button>
+          <button
+            role="menuitem"
+            disabled={
+              !editables.some(
+                (ed) => ed.id === contextMenu.graphicId && !ed.inherited,
+              )
+            }
+            onClick={handleDeleteGraphic}
+          >
+            Delete
+          </button>
+        </div>
+      )}
       {editable && (
         <GraphicProperties
-          editable={editables.find((ed) => ed.id === sel.selectedId) ?? null}
+          editable={inspectorEditable ?? null}
           onPropertyEdit={handlePropertyEdit}
         />
       )}
@@ -1164,6 +1366,29 @@ function buildPointsEdit(ed: EditableGraphic, points: Point[]): Edit | null {
     end: ed.source.pointsRange.end,
     expectedText: ed.source.pointsRange.expectedText,
     replacement: serializeModelicaPoints(points),
+  };
+}
+
+export function buildDeleteEdit(
+  ed: EditableGraphic,
+  sourceText: string,
+): DeleteEdit | null {
+  if (!sourceText || ed.inherited) return null;
+  const { start, end } = ed.source.itemRange;
+  if (start < 0 || end <= start || end > sourceText.length) return null;
+  const after = sourceText.slice(end);
+  const before = sourceText.slice(0, start);
+  const followingComma = after.match(/^(\s*,\s*)/)?.[1];
+  const precedingComma = before.match(/(,\s*)$/)?.[1];
+  const deleteStart = followingComma ? start : precedingComma ? start - precedingComma.length : start;
+  const deleteEnd = followingComma ? end + followingComma.length : end;
+  const deletedText = sourceText.slice(deleteStart, deleteEnd);
+  return {
+    start: deleteStart,
+    end: deleteEnd,
+    expectedText: deletedText,
+    replacement: "",
+    deletedText,
   };
 }
 
@@ -1274,6 +1499,116 @@ function parseHex(hex: string): [number, number, number] {
   ) as [number, number, number];
 }
 
+function exactBounds(graphic: EditableGraphic["graphic"]): Extent {
+  if ("extent" in graphic) return graphic.extent;
+  const xs = graphic.points.map((point) => point.x);
+  const ys = graphic.points.map((point) => point.y);
+  return {
+    p1: { x: Math.min(...xs), y: Math.min(...ys) },
+    p2: { x: Math.max(...xs), y: Math.max(...ys) },
+  };
+}
+
+function graphicPosition(graphic: EditableGraphic["graphic"]): Point {
+  if (graphic.origin) return graphic.origin;
+  const bounds = exactBounds(graphic);
+  return {
+    x: (bounds.p1.x + bounds.p2.x) / 2,
+    y: (bounds.p1.y + bounds.p2.y) / 2,
+  };
+}
+
+function translateGraphic(
+  graphic: EditableGraphic["graphic"],
+  dx: number,
+  dy: number,
+): EditableGraphic["graphic"] {
+  if (graphic.origin) return { ...graphic, origin: { x: graphic.origin.x + dx, y: graphic.origin.y + dy } } as EditableGraphic["graphic"];
+  if ("extent" in graphic) {
+    return {
+      ...graphic,
+      extent: {
+        p1: { x: graphic.extent.p1.x + dx, y: graphic.extent.p1.y + dy },
+        p2: { x: graphic.extent.p2.x + dx, y: graphic.extent.p2.y + dy },
+      },
+    };
+  }
+  return {
+    ...graphic,
+    points: graphic.points.map((point) => ({ x: point.x + dx, y: point.y + dy })),
+  };
+}
+
+function resizeGraphic(
+  graphic: EditableGraphic["graphic"],
+  width: number,
+  height: number,
+): EditableGraphic["graphic"] {
+  const bounds = exactBounds(graphic);
+  const oldWidth = Math.max(bounds.p2.x - bounds.p1.x, 1e-9);
+  const oldHeight = Math.max(bounds.p2.y - bounds.p1.y, 1e-9);
+  const cx = (bounds.p1.x + bounds.p2.x) / 2;
+  const cy = (bounds.p1.y + bounds.p2.y) / 2;
+  const sx = width / oldWidth;
+  const sy = height / oldHeight;
+  if ("extent" in graphic) {
+    return {
+      ...graphic,
+      extent: {
+        p1: { x: cx - width / 2, y: cy - height / 2 },
+        p2: { x: cx + width / 2, y: cy + height / 2 },
+      },
+    };
+  }
+  return {
+    ...graphic,
+    points: graphic.points.map((point) => ({
+      x: cx + (point.x - cx) * sx,
+      y: cy + (point.y - cy) * sy,
+    })),
+  };
+}
+
+function NumericProperty({
+  label,
+  value,
+  disabled,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  disabled?: boolean;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const next = Number(draft);
+    if (Number.isFinite(next)) onCommit(next);
+    else setDraft(String(value));
+  };
+  return (
+    <label>
+      {label}
+      <input
+        type="number"
+        min={label === "Width" || label === "Height" ? "0" : undefined}
+        step="0.25"
+        value={draft}
+        disabled={disabled}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            commit();
+            event.currentTarget.blur();
+          }
+        }}
+      />
+    </label>
+  );
+}
+
 function GraphicProperties({
   editable,
   onPropertyEdit,
@@ -1282,154 +1617,80 @@ function GraphicProperties({
   onPropertyEdit?: (edit: Edit, after: EditableGraphic["graphic"]) => void;
 }) {
   if (!editable || !onPropertyEdit)
-    return (
-      <aside className="graphic-properties empty-properties">
-        选择图元查看属性
-      </aside>
-    );
+    return <aside className="graphic-properties empty-properties">选择图元查看属性</aside>;
   const graphic = editable.graphic;
   const source = editable.source;
+  const readOnly = !!editable.inherited;
   const patch = (
     range: { start: number; end: number; expectedText?: string } | undefined,
     value: string,
     after: EditableGraphic["graphic"],
   ) => {
-    if (!range) return;
-    onPropertyEdit(
-      {
-        start: range.start,
-        end: range.end,
-        expectedText: range.expectedText,
-        replacement: value,
-      },
-      after,
-    );
+    if (!range || readOnly) return;
+    onPropertyEdit({ start: range.start, end: range.end, expectedText: range.expectedText, replacement: value }, after);
   };
-  const line =
-    graphic.type === "Line"
-      ? graphic.color
-      : graphic.type === "Text"
-        ? graphic.textColor
-        : graphic.lineColor;
-  const fill =
-    graphic.type === "Line" || graphic.type === "Text"
-      ? undefined
-      : graphic.fillColor;
-  const lineProperty =
-    graphic.type === "Line"
-      ? "color"
-      : graphic.type === "Text"
-        ? "textColor"
-        : "lineColor";
-  const lineRange =
-    graphic.type === "Line"
-      ? source.colorRange
-      : graphic.type === "Text"
-        ? source.textColorRange
-        : source.lineColorRange;
-  const pattern =
-    graphic.type === "Line"
-      ? (graphic.pattern ?? "LinePattern.Solid")
-      : "LinePattern.Solid";
-  const fillPattern =
-    graphic.type === "Line" || graphic.type === "Text"
-      ? "FillPattern.None"
-      : (graphic.fillPattern ?? "FillPattern.None");
-  const thickness =
-    graphic.type === "Line"
-      ? graphic.thickness
-      : graphic.type === "Text"
-        ? undefined
-        : graphic.lineThickness;
-  const thicknessName = graphic.type === "Line" ? "thickness" : "lineThickness";
-  const thicknessRange =
-    graphic.type === "Line" ? source.thicknessRange : source.lineThicknessRange;
+  const position = graphicPosition(graphic);
+  const bounds = exactBounds(graphic);
+  const width = Math.abs(bounds.p2.x - bounds.p1.x);
+  const height = Math.abs(bounds.p2.y - bounds.p1.y);
+  const positionRange = source.originRange;
+  const extentRange = source.extentRange;
+  const pointsRange = source.pointsRange;
+  const positionValue = (axis: "x" | "y", value: number) => {
+    const delta = value - position[axis];
+    const next = translateGraphic(graphic, axis === "x" ? delta : 0, axis === "y" ? delta : 0);
+    const range = graphic.origin && positionRange ? positionRange : "extent" in graphic ? extentRange : pointsRange;
+    if (graphic.origin && positionRange) {
+      patch(positionRange, `{${formatModelicaNumber(next.origin!.x)},${formatModelicaNumber(next.origin!.y)}}`, next);
+    } else if ("extent" in next && extentRange) {
+      patch(extentRange, formatModelicaExtent(next.extent), next);
+    } else if ("points" in next && pointsRange) {
+      patch(pointsRange, serializeModelicaPoints(next.points), next);
+    } else if (!range) return;
+  };
+  const sizeValue = (axis: "width" | "height", value: number) => {
+    const next = resizeGraphic(graphic, axis === "width" ? value : width, axis === "height" ? value : height);
+    if ("extent" in next && extentRange) patch(extentRange, formatModelicaExtent(next.extent), next);
+    else if ("points" in next && pointsRange) patch(pointsRange, serializeModelicaPoints(next.points), next);
+  };
+  const line = graphic.type === "Line" ? graphic.color : graphic.type === "Text" ? graphic.textColor : graphic.lineColor;
+  const lineRange = graphic.type === "Line" ? (source.colorRange ?? source.lineColorRange) : graphic.type === "Text" ? source.textColorRange : source.lineColorRange;
+  const lineProperty = graphic.type === "Line" ? "color" : graphic.type === "Text" ? "textColor" : "lineColor";
+  const fill = graphic.type === "Line" || graphic.type === "Text" ? undefined : graphic.fillColor;
+  const thickness = graphic.type === "Line" ? graphic.thickness : graphic.type === "Text" ? undefined : graphic.lineThickness;
+  const thicknessRange = graphic.type === "Line" ? source.thicknessRange : source.lineThicknessRange;
+  const pattern = graphic.type === "Text" ? "LinePattern.Solid" : (graphic.pattern ?? "LinePattern.Solid");
+  const fillPattern = "fillPattern" in graphic ? (graphic.fillPattern ?? "FillPattern.None") : "FillPattern.None";
   return (
-    <aside className="graphic-properties">
-      <h3>Selected Graphic</h3>
-      <label>
-        Type <strong>{graphic.type}</strong>
-      </label>
-      <label>
-        Line Color{" "}
-        <input
-          type="color"
-          value={colorHex(line)}
-          onChange={(e) => {
-            const value = parseHex(e.target.value);
-            patch(lineRange, `{${value.join(",")}}`, {
-              ...graphic,
-              [lineProperty]: value,
-            } as EditableGraphic["graphic"]);
-          }}
-        />
-      </label>
-      <label>
-        Line Style{" "}
-        <select
-          value={pattern}
-          onChange={(e) =>
-            patch(source.patternRange, e.target.value, {
-              ...graphic,
-              pattern: e.target.value,
-            } as EditableGraphic["graphic"])
-          }
-        >
-          {linePatterns.map((value) => (
-            <option key={value}>{value}</option>
-          ))}
-        </select>
-      </label>
-      <label>
-        Line Thickness{" "}
-        <input
-          type="number"
-          min="0"
-          step="0.5"
-          value={thickness ?? 1}
-          onChange={(e) => {
-            const value = Number(e.target.value);
-            patch(thicknessRange, e.target.value, {
-              ...graphic,
-              [thicknessName]: value,
-            } as EditableGraphic["graphic"]);
-          }}
-        />
-      </label>
-      {graphic.type !== "Line" && graphic.type !== "Text" && (
-        <>
-          <label>
-            Fill Color{" "}
-            <input
-              type="color"
-              value={colorHex(fill)}
-              onChange={(e) => {
-                const value = parseHex(e.target.value);
-                patch(source.fillColorRange, `{${value.join(",")}}`, {
-                  ...graphic,
-                  fillColor: value,
-                });
-              }}
-            />
-          </label>
-          <label>
-            Fill Style{" "}
-            <select
-              value={fillPattern}
-              onChange={(e) =>
-                patch(source.fillPatternRange, e.target.value, {
-                  ...graphic,
-                  fillPattern: e.target.value,
-                } as EditableGraphic["graphic"])
-              }
-            >
-              {fillPatterns.map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </label>
-        </>
-      )}
+    <aside className="graphic-properties" data-graphic-properties>
+      <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span></div>
+      {readOnly && <p className="property-note">来自 {editable.ownerQualifiedName ?? "基类"}，当前类不可编辑。</p>}
+      <PropertySection title="Geometry">
+        <NumericProperty label={graphic.origin ? "Origin X" : "X"} value={position.x} disabled={readOnly || (!positionRange && !extentRange && !pointsRange)} onCommit={(value) => positionValue("x", value)} />
+        <NumericProperty label={graphic.origin ? "Origin Y" : "Y"} value={position.y} disabled={readOnly || (!positionRange && !extentRange && !pointsRange)} onCommit={(value) => positionValue("y", value)} />
+        <NumericProperty label="Width" value={width} disabled={readOnly || (!extentRange && !pointsRange)} onCommit={(value) => sizeValue("width", Math.max(0, value))} />
+        <NumericProperty label="Height" value={height} disabled={readOnly || (!extentRange && !pointsRange)} onCommit={(value) => sizeValue("height", Math.max(0, value))} />
+        <label>Rotation <input className="property-disabled" type="number" value="0" disabled title="Add rotation is not yet supported" readOnly /></label>
+        {"points" in graphic && <div className="points-list"><span>Points</span><code>{serializeModelicaPoints(graphic.points)}</code></div>}
+      </PropertySection>
+      <PropertySection title="Line">
+        <label>Color <input type="color" value={colorHex(line)} disabled={readOnly || !lineRange} onChange={(event) => { const value = parseHex(event.target.value); patch(lineRange, `{${value.join(",")}}`, { ...graphic, [lineProperty]: value } as EditableGraphic["graphic"]); }} /></label>
+        <label>Style <select value={pattern} disabled={readOnly || !source.patternRange} onChange={(event) => patch(source.patternRange, event.target.value, { ...graphic, pattern: event.target.value } as EditableGraphic["graphic"])}>{linePatterns.map((value) => <option key={value} value={value}>{value.replace("LinePattern.", "")}</option>)}</select></label>
+        {thickness !== undefined && <NumericProperty label="Thickness" value={thickness} disabled={readOnly || !thicknessRange} onCommit={(value) => patch(thicknessRange, formatModelicaNumber(Math.max(0, value)), { ...graphic, [graphic.type === "Line" ? "thickness" : "lineThickness"]: Math.max(0, value) } as EditableGraphic["graphic"])} />}
+      </PropertySection>
+      {(graphic.type === "Rectangle" || graphic.type === "Ellipse" || graphic.type === "Polygon") && <PropertySection title="Fill"><label>Color <input type="color" value={colorHex(fill)} disabled={readOnly || !source.fillColorRange} onChange={(event) => { const value = parseHex(event.target.value); patch(source.fillColorRange, `{${value.join(",")}}`, { ...graphic, fillColor: value }); }} /></label><label>Style <select value={fillPattern} disabled={readOnly || !source.fillPatternRange} onChange={(event) => patch(source.fillPatternRange, event.target.value, { ...graphic, fillPattern: event.target.value } as EditableGraphic["graphic"])}>{fillPatterns.map((value) => <option key={value} value={value}>{value.replace("FillPattern.", "")}</option>)}</select></label></PropertySection>}
+      {graphic.type === "Text" && <PropertySection title="Text"><TextProperty value={graphic.textString} disabled={readOnly || !source.textStringRange} onCommit={(value) => patch(source.textStringRange, JSON.stringify(value), { ...graphic, textString: value })} /><NumericProperty label="Font Size" value={graphic.fontSize ?? 12} disabled={readOnly || !source.fontSizeRange} onCommit={(value) => patch(source.fontSizeRange, formatModelicaNumber(Math.max(1, value)), { ...graphic, fontSize: Math.max(1, value) })} /><div className="text-style-options">{["TextStyle.Bold", "TextStyle.Italic", "TextStyle.UnderLine"].map((style) => <label key={style}><input type="checkbox" checked={graphic.textStyle?.includes(style) ?? false} disabled={readOnly || !source.textStyleRange} onChange={(event) => { const styles = new Set(graphic.textStyle ?? []); if (event.target.checked) styles.add(style); else styles.delete(style); const list = [...styles]; patch(source.textStyleRange, `{${list.join(",")}}`, { ...graphic, textStyle: list }); }} />{style.replace("TextStyle.", "")}</label>)}</div></PropertySection>}
     </aside>
   );
+}
+
+function PropertySection({ title, children }: { title: string; children: ReactNode }) {
+  return <section className="property-section"><h4>{title}</h4>{children}</section>;
+}
+
+function TextProperty({ value, disabled, onCommit }: { value: string; disabled?: boolean; onCommit: (value: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => onCommit(draft);
+  return <label>String <input className="property-text" value={draft} disabled={disabled} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => { if (event.key === "Enter") { commit(); event.currentTarget.blur(); } }} /></label>;
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatModelicaExtent } from "./IconViewer";
+import { buildDeleteEdit, formatModelicaExtent } from "./IconViewer";
 
 describe("IconViewer source edit formatting", () => {
   it("keeps both point braces and the outer extent braces", () => {
@@ -18,5 +18,26 @@ describe("IconViewer source edit formatting", () => {
         p2: { x: -53.2064749, y: -4.5290168 },
       }),
     ).toBe("{{-63.206475,5.470983},{-53.206475,-4.529017}}");
+  });
+
+  it("deletes the following comma without damaging the next graphic", () => {
+    const source = "graphics={Rectangle(...), Line(...), Ellipse(...)}";
+    const editable = {
+      id: "line",
+      graphic: {} as never,
+      selected: false,
+      transform: { translate: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotate: 0 },
+      source: {
+        itemRange: {
+          start: source.indexOf("Line"),
+          end: source.indexOf("Line") + "Line(...)".length,
+        },
+      },
+    };
+    const edit = buildDeleteEdit(editable, source);
+    expect(edit?.replacement).toBe("");
+    expect(source.slice(0, edit!.start) + edit!.replacement + source.slice(edit!.end)).toBe(
+      "graphics={Rectangle(...), Ellipse(...)}",
+    );
   });
 });

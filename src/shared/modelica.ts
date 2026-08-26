@@ -69,6 +69,7 @@ export type SourceEditReason =
   | "resize"
   | "vertex"
   | "property"
+  | "delete"
   | "undo"
   | "redo";
 

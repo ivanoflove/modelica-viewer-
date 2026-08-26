@@ -2,6 +2,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type MouseEvent,
   type PointerEvent,
   type ReactNode,
   type RefObject,
@@ -34,6 +35,8 @@ interface Props {
   onPointerMove: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerUp: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerCancel: (event: PointerEvent<SVGSVGElement>) => void;
+  onCanvasPointerDown?: (event: PointerEvent<SVGSVGElement>) => void;
+  onCanvasContextMenu?: (event: MouseEvent<SVGSVGElement>) => void;
   onUndo?: () => void;
   onRedo?: () => void;
   canUndo?: boolean;
@@ -168,6 +171,8 @@ export function GraphicViewport({
   onPointerMove,
   onPointerUp,
   onPointerCancel,
+  onCanvasPointerDown,
+  onCanvasContextMenu,
   onUndo,
   onRedo,
   canUndo = false,
@@ -419,6 +424,7 @@ export function GraphicViewport({
           preserveAspectRatio="xMidYMid meet"
           style={{ touchAction: "none", cursor: isPanning ? "grabbing" : "default" }}
           onPointerDownCapture={startPan}
+          onPointerDown={(event) => onCanvasPointerDown?.(event)}
           onPointerMove={(event) => {
             handlePanMove(event);
             onPointerMove(event);
@@ -431,6 +437,7 @@ export function GraphicViewport({
             endPan(event);
             onPointerCancel(event);
           }}
+          onContextMenu={onCanvasContextMenu}
           onDoubleClick={(event) => {
             if (event.target === event.currentTarget) fit();
           }}

@@ -26,6 +26,7 @@ function App(): JSX.Element {
   const [libraryError, setLibraryError] = useState<string | null>(null);
 
   const [source, setSource] = useState("");
+  const [documentSource, setDocumentSource] = useState("");
   const [sourceLoading, setSourceLoading] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
   const sourceEditorRef = useRef<HTMLDivElement>(null);
@@ -98,6 +99,7 @@ function App(): JSX.Element {
   useEffect(() => {
     if (!selected || !window.api) {
       setSource("");
+      setDocumentSource("");
       setSourceError(null);
       setIcon(null);
       setIconError(null);
@@ -116,8 +118,10 @@ function App(): JSX.Element {
         if ("error" in result) {
           setSourceError(result.error);
           setSource("");
+          setDocumentSource("");
           return;
         }
+        setDocumentSource(result.content);
         if (selected.node.sourceRange) {
           const range = selected.node.sourceRange;
           setSource(result.content.slice(range.start, range.end));
@@ -306,8 +310,10 @@ function App(): JSX.Element {
       if ("error" in srcRes) {
         setSourceError(srcRes.error);
       } else if (freshRange) {
+        setDocumentSource(srcRes.content);
         setSource(srcRes.content.slice(freshRange.start, freshRange.end));
       } else {
+        setDocumentSource(srcRes.content);
         setSource(srcRes.content);
       }
       if ("error" in iconRes || !iconRes.icon) {
@@ -537,6 +543,7 @@ function App(): JSX.Element {
                           editable={editableIcon}
                           modelName={selected.node.name}
                           resetKey={selected.node.qualifiedName}
+                          sourceText={documentSource}
                           onEdit={handleIconEdit}
                         />
                       </>

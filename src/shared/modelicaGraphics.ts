@@ -66,6 +66,9 @@ export interface EditableGraphic {
     colorRange?: SourceRangeRef;
     textColorRange?: SourceRangeRef;
     fillColorRange?: SourceRangeRef;
+    textStringRange?: SourceRangeRef;
+    fontSizeRange?: SourceRangeRef;
+    textStyleRange?: SourceRangeRef;
     lineThicknessRange?: SourceRangeRef;
     thicknessRange?: SourceRangeRef;
     patternRange?: SourceRangeRef;
