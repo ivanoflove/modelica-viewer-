@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   IconDto,
   EditableIconDto,
@@ -528,7 +528,6 @@ export function IconViewer({
 
   const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
   const canRedo = historyVersion >= 0 && historyRef.current.canRedo;
-  recordViewerPerformance("graphicLayerRenders");
 
   return (
     <div className="icon-editor-shell">
@@ -545,7 +544,7 @@ export function IconViewer({
         canRedo={canRedo}
       >
         <g transform="scale(1,-1)">
-          <g className="modelica-layer">
+          <GraphicLayer>
             {entries.map(({ id, graphic, editable: ed }, index) => {
               const transform = transformFor(id);
               const baseGraphic = ed
@@ -586,7 +585,7 @@ export function IconViewer({
                 </g>
               );
             })}
-          </g>
+          </GraphicLayer>
           <g className="selection-layer" pointerEvents="none">
             {entries.map(({ id, graphic, editable: ed }) => {
               if (sel.selectedId !== id && sel.hoverId !== id) return null;
@@ -659,6 +658,11 @@ export function IconViewer({
     </div>
   );
 }
+
+const GraphicLayer = memo(function GraphicLayer({ children }: { children: ReactNode }) {
+  recordViewerPerformance("graphicLayerRenders");
+  return <g className="modelica-layer">{children}</g>;
+});
 
 function handlePosition(
   handle: ResizeHandle,
