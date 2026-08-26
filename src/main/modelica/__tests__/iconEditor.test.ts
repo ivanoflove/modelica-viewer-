@@ -32,6 +32,14 @@ end HeatXNTU;`;
     expect(iconRange!.start).toBeGreaterThan(source.indexOf("model HeatXNTU"));
   });
 
+  it("keeps a structural Icon range when the Icon body has syntax errors", () => {
+    const source =
+      "model Dryer annotation(Icon(graphics={Rectangle(extent={{0,0},{1,1})}))); end Dryer;";
+    const iconRange = findIconSourceRange(source);
+    expect(iconRange).not.toBeNull();
+    expect(source.slice(iconRange!.start, iconRange!.end)).toMatch(/^Icon\(/);
+  });
+
   it("can relocate a class by stable qualified name after a loader requalification", () => {
     const parsed = parseModelicaFile(
       "model WaterPump annotation(Icon(graphics={Rectangle(extent={{-1,-1},{1,1}})})); end WaterPump;",

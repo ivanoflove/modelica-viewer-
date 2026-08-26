@@ -399,28 +399,41 @@ function registerIpcHandlers(): void {
             target.sourceRange.start,
             target.sourceRange.end,
           );
-          const annotationOffset = findIconAnnotationOffset(targetSlice);
           const tokens = tokenize(targetSlice);
           const iconToken = tokens.find(
             (token, index) =>
               token.value === "Icon" && tokens[index + 1]?.type === "LPAREN",
           );
           const hasIconCall = !!iconToken;
-          const iconStart = target.sourceRange.start + (iconToken?.start ?? 0);
           const iconRange = findIconSourceRange(targetSlice);
+          const iconStart =
+            target.sourceRange.start +
+            (iconRange?.start ?? iconToken?.start ?? 0);
           if (!hasIconCall) {
             return {
               error: `OWN_ICON_NOT_FOUND: ${edit.targetQualifiedName} (${sourceLocation(updated, target.sourceRange.start)})`,
             };
           }
-          if (annotationOffset < 0) {
+          if (!iconRange) {
             return {
               error: `ICON_RANGE_ERROR: Icon range is invalid in ${edit.targetQualifiedName}; iconStart=${iconStart}; iconRange=${JSON.stringify(iconRange)} (${sourceLocation(updated, iconStart)})`,
             };
           }
+          const iconText = targetSlice.slice(iconRange.start, iconRange.end);
+          if (!iconText.trimStart().startsWith("Icon(")) {
+            return {
+              error: `ICON_RANGE_ERROR: expected Icon(...) range in ${edit.targetQualifiedName}, got ${JSON.stringify(iconText.slice(0, 120))} (${sourceLocation(updated, iconStart)})`,
+            };
+          }
           return {
-            error: `ICON_RESOLVE_FAILED: ${edit.targetQualifiedName} iconRange=${JSON.stringify(iconRange)} (${sourceLocation(updated, iconStart)})`,
+            error: `ICON_SYNTAX_ERROR: invalid Icon annotation in ${edit.targetQualifiedName}; iconRange=${JSON.stringify(iconRange)} (${sourceLocation(updated, iconStart)})`,
           };
+        }
+        if (resolved.warnings.length > 0) {
+          console.debug("[ICON_RESOLVE_WARNING]", {
+            targetQualifiedName: edit.targetQualifiedName,
+            warnings: resolved.warnings,
+          });
         }
         tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
         await writeFile(tempPath, updated, "utf-8");

@@ -556,11 +556,33 @@ export function findIconSourceRange(
   slice: string,
 ): { start: number; end: number } | null {
   const match = findIconAnnotation(slice);
-  if (!match) return null;
-  return {
-    start: match.offset + match.icon.sourceRange.start,
-    end: match.offset + match.icon.sourceRange.end,
-  };
+  if (match) {
+    return {
+      start: match.offset + match.icon.sourceRange.start,
+      end: match.offset + match.icon.sourceRange.end,
+    };
+  }
+
+  // Keep the structural range available even when the annotation value has
+  // a syntax error. This lets callers distinguish a bad Icon body from a
+  // missing/mis-bound Icon range. Tokens already ignore strings/comments.
+  const tokens = tokenize(slice);
+  for (let i = 0; i < tokens.length - 1; i++) {
+    if (tokens[i]!.value !== "Icon" || tokens[i + 1]!.type !== "LPAREN")
+      continue;
+    let depth = 0;
+    for (let j = i + 1; j < tokens.length; j++) {
+      const token = tokens[j]!;
+      if (token.type === "LPAREN") depth++;
+      if (token.type === "RPAREN") {
+        depth--;
+        if (depth === 0) {
+          return { start: tokens[i]!.start, end: token.end };
+        }
+      }
+    }
+  }
+  return null;
 }
 
 // Editable helpers
