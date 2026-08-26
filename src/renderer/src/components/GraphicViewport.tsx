@@ -27,6 +27,10 @@ interface Props {
   resetKey: string;
   svgRef: RefObject<SVGSVGElement>;
   children: ReactNode;
+  overlay?: ReactNode;
+  viewportGroupRef?: RefObject<SVGGElement>;
+  screenOverlayRef?: RefObject<SVGGElement>;
+  onViewportTransform?: () => void;
   onPointerMove: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerUp: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerCancel: (event: PointerEvent<SVGSVGElement>) => void;
@@ -157,6 +161,10 @@ export function GraphicViewport({
   resetKey,
   svgRef,
   children,
+  overlay,
+  viewportGroupRef: externalViewportGroupRef,
+  screenOverlayRef,
+  onViewportTransform,
   onPointerMove,
   onPointerUp,
   onPointerCancel,
@@ -167,10 +175,13 @@ export function GraphicViewport({
 }: Props) {
   const shellRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
-  const viewportGroupRef = useRef<SVGGElement>(null);
+  const internalViewportGroupRef = useRef<SVGGElement>(null);
+  const viewportGroupRef = externalViewportGroupRef ?? internalViewportGroupRef;
   const spacePressed = useRef(false);
   const renderRafRef = useRef<number | null>(null);
   const stateSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onViewportTransformRef = useRef(onViewportTransform);
+  onViewportTransformRef.current = onViewportTransform;
   const [fitMode, setFitMode] = useState<"content" | "coordinateSystem">(
     "content",
   );
@@ -199,6 +210,7 @@ export function GraphicViewport({
       renderRafRef.current = null;
       recordViewerPerformance("viewportRafUpdates");
       applyViewportTransform();
+      onViewportTransformRef.current?.();
     });
   };
 
@@ -425,6 +437,9 @@ export function GraphicViewport({
           onFocus={() => undefined}
         >
           <g ref={viewportGroupRef}>{children}</g>
+          <g ref={screenOverlayRef} className="screen-overlay" pointerEvents="none">
+            {overlay}
+          </g>
         </svg>
       </div>
       <span className="icon-editor-hint">

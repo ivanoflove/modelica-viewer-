@@ -15,8 +15,6 @@ import {
 import {
   clientToModelicaWithInverse,
   dragDeltaFromStart,
-  transformWithDragPreview,
-  type DragPreview,
 } from "../../editor/DragController";
 import {
   resizeExtent,
@@ -70,6 +68,11 @@ export function IconViewer({
 }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<DragSession | null>(null);
+  const viewportGroupRef = useRef<SVGGElement>(null);
+  const graphicGroupRefs = useRef(new Map<string, SVGGElement>());
+  const selectionGroupRefs = useRef(new Map<string, SVGGElement>());
+  const screenOverlayRef = useRef<SVGGElement>(null);
+  const screenOverlayUpdateRef = useRef<() => void>(() => undefined);
   const resizeRef = useRef<ResizeSession | null>(null);
   const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -81,7 +84,6 @@ export function IconViewer({
   const resizeRafRef = useRef<number | null>(null);
   const historyRef = useRef(new HistoryManager(100));
   const historyBusyRef = useRef(false);
-  const [dragPreview, setDragPreview] = useState<DragPreview | null>(null);
   const [resizePreview, setResizePreview] = useState<{
     graphicId: string;
     extent: Extent;
@@ -112,11 +114,14 @@ export function IconViewer({
     rafRef.current = null;
     resizeRafRef.current = null;
     historyRef.current = new HistoryManager(100);
-    setDragPreview(null);
     setResizePreview(null);
     setInteractionNotice(null);
     setHistoryVersion((version) => version + 1);
   }, [resetKey]);
+
+  useEffect(() => {
+    screenOverlayUpdateRef.current();
+  }, [sel.selectedId, icon, editable, optimisticGraphics, resizePreview, resetKey]);
 
   if (!icon) return <div className="no-icon">No Icon annotation</div>;
 
@@ -134,17 +139,42 @@ export function IconViewer({
       editable: ed,
     };
   });
+
   const transformFor = (id: string): GraphicTransform => {
     const base = editables.find((ed) => ed.id === id)?.transform ?? identity;
-    return transformWithDragPreview(id, base, dragPreview);
+    return base;
   };
 
-  const updatePreview = (
+  const modelDeltaToRootTransform = (dx: number, dy: number) => {
+    const svg = svgRef.current;
+    const viewport = viewportGroupRef.current;
+    const rootInverse = svg?.getScreenCTM()?.inverse();
+    const viewportMatrix = viewport?.getScreenCTM();
+    if (!rootInverse || !viewportMatrix) return "translate(0,0)";
+    const origin = new DOMPoint(0, 0)
+      .matrixTransform(viewportMatrix)
+      .matrixTransform(rootInverse);
+    const moved = new DOMPoint(dx, -dy)
+      .matrixTransform(viewportMatrix)
+      .matrixTransform(rootInverse);
+    return `translate(${moved.x - origin.x},${moved.y - origin.y})`;
+  };
+
+  const applyDragPreview = (
     session: DragSession,
     point: { x: number; y: number },
   ) => {
     const delta = dragDeltaFromStart(session.pointerStart, point);
-    setDragPreview({ graphicId: session.id, dx: delta.x, dy: delta.y });
+    const graphicGroup = graphicGroupRefs.current.get(session.id);
+    const selectionGroup = selectionGroupRefs.current.get(session.id);
+    const transform = `translate(${delta.x},${delta.y})`;
+    graphicGroup?.setAttribute("transform", transform);
+    selectionGroup?.setAttribute("transform", transform);
+    screenOverlayRef.current?.setAttribute(
+      "transform",
+      modelDeltaToRootTransform(delta.x, delta.y),
+    );
+    recordViewerPerformance("dragPreviewRafUpdates");
   };
 
   const schedulePreview = (point: { x: number; y: number }) => {
@@ -154,7 +184,7 @@ export function IconViewer({
       rafRef.current = null;
       const session = dragRef.current;
       const pending = pendingPointRef.current;
-      if (session && pending) updatePreview(session, pending);
+      if (session && pending) applyDragPreview(session, pending);
     });
   };
 
@@ -162,8 +192,15 @@ export function IconViewer({
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
     pendingPointRef.current = null;
+    const session = dragRef.current;
+    if (session) {
+      graphicGroupRefs.current.get(session.id)?.removeAttribute("transform");
+      selectionGroupRefs.current
+        .get(session.id)
+        ?.removeAttribute("transform");
+    }
+    screenOverlayRef.current?.removeAttribute("transform");
     dragRef.current = null;
-    setDragPreview(null);
   };
 
   const clearResize = () => {
@@ -526,6 +563,79 @@ export function IconViewer({
     clearResize();
   };
 
+  const selectedEntry = entries.find(({ id }) => id === sel.selectedId);
+  const selectedEditable = selectedEntry?.editable;
+  const selectedGraphic = selectedEditable
+    ? (optimisticGraphics.get(selectedEditable.id) ?? selectedEditable.graphic)
+    : null;
+  const selectedBounds = selectedEditable && selectedGraphic
+    ? boundsOf(applyTransform(selectedGraphic, transformFor(selectedEditable.id)))
+    : null;
+  const canResizeSelected =
+    !!selectedEditable &&
+    !selectedEditable.inherited &&
+    !!selectedEditable.source.extentRange &&
+    (selectedEditable.graphic.type === "Rectangle" ||
+      selectedEditable.graphic.type === "Ellipse" ||
+      selectedEditable.graphic.type === "Text");
+
+  const modelPointToRoot = (point: { x: number; y: number }) => {
+    const svg = svgRef.current;
+    const viewport = viewportGroupRef.current;
+    const rootInverse = svg?.getScreenCTM()?.inverse();
+    const viewportMatrix = viewport?.getScreenCTM();
+    if (!rootInverse || !viewportMatrix) return null;
+    return new DOMPoint(point.x, -point.y)
+      .matrixTransform(viewportMatrix)
+      .matrixTransform(rootInverse);
+  };
+
+  const updateScreenOverlay = () => {
+    const overlay = screenOverlayRef.current;
+    const svg = svgRef.current;
+    if (!overlay || !svg || !selectedBounds) {
+      overlay?.removeAttribute("transform");
+      return;
+    }
+    const rootMatrix = svg.getScreenCTM();
+    if (!rootMatrix) return;
+    const rootScale = Math.max(Math.hypot(rootMatrix.a, rootMatrix.b), 1e-6);
+    for (const handle of resizeHandles) {
+      const point = modelPointToRoot(handlePosition(handle, selectedBounds));
+      if (!point) continue;
+      const visual = overlay.querySelector<SVGCircleElement>(
+        `[data-screen-handle="${handle}"] .resize-handle`,
+      );
+      const hit = overlay.querySelector<SVGCircleElement>(
+        `[data-screen-handle="${handle}"] .resize-hit-target`,
+      );
+      visual?.setAttribute("cx", String(point.x));
+      visual?.setAttribute("cy", String(point.y));
+      visual?.setAttribute("r", String(5 / rootScale));
+      hit?.setAttribute("cx", String(point.x));
+      hit?.setAttribute("cy", String(point.y));
+      hit?.setAttribute("r", String(9 / rootScale));
+    }
+  };
+
+  const screenOverlay = canResizeSelected && selectedBounds && selectedEditable
+    ? resizeHandles.map((handle) => (
+        <g key={`screen:${selectedEditable.id}:${handle}`} data-screen-handle={handle}>
+          <circle
+            className="resize-hit-target"
+            cx={0}
+            cy={0}
+            r={9}
+            onPointerDown={(e) => handleResizeDown(e, selectedEditable, handle)}
+            pointerEvents="all"
+          />
+          <circle className="resize-handle" cx={0} cy={0} r={5} pointerEvents="none" />
+        </g>
+      ))
+    : null;
+
+  screenOverlayUpdateRef.current = updateScreenOverlay;
+
   const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
   const canRedo = historyVersion >= 0 && historyRef.current.canRedo;
 
@@ -535,9 +645,22 @@ export function IconViewer({
         icon={icon}
         resetKey={resetKey}
         svgRef={svgRef}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerCancel}
+        viewportGroupRef={viewportGroupRef}
+        screenOverlayRef={screenOverlayRef}
+        onViewportTransform={updateScreenOverlay}
+        overlay={screenOverlay}
+        onPointerMove={(event) => {
+          handlePointerMove(event);
+          handleResizeMove(event);
+        }}
+        onPointerUp={(event) => {
+          handlePointerUp(event);
+          handleResizeUp(event);
+        }}
+        onPointerCancel={(event) => {
+          handlePointerCancel(event);
+          handleResizeCancel(event);
+        }}
         onUndo={() => void applyHistory("undo")}
         onRedo={() => void applyHistory("redo")}
         canUndo={canUndo}
@@ -557,6 +680,10 @@ export function IconViewer({
               return (
                 <g
                   key={id}
+                  ref={(node) => {
+                    if (node) graphicGroupRefs.current.set(id, node);
+                    else graphicGroupRefs.current.delete(id);
+                  }}
                   onPointerDown={
                     ed
                       ? (e) => handlePointerDown(e, ed)
@@ -600,16 +727,16 @@ export function IconViewer({
                 applyTransform(previewGraphic, transformFor(id)),
               );
               if (!bounds) return null;
-              const resizable =
-                !!ed &&
-                sel.selectedId === id &&
-                !ed.inherited &&
-                !!ed.source.extentRange &&
-                (ed.graphic.type === "Rectangle" ||
-                  ed.graphic.type === "Ellipse" ||
-                  ed.graphic.type === "Text");
               return (
-                <g key={`selection:${id}`}>
+                <g
+                  key={`selection:${id}`}
+                  ref={(node) => {
+                    if (sel.selectedId === id) {
+                      if (node) selectionGroupRefs.current.set(id, node);
+                      else selectionGroupRefs.current.delete(id);
+                    }
+                  }}
+                >
                   <rect
                     className={
                       sel.selectedId === id ? "selection-box" : "hover-outline"
@@ -619,27 +746,6 @@ export function IconViewer({
                     width={bounds.width}
                     height={bounds.height}
                   />
-                  {resizable &&
-                    ed &&
-                    resizeHandles.map((handle) => {
-                      const position = handlePosition(handle, bounds);
-                      const size = 6;
-                      return (
-                        <rect
-                          key={`${id}:handle:${handle}`}
-                          className="resize-handle"
-                          x={position.x - size / 2}
-                          y={position.y - size / 2}
-                          width={size}
-                          height={size}
-                          onPointerDown={(e) => handleResizeDown(e, ed, handle)}
-                          onPointerMove={handleResizeMove}
-                          onPointerUp={handleResizeUp}
-                          onPointerCancel={handleResizeCancel}
-                          pointerEvents="all"
-                        />
-                      );
-                    })}
                 </g>
               );
             })}

@@ -1,6 +1,7 @@
 export type ViewerPerformanceCounter =
   | "wheelEvents"
   | "viewportRafUpdates"
+  | "dragPreviewRafUpdates"
   | "graphicLayerRenders"
   | "graphicItemRenders";
 
@@ -17,8 +18,9 @@ export function recordViewerPerformance(counter: ViewerPerformanceCounter) {
   const counters = (window.__modelicaViewerPerf ??= {
     wheelEvents: 0,
     viewportRafUpdates: 0,
+    dragPreviewRafUpdates: 0,
     graphicLayerRenders: 0,
     graphicItemRenders: 0,
   });
-  counters[counter] += 1;
+  counters[counter] = (counters[counter] ?? 0) + 1;
 }
