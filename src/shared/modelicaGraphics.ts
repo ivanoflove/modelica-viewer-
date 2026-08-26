@@ -11,6 +11,8 @@ export interface Extent {
 export interface CoordinateSystemDto {
   extent: Extent;
   preserveAspectRatio?: boolean;
+  grid?: Point;
+  initialScale?: number;
 }
 
 export interface IconDto {
@@ -62,6 +64,9 @@ export interface RectangleDto {
   fillColor?: [number, number, number];
   lineThickness?: number;
   radius?: number;
+  origin?: Point;
+  fillPattern?: string;
+  pattern?: string;
 }
 
 export interface EllipseDto {
@@ -71,6 +76,9 @@ export interface EllipseDto {
   fillColor?: [number, number, number];
   startAngle?: number;
   endAngle?: number;
+  origin?: Point;
+  fillPattern?: string;
+  pattern?: string;
 }
 
 export interface LineDto {
@@ -78,6 +86,9 @@ export interface LineDto {
   points: Point[];
   color?: [number, number, number];
   thickness?: number;
+  origin?: Point;
+  smooth?: string;
+  pattern?: string;
 }
 
 export interface PolygonDto {
@@ -85,6 +96,9 @@ export interface PolygonDto {
   points: Point[];
   lineColor?: [number, number, number];
   fillColor?: [number, number, number];
+  origin?: Point;
+  fillPattern?: string;
+  pattern?: string;
 }
 
 export interface TextDto {
@@ -93,4 +107,6 @@ export interface TextDto {
   textString: string;
   textColor?: [number, number, number];
   fontSize?: number;
+  origin?: Point;
+  textStyle?: string[];
 }

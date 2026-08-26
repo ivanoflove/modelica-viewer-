@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseAnnotationSlice, findIconCall } from "../annotation.js";
-import { resolveIcon } from "../iconResolver.js";
+import { extractIconFromSlice, resolveIcon } from "../iconResolver.js";
 
 function resolveIconFromAnnotation(
   src: string,
@@ -100,4 +100,62 @@ describe("iconResolver", () => {
     });
     expect(icon.coordinateSystem.preserveAspectRatio).toBe(true);
   });
+
+  it("should preserve origin, fillPattern, smooth and textStyle with safe fallbacks", () => {
+    const src = `annotation(Icon(coordinateSystem(extent={{-100,-100},{100,100}}, grid={2,2}, initialScale=0.2), graphics={Rectangle(origin={10,20}, extent={{-10,-10},{10,10}}, fillColor={255,0,0}, fillPattern=FillPattern.Sphere), Line(origin={-5,0}, points={{0,0},{20,20}}, smooth=Smooth.Bezier), Text(origin={0,5}, extent={{-20,-10},{20,10}}, textString="%comps", textStyle={TextStyle.Bold})}))`;
+    const icon = resolveIconFromAnnotation(src, "MediumWorld")!;
+    expect(icon.coordinateSystem.grid).toEqual({ x: 2, y: 2 });
+    expect(icon.coordinateSystem.initialScale).toBe(0.2);
+    expect(icon.graphics[0]).toMatchObject({
+      origin: { x: 10, y: 20 },
+      fillPattern: "FillPattern.Sphere",
+    });
+    expect(icon.graphics[1]).toMatchObject({
+      origin: { x: -5, y: 0 },
+      smooth: "Smooth.Bezier",
+    });
+    expect(icon.graphics[2]).toMatchObject({
+      origin: { x: 0, y: 5 },
+      textStyle: ["TextStyle.Bold"],
+      textString: "%comps",
+    });
+  });
+
+  it("should find Icon after earlier Placement annotations", () => {
+    const src = `model WaterPump
+      annotation(Placement(transformation(origin={-54,0}, extent={{-10,-10},{10,10}})));
+      annotation(Documentation(info="<html>package and annotation are text</html>"));
+      annotation(Icon(graphics={
+        Ellipse(origin={0,14}, fillColor={225,251,255}, fillPattern=FillPattern.Sphere, extent={{-50,50},{50,-50}}),
+        Polygon(pattern=LinePattern.None, fillPattern=FillPattern.VerticalCylinder, points={{-29,-10},{-50,-45},{50,-45},{29,-10},{-29,-10}}),
+        Text(origin={0,-81}, extent={{-48,19},{48,-19}}, textString="%bound", textStyle={TextStyle.Bold})
+      }));
+    end WaterPump;`;
+    const icon = requireIconFromClassSource(src, "WaterPump");
+    expect(icon.graphics.map((item) => item.type)).toEqual([
+      "Ellipse",
+      "Polygon",
+      "Text",
+    ]);
+    expect(icon.graphics[1]).toMatchObject({
+      pattern: "LinePattern.None",
+      fillPattern: "FillPattern.VerticalCylinder",
+    });
+    expect(icon.graphics[2]).toMatchObject({ textString: "%bound" });
+  });
+
+  it("should retain later graphics when a graphic kind is unsupported", () => {
+    const src = `annotation(Icon(graphics={UnknownGraphic(foo=1), Rectangle(extent={{0,0},{10,10}})}))`;
+    const icon = resolveIconFromAnnotation(src)!;
+    expect(icon.graphics).toHaveLength(1);
+    expect(icon.graphics[0]?.type).toBe("Rectangle");
+  });
 });
+
+function requireIconFromClassSource(source: string, name: string) {
+  // Keep this test focused on annotation extraction while using the same
+  // source-slice path as the main process.
+  const start = source.indexOf(`model ${name}`);
+  const end = source.lastIndexOf(`end ${name};`) + `end ${name};`.length;
+  return extractIconFromSlice(source.slice(start, end), name)!;
+}

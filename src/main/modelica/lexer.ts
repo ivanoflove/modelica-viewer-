@@ -130,7 +130,9 @@ export function tokenize(input: string): Token[] {
     }
 
     // single-char punctuation for annotation
-    if (ch === ".") {
+    // A dot followed by a digit starts a decimal such as .5. A standalone
+    // dot remains the qualified-name punctuation token.
+    if (ch === "." && !/[0-9]/.test(peek(1))) {
       const start = i;
       const startLine = line;
       const startCol = col;

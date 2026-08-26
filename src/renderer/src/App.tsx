@@ -23,6 +23,7 @@ function App(): JSX.Element {
   const [icon, setIcon] = useState<IconDto | null>(null);
   const [iconLoading, setIconLoading] = useState(false);
   const [iconError, setIconError] = useState<string | null>(null);
+  const [iconWarning, setIconWarning] = useState<string | null>(null);
   const [editableIcon, setEditableIcon] = useState<EditableIconDto | null>(
     null,
   );
@@ -55,6 +56,7 @@ function App(): JSX.Element {
       setSourceError(null);
       setIcon(null);
       setIconError(null);
+      setIconWarning(null);
       return;
     }
     const loadSource = async () => {
@@ -69,14 +71,8 @@ function App(): JSX.Element {
           setSource("");
           return;
         }
-        if (
-          selected.kind !== "package" &&
-          (selected.node as { sourceRange?: { start: number; end: number } })
-            .sourceRange
-        ) {
-          const range = (
-            selected.node as { sourceRange: { start: number; end: number } }
-          ).sourceRange;
+        if (selected.node.sourceRange) {
+          const range = selected.node.sourceRange;
           setSource(result.content.slice(range.start, range.end));
         } else {
           setSource(result.content);
@@ -91,33 +87,27 @@ function App(): JSX.Element {
     const loadIcon = async () => {
       setIconLoading(true);
       setIconError(null);
+      setIconWarning(null);
       try {
-        if (selected.kind === "package") {
-          setIcon(null);
-          setEditableIcon(null);
-          setIconLoading(false);
-          return;
-        }
-        const range =
-          (selected.node as { sourceRange?: { start: number; end: number } })
-            .sourceRange ?? null;
-        const [iconRes, editableRes] = await Promise.all([
-          window.api.modelica.getIcon(
-            selected.node.sourceFile,
-            range,
-            selected.node.name,
-          ),
-          window.api.modelica.getEditableIcon(
-            selected.node.sourceFile,
-            range,
-            selected.node.name,
-          ),
-        ]);
+        const range = selected.node.sourceRange ?? null;
+        const iconRes = await window.api.modelica.getIcon(
+          selected.node.sourceFile,
+          range,
+          selected.node.name,
+        );
+        const editableRes = selected.kind === "package"
+          ? { editable: null }
+          : await window.api.modelica.getEditableIcon(
+              selected.node.sourceFile,
+              range,
+              selected.node.name,
+            );
         if ("error" in iconRes) {
           setIconError(iconRes.error);
           setIcon(null);
         } else {
           setIcon(iconRes.icon);
+          setIconWarning(iconRes.warnings?.join("；") ?? null);
         }
         if ("error" in editableRes) {
           setEditableIcon(null);
@@ -128,6 +118,7 @@ function App(): JSX.Element {
         setIconError((e as Error).message);
         setIcon(null);
         setEditableIcon(null);
+        setIconWarning(null);
       } finally {
         setIconLoading(false);
       }
@@ -220,7 +211,7 @@ function App(): JSX.Element {
         selected.node.sourceFile,
         selected.node.qualifiedName,
       );
-      const freshRange =
+        const freshRange =
         !("error" in freshRangeRes) && freshRangeRes.sourceRange
           ? freshRangeRes.sourceRange
           : null;
@@ -239,7 +230,7 @@ function App(): JSX.Element {
       ]);
       if ("error" in srcRes) {
         setSourceError(srcRes.error);
-      } else if (selected.kind !== "package" && freshRange) {
+      } else if (freshRange) {
         setSource(srcRes.content.slice(freshRange.start, freshRange.end));
       } else {
         setSource(srcRes.content);
@@ -376,12 +367,17 @@ function App(): JSX.Element {
                     ) : iconError ? (
                       <div className="source-error">{iconError}</div>
                     ) : (
-                      <IconViewer
-                        icon={icon}
-                        editable={editableIcon}
-                        modelName={selected.node.name}
-                        onEdit={handleIconEdit}
-                      />
+                      <>
+                        {iconWarning && (
+                          <div className="source-status">{iconWarning}</div>
+                        )}
+                        <IconViewer
+                          icon={icon}
+                          editable={editableIcon}
+                          modelName={selected.node.name}
+                          onEdit={handleIconEdit}
+                        />
+                      </>
                     )}
                   </div>
                 )}

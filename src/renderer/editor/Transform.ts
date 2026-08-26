@@ -102,14 +102,16 @@ export interface Bounds {
 
 export function boundsOf(graphic: GraphicItemDto): Bounds | null {
   const g = graphic as any;
+  const ox = g.origin?.x ?? 0;
+  const oy = g.origin?.y ?? 0;
   if (g.extent) {
     const x1 = g.extent.p1.x;
     const y1 = g.extent.p1.y;
     const x2 = g.extent.p2.x;
     const y2 = g.extent.p2.y;
     return {
-      x: Math.min(x1, x2),
-      y: Math.min(y1, y2),
+      x: Math.min(x1, x2) + ox,
+      y: Math.min(y1, y2) + oy,
       width: Math.abs(x2 - x1),
       height: Math.abs(y2 - y1),
     };
@@ -120,8 +122,8 @@ export function boundsOf(graphic: GraphicItemDto): Bounds | null {
     const minX = Math.min(...xs);
     const minY = Math.min(...ys);
     return {
-      x: minX - 2,
-      y: minY - 2,
+      x: minX - 2 + ox,
+      y: minY - 2 + oy,
       width: Math.max(...xs) - minX + 4,
       height: Math.max(...ys) - minY + 4,
     };

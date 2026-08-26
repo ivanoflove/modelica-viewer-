@@ -5,6 +5,7 @@ import {
   parseAnnotationSlice,
   findIconCall,
 } from "./annotation.js";
+import { tokenize } from "./lexer.js";
 import type {
   IconDto,
   CoordinateSystemDto,
@@ -20,6 +21,7 @@ import type {
   EditableIconDto,
 } from "../../shared/modelicaGraphics.js";
 import { identityTransform } from "../../shared/modelicaGraphics.js";
+import type { ClassNode } from "./types.js";
 
 function asNumber(v: AnnotationValue | undefined): number | undefined {
   if (v && v.type === "number") return v.value;
@@ -31,6 +33,20 @@ function asString(v: AnnotationValue | undefined): string | undefined {
   return undefined;
 }
 
+function asName(v: AnnotationValue | undefined): string | undefined {
+  if (
+    v &&
+    (v.type === "identifier" || v.type === "qualifiedName")
+  )
+    return v.name;
+  return undefined;
+}
+
+function asNames(v: AnnotationValue | undefined): string[] {
+  if (!v || v.type !== "array") return [];
+  return v.items.map(asName).filter((name): name is string => !!name);
+}
+
 function asArray(
   v: AnnotationValue | undefined,
 ): AnnotationValue[] | undefined {
@@ -38,7 +54,7 @@ function asArray(
   return undefined;
 }
 
-function parsePoint(value: AnnotationValue): Point | null {
+function parsePoint(value: AnnotationValue | undefined): Point | null {
   // points can be {x, y} as array of two numbers, or possibly as array with identifier?
   const arr = asArray(value);
   if (!arr || arr.length !== 2) return null;
@@ -85,6 +101,14 @@ function parseColor(
   return [Math.round(r), Math.round(g), Math.round(b)];
 }
 
+function parseOrigin(call: AnnotationCall): Point | undefined {
+  return parsePoint(getArg(call, "origin")) ?? undefined;
+}
+
+function parseFillPattern(call: AnnotationCall): string | undefined {
+  return asName(getArg(call, "fillPattern"));
+}
+
 function resolveRectangle(call: AnnotationCall): RectangleDto | null {
   const extent = parseExtent(getArg(call, "extent"));
   if (!extent) return null;
@@ -95,6 +119,9 @@ function resolveRectangle(call: AnnotationCall): RectangleDto | null {
     fillColor: parseColor(getArg(call, "fillColor")),
     lineThickness: asNumber(getArg(call, "lineThickness")),
     radius: asNumber(getArg(call, "radius")),
+    origin: parseOrigin(call),
+    fillPattern: parseFillPattern(call),
+    pattern: asName(getArg(call, "pattern")),
   };
 }
 
@@ -108,6 +135,9 @@ function resolveEllipse(call: AnnotationCall): EllipseDto | null {
     fillColor: parseColor(getArg(call, "fillColor")),
     startAngle: asNumber(getArg(call, "startAngle")),
     endAngle: asNumber(getArg(call, "endAngle")),
+    origin: parseOrigin(call),
+    fillPattern: parseFillPattern(call),
+    pattern: asName(getArg(call, "pattern")),
   };
 }
 
@@ -123,6 +153,9 @@ function resolveLine(call: AnnotationCall): LineDto | null {
     thickness:
       asNumber(getArg(call, "thickness")) ??
       asNumber(getArg(call, "lineThickness")),
+    origin: parseOrigin(call),
+    smooth: asName(getArg(call, "smooth")),
+    pattern: asName(getArg(call, "pattern")),
   };
 }
 
@@ -134,6 +167,9 @@ function resolvePolygon(call: AnnotationCall): PolygonDto | null {
     points,
     lineColor: parseColor(getArg(call, "lineColor")),
     fillColor: parseColor(getArg(call, "fillColor")),
+    origin: parseOrigin(call),
+    fillPattern: parseFillPattern(call),
+    pattern: asName(getArg(call, "pattern")),
   };
 }
 
@@ -150,6 +186,8 @@ function resolveText(call: AnnotationCall, modelName: string): TextDto | null {
       parseColor(getArg(call, "textColor")) ??
       parseColor(getArg(call, "lineColor")),
     fontSize: asNumber(getArg(call, "fontSize")),
+    origin: parseOrigin(call),
+    textStyle: asNames(getArg(call, "textStyle")),
   };
 }
 
@@ -187,11 +225,17 @@ function parseCoordinateSystem(
   if (preserveArg && preserveArg.type === "boolean")
     preserveAspectRatio = preserveArg.value;
   // Modelica Boolean may also be identifier true/false
-  if (preserveArg && preserveArg.type === "identifier") {
-    if (preserveArg.name === "true") preserveAspectRatio = true;
-    if (preserveArg.name === "false") preserveAspectRatio = false;
+  if (preserveArg) {
+    const preserveName = asName(preserveArg);
+    if (preserveName === "true") preserveAspectRatio = true;
+    if (preserveName === "false") preserveAspectRatio = false;
   }
-  return { extent, preserveAspectRatio };
+  return {
+    extent,
+    preserveAspectRatio,
+    grid: parsePoint(getArg(call, "grid")) ?? undefined,
+    initialScale: asNumber(getArg(call, "initialScale")),
+  };
 }
 
 export function resolveIcon(
@@ -269,23 +313,159 @@ export function resolveIcon(
   return { coordinateSystem, graphics };
 }
 
+export interface IconResolution {
+  icon: IconDto | null;
+  warnings: string[];
+}
+
+function fallbackBaseIcon(baseName: string): IconDto | null {
+  if (!baseName.startsWith("Modelica.Icons."))
+    return null;
+  return {
+    coordinateSystem: {
+      extent: { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } },
+    },
+    graphics: [
+      {
+        type: "Rectangle",
+        extent: { p1: { x: -80, y: -60 }, p2: { x: 80, y: 60 } },
+        lineColor: [0, 0, 127],
+        fillColor: [255, 255, 255],
+        fillPattern: "FillPattern.Solid",
+      },
+    ],
+  };
+}
+
+function findInheritedClass(
+  target: ClassNode,
+  baseName: string,
+  allClasses: ClassNode[],
+): ClassNode | null {
+  const direct = findClassByQualifiedName(allClasses, baseName);
+  if (direct) return direct;
+  if (baseName.includes(".")) return null;
+
+  const namespace = target.qualifiedName.split(".").slice(0, -1);
+  for (let length = namespace.length; length >= 0; length--) {
+    const prefix = namespace.slice(0, length).join(".");
+    const candidate = prefix ? `${prefix}.${baseName}` : baseName;
+    const found = findClassByQualifiedName(allClasses, candidate);
+    if (found) return found;
+  }
+  return null;
+}
+
+export function findClassBySourceRange(
+  classes: ClassNode[],
+  sourceRange: { start: number; end: number } | null,
+): ClassNode | null {
+  if (!sourceRange) return null;
+  for (const cls of classes) {
+    if (
+      cls.sourceRange.start === sourceRange.start &&
+      cls.sourceRange.end === sourceRange.end
+    )
+      return cls;
+    const found = findClassBySourceRange(cls.children, sourceRange);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Resolve a class's own Icon and any resolvable `extends` Icon graphics. */
+export function resolveIconForClass(
+  target: ClassNode,
+  allClasses: ClassNode[],
+  source: string,
+  modelName: string,
+  resolving = new Set<string>(),
+): IconResolution {
+  if (resolving.has(target.qualifiedName)) {
+    return { icon: null, warnings: [`Icon inheritance cycle at ${target.qualifiedName}`] };
+  }
+  const nextResolving = new Set(resolving).add(target.qualifiedName);
+  const ownSlice = source.slice(target.sourceRange.start, target.sourceRange.end);
+  const ownIcon = extractIconFromSlice(ownSlice, modelName);
+  let inherited: IconDto | null = null;
+  const warnings: string[] = [];
+
+  for (const baseName of target.extendsClauses) {
+    const baseClass = findInheritedClass(target, baseName, allClasses);
+    const baseResult = baseClass
+      ? resolveIconForClass(baseClass, allClasses, source, baseClass.name, nextResolving)
+      : {
+          icon: fallbackBaseIcon(baseName),
+          warnings: [`Base icon not resolved: ${baseName}`],
+        };
+    warnings.push(...baseResult.warnings);
+    if (baseResult.icon) {
+      const currentInherited = inherited as IconDto | null;
+      if (currentInherited !== null) {
+        inherited = {
+          graphics: [...currentInherited.graphics, ...baseResult.icon.graphics],
+          coordinateSystem: currentInherited.coordinateSystem,
+        };
+      } else {
+        inherited = baseResult.icon;
+      }
+    }
+  }
+
+  if (!ownIcon && !inherited) return { icon: null, warnings };
+  if (!ownIcon) return { icon: inherited, warnings };
+  if (!inherited) return { icon: ownIcon, warnings };
+  return {
+    icon: {
+      coordinateSystem: ownIcon.coordinateSystem,
+      graphics: [...inherited.graphics, ...ownIcon.graphics],
+    },
+    warnings,
+  };
+}
+
+interface IconAnnotationMatch {
+  annotation: AnnotationCall;
+  icon: AnnotationCall;
+  offset: number;
+}
+
+/**
+ * A class may contain many annotations (Placement, Documentation, Icon, ...).
+ * Do not use String#indexOf here: the first annotation is often a connector
+ * Placement annotation, and strings/comments may also contain that word.
+ */
+function findIconAnnotation(slice: string): IconAnnotationMatch | null {
+  const tokens = tokenize(slice);
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const token = tokens[i]!;
+    const next = tokens[i + 1]!;
+    if (token.type !== "KEYWORD" || token.value !== "annotation") continue;
+    if (next.type !== "LPAREN") continue;
+    const annotation = parseAnnotationSlice(slice.slice(token.start));
+    if (!annotation) continue;
+    const icon = findIconCall(annotation);
+    if (icon) return { annotation, icon, offset: token.start };
+  }
+  return null;
+}
+
 // Top-level helper: extract annotation string slice -> IconDto
 export function extractIconFromSlice(
   slice: string,
   modelName: string,
 ): IconDto | null {
-  const idx = slice.indexOf("annotation");
-  if (idx === -1) return null;
-  const sub = slice.slice(idx);
   try {
-    const anno = parseAnnotationSlice(sub);
-    if (!anno) return null;
-    const iconCall = findIconCall(anno);
-    if (!iconCall) return null;
-    return resolveIcon(iconCall, modelName);
+    const match = findIconAnnotation(slice);
+    return match ? resolveIcon(match.icon, modelName) : null;
   } catch {
     return null;
   }
+}
+
+/** Return the offset of the actual Icon annotation within a class slice. */
+export function findIconAnnotationOffset(slice: string): number {
+  return findIconAnnotation(slice)?.offset ?? -1;
 }
 
 // Editable helpers
@@ -384,15 +564,9 @@ export function extractEditableIconFromSlice(
   slice: string,
   modelName: string,
 ): EditableIconDto | null {
-  const idx = slice.indexOf("annotation");
-  if (idx === -1) return null;
-  const sub = slice.slice(idx);
   try {
-    const anno = parseAnnotationSlice(sub);
-    if (!anno) return null;
-    const iconCall = findIconCall(anno);
-    if (!iconCall) return null;
-    return resolveEditableIcon(iconCall, modelName);
+    const match = findIconAnnotation(slice);
+    return match ? resolveEditableIcon(match.icon, modelName) : null;
   } catch {
     return null;
   }
@@ -424,8 +598,6 @@ export function toAbsoluteEditableRanges(
 }
 
 // Recursively locate a class by its qualified name inside parsed classes.
-import type { ClassNode } from "./types.js";
-
 export function findClassByQualifiedName(
   classes: ClassNode[],
   qualifiedName: string,

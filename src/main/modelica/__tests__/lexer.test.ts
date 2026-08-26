@@ -73,4 +73,11 @@ describe("lexer", () => {
     expect(str.start).toBe(0);
     expect(src2.slice(str.start, str.end)).toBe(`"hello ""world"""`);
   });
+
+  it("should tokenize signed scientific notation", () => {
+    const numbers = tokenize("{1.77636e-15,-8.88178E-16,2e+3,.5}")
+      .filter((token) => token.type === "NUMBER")
+      .map((token) => Number(token.value));
+    expect(numbers).toEqual([1.77636e-15, -8.88178e-16, 2000, 0.5]);
+  });
 });

@@ -13,6 +13,7 @@ export interface PackageNode {
   within: string | null;
   qualifiedName: string;
   sourceFile: string;
+  sourceRange?: SourceRange;
   children: PackageNode[];
   classes: ClassNode[];
   loadErrors?: string[];
@@ -31,6 +32,7 @@ export interface ClassNode {
   sourceRange: SourceRange;
   isPartial: boolean;
   isEncapsulated: boolean;
+  extendsClauses: string[];
   children: ClassNode[];
 }
 

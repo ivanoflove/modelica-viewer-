@@ -11,7 +11,10 @@ import {
   extractIconFromSlice,
   extractEditableIconFromSlice,
   toAbsoluteEditableRanges,
+  findIconAnnotationOffset,
   findClassByQualifiedName,
+  findClassBySourceRange,
+  resolveIconForClass,
 } from "./modelica/iconResolver.js";
 import { parseModelicaFile } from "./modelica/parser.js";
 
@@ -149,11 +152,24 @@ function registerIpcHandlers(): void {
       try {
         if (!filePath) return { error: "No file path provided" };
         const content = await readFile(filePath, "utf-8");
+        const parsed = parseModelicaFile(content, filePath);
+        const target = findClassBySourceRange(parsed.classes, sourceRange);
+        if (target) {
+          const resolved = resolveIconForClass(
+            target,
+            parsed.classes,
+            content,
+            modelName ?? target.name,
+          );
+          return {
+            icon: resolved.icon,
+            warnings: resolved.warnings.length ? resolved.warnings : undefined,
+          };
+        }
         const slice = sourceRange
           ? content.slice(sourceRange.start, sourceRange.end)
           : content;
-        const icon = extractIconFromSlice(slice, modelName ?? "");
-        return { icon };
+        return { icon: extractIconFromSlice(slice, modelName ?? "") };
       } catch (e) {
         return { error: (e as Error).message };
       }
@@ -175,7 +191,7 @@ function registerIpcHandlers(): void {
           ? content.slice(sourceRange.start, sourceRange.end)
           : content;
         const sliceBase = sourceRange ? sourceRange.start : 0;
-        const annotationIdx = slice.indexOf("annotation");
+        const annotationIdx = findIconAnnotationOffset(slice);
         const editable = extractEditableIconFromSlice(slice, modelName ?? "");
         if (editable && annotationIdx >= 0) {
           return {

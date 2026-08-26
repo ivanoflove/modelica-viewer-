@@ -57,6 +57,7 @@ function classNodeToPackageNode(
     within,
     qualifiedName: qualified,
     sourceFile,
+    sourceRange: cls.sourceRange,
     children: pkgChildren,
     classes: pkgClasses,
   };
@@ -279,6 +280,7 @@ export class PackageLoader {
       within: pkgWithin!,
       qualifiedName: pkgQualified!,
       sourceFile: packageMoPath,
+      sourceRange: pkgClass?.sourceRange,
       children: mergedChildren,
       classes: mergedClasses,
       loadErrors: errors.length ? [...errors] : undefined,

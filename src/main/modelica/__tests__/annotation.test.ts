@@ -76,4 +76,34 @@ describe("annotation parser", () => {
     expect(g?.type).toBe("array");
     if (g && g.type === "array") expect(g.items.length).toBe(0);
   });
+
+  it("should preserve qualified enum values as qualifiedName AST nodes", () => {
+    const anno = parseAnnotationSlice(
+      "annotation(Icon(graphics={Line(points={{0,0},{10,10}}, smooth=Smooth.Bezier, pattern=LinePattern.None)}))",
+    )!;
+    const icon = findIconCall(anno)!;
+    const line = icon.arguments.find((a) => a.name === "graphics")!.value;
+    expect(line.type).toBe("array");
+    if (line.type === "array") {
+      const smooth = line.items[0]!.type === "call"
+        ? line.items[0]!.call.arguments.find((a) => a.name === "smooth")!.value
+        : null;
+      expect(smooth?.type).toBe("qualifiedName");
+      if (smooth?.type === "qualifiedName") {
+        expect(smooth.parts).toEqual(["Smooth", "Bezier"]);
+      }
+    }
+  });
+
+  it("should parse scientific notation in graphic origins", () => {
+    const call = parseAnnotationSlice(
+      "Ellipse(origin={1.77636e-15,-8.88178e-16}, extent={{-10,-10},{10,10}})",
+    )!;
+    const origin = call.arguments.find((a) => a.name === "origin")?.value;
+    expect(origin?.type).toBe("array");
+    if (origin?.type === "array") {
+      expect(origin.items[0]).toMatchObject({ type: "number", value: 1.77636e-15 });
+      expect(origin.items[1]).toMatchObject({ type: "number", value: -8.88178e-16 });
+    }
+  });
 });

@@ -6,6 +6,12 @@ export type AnnotationValue =
   | { type: "boolean"; value: boolean; range: { start: number; end: number } }
   | { type: "identifier"; name: string; range: { start: number; end: number } }
   | {
+      type: "qualifiedName";
+      name: string;
+      parts: string[];
+      range: { start: number; end: number };
+    }
+  | {
       type: "array";
       items: AnnotationValue[];
       range: { start: number; end: number };
@@ -108,6 +114,15 @@ class AnnotationParser {
           name += "." + id.value;
           end = id.end;
         } else break;
+      }
+      const parts = name.split(".");
+      if (parts.length > 1) {
+        return {
+          type: "qualifiedName",
+          name,
+          parts,
+          range: { start: tok.start, end },
+        };
       }
       return { type: "identifier", name, range: { start: tok.start, end } };
     }

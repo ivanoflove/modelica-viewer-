@@ -15,6 +15,7 @@ export interface PackageNodeDto {
   within: string | null;
   qualifiedName: string;
   sourceFile: string;
+  sourceRange?: SourceRangeDto;
   children: PackageNodeDto[];
   classes: ClassNodeDto[];
   loadErrors?: string[];
@@ -33,6 +34,7 @@ export interface ClassNodeDto {
   sourceRange: SourceRangeDto;
   isPartial: boolean;
   isEncapsulated: boolean;
+  extendsClauses: string[];
   children: ClassNodeDto[];
 }
 
@@ -45,7 +47,9 @@ export type ReadSourceResult =
   | { content: string; filePath: string }
   | { error: string };
 
-export type GetIconResult = { icon: IconDto | null } | { error: string };
+export type GetIconResult =
+  | { icon: IconDto | null; warnings?: string[] }
+  | { error: string };
 
 export type GetEditableIconResult =
   | { editable: EditableIconDto | null }

@@ -10,6 +10,7 @@ Electron + React + TypeScript 的 Modelica 包浏览器。**M1 仅实现「正�
 - ✅ Electron IPC：`modelica:openFile` / `modelica:loadFile` / `modelica:loadDirectory` / `modelica:reveal`，主进程解析、renderer 仅展示 DTO
 - ✅ UI：顶部「打开 .mo 文件」/「打开库目录」→ 左侧 TreeView（📦/📘/🧱/🔌）→ 右侧详情（qualifiedName / within / sourceFile / Reveal in Folder）
 - ✅ 单文件加载：顶层 `package IEH_CPP ... end IEH_CPP;` 不要求重命名为 `package.mo`；选择包含同名 `.mo` 文件的项目目录也会自动识别，所有嵌套节点保留同一 `sourceFile` 和独立 `sourceRange`
+- ✅ Icon 容错与继承：支持 `origin`、qualified enum（如 `Smooth.Bezier`）、`fillPattern`、`textStyle`、短 `type` 与 `extends`；未知 graphics 属性安全忽略，未加载 MSL 时使用安全 fallback 并显示 warning
 
 ## Requirements
 

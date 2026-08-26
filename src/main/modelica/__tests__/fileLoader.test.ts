@@ -3,6 +3,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadModelicaFile } from "../loader.js";
+import {
+  findClassByQualifiedName,
+  resolveIconForClass,
+} from "../iconResolver.js";
+import { parseModelicaFile } from "../parser.js";
 
 const fixturePath = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -73,5 +78,52 @@ describe("loadModelicaFile", () => {
 
   it("does not require the source filename to be package.mo", () => {
     expect(loadModelicaFile(fixturePath).qualifiedName).toBe("IEH_CPP");
+  });
+
+  it("resolves a safe fallback for an inherited Modelica package icon", () => {
+    const source = readFileSync(fixturePath, "utf8");
+    const parsed = loadModelicaFile(fixturePath);
+    const classNode = {
+      kind: "package" as const,
+      name: parsed.name,
+      qualifiedName: parsed.qualifiedName,
+      sourceFile: fixturePath,
+      sourceRange: parsed.sourceRange!,
+      isPartial: false,
+      isEncapsulated: false,
+      extendsClauses: ["Modelica.Icons.Package"],
+      children: [],
+    };
+    const resolved = resolveIconForClass(
+      classNode,
+      [classNode],
+      source,
+      "IEH_CPP",
+    );
+    expect(resolved.icon?.graphics.length).toBeGreaterThan(0);
+    expect(resolved.warnings).toContain(
+      "Base icon not resolved: Modelica.Icons.Package",
+    );
+  });
+
+  it("resolves relative extends names inside the same package", () => {
+    const source = `package P
+      model Base
+        annotation(Icon(graphics={Rectangle(extent={{-10,-10},{10,10}})}));
+      end Base;
+      model Child
+        extends Base;
+      end Child;
+    end P;`;
+    const parsed = parseModelicaFile(source, "relative.mo");
+    const child = findClassByQualifiedName(parsed.classes, "P.Child")!;
+    const resolved = resolveIconForClass(
+      child,
+      parsed.classes,
+      source,
+      "Child",
+    );
+    expect(resolved.icon?.graphics[0]?.type).toBe("Rectangle");
+    expect(resolved.warnings).toEqual([]);
   });
 });

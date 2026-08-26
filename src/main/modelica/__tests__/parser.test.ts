@@ -95,6 +95,18 @@ describe("parser", () => {
     expect(functions.name).toBe("Functions");
   });
 
+  it("should collect extends clauses without treating their arguments as classes", () => {
+    const src = `package P
+      extends Modelica.Icons.Package;
+      model M
+        extends Base(redeclare package Medium = Modelica.Media);
+      end M;
+    end P;`;
+    const file = parseModelicaFile(src, "test.mo");
+    expect(file.classes[0]!.extendsClauses).toEqual(["Modelica.Icons.Package"]);
+    expect(file.classes[0]!.children[0]!.extendsClauses).toEqual(["Base"]);
+  });
+
   it("should set sourceRange and slice equals original class text", () => {
     const src = `package P\n  model A\n    Real x;\n  end A;\n  model B\n    Real y;\n  end B;\nend P;`;
     const file = parseModelicaFile(src, "test.mo");

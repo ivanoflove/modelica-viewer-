@@ -12,6 +12,18 @@ function toCssColor(color?: [number, number, number]): string {
     return `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
 }
 
+function hasFill(fillColor: [number, number, number] | undefined, pattern?: string) {
+    return !!fillColor && pattern !== "FillPattern.None";
+}
+
+function toCssStroke(
+    color: [number, number, number] | undefined,
+    pattern?: string,
+): string {
+    if (pattern === "LinePattern.None") return "none";
+    return toCssColor(color) === "none" ? "#000" : toCssColor(color);
+}
+
 function renderRectangle(item: RectangleDto) {
     const x1 = item.extent.p1.x;
     const y1 = item.extent.p1.y;
@@ -21,7 +33,7 @@ function renderRectangle(item: RectangleDto) {
     const y = Math.min(y1, y2);
     const width = Math.abs(x2 - x1);
     const height = Math.abs(y2 - y1);
-    const hasFill = !!item.fillColor;
+    const filled = hasFill(item.fillColor, item.fillPattern);
     return (
         <rect
             x={x}
@@ -30,12 +42,8 @@ function renderRectangle(item: RectangleDto) {
             height={height}
             rx={item.radius}
             ry={item.radius}
-            stroke={
-                toCssColor(item.lineColor) === "none"
-                    ? "#000"
-                    : toCssColor(item.lineColor)
-            }
-            fill={hasFill ? toCssColor(item.fillColor) : "none"}
+            stroke={toCssStroke(item.lineColor, item.pattern)}
+            fill={filled ? toCssColor(item.fillColor) : "none"}
             strokeWidth={item.lineThickness ?? 1}
             vectorEffect="non-scaling-stroke"
         />
@@ -51,19 +59,15 @@ function renderEllipse(item: EllipseDto) {
     const cy = (y1 + y2) / 2;
     const rx = Math.abs(x2 - x1) / 2;
     const ry = Math.abs(y2 - y1) / 2;
-    const hasFill = !!item.fillColor;
+    const filled = hasFill(item.fillColor, item.fillPattern);
     return (
         <ellipse
             cx={cx}
             cy={cy}
             rx={rx}
             ry={ry}
-            stroke={
-                toCssColor(item.lineColor) === "none"
-                    ? "#000"
-                    : toCssColor(item.lineColor)
-            }
-            fill={hasFill ? toCssColor(item.fillColor) : "none"}
+            stroke={toCssStroke(item.lineColor, item.pattern)}
+            fill={filled ? toCssColor(item.fillColor) : "none"}
             strokeWidth={1}
             vectorEffect="non-scaling-stroke"
         />
@@ -76,11 +80,7 @@ function renderLine(item: LineDto) {
         <polyline
             points={points}
             fill="none"
-            stroke={
-                toCssColor(item.color) === "none"
-                    ? "#000"
-                    : toCssColor(item.color)
-            }
+            stroke={toCssStroke(item.color, item.pattern)}
             strokeWidth={item.thickness ?? 1}
             vectorEffect="non-scaling-stroke"
         />
@@ -89,16 +89,12 @@ function renderLine(item: LineDto) {
 
 function renderPolygon(item: PolygonDto) {
     const points = item.points.map((p) => `${p.x},${p.y}`).join(" ");
-    const hasFill = !!item.fillColor;
+    const filled = hasFill(item.fillColor, item.fillPattern);
     return (
         <polygon
             points={points}
-            stroke={
-                toCssColor(item.lineColor) === "none"
-                    ? "#000"
-                    : toCssColor(item.lineColor)
-            }
-            fill={hasFill ? toCssColor(item.fillColor) : "none"}
+            stroke={toCssStroke(item.lineColor, item.pattern)}
+            fill={filled ? toCssColor(item.fillColor) : "none"}
             strokeWidth={1}
             vectorEffect="non-scaling-stroke"
         />
@@ -127,7 +123,10 @@ function renderText(item: TextDto) {
                         ? "#000"
                         : toCssColor(item.textColor)
                 }
-                style={{ fontFamily: "Inter, sans-serif" }}
+                style={{
+                    fontFamily: "Inter, sans-serif",
+                    fontWeight: item.textStyle?.includes("TextStyle.Bold") ? 700 : 400,
+                }}
             >
                 {item.textString}
             </text>
@@ -136,7 +135,8 @@ function renderText(item: TextDto) {
 }
 
 export function GraphicItem({ item }: { item: GraphicItemDto }) {
-    switch (item.type) {
+    const rendered = (() => {
+      switch (item.type) {
         case "Rectangle":
             return renderRectangle(item);
         case "Ellipse":
@@ -149,5 +149,12 @@ export function GraphicItem({ item }: { item: GraphicItemDto }) {
             return renderText(item);
         default:
             return null;
-    }
+      }
+    })();
+    if (!rendered || !item.origin) return rendered;
+    return (
+      <g transform={`translate(${item.origin.x},${item.origin.y})`}>
+        {rendered}
+      </g>
+    );
 }

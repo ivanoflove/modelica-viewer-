@@ -165,6 +165,7 @@ class Parser {
       sourceRange: { start: sourceStart, end: sourceStart },
       isPartial,
       isEncapsulated,
+      extendsClauses: [],
       children: [],
     };
 
@@ -207,6 +208,36 @@ class Parser {
       if (nested.isStart) {
         const child = this.parseClass(qualifiedName);
         node.children.push(child);
+        continue;
+      }
+
+      if (tok.value === "extends") {
+        this.advance();
+        if (this.peek().type === "IDENT") {
+          const parts = [this.advance().value];
+          while (this.peek().type === "DOT") {
+            this.advance();
+            if (this.peek().type !== "IDENT") break;
+            parts.push(this.advance().value);
+          }
+          node.extendsClauses.push(parts.join("."));
+        }
+        // Skip modifiers/arguments until this extends declaration ends.
+        let parenDepth = 0;
+        let braceDepth = 0;
+        while (this.peek().type !== "EOF") {
+          const part = this.advance();
+          if (part.type === "LPAREN") parenDepth++;
+          if (part.type === "RPAREN") parenDepth = Math.max(0, parenDepth - 1);
+          if (part.type === "LBRACE") braceDepth++;
+          if (part.type === "RBRACE") braceDepth = Math.max(0, braceDepth - 1);
+          if (
+            part.type === "SEMICOLON" &&
+            parenDepth === 0 &&
+            braceDepth === 0
+          )
+            break;
+        }
         continue;
       }
 
