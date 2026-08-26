@@ -317,6 +317,11 @@ button { -webkit-app-region: no-drag; }
 .screen-overlay { pointer-events: none; }
 .resize-handle { fill: var(--surface); stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke; pointer-events: none; }
 .resize-hit-target { fill: transparent; stroke: none; pointer-events: all; cursor: nwse-resize; }
+.hit-layer { pointer-events: auto; }
+.line-hit-target, .polygon-hit-target { cursor: pointer; }
+.vertex-handle { fill: var(--surface); stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke; pointer-events: none; }
+.vertex-handle.active { fill: var(--accent); }
+.vertex-hit-target { fill: transparent; stroke: none; pointer-events: all; cursor: crosshair; }
 
 .shell { flex: 1; display: grid; place-items: center; min-height: 0; padding: 36px; }
 .welcome-card { width: min(680px, 100%); padding: 42px; border: 1px solid var(--border-subtle); border-radius: 24px; background: var(--surface-raised); box-shadow: var(--shadow-panel); backdrop-filter: var(--blur-panel); }

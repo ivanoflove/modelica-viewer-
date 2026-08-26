@@ -5,6 +5,9 @@ import type {
   EditableGraphic,
   GraphicTransform,
   Extent,
+  LineDto,
+  PolygonDto,
+  Point,
 } from "../../../shared/modelicaGraphics";
 import { GraphicItem } from "./GraphicItem";
 import {
@@ -22,6 +25,13 @@ import {
   type ResizeHandle,
   type ResizeSession,
 } from "../../editor/controllers/ResizeController";
+import {
+  LINE_HIT_WIDTH_PX,
+  VERTEX_HIT_RADIUS_PX,
+  VERTEX_VISUAL_RADIUS_PX,
+  moveVertex,
+  serializeModelicaPoints,
+} from "../../editor/VertexEditor";
 import { HistoryManager } from "../../editor/history/HistoryManager";
 import { useSelection } from "../../editor/Selection";
 import type { SelectionState } from "../../editor/Selection";
@@ -53,6 +63,16 @@ interface DragSession {
   transformStart: GraphicTransform;
 }
 
+interface VertexDragSession {
+  graphicId: string;
+  vertexIndex: number;
+  pointerId: number;
+  originalGraphic: LineDto | PolygonDto;
+  originalPoints: Point[];
+  startPointerLocal: Point;
+  inverseScreenToLocal: DOMMatrix;
+}
+
 const identity: GraphicTransform = {
   translate: { x: 0, y: 0 },
   scale: { x: 1, y: 1 },
@@ -70,10 +90,13 @@ export function IconViewer({
   const dragRef = useRef<DragSession | null>(null);
   const viewportGroupRef = useRef<SVGGElement>(null);
   const graphicGroupRefs = useRef(new Map<string, SVGGElement>());
+  const hitGraphicGroupRefs = useRef(new Map<string, SVGGElement>());
+  const localGroupRefs = useRef(new Map<string, SVGGElement>());
   const selectionGroupRefs = useRef(new Map<string, SVGGElement>());
   const screenOverlayRef = useRef<SVGGElement>(null);
   const screenOverlayUpdateRef = useRef<() => void>(() => undefined);
   const resizeRef = useRef<ResizeSession | null>(null);
+  const vertexRef = useRef<VertexDragSession | null>(null);
   const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
   const rafRef = useRef<number | null>(null);
   const pendingResizeRef = useRef<{
@@ -82,11 +105,17 @@ export function IconViewer({
     alt: boolean;
   } | null>(null);
   const resizeRafRef = useRef<number | null>(null);
+  const vertexRafRef = useRef<number | null>(null);
+  const pendingVertexPointRef = useRef<Point | null>(null);
   const historyRef = useRef(new HistoryManager(100));
   const historyBusyRef = useRef(false);
   const [resizePreview, setResizePreview] = useState<{
     graphicId: string;
     extent: Extent;
+  } | null>(null);
+  const [vertexSelection, setVertexSelection] = useState<{
+    graphicId: string;
+    vertexIndex: number;
   } | null>(null);
   const [optimisticGraphics, setOptimisticGraphics] = useState<
     Map<string, EditableGraphic["graphic"]>
@@ -107,14 +136,20 @@ export function IconViewer({
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     if (resizeRafRef.current !== null)
       cancelAnimationFrame(resizeRafRef.current);
+    if (vertexRafRef.current !== null)
+      cancelAnimationFrame(vertexRafRef.current);
     dragRef.current = null;
     resizeRef.current = null;
+    vertexRef.current = null;
     pendingPointRef.current = null;
     pendingResizeRef.current = null;
     rafRef.current = null;
     resizeRafRef.current = null;
+    vertexRafRef.current = null;
+    pendingVertexPointRef.current = null;
     historyRef.current = new HistoryManager(100);
     setResizePreview(null);
+    setVertexSelection(null);
     setInteractionNotice(null);
     setHistoryVersion((version) => version + 1);
   }, [resetKey]);
@@ -166,9 +201,11 @@ export function IconViewer({
   ) => {
     const delta = dragDeltaFromStart(session.pointerStart, point);
     const graphicGroup = graphicGroupRefs.current.get(session.id);
+    const hitGraphicGroup = hitGraphicGroupRefs.current.get(session.id);
     const selectionGroup = selectionGroupRefs.current.get(session.id);
     const transform = `translate(${delta.x},${delta.y})`;
     graphicGroup?.setAttribute("transform", transform);
+    hitGraphicGroup?.setAttribute("transform", transform);
     selectionGroup?.setAttribute("transform", transform);
     screenOverlayRef.current?.setAttribute(
       "transform",
@@ -195,6 +232,7 @@ export function IconViewer({
     const session = dragRef.current;
     if (session) {
       graphicGroupRefs.current.get(session.id)?.removeAttribute("transform");
+      hitGraphicGroupRefs.current.get(session.id)?.removeAttribute("transform");
       selectionGroupRefs.current
         .get(session.id)
         ?.removeAttribute("transform");
@@ -210,6 +248,93 @@ export function IconViewer({
     pendingResizeRef.current = null;
     resizeRef.current = null;
     setResizePreview(null);
+  };
+
+  const pointShape = (group: SVGGElement | undefined) =>
+    group?.querySelector<SVGPolylineElement | SVGPolygonElement>(
+      "polyline, polygon",
+    );
+
+  const setPointShapePoints = (graphicId: string, points: Point[]) => {
+    const value = points.map((point) => `${point.x},${point.y}`).join(" ");
+    pointShape(graphicGroupRefs.current.get(graphicId))?.setAttribute(
+      "points",
+      value,
+    );
+    pointShape(hitGraphicGroupRefs.current.get(graphicId))?.setAttribute(
+      "points",
+      value,
+    );
+  };
+
+  const updateVertexHandle = (session: VertexDragSession, point: Point) => {
+    const svg = svgRef.current;
+    const localGroup = localGroupRefs.current.get(session.graphicId);
+    const rootInverse = svg?.getScreenCTM()?.inverse();
+    const localMatrix = localGroup?.getScreenCTM();
+    if (!svg || !rootInverse || !localMatrix) return;
+    const rootPoint = new DOMPoint(point.x, point.y)
+      .matrixTransform(localMatrix)
+      .matrixTransform(rootInverse);
+    const rootMatrix = svg.getScreenCTM();
+    const rootScale = Math.max(
+      rootMatrix ? Math.hypot(rootMatrix.a, rootMatrix.b) : 1,
+      1e-6,
+    );
+    const handle = screenOverlayRef.current?.querySelector<SVGCircleElement>(
+      `[data-vertex-handle="${session.vertexIndex}"] .vertex-handle`,
+    );
+    const hit = screenOverlayRef.current?.querySelector<SVGCircleElement>(
+      `[data-vertex-handle="${session.vertexIndex}"] .vertex-hit-target`,
+    );
+    handle?.setAttribute("cx", String(rootPoint.x));
+    handle?.setAttribute("cy", String(rootPoint.y));
+    handle?.setAttribute("r", String(4 / rootScale));
+    hit?.setAttribute("cx", String(rootPoint.x));
+    hit?.setAttribute("cy", String(rootPoint.y));
+    hit?.setAttribute("r", String(9 / rootScale));
+  };
+
+  const applyVertexPreview = (
+    session: VertexDragSession,
+    point: Point,
+  ) => {
+    const dx = point.x - session.startPointerLocal.x;
+    const dy = point.y - session.startPointerLocal.y;
+    const next = moveVertex(
+      session.originalPoints,
+      session.vertexIndex,
+      dx,
+      dy,
+      session.originalGraphic.type === "Polygon",
+    );
+    setPointShapePoints(session.graphicId, next);
+    updateVertexHandle(session, next[session.vertexIndex] ?? point);
+    recordViewerPerformance("vertexPreviewRafUpdates");
+  };
+
+  const scheduleVertexPreview = (point: Point) => {
+    pendingVertexPointRef.current = point;
+    if (vertexRafRef.current !== null) return;
+    vertexRafRef.current = requestAnimationFrame(() => {
+      vertexRafRef.current = null;
+      const session = vertexRef.current;
+      const pending = pendingVertexPointRef.current;
+      if (session && pending) applyVertexPreview(session, pending);
+    });
+  };
+
+  const clearVertex = (restore = true) => {
+    if (vertexRafRef.current !== null)
+      cancelAnimationFrame(vertexRafRef.current);
+    const session = vertexRef.current;
+    if (restore && session) {
+      setPointShapePoints(session.graphicId, session.originalPoints);
+    }
+    vertexRafRef.current = null;
+    pendingVertexPointRef.current = null;
+    vertexRef.current = null;
+    setVertexSelection(null);
   };
 
   // Capture on the stable SVG root instead of the transient graphic group.
@@ -239,10 +364,13 @@ export function IconViewer({
     const cancelInteraction = () => {
       const drag = dragRef.current;
       const resize = resizeRef.current;
+      const vertex = vertexRef.current;
       if (drag) releasePointer(drag.pointerId);
       if (resize) releasePointer(resize.pointerId);
+      if (vertex) releasePointer(vertex.pointerId);
       clearDrag();
       clearResize();
+      clearVertex();
     };
     window.addEventListener("blur", cancelInteraction);
     return () => window.removeEventListener("blur", cancelInteraction);
@@ -300,6 +428,7 @@ export function IconViewer({
   const handlePointerDown = (e: React.PointerEvent, ed: EditableGraphic) => {
     if (e.button !== 0) return;
     sel.setSelected(ed.id);
+    setVertexSelection(null);
     if (ed.inherited) {
       e.preventDefault();
       e.stopPropagation();
@@ -396,6 +525,87 @@ export function IconViewer({
     }
     releasePointer(e.pointerId);
     clearDrag();
+  };
+
+  const handleVertexDown = (
+    e: React.PointerEvent,
+    ed: EditableGraphic,
+    vertexIndex: number,
+  ) => {
+    const graphic = optimisticGraphics.get(ed.id) ?? ed.graphic;
+    if (!isPointBasedGraphic(graphic) || !ed.source.pointsRange) return;
+    const localGroup = localGroupRefs.current.get(ed.id);
+    const inverse = localGroup?.getScreenCTM()?.inverse();
+    if (!inverse || !graphic.points[vertexIndex]) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(inverse);
+    setVertexSelection({ graphicId: ed.id, vertexIndex });
+    setInteractionNotice(null);
+    capturePointer(e.pointerId);
+    vertexRef.current = {
+      graphicId: ed.id,
+      vertexIndex,
+      pointerId: e.pointerId,
+      originalGraphic: graphic,
+      originalPoints: graphic.points.map((item) => ({ ...item })),
+      startPointerLocal: { x: point.x, y: point.y },
+      inverseScreenToLocal: inverse,
+    };
+  };
+
+  const handleVertexMove = (e: React.PointerEvent) => {
+    const session = vertexRef.current;
+    if (!session || session.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(
+      session.inverseScreenToLocal,
+    );
+    scheduleVertexPreview({ x: point.x, y: point.y });
+  };
+
+  const handleVertexUp = (e: React.PointerEvent) => {
+    const session = vertexRef.current;
+    if (!session || session.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(
+      session.inverseScreenToLocal,
+    );
+    const ed = editables.find((item) => item.id === session.graphicId);
+    if (ed) {
+      const next = moveVertex(
+        session.originalPoints,
+        session.vertexIndex,
+        point.x - session.startPointerLocal.x,
+        point.y - session.startPointerLocal.y,
+        session.originalGraphic.type === "Polygon",
+      );
+      const edit = buildPointsEdit(ed, next);
+      if (edit) {
+        releasePointer(e.pointerId);
+        clearVertex(false);
+        commitGraphicChange(
+          ed,
+          session.originalGraphic,
+          { ...session.originalGraphic, points: next },
+          edit,
+          "vertex",
+        );
+        return;
+      }
+    }
+    releasePointer(e.pointerId);
+    clearVertex();
+  };
+
+  const handleVertexCancel = (e: React.PointerEvent) => {
+    if (!vertexRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    releasePointer(e.pointerId);
+    clearVertex();
   };
 
   const scheduleResize = (
@@ -506,13 +716,6 @@ export function IconViewer({
     clearResize();
   };
 
-  const handleResizeCancel = (e: React.PointerEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    releasePointer(e.pointerId);
-    clearResize();
-  };
-
   const applyHistory = async (direction: "undo" | "redo") => {
     if (historyBusyRef.current || !onEdit) return;
     const command =
@@ -561,6 +764,7 @@ export function IconViewer({
     releasePointer(e.pointerId);
     clearDrag();
     clearResize();
+    clearVertex();
   };
 
   const selectedEntry = entries.find(({ id }) => id === sel.selectedId);
@@ -616,16 +820,41 @@ export function IconViewer({
       hit?.setAttribute("cy", String(point.y));
       hit?.setAttribute("r", String(9 / rootScale));
     }
+    if (selectedEditable && selectedGraphic && isPointBasedGraphic(selectedGraphic)) {
+      const localMatrix = localGroupRefs.current
+        .get(selectedEditable.id)
+        ?.getScreenCTM();
+      const rootInverse = svg.getScreenCTM()?.inverse();
+      if (localMatrix && rootInverse) {
+        selectedGraphic.points.forEach((point, index) => {
+          const rootPoint = new DOMPoint(point.x, point.y)
+            .matrixTransform(localMatrix)
+            .matrixTransform(rootInverse);
+          const visual = overlay.querySelector<SVGCircleElement>(
+            `[data-vertex-handle="${index}"] .vertex-handle`,
+          );
+          const hit = overlay.querySelector<SVGCircleElement>(
+            `[data-vertex-handle="${index}"] .vertex-hit-target`,
+          );
+          visual?.setAttribute("cx", String(rootPoint.x));
+          visual?.setAttribute("cy", String(rootPoint.y));
+          visual?.setAttribute("r", String(VERTEX_VISUAL_RADIUS_PX / rootScale));
+          hit?.setAttribute("cx", String(rootPoint.x));
+          hit?.setAttribute("cy", String(rootPoint.y));
+          hit?.setAttribute("r", String(VERTEX_HIT_RADIUS_PX / rootScale));
+        });
+      }
+    }
   };
 
-  const screenOverlay = canResizeSelected && selectedBounds && selectedEditable
+  const resizeOverlay = canResizeSelected && selectedBounds && selectedEditable
     ? resizeHandles.map((handle) => (
         <g key={`screen:${selectedEditable.id}:${handle}`} data-screen-handle={handle}>
           <circle
             className="resize-hit-target"
             cx={0}
             cy={0}
-            r={9}
+            r={VERTEX_HIT_RADIUS_PX}
             onPointerDown={(e) => handleResizeDown(e, selectedEditable, handle)}
             pointerEvents="all"
           />
@@ -633,6 +862,34 @@ export function IconViewer({
         </g>
       ))
     : null;
+
+  const vertexOverlay = selectedEditable && selectedGraphic && isPointBasedGraphic(selectedGraphic)
+    ? selectedGraphic.points.map((_, index) => (
+        <g key={`vertex:${selectedEditable.id}:${index}`} data-vertex-handle={index}>
+          <circle
+            className="vertex-hit-target"
+            cx={0}
+            cy={0}
+            r={9}
+            onPointerDown={(e) => handleVertexDown(e, selectedEditable, index)}
+            pointerEvents="all"
+          />
+          <circle
+            className={
+              vertexSelection?.vertexIndex === index
+                ? "vertex-handle active"
+                : "vertex-handle"
+            }
+            cx={0}
+            cy={0}
+            r={VERTEX_VISUAL_RADIUS_PX}
+            pointerEvents="none"
+          />
+        </g>
+      ))
+    : null;
+
+  const screenOverlay = <>{resizeOverlay}{vertexOverlay}</>;
 
   screenOverlayUpdateRef.current = updateScreenOverlay;
 
@@ -650,16 +907,18 @@ export function IconViewer({
         onViewportTransform={updateScreenOverlay}
         overlay={screenOverlay}
         onPointerMove={(event) => {
+          handleVertexMove(event);
           handlePointerMove(event);
           handleResizeMove(event);
         }}
         onPointerUp={(event) => {
+          handleVertexUp(event);
           handlePointerUp(event);
           handleResizeUp(event);
         }}
         onPointerCancel={(event) => {
+          handleVertexCancel(event);
           handlePointerCancel(event);
-          handleResizeCancel(event);
         }}
         onUndo={() => void applyHistory("undo")}
         onRedo={() => void applyHistory("redo")}
@@ -704,6 +963,18 @@ export function IconViewer({
                   style={ed ? { cursor: "move" } : undefined}
                 >
                   <g transform={ed ? toSvgTransform(transform) : undefined}>
+                    <g
+                      ref={(node) => {
+                        if (node) localGroupRefs.current.set(id, node);
+                        else localGroupRefs.current.delete(id);
+                      }}
+                      transform={
+                        graphic.origin
+                          ? `translate(${graphic.origin.x},${graphic.origin.y})`
+                          : undefined
+                      }
+                      pointerEvents="none"
+                    />
                     <GraphicItem
                       item={renderGraphic}
                       styleId={`graphic-style-${index}`}
@@ -713,6 +984,47 @@ export function IconViewer({
               );
             })}
           </GraphicLayer>
+          <g className="hit-layer">
+            {entries.map(({ id, graphic, editable: ed }) => {
+              if (!isPointBasedGraphic(graphic)) return null;
+              return (
+                <g
+                  key={`hit:${id}`}
+                  ref={(node) => {
+                    if (node) hitGraphicGroupRefs.current.set(id, node);
+                    else hitGraphicGroupRefs.current.delete(id);
+                  }}
+                  onPointerDown={
+                    ed
+                      ? (e) => handlePointerDown(e, ed)
+                      : graphic.inherited
+                        ? (e) =>
+                            handleReadonlyPointerDown(
+                              e,
+                              id,
+                              graphic.ownerQualifiedName,
+                            )
+                        : undefined
+                  }
+                  onPointerEnter={() => sel.setHover(id)}
+                  onPointerLeave={() => sel.setHover(null)}
+                  style={ed ? { cursor: "pointer" } : undefined}
+                >
+                  <g transform={ed ? toSvgTransform(transformFor(id)) : undefined}>
+                    <g
+                      transform={
+                        graphic.origin
+                          ? `translate(${graphic.origin.x},${graphic.origin.y})`
+                          : undefined
+                      }
+                    >
+                      <GraphicHitTarget item={graphic} />
+                    </g>
+                  </g>
+                </g>
+              );
+            })}
+          </g>
           <g className="selection-layer" pointerEvents="none">
             {entries.map(({ id, graphic, editable: ed }) => {
               if (sel.selectedId !== id && sel.hoverId !== id) return null;
@@ -770,6 +1082,43 @@ const GraphicLayer = memo(function GraphicLayer({ children }: { children: ReactN
   return <g className="modelica-layer">{children}</g>;
 });
 
+function isPointBasedGraphic(
+  graphic: EditableGraphic["graphic"],
+): graphic is LineDto | PolygonDto {
+  return graphic.type === "Line" || graphic.type === "Polygon";
+}
+
+function pointsAttribute(points: Point[]): string {
+  return points.map((point) => `${point.x},${point.y}`).join(" ");
+}
+
+function GraphicHitTarget({ item }: { item: LineDto | PolygonDto }) {
+  if (item.type === "Line") {
+    return (
+      <polyline
+        className="line-hit-target"
+        points={pointsAttribute(item.points)}
+        fill="none"
+        stroke="transparent"
+        strokeWidth={LINE_HIT_WIDTH_PX}
+        vectorEffect="non-scaling-stroke"
+        pointerEvents="stroke"
+      />
+    );
+  }
+  return (
+    <polygon
+      className="polygon-hit-target"
+      points={pointsAttribute(item.points)}
+      fill="transparent"
+      stroke="transparent"
+      strokeWidth={LINE_HIT_WIDTH_PX}
+      vectorEffect="non-scaling-stroke"
+      pointerEvents="all"
+    />
+  );
+}
+
 function handlePosition(
   handle: ResizeHandle,
   bounds: { x: number; y: number; width: number; height: number },
@@ -805,6 +1154,16 @@ function buildExtentEdit(ed: EditableGraphic, extent: Extent): Edit | null {
     end: ed.source.extentRange.end,
     expectedText: ed.source.extentRange.expectedText,
     replacement: formatModelicaExtent(extent),
+  };
+}
+
+function buildPointsEdit(ed: EditableGraphic, points: Point[]): Edit | null {
+  if (!ed.source.pointsRange) return null;
+  return {
+    start: ed.source.pointsRange.start,
+    end: ed.source.pointsRange.end,
+    expectedText: ed.source.pointsRange.expectedText,
+    replacement: serializeModelicaPoints(points),
   };
 }
 

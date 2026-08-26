@@ -2,6 +2,7 @@ export type ViewerPerformanceCounter =
   | "wheelEvents"
   | "viewportRafUpdates"
   | "dragPreviewRafUpdates"
+  | "vertexPreviewRafUpdates"
   | "graphicLayerRenders"
   | "graphicItemRenders";
 
@@ -19,6 +20,7 @@ export function recordViewerPerformance(counter: ViewerPerformanceCounter) {
     wheelEvents: 0,
     viewportRafUpdates: 0,
     dragPreviewRafUpdates: 0,
+    vertexPreviewRafUpdates: 0,
     graphicLayerRenders: 0,
     graphicItemRenders: 0,
   });

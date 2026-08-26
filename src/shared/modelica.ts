@@ -64,7 +64,13 @@ export interface SourceEdit {
   targetQualifiedName?: string;
 }
 
-export type SourceEditReason = "drag" | "resize" | "property" | "undo" | "redo";
+export type SourceEditReason =
+  | "drag"
+  | "resize"
+  | "vertex"
+  | "property"
+  | "undo"
+  | "redo";
 
 export type ApplySourceEditResult = { ok: true } | { error: string };
 
