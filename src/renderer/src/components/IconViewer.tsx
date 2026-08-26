@@ -137,6 +137,9 @@ export function IconViewer({
     x: number;
     y: number;
   } | null>(null);
+  const [propertiesGraphicId, setPropertiesGraphicId] = useState<string | null>(
+    null,
+  );
   const shellRef = useRef<HTMLDivElement>(null);
   const [optimisticGraphics, setOptimisticGraphics] = useState<
     Map<string, EditableGraphic["graphic"]>
@@ -153,6 +156,7 @@ export function IconViewer({
     setOptimisticGraphics(new Map());
     setHiddenGraphicIds(new Set());
     setContextMenu(null);
+    setPropertiesGraphicId(null);
   }, [editable]);
 
   useEffect(() => {
@@ -182,24 +186,27 @@ export function IconViewer({
   }, [sel.selectedId, icon, editable, optimisticGraphics, resizePreview, resetKey]);
 
   useEffect(() => {
-    if (!contextMenu) return;
-    const close = () => setContextMenu(null);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
+      if (event.key === "Escape") {
+        setContextMenu(null);
+        setPropertiesGraphicId(null);
+      }
     };
-    window.addEventListener("pointerdown", close);
+    const onPointerDown = () => setContextMenu(null);
+    window.addEventListener("pointerdown", onPointerDown);
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [contextMenu]);
+  }, []);
 
   if (!icon) return <div className="no-icon">No Icon annotation</div>;
 
   const handleCanvasPointerDown = (e: PointerEvent<SVGSVGElement>) => {
     if (e.button !== 0 || e.target !== e.currentTarget) return;
     sel.setSelected(null);
+    setPropertiesGraphicId(null);
     setVertexSelection(null);
     setInteractionNotice(null);
     closeContextMenu();
@@ -464,7 +471,7 @@ export function IconViewer({
     edit: Edit,
     after: EditableGraphic["graphic"],
   ) => {
-    const ed = editables.find((item) => item.id === sel.selectedId);
+    const ed = editables.find((item) => item.id === propertiesGraphicId);
     if (!ed) return;
     const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
     commitGraphicChange(ed, before, after, edit, "property");
@@ -534,6 +541,7 @@ export function IconViewer({
           deletion: { start: edit.start, deletedText: edit.deletedText },
         });
         sel.setSelected(null);
+        setPropertiesGraphicId(null);
         setVertexSelection(null);
         setHistoryVersion((version) => version + 1);
       })
@@ -552,6 +560,7 @@ export function IconViewer({
   const handlePointerDown = (e: React.PointerEvent, ed: EditableGraphic) => {
     if (e.button !== 0) return;
     sel.setSelected(ed.id);
+    setPropertiesGraphicId(null);
     setVertexSelection(null);
     if (ed.inherited) {
       e.preventDefault();
@@ -590,6 +599,7 @@ export function IconViewer({
     e.preventDefault();
     e.stopPropagation();
     sel.setSelected(id);
+    setPropertiesGraphicId(null);
     setInteractionNotice(`继承图形不可在当前类直接编辑：${owner ?? "基类"}`);
   };
 
@@ -665,6 +675,7 @@ export function IconViewer({
     e.stopPropagation();
     const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(inverse);
     setVertexSelection({ graphicId: ed.id, vertexIndex });
+    setPropertiesGraphicId(null);
     setInteractionNotice(null);
     capturePointer(e.pointerId);
     vertexRef.current = {
@@ -778,6 +789,7 @@ export function IconViewer({
     const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
     capturePointer(e.pointerId);
     sel.setSelected(ed.id);
+    setPropertiesGraphicId(null);
     setInteractionNotice(null);
     setResizePreview(null);
     resizeRef.current = {
@@ -1051,13 +1063,20 @@ export function IconViewer({
 
   const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
   const canRedo = historyVersion >= 0 && historyRef.current.canRedo;
-  const inspectorEditable = selectedEntry && selectedGraphic
-    ? selectedEditable
-      ? { ...selectedEditable, graphic: selectedGraphic }
+  const propertiesEntry = entries.find(({ id }) => id === propertiesGraphicId);
+  const propertiesEditable = propertiesEntry?.editable;
+  const propertiesGraphic = propertiesEntry
+    ? propertiesEditable
+      ? (optimisticGraphics.get(propertiesEditable.id) ?? propertiesEditable.graphic)
+      : propertiesEntry.graphic
+    : null;
+  const inspectorEditable = propertiesEntry && propertiesGraphic
+    ? propertiesEditable
+      ? { ...propertiesEditable, graphic: propertiesGraphic }
       : {
-          id: selectedEntry.id,
-          graphic: selectedGraphic,
-          ownerQualifiedName: selectedGraphic.ownerQualifiedName,
+          id: propertiesEntry.id,
+          graphic: propertiesGraphic,
+          ownerQualifiedName: propertiesGraphic.ownerQualifiedName,
           inherited: true,
           selected: true,
           transform: identity,
@@ -1249,7 +1268,10 @@ export function IconViewer({
         >
           <button
             role="menuitem"
-            onClick={() => closeContextMenu()}
+            onClick={() => {
+              setPropertiesGraphicId(contextMenu.graphicId);
+              closeContextMenu();
+            }}
           >
             Properties…
           </button>
@@ -1266,10 +1288,11 @@ export function IconViewer({
           </button>
         </div>
       )}
-      {editable && (
+      {inspectorEditable && (
         <GraphicProperties
           editable={inspectorEditable ?? null}
           onPropertyEdit={handlePropertyEdit}
+          onClose={() => setPropertiesGraphicId(null)}
         />
       )}
       {interactionNotice && (
@@ -1612,12 +1635,13 @@ function NumericProperty({
 function GraphicProperties({
   editable,
   onPropertyEdit,
+  onClose,
 }: {
   editable: EditableGraphic | null;
   onPropertyEdit?: (edit: Edit, after: EditableGraphic["graphic"]) => void;
+  onClose: () => void;
 }) {
-  if (!editable || !onPropertyEdit)
-    return <aside className="graphic-properties empty-properties">选择图元查看属性</aside>;
+  if (!editable || !onPropertyEdit) return null;
   const graphic = editable.graphic;
   const source = editable.source;
   const readOnly = !!editable.inherited;
@@ -1662,8 +1686,8 @@ function GraphicProperties({
   const pattern = graphic.type === "Text" ? "LinePattern.Solid" : (graphic.pattern ?? "LinePattern.Solid");
   const fillPattern = "fillPattern" in graphic ? (graphic.fillPattern ?? "FillPattern.None") : "FillPattern.None";
   return (
-    <aside className="graphic-properties" data-graphic-properties>
-      <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span></div>
+    <aside className="graphic-properties floating-inspector" data-graphic-properties>
+      <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><div className="properties-heading-actions"><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span><button className="properties-close" type="button" aria-label="Close properties" onClick={onClose}>×</button></div></div>
       {readOnly && <p className="property-note">来自 {editable.ownerQualifiedName ?? "基类"}，当前类不可编辑。</p>}
       <PropertySection title="Geometry">
         <NumericProperty label={graphic.origin ? "Origin X" : "X"} value={position.x} disabled={readOnly || (!positionRange && !extentRange && !pointsRange)} onCommit={(value) => positionValue("x", value)} />
