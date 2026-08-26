@@ -74,6 +74,27 @@ describe("parser", () => {
     expect(file.classes[0]!.qualifiedName).toBe("Test.Pin");
   });
 
+  it("should treat short type declarations as leaf classes", () => {
+    const src = `package P
+      package Types
+        type EosType = String annotation(choices(choice="PR"));
+        type FlashType = enumeration(PT, PH);
+      end Types;
+      package Functions
+        function create end create;
+      end Functions;
+    end P;`;
+    const file = parseModelicaFile(src, "test.mo");
+    const types = file.classes[0]!.children[0]!;
+    const functions = file.classes[0]!.children[1]!;
+    expect(types.name).toBe("Types");
+    expect(types.children.map((c) => c.name)).toEqual(["EosType", "FlashType"]);
+    expect(types.children.every((c) => c.sourceRange.end > c.sourceRange.start)).toBe(
+      true,
+    );
+    expect(functions.name).toBe("Functions");
+  });
+
   it("should set sourceRange and slice equals original class text", () => {
     const src = `package P\n  model A\n    Real x;\n  end A;\n  model B\n    Real y;\n  end B;\nend P;`;
     const file = parseModelicaFile(src, "test.mo");

@@ -16,6 +16,38 @@ function mkTmp(): string {
 }
 
 describe("PackageLoader", () => {
+  it("requires package.mo at the selected library root", () => {
+    const tmp = mkTmp();
+    try {
+      writeFileSync(join(tmp, "IEH_CPP.mo"), "package IEH_CPP end IEH_CPP;");
+      writeFileSync(join(tmp, "Other.mo"), "model Other end Other;");
+      const loader = new PackageLoader();
+      expect(() => loader.load(tmp)).toThrow("未找到 package.mo");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("loads a directory containing one same-named standalone package file", () => {
+    const tmp = mkTmp();
+    const rootDir = join(tmp, "IEH_CPP");
+    try {
+      mkdirSync(rootDir, { recursive: true });
+      writeFileSync(
+        join(rootDir, "IEH_CPP.mo"),
+        "package IEH_CPP package ThermoMedium end ThermoMedium; end IEH_CPP;",
+      );
+      mkdirSync(join(rootDir, "Resources"), { recursive: true });
+
+      const root = new PackageLoader().load(rootDir);
+      expect(root.qualifiedName).toBe("IEH_CPP");
+      expect(root.sourceFile).toBe(join(rootDir, "IEH_CPP.mo"));
+      expect(root.children[0]?.qualifiedName).toBe("IEH_CPP.ThermoMedium");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("should load single-file inline package (demo MyLibrary)", () => {
     const loader = new PackageLoader();
     const root = loader.load(path.resolve("demo-modelica/MyLibrary"));

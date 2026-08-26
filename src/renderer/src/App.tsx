@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { PackageNodeDto } from "../../shared/modelica";
+import type { LoadPackageResult, PackageNodeDto } from "../../shared/modelica";
 import type { IconDto, EditableIconDto } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
@@ -26,6 +26,17 @@ function App(): JSX.Element {
   const [editableIcon, setEditableIcon] = useState<EditableIconDto | null>(
     null,
   );
+
+  const applyLoadResult = (result: LoadPackageResult): void => {
+    if ("error" in result) {
+      setError(result.error);
+      return;
+    }
+    if (result.canceled) return;
+    setRoot(result.root);
+    setCurrentPath(result.root.sourceFile);
+    setSelected({ kind: "package", node: result.root });
+  };
 
   useEffect(() => {
     if (!window.api) {
@@ -135,14 +146,7 @@ function App(): JSX.Element {
     setError(null);
     try {
       const result = await window.api.modelica.loadDirectory(dirPath);
-      if ("error" in result) {
-        setError(result.error);
-        return;
-      }
-      if (result.canceled) return;
-      setRoot(result.root);
-      setCurrentPath(result.root.sourceFile);
-      setSelected({ kind: "package", node: result.root });
+      applyLoadResult(result);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -165,14 +169,24 @@ function App(): JSX.Element {
     setError(null);
     try {
       const result = await window.api.modelica.openAndLoad();
-      if ("error" in result) {
-        setError(result.error);
-        return;
-      }
-      if (result.canceled) return;
-      setRoot(result.root);
-      setCurrentPath(result.root.sourceFile);
-      setSelected({ kind: "package", node: result.root });
+      applyLoadResult(result);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleOpenFile = async () => {
+    if (!window.api) {
+      setError("preload 未加载：window.api 为空，请重新构建");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await window.api.modelica.openFile();
+      applyLoadResult(result);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -259,10 +273,17 @@ function App(): JSX.Element {
         <div className="header-right">
           <button
             className="primary-btn"
+            onClick={() => void handleOpenFile()}
+            disabled={loading}
+          >
+            {loading ? "加载中…" : "打开 .mo 文件"}
+          </button>
+          <button
+            className="secondary-btn"
             onClick={() => void handleOpen()}
             disabled={loading}
           >
-            {loading ? "加载中…" : "打开目录"}
+            打开库目录
           </button>
           {currentPath && (
             <span className="current-path" title={currentPath}>
@@ -378,8 +399,11 @@ function App(): JSX.Element {
       ) : (
         <main className="shell">
           <section className="welcome-card">
-            <h2>选择 Modelica 库目录</h2>
+            <h2>打开 Modelica 文件或库目录</h2>
             <p className="description">
+              单个顶层 package 文件（例如 <code>IEH_CPP.mo</code>）可以直接打开；
+              标准目录式库请选择包含 <code>package.mo</code> 的库根目录。
+              <br />
               支持单文件内嵌{" "}
               <code>
                 package A &#123; package B &#123; model C &#125; &#125;
@@ -394,12 +418,20 @@ function App(): JSX.Element {
               </code>
               。
             </p>
-            <button
-              className="primary-btn large"
-              onClick={() => void handleOpen()}
-            >
-              打开目录
-            </button>
+            <div className="welcome-actions">
+              <button
+                className="primary-btn large"
+                onClick={() => void handleOpenFile()}
+              >
+                打开 .mo 文件
+              </button>
+              <button
+                className="secondary-btn large"
+                onClick={() => void handleOpen()}
+              >
+                打开库目录
+              </button>
+            </div>
             <p className="hint">
               已内置 demo: <code>demo-modelica/MyLibrary</code> /{" "}
               <code>showcase</code>

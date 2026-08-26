@@ -18,6 +18,13 @@ const api: WindowApi = {
       "dialog:openDirectory",
     ) as Promise<DirectoryDialogResult>,
   modelica: {
+    openFile: () =>
+      ipcRenderer.invoke("modelica:openFile") as Promise<LoadPackageResult>,
+    loadFile: (filePath: string) =>
+      ipcRenderer.invoke(
+        "modelica:loadFile",
+        filePath,
+      ) as Promise<LoadPackageResult>,
     openAndLoad: () =>
       ipcRenderer.invoke("modelica:openAndLoad") as Promise<LoadPackageResult>,
     loadDirectory: (dirPath: string) =>

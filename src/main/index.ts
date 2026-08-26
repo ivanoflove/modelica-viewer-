@@ -1,8 +1,12 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import type { OpenDialogOptions } from "electron";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
-import { PackageLoader } from "./modelica/loader.js";
+import {
+  loadModelicaFile,
+  PackageLoader,
+} from "./modelica/loader.js";
 import {
   extractIconFromSlice,
   extractEditableIconFromSlice,
@@ -67,6 +71,37 @@ function registerIpcHandlers(): void {
     try {
       if (!dirPath) return { error: "No directory path provided" };
       const root = loader.load(dirPath);
+      return { canceled: false, root };
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+  });
+
+  ipcMain.handle("modelica:loadFile", async (_event, filePath: string) => {
+    try {
+      if (!filePath) return { error: "No Modelica file path provided" };
+      const root = loadModelicaFile(filePath);
+      return { canceled: false, root };
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+  });
+
+  ipcMain.handle("modelica:openFile", async () => {
+    const win = BrowserWindow.getFocusedWindow();
+    const options: OpenDialogOptions = {
+      title: "打开 Modelica 文件",
+      properties: ["openFile"],
+      filters: [{ name: "Modelica files", extensions: ["mo"] }],
+    };
+    const picked = win
+      ? await dialog.showOpenDialog(win, options)
+      : await dialog.showOpenDialog(options);
+    if (picked.canceled || picked.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    try {
+      const root = loadModelicaFile(picked.filePaths[0]!);
       return { canceled: false, root };
     } catch (e) {
       return { error: (e as Error).message };

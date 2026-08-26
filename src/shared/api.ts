@@ -18,6 +18,8 @@ export interface WindowApi {
   ping: () => Promise<string>;
   openDirectory: () => Promise<DirectoryDialogResult>;
   modelica: {
+    openFile: () => Promise<LoadPackageResult>;
+    loadFile: (filePath: string) => Promise<LoadPackageResult>;
     openAndLoad: () => Promise<LoadPackageResult>;
     loadDirectory: (dirPath: string) => Promise<LoadPackageResult>;
     readSource: (filePath: string) => Promise<ReadSourceResult>;

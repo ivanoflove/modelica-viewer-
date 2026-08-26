@@ -168,6 +168,32 @@ class Parser {
       children: [],
     };
 
+    // Short type definitions use `type Name = BaseType(...);` and do not
+    // have an `end Name;` terminator. Track annotation/array delimiters so
+    // semicolons inside nested expressions do not end the declaration.
+    if (kind === "type") {
+      let parenDepth = 0;
+      let braceDepth = 0;
+      while (true) {
+        const tok = this.peek();
+        if (tok.type === "EOF") break;
+        if (tok.type === "LPAREN") parenDepth++;
+        if (tok.type === "RPAREN") parenDepth = Math.max(0, parenDepth - 1);
+        if (tok.type === "LBRACE") braceDepth++;
+        if (tok.type === "RBRACE") braceDepth = Math.max(0, braceDepth - 1);
+        const endTok = this.advance();
+        if (
+          endTok.type === "SEMICOLON" &&
+          parenDepth === 0 &&
+          braceDepth === 0
+        ) {
+          node.sourceRange.end = endTok.end;
+          break;
+        }
+      }
+      return node;
+    }
+
     // scan body until matching end <name>;
     while (true) {
       const tok = this.peek();

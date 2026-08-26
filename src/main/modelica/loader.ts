@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, extname } from "node:path";
 import { parseModelicaFile, requalifyClassTree } from "./parser.js";
 import type { PackageNode, ClassNode } from "./types.js";
 
@@ -62,11 +62,60 @@ function classNodeToPackageNode(
   };
 }
 
+export const MISSING_PACKAGE_ERROR =
+  "未找到 package.mo。该目录可能不是目录式 Modelica 库；如果你要打开单个模型/库文件，请使用‘打开 .mo 文件’。";
+
+/**
+ * Load one standalone .mo file. A top-level package is the semantic root;
+ * unlike PackageLoader this path does not require the filename to be
+ * package.mo or the containing directory to have a package.mo.
+ */
+export function loadModelicaFile(filePath: string): PackageNode {
+  const content = readFileSync(filePath, "utf-8");
+  const parsed = parseModelicaFile(content, filePath);
+  const topLevelPackage = parsed.classes.find((cls) => cls.kind === "package");
+
+  if (topLevelPackage) {
+    const qualifiedPackage = requalifyClassTree(
+      topLevelPackage,
+      parsed.within ?? "",
+      filePath,
+    );
+    return classNodeToPackageNode(
+      qualifiedPackage,
+      parsed.within,
+      filePath,
+      parsed.within,
+    );
+  }
+
+  // A standalone file may contain a model/function without a package. Keep
+  // it visible under a virtual root instead of rejecting a valid .mo file.
+  const rootName = basename(filePath, extname(filePath));
+  const rootQualified = parsed.within
+    ? `${parsed.within}.${rootName}`
+    : rootName;
+  const classes = parsed.classes.map((cls) =>
+    requalifyClassTree(cls, rootQualified, filePath),
+  );
+  const packageChildren = classes
+    .filter((cls) => cls.kind === "package")
+    .map((cls) => classNodeToPackageNode(cls, rootQualified, filePath, null));
+
+  return {
+    name: rootName,
+    within: parsed.within,
+    qualifiedName: rootQualified,
+    sourceFile: filePath,
+    children: packageChildren,
+    classes: classes.filter((cls) => cls.kind !== "package"),
+  };
+}
+
 export class PackageLoader {
   /**
    * Load a Modelica library rooted at `rootDir`.
    * - If root/package.mo exists, it is the root package.
-   * - Else, root directory name is used as root package name (fallback).
    * - Recursively scans subdirectories containing package.mo and *.mo files.
    */
   load(rootDir: string): PackageNode {
@@ -78,47 +127,23 @@ export class PackageLoader {
       return this.loadPackageDirectory(rootDir, null, errors);
     }
 
-    // Fallback: treat root as package named after directory
-    const fallbackName = basename(rootDir);
-    const moFiles = listDirEntries(rootDir).filter((f) => f.endsWith(".mo"));
-    const classes: ClassNode[] = [];
-    for (const f of moFiles) {
-      const fp = join(rootDir, f);
-      const content = safeReadFile(fp);
-      if (!content) continue;
-      try {
-        const parsed = parseModelicaFile(content, fp);
-        for (const cls of parsed.classes) {
-          const rq = requalifyClassTree(cls, parsed.within ?? "", fp);
-          // if within is null, we need to prefix with fallback
-          const finalQ = parsed.within
-            ? rq.qualifiedName
-            : `${fallbackName}.${rq.name}`;
-          const finalNode: ClassNode = {
-            ...rq,
-            qualifiedName: parsed.within ? rq.qualifiedName : finalQ,
-            sourceFile: fp,
-            children: rq.children.map((c) => requalifyClassTree(c, finalQ, fp)),
-          };
-          classes.push(finalNode);
-        }
-      } catch (e) {
-        errors.push(`${fp}: ${(e as Error).message}`);
-      }
+    // A common Modelica project layout is a directory named after a single
+    // top-level package, containing `IEH_CPP/IEH_CPP.mo` plus Resources/.
+    // Treat that unambiguous file as the directory's package entry point.
+    const rootMoFiles = listDirEntries(rootDir).filter((entry) =>
+      entry.toLowerCase().endsWith(".mo"),
+    );
+    const directoryName = basename(rootDir).toLowerCase();
+    const matchingMoFile = rootMoFiles.find(
+      (entry) => basename(entry, extname(entry)).toLowerCase() === directoryName,
+    );
+    const singleFile =
+      matchingMoFile ?? (rootMoFiles.length === 1 ? rootMoFiles[0] : null);
+    if (singleFile) {
+      return loadModelicaFile(join(rootDir, singleFile));
     }
 
-    // scan subdirectories
-    const children = this.scanSubdirectories(rootDir, fallbackName, errors);
-
-    return {
-      name: fallbackName,
-      within: null,
-      qualifiedName: fallbackName,
-      sourceFile: rootDir,
-      children,
-      classes: classes.filter((c) => c.kind !== "package") as ClassNode[],
-      loadErrors: errors.length ? errors : undefined,
-    };
+    throw new Error(MISSING_PACKAGE_ERROR);
   }
 
   private loadPackageDirectory(
