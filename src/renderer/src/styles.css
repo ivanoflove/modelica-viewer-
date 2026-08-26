@@ -52,6 +52,24 @@ select {
   backdrop-filter: blur(6px);
 }
 
+.compact-app-bar {
+  min-height: 48px;
+  padding: 6px 16px;
+  align-items: center;
+}
+
+.compact-app-bar .header-right {
+  width: 100%;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.compact-app-bar .current-path {
+  margin-left: auto;
+}
+
 .header-left h1 {
   margin: 4px 0 0;
   font-size: 28px;
@@ -108,6 +126,77 @@ select {
 
 .header-right .secondary-btn {
   margin-top: 0;
+}
+
+.library-popover {
+  position: relative;
+  z-index: 2;
+  padding: 12px 32px;
+  border-bottom: 1px solid rgba(49, 57, 251, 0.12);
+  background: #fff;
+  box-shadow: 0 8px 20px rgba(49, 57, 251, 0.08);
+}
+
+.library-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 13px;
+}
+
+.library-popover-header > div {
+  display: flex;
+  gap: 8px;
+}
+
+.library-list {
+  max-height: 180px;
+  margin: 8px 0 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.library-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(49, 57, 251, 0.08);
+}
+
+.library-list li span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-list small {
+  color: rgba(49, 57, 251, 0.5);
+}
+
+.library-remove {
+  border: 0;
+  background: transparent;
+  color: #b00020;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.library-empty,
+.library-error {
+  padding: 10px 0 2px;
+  color: rgba(49, 57, 251, 0.58);
+  font-size: 12px;
+}
+
+.library-error {
+  color: #b00020;
 }
 
 .secondary-btn.large {
@@ -340,6 +429,17 @@ h1 {
   background: #fff;
 }
 
+.source-editor.icon-tab {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  align-items: stretch;
+  justify-content: stretch;
+}
+
 .source-editor pre {
   margin: 0;
   padding: 18px 20px;
@@ -360,6 +460,16 @@ h1 {
 .source-error {
   color: #b00020;
   background: #fff3f3;
+}
+
+.icon-warning {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  right: 12px;
+  z-index: 1;
+  padding: 4px 8px;
+  pointer-events: none;
 }
 
 .viewer-tabs {
@@ -391,7 +501,10 @@ h1 {
   align-items: stretch;
   justify-content: center;
   background: #fff;
-  overflow: auto;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  user-select: none;
 }
 
 .icon-editor-shell {
@@ -399,9 +512,26 @@ h1 {
   min-height: 100%;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 230px;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 0;
   background: #fff;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  user-select: none;
+}
+
+.graphic-viewport {
+  grid-column: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  outline: none;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  user-select: none;
 }
 
 .icon-viewer-toolbar {
@@ -443,6 +573,10 @@ h1 {
   place-items: center;
   padding: 18px;
   background: #fdfdff;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  user-select: none;
 }
 
 .modelica-icon {
@@ -451,9 +585,14 @@ h1 {
   min-height: 360px;
   border: 1px solid rgba(49, 57, 251, 0.12);
   background: #fff;
+  display: block;
+  touch-action: none;
+  user-select: none;
 }
 
 .graphic-properties {
+  grid-column: 2;
+  grid-row: 1;
   min-width: 0;
   padding: 14px 12px;
   border-left: 1px solid rgba(49, 57, 251, 0.12);
@@ -501,8 +640,7 @@ h1 {
   text-align: center;
 }
 
-.icon-editor-hint,
-.drag-status {
+.icon-editor-hint {
   grid-column: 1 / -1;
   padding: 6px 12px;
   color: rgba(49, 57, 251, 0.5);
@@ -510,8 +648,19 @@ h1 {
   text-align: center;
 }
 
-.drag-status {
-  color: #3139fb;
+.icon-interaction-notice {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  max-width: calc(100% - 24px);
+  padding: 6px 10px;
+  border: 1px solid rgba(176, 0, 32, 0.18);
+  border-radius: 6px;
+  background: rgba(255, 243, 243, 0.94);
+  color: #b00020;
+  font-size: 11px;
+  pointer-events: none;
 }
 
 .no-icon {
@@ -521,9 +670,17 @@ h1 {
 }
 
 .icon-tab {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+  user-select: none;
 }
 
 .selection-box {
@@ -541,6 +698,15 @@ h1 {
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
   pointer-events: none;
+}
+
+.resize-handle {
+  fill: #fff;
+  stroke: #3139fb;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  pointer-events: all;
+  cursor: nwse-resize;
 }
 
 .empty-detail {

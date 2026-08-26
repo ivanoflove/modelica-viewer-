@@ -58,8 +58,13 @@ export type GetEditableIconResult =
 export interface SourceEdit {
   start: number;
   end: number;
+  expectedText?: string;
   replacement: string;
+  sourceVersion?: number;
+  targetQualifiedName?: string;
 }
+
+export type SourceEditReason = "drag" | "resize" | "property" | "undo" | "redo";
 
 export type ApplySourceEditResult = { ok: true } | { error: string };
 

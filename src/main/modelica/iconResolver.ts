@@ -19,6 +19,8 @@ import type {
   TextDto,
   EditableGraphic,
   EditableIconDto,
+  GraphicProvenance,
+  SourceRangeRef,
 } from "../../shared/modelicaGraphics.js";
 import { identityTransform } from "../../shared/modelicaGraphics.js";
 import type { ClassNode } from "./types.js";
@@ -34,10 +36,7 @@ function asString(v: AnnotationValue | undefined): string | undefined {
 }
 
 function asName(v: AnnotationValue | undefined): string | undefined {
-  if (
-    v &&
-    (v.type === "identifier" || v.type === "qualifiedName")
-  )
+  if (v && (v.type === "identifier" || v.type === "qualifiedName"))
     return v.name;
   return undefined;
 }
@@ -320,9 +319,19 @@ export interface IconResolution {
   warnings: string[];
 }
 
+export interface IconClassLocation {
+  target: ClassNode;
+  allClasses: ClassNode[];
+  source: string;
+}
+
+export type ExternalClassResolver = (
+  target: ClassNode,
+  baseName: string,
+) => IconClassLocation | null;
+
 function fallbackBaseIcon(baseName: string): IconDto | null {
-  if (!baseName.startsWith("Modelica.Icons."))
-    return null;
+  if (!baseName.startsWith("Modelica.Icons.")) return null;
   return {
     coordinateSystem: {
       extent: { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } },
@@ -334,8 +343,49 @@ function fallbackBaseIcon(baseName: string): IconDto | null {
         lineColor: [0, 0, 127],
         fillColor: [255, 255, 255],
         fillPattern: "FillPattern.Solid",
+        graphicId: `${baseName}:Icon.graphics:0`,
+        ownerQualifiedName: baseName,
+        inherited: true,
+        inheritancePath: [baseName],
       },
     ],
+  };
+}
+
+function annotateGraphics(
+  icon: IconDto,
+  owner: ClassNode,
+  inherited: boolean,
+  inheritancePath: string[],
+): IconDto {
+  return {
+    coordinateSystem: icon.coordinateSystem,
+    graphics: icon.graphics.map((graphic, index) => {
+      const provenance: GraphicProvenance = {
+        graphicId: `${owner.qualifiedName}:Icon.graphics:${index}`,
+        ownerQualifiedName: owner.qualifiedName,
+        ownerSourceFile: owner.sourceFile,
+        inherited,
+        inheritancePath,
+      };
+      return { ...graphic, ...provenance } as typeof graphic;
+    }),
+  };
+}
+
+function markInherited(icon: IconDto, through: string): IconDto {
+  return {
+    coordinateSystem: icon.coordinateSystem,
+    graphics: icon.graphics.map((graphic) => ({
+      ...graphic,
+      inherited: true,
+      inheritancePath: [
+        through,
+        ...(graphic.inheritancePath ?? [
+          graphic.ownerQualifiedName ?? "<base>",
+        ]),
+      ],
+    })),
   };
 }
 
@@ -382,34 +432,65 @@ export function resolveIconForClass(
   source: string,
   modelName: string,
   resolving = new Set<string>(),
+  externalResolver?: ExternalClassResolver,
 ): IconResolution {
   if (resolving.has(target.qualifiedName)) {
-    return { icon: null, warnings: [`Icon inheritance cycle at ${target.qualifiedName}`] };
+    return {
+      icon: null,
+      warnings: [`Icon inheritance cycle at ${target.qualifiedName}`],
+    };
   }
   const nextResolving = new Set(resolving).add(target.qualifiedName);
-  const ownSlice = source.slice(target.sourceRange.start, target.sourceRange.end);
-  const ownIcon = extractIconFromSlice(ownSlice, modelName);
+  const ownSlice = source.slice(
+    target.sourceRange.start,
+    target.sourceRange.end,
+  );
+  const ownRawIcon = extractIconFromSlice(ownSlice, modelName);
+  const ownIcon = ownRawIcon
+    ? annotateGraphics(ownRawIcon, target, false, [target.qualifiedName])
+    : null;
   let inherited: IconDto | null = null;
   const warnings: string[] = [];
 
   for (const baseName of target.extendsClauses) {
     const baseClass = findInheritedClass(target, baseName, allClasses);
-    const baseResult = baseClass
-      ? resolveIconForClass(baseClass, allClasses, source, baseClass.name, nextResolving)
-      : {
-          icon: fallbackBaseIcon(baseName),
-          warnings: [`Base icon not resolved: ${baseName}`],
-        };
+    const externalLocation = externalResolver?.(target, baseName) ?? null;
+    const baseResult = externalLocation
+      ? resolveIconForClass(
+          externalLocation.target,
+          externalLocation.allClasses,
+          externalLocation.source,
+          externalLocation.target.name,
+          nextResolving,
+          externalResolver,
+        )
+      : baseClass
+        ? resolveIconForClass(
+            baseClass,
+            allClasses,
+            source,
+            baseClass.name,
+            nextResolving,
+            externalResolver,
+          )
+        : {
+            icon: fallbackBaseIcon(baseName),
+            warnings: [`Base icon not resolved: ${baseName}`],
+          };
     warnings.push(...baseResult.warnings);
     if (baseResult.icon) {
+      const inheritedBase = markInherited(
+        baseResult.icon,
+        target.qualifiedName,
+      );
       const currentInherited = inherited as IconDto | null;
-      if (currentInherited !== null) {
+      if (currentInherited === null) {
+        inherited = inheritedBase;
+      } else {
         inherited = {
-          graphics: [...currentInherited.graphics, ...baseResult.icon.graphics],
+          graphics: [...currentInherited.graphics, ...inheritedBase.graphics],
           coordinateSystem: currentInherited.coordinateSystem,
         };
-      } else {
-        inherited = baseResult.icon;
       }
     }
   }
@@ -470,7 +551,25 @@ export function findIconAnnotationOffset(slice: string): number {
   return findIconAnnotation(slice)?.offset ?? -1;
 }
 
+/** Return the Icon(...) range relative to the supplied source slice. */
+export function findIconSourceRange(
+  slice: string,
+): { start: number; end: number } | null {
+  const match = findIconAnnotation(slice);
+  if (!match) return null;
+  return {
+    start: match.offset + match.icon.sourceRange.start,
+    end: match.offset + match.icon.sourceRange.end,
+  };
+}
+
 // Editable helpers
+export interface EditableOwnerMetadata {
+  qualifiedName: string;
+  sourceFile?: string;
+  inheritancePath?: string[];
+}
+
 function formatNumber(n: number): string {
   // avoid 19.9999999, normalize to 6 decimals and trim
   if (Number.isInteger(n)) return String(n);
@@ -493,6 +592,7 @@ export function serializeOrigin(origin: Point): string {
 export function resolveEditableIcon(
   iconCall: AnnotationCall,
   modelName: string,
+  owner?: EditableOwnerMetadata,
 ): EditableIconDto | null {
   const base = resolveIcon(iconCall, modelName);
   if (!base) return null;
@@ -525,12 +625,11 @@ export function resolveEditableIcon(
     }
   }
   if (!graphicsItems) return { icon: base, editables };
-  let callIdx = 0;
+  let graphicIndex = 0;
   for (const item of graphicsItems) {
     if (item.type !== "call") continue;
     const graphic = resolveGraphic(item.call, modelName);
     if (!graphic) {
-      callIdx++;
       continue;
     }
     const itemRange = (item as { range: { start: number; end: number } }).range;
@@ -548,10 +647,25 @@ export function resolveEditableIcon(
       getArgWithRange(item.call, name)?.value.range as
         | { start: number; end: number }
         | undefined;
-    const id = `${modelName}:${itemRange.start}`;
+    const ownerQualifiedName = owner?.qualifiedName ?? modelName;
+    const id = `${ownerQualifiedName}:Icon.graphics:${graphicIndex++}`;
+    const graphicWithProvenance = {
+      ...graphic,
+      graphicId: id,
+      ownerQualifiedName,
+      ownerSourceFile: owner?.sourceFile,
+      inherited: false,
+      inheritancePath: owner?.inheritancePath ?? [ownerQualifiedName],
+    } as GraphicItemDto;
     editables.push({
       id,
-      graphic,
+      graphic: graphicWithProvenance,
+      ownerQualifiedName,
+      ownerSourceFile: owner?.sourceFile,
+      inherited: false,
+      inheritancePath: owner?.inheritancePath ?? [
+        owner?.qualifiedName ?? modelName,
+      ],
       selected: false,
       transform: identityTransform,
       source: {
@@ -560,6 +674,8 @@ export function resolveEditableIcon(
         pointsRange,
         originRange,
         lineColorRange: rangeOf("lineColor"),
+        colorRange: rangeOf("color"),
+        textColorRange: rangeOf("textColor"),
         fillColorRange: rangeOf("fillColor"),
         lineThicknessRange: rangeOf("lineThickness"),
         thicknessRange: rangeOf("thickness"),
@@ -567,7 +683,6 @@ export function resolveEditableIcon(
         fillPatternRange: rangeOf("fillPattern"),
       },
     });
-    callIdx++;
   }
   return { icon: base, editables };
 }
@@ -575,10 +690,45 @@ export function resolveEditableIcon(
 export function extractEditableIconFromSlice(
   slice: string,
   modelName: string,
+  owner?: EditableOwnerMetadata,
 ): EditableIconDto | null {
   try {
     const match = findIconAnnotation(slice);
-    return match ? resolveEditableIcon(match.icon, modelName) : null;
+    const editable = match
+      ? resolveEditableIcon(match.icon, modelName, owner)
+      : null;
+    if (!editable || !match) return editable;
+    const withExpectedText = (range?: { start: number; end: number }) =>
+      range
+        ? {
+            ...range,
+            expectedText: slice.slice(
+              match.offset + range.start,
+              match.offset + range.end,
+            ),
+          }
+        : undefined;
+    return {
+      ...editable,
+      editables: editable.editables.map((item) => ({
+        ...item,
+        source: {
+          ...item.source,
+          itemRange: withExpectedText(item.source.itemRange)!,
+          extentRange: withExpectedText(item.source.extentRange),
+          pointsRange: withExpectedText(item.source.pointsRange),
+          originRange: withExpectedText(item.source.originRange),
+          lineColorRange: withExpectedText(item.source.lineColorRange),
+          colorRange: withExpectedText(item.source.colorRange),
+          textColorRange: withExpectedText(item.source.textColorRange),
+          fillColorRange: withExpectedText(item.source.fillColorRange),
+          lineThicknessRange: withExpectedText(item.source.lineThicknessRange),
+          thicknessRange: withExpectedText(item.source.thicknessRange),
+          patternRange: withExpectedText(item.source.patternRange),
+          fillPatternRange: withExpectedText(item.source.fillPatternRange),
+        },
+      })),
+    };
   } catch {
     return null;
   }
@@ -594,8 +744,8 @@ export function toAbsoluteEditableRanges(
 ): EditableIconDto {
   const shift = sliceBase + annotationIdx;
   const editables = editable.editables.map((e) => {
-    const shiftRange = (r?: { start: number; end: number }) =>
-      r ? { start: r.start + shift, end: r.end + shift } : undefined;
+    const shiftRange = (r?: SourceRangeRef): SourceRangeRef | undefined =>
+      r ? { ...r, start: r.start + shift, end: r.end + shift } : undefined;
     return {
       ...e,
       source: {
@@ -604,6 +754,8 @@ export function toAbsoluteEditableRanges(
         pointsRange: shiftRange(e.source.pointsRange),
         originRange: shiftRange(e.source.originRange),
         lineColorRange: shiftRange(e.source.lineColorRange),
+        colorRange: shiftRange(e.source.colorRange),
+        textColorRange: shiftRange(e.source.textColorRange),
         fillColorRange: shiftRange(e.source.fillColorRange),
         lineThicknessRange: shiftRange(e.source.lineThicknessRange),
         thicknessRange: shiftRange(e.source.thicknessRange),
@@ -626,4 +778,28 @@ export function findClassByQualifiedName(
     if (found) return found;
   }
   return null;
+}
+
+/**
+ * Resolve a class after reparsing a source file. Normally the qualified name
+ * is sufficient; the unique-leaf fallback covers legacy Modelica files that
+ * omit `within` and are qualified by the directory loader instead.
+ */
+export function findClassByQualifiedNameOrUniqueLeaf(
+  classes: ClassNode[],
+  qualifiedName: string,
+): ClassNode | null {
+  const exact = findClassByQualifiedName(classes, qualifiedName);
+  if (exact) return exact;
+  const leaf = qualifiedName.split(".").at(-1);
+  if (!leaf) return null;
+  const matches: ClassNode[] = [];
+  const visit = (nodes: ClassNode[]) => {
+    for (const node of nodes) {
+      if (node.name === leaf) matches.push(node);
+      visit(node.children);
+    }
+  };
+  visit(classes);
+  return matches.length === 1 ? matches[0]! : null;
 }

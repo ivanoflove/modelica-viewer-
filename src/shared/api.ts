@@ -14,6 +14,15 @@ export interface DirectoryDialogResult {
   path?: string;
 }
 
+export interface LibraryInfo {
+  path: string;
+  classCount: number;
+}
+
+export type LibraryMutationResult =
+  | { ok: true; library: LibraryInfo }
+  | { error: string };
+
 export interface WindowApi {
   ping: () => Promise<string>;
   openDirectory: () => Promise<DirectoryDialogResult>;
@@ -42,6 +51,10 @@ export interface WindowApi {
       qualifiedName: string,
     ) => Promise<ReloadClassRangeResult>;
     reveal: (filePath: string) => Promise<void>;
+    listLibraries: () => Promise<LibraryInfo[]>;
+    addLibrary: () => Promise<LibraryMutationResult>;
+    removeLibrary: (path: string) => Promise<{ ok: true } | { error: string }>;
+    rescanLibraries: () => Promise<LibraryInfo[]>;
   };
   onAutoOpen: (callback: (dirPath: string) => void) => void;
 }

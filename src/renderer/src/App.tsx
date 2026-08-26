@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import type { LoadPackageResult, PackageNodeDto } from "../../shared/modelica";
+import type {
+  LoadPackageResult,
+  PackageNodeDto,
+  SourceEditReason,
+} from "../../shared/modelica";
+import type { LibraryInfo } from "../../shared/api";
 import type { IconDto, EditableIconDto } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
@@ -14,6 +19,9 @@ function App(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Selection | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("source");
+  const [libraries, setLibraries] = useState<LibraryInfo[]>([]);
+  const [showLibraries, setShowLibraries] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
 
   const [source, setSource] = useState("");
   const [sourceLoading, setSourceLoading] = useState(false);
@@ -49,6 +57,41 @@ function App(): JSX.Element {
       .then((m) => setIpcStatus(m))
       .catch(() => setIpcStatus("unavailable"));
   }, []);
+
+  useEffect(() => {
+    if (!window.api) return;
+    void window.api.modelica
+      .listLibraries()
+      .then(setLibraries)
+      .catch(() => undefined);
+  }, []);
+
+  const addLibrary = async () => {
+    if (!window.api) return;
+    setLibraryError(null);
+    const result = await window.api.modelica.addLibrary();
+    if ("error" in result) {
+      if (result.error !== "canceled") setLibraryError(result.error);
+      return;
+    }
+    setLibraries((current) => [
+      ...current.filter((item) => item.path !== result.library.path),
+      result.library,
+    ]);
+  };
+
+  const removeLibrary = async (path: string) => {
+    if (!window.api) return;
+    const result = await window.api.modelica.removeLibrary(path);
+    if ("error" in result) setLibraryError(result.error);
+    else
+      setLibraries((current) => current.filter((item) => item.path !== path));
+  };
+
+  const rescanLibraries = async () => {
+    if (!window.api) return;
+    setLibraries(await window.api.modelica.rescanLibraries());
+  };
 
   useEffect(() => {
     if (!selected || !window.api) {
@@ -95,13 +138,14 @@ function App(): JSX.Element {
           range,
           selected.node.name,
         );
-        const editableRes = selected.kind === "package"
-          ? { editable: null }
-          : await window.api.modelica.getEditableIcon(
-              selected.node.sourceFile,
-              range,
-              selected.node.name,
-            );
+        const editableRes =
+          selected.kind === "package"
+            ? { editable: null }
+            : await window.api.modelica.getEditableIcon(
+                selected.node.sourceFile,
+                range,
+                selected.node.name,
+              );
         if ("error" in iconRes) {
           setIconError(iconRes.error);
           setIcon(null);
@@ -191,30 +235,49 @@ function App(): JSX.Element {
     await window.api.modelica.reveal(path);
   };
 
-  const handleIconEdit = async (edit: {
-    start: number;
-    end: number;
-    replacement: string;
-  }) => {
-    if (!selected || !window.api) return;
+  const handleIconEdit = async (
+    edit: {
+      start: number;
+      end: number;
+      expectedText?: string;
+      replacement: string;
+    },
+    reason: SourceEditReason,
+  ): Promise<boolean> => {
+    if (!selected || !window.api) return false;
+    console.debug("[SOURCE_COMMIT]", {
+      reason,
+      targetQualifiedName: selected.node.qualifiedName,
+      start: edit.start,
+      end: edit.end,
+    });
     try {
+      const transactionEdit = {
+        ...edit,
+        sourceVersion: editableIcon?.sourceVersion,
+        targetQualifiedName: selected.node.qualifiedName,
+      };
       const res = await window.api.modelica.applySourceEdit(
         selected.node.sourceFile,
-        edit,
+        transactionEdit,
       );
       if ("error" in res) {
         setIconError(res.error);
-        return;
+        return false;
       }
       // refresh source and icon after write: re-parse current class for fresh range
       const freshRangeRes = await window.api.modelica.reloadClassRange(
         selected.node.sourceFile,
         selected.node.qualifiedName,
       );
-        const freshRange =
+      const freshRange =
         !("error" in freshRangeRes) && freshRangeRes.sourceRange
           ? freshRangeRes.sourceRange
           : null;
+      if (!freshRange) {
+        setIconError("保存后无法重新定位当前 Modelica 类，已保留原 Icon");
+        return false;
+      }
       const [srcRes, iconRes, editableRes] = await Promise.all([
         window.api.modelica.readSource(selected.node.sourceFile),
         window.api.modelica.getIcon(
@@ -235,12 +298,22 @@ function App(): JSX.Element {
       } else {
         setSource(srcRes.content);
       }
-      if ("error" in iconRes) setIconError(iconRes.error);
-      else setIcon(iconRes.icon);
+      if ("error" in iconRes || !iconRes.icon) {
+        setIconError(
+          "error" in iconRes
+            ? iconRes.error
+            : "保存后重新解析未找到 Icon，已保留原 Icon",
+        );
+        return false;
+      }
+      setIconError(null);
+      setIcon(iconRes.icon);
       if ("error" in editableRes) setEditableIcon(null);
       else setEditableIcon(editableRes.editable);
+      return true;
     } catch (e) {
       setIconError((e as Error).message);
+      return false;
     }
   };
 
@@ -253,14 +326,7 @@ function App(): JSX.Element {
 
   return (
     <div className="app-layout">
-      <header className="app-header">
-        <div className="header-left">
-          <span className="eyebrow">
-            MODELICA LIBRARY VIEWER — M1 · M2 Source Viewer · M3 Icon
-          </span>
-          <h1>Package Browser</h1>
-          <p className="ipc-status">IPC: {ipcStatus}</p>
-        </div>
+      <header className="app-header compact-app-bar">
         <div className="header-right">
           <button
             className="primary-btn"
@@ -276,6 +342,12 @@ function App(): JSX.Element {
           >
             打开库目录
           </button>
+          <button
+            className="secondary-btn"
+            onClick={() => setShowLibraries((value) => !value)}
+          >
+            Modelica 库路径
+          </button>
           {currentPath && (
             <span className="current-path" title={currentPath}>
               {currentPath}
@@ -283,6 +355,50 @@ function App(): JSX.Element {
           )}
         </div>
       </header>
+
+      {showLibraries && (
+        <div className="library-popover">
+          <div className="library-popover-header">
+            <strong>Modelica Library Paths</strong>
+            <div>
+              <button
+                className="secondary-btn"
+                onClick={() => void addLibrary()}
+              >
+                添加库
+              </button>
+              <button
+                className="secondary-btn"
+                onClick={() => void rescanLibraries()}
+              >
+                重新扫描
+              </button>
+            </div>
+          </div>
+          {libraryError && <div className="library-error">{libraryError}</div>}
+          {libraries.length === 0 ? (
+            <div className="library-empty">
+              尚未添加标准库。请选择包含 package.mo 的库根目录。
+            </div>
+          ) : (
+            <ul className="library-list">
+              {libraries.map((library) => (
+                <li key={library.path}>
+                  <span title={library.path}>
+                    {library.path} <small>({library.classCount} classes)</small>
+                  </span>
+                  <button
+                    className="library-remove"
+                    onClick={() => void removeLibrary(library.path)}
+                  >
+                    移除
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {error && <div className="error-banner">{error}</div>}
 
@@ -369,12 +485,15 @@ function App(): JSX.Element {
                     ) : (
                       <>
                         {iconWarning && (
-                          <div className="source-status">{iconWarning}</div>
+                          <div className="source-status icon-warning">
+                            {iconWarning}
+                          </div>
                         )}
                         <IconViewer
                           icon={icon}
                           editable={editableIcon}
                           modelName={selected.node.name}
+                          resetKey={selected.node.qualifiedName}
                           onEdit={handleIconEdit}
                         />
                       </>
@@ -397,8 +516,9 @@ function App(): JSX.Element {
           <section className="welcome-card">
             <h2>打开 Modelica 文件或库目录</h2>
             <p className="description">
-              单个顶层 package 文件（例如 <code>IEH_CPP.mo</code>）可以直接打开；
-              标准目录式库请选择包含 <code>package.mo</code> 的库根目录。
+              单个顶层 package 文件（例如 <code>IEH_CPP.mo</code>
+              ）可以直接打开； 标准目录式库请选择包含 <code>package.mo</code>{" "}
+              的库根目录。
               <br />
               支持单文件内嵌{" "}
               <code>

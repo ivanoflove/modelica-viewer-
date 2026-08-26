@@ -10,7 +10,10 @@ import {
   serializePoints,
   serializeOrigin,
   extractEditableIconFromSlice,
+  findClassByQualifiedNameOrUniqueLeaf,
+  findIconSourceRange,
 } from "../iconResolver.js";
+import { parseModelicaFile } from "../parser.js";
 
 function editableFrom(src: string, modelName = "MyModel") {
   const anno = parseAnnotationSlice(src)!;
@@ -19,6 +22,28 @@ function editableFrom(src: string, modelName = "MyModel") {
 }
 
 describe("iconEditor: editable ranges", () => {
+  it("keeps Icon range separate from the enclosing class range", () => {
+    const source = `model HeatXNTU "description"
+  annotation(Icon(graphics={Rectangle(extent={{-1,-1},{1,1}})}));
+end HeatXNTU;`;
+    const iconRange = findIconSourceRange(source);
+    expect(iconRange).not.toBeNull();
+    expect(source.slice(iconRange!.start, iconRange!.end)).toMatch(/^Icon\(/);
+    expect(iconRange!.start).toBeGreaterThan(source.indexOf("model HeatXNTU"));
+  });
+
+  it("can relocate a class by stable qualified name after a loader requalification", () => {
+    const parsed = parseModelicaFile(
+      "model WaterPump annotation(Icon(graphics={Rectangle(extent={{-1,-1},{1,1}})})); end WaterPump;",
+      "WaterPump.mo",
+    );
+    const target = findClassByQualifiedNameOrUniqueLeaf(
+      parsed.classes,
+      "IEH_CPP.FluidUnits.WaterPump",
+    );
+    expect(target?.name).toBe("WaterPump");
+  });
+
   it("should capture item/extent ranges for Rectangle", () => {
     const src = `annotation(Icon(graphics={Rectangle(extent={{-80,-50},{80,50}}, lineColor={0,0,255})}))`;
     const ed = editableFrom(src);
@@ -102,6 +127,7 @@ describe("iconEditor: source patch semantics", () => {
     )!;
     const e = ed.editables[0]!;
     const range = e.source.extentRange!;
+    expect(range.expectedText).toBe("{{-80,-50},{80,50}}");
     const baseOffset = full.indexOf("annotation");
     const start = baseOffset + range.start;
     const end = baseOffset + range.end;
@@ -139,6 +165,25 @@ describe("iconEditor: source patch semantics", () => {
     );
     expect(text).toBe("{{0,0},{10,10}}");
     expect(second.icon.graphics[0]!.type).toBe("Rectangle");
+  });
+
+  it("keeps stable graphic identity while source offsets change", () => {
+    const first = extractEditableIconFromSlice(
+      "annotation(Icon(graphics={Rectangle(extent={{0,0},{10,10}}), Ellipse(extent={{20,20},{30,30}})}))",
+      "M",
+      { qualifiedName: "M", sourceFile: "M.mo" },
+    )!;
+    const second = extractEditableIconFromSlice(
+      "annotation(Icon(graphics={Rectangle(extent={{-123.456,78.9},{1000.25,-40.125}}), Ellipse(extent={{20,20},{30,30}})}))",
+      "M",
+      { qualifiedName: "M", sourceFile: "M.mo" },
+    )!;
+
+    expect(first.editables[0]!.id).toBe("M:Icon.graphics:0");
+    expect(second.editables[0]!.id).toBe("M:Icon.graphics:0");
+    expect(second.editables[1]!.source.extentRange!.expectedText).toBe(
+      "{{20,20},{30,30}}",
+    );
   });
 
   it("should prefer origin when both origin and extent exist", () => {

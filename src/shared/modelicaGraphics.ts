@@ -26,6 +26,21 @@ export interface GraphicTransform {
   rotate: number;
 }
 
+export interface GraphicProvenance {
+  graphicId?: string;
+  ownerQualifiedName?: string;
+  ownerSourceFile?: string;
+  inherited?: boolean;
+  inheritancePath?: string[];
+  sourceRange?: { start: number; end: number };
+}
+
+export interface SourceRangeRef {
+  start: number;
+  end: number;
+  expectedText?: string;
+}
+
 export const identityTransform: GraphicTransform = {
   translate: { x: 0, y: 0 },
   scale: { x: 1, y: 1 },
@@ -35,25 +50,33 @@ export const identityTransform: GraphicTransform = {
 export interface EditableGraphic {
   id: string;
   graphic: GraphicItemDto;
+  /** Provenance of the source class that owns this graphic. */
+  ownerQualifiedName?: string;
+  ownerSourceFile?: string;
+  inherited?: boolean;
+  inheritancePath?: string[];
   selected: boolean;
   transform: GraphicTransform;
   source: {
-    itemRange: { start: number; end: number };
-    extentRange?: { start: number; end: number };
-    pointsRange?: { start: number; end: number };
-    originRange?: { start: number; end: number };
-    lineColorRange?: { start: number; end: number };
-    fillColorRange?: { start: number; end: number };
-    lineThicknessRange?: { start: number; end: number };
-    thicknessRange?: { start: number; end: number };
-    patternRange?: { start: number; end: number };
-    fillPatternRange?: { start: number; end: number };
+    itemRange: SourceRangeRef;
+    extentRange?: SourceRangeRef;
+    pointsRange?: SourceRangeRef;
+    originRange?: SourceRangeRef;
+    lineColorRange?: SourceRangeRef;
+    colorRange?: SourceRangeRef;
+    textColorRange?: SourceRangeRef;
+    fillColorRange?: SourceRangeRef;
+    lineThicknessRange?: SourceRangeRef;
+    thicknessRange?: SourceRangeRef;
+    patternRange?: SourceRangeRef;
+    fillPatternRange?: SourceRangeRef;
   };
 }
 
 export interface EditableIconDto {
   icon: IconDto;
   editables: EditableGraphic[];
+  sourceVersion?: number;
 }
 
 export type GraphicItemDto =
@@ -63,7 +86,7 @@ export type GraphicItemDto =
   | PolygonDto
   | TextDto;
 
-export interface RectangleDto {
+export interface RectangleDto extends GraphicProvenance {
   type: "Rectangle";
   extent: Extent;
   lineColor?: [number, number, number];
@@ -75,7 +98,7 @@ export interface RectangleDto {
   pattern?: string;
 }
 
-export interface EllipseDto {
+export interface EllipseDto extends GraphicProvenance {
   type: "Ellipse";
   extent: Extent;
   lineColor?: [number, number, number];
@@ -88,7 +111,7 @@ export interface EllipseDto {
   pattern?: string;
 }
 
-export interface LineDto {
+export interface LineDto extends GraphicProvenance {
   type: "Line";
   points: Point[];
   color?: [number, number, number];
@@ -98,7 +121,7 @@ export interface LineDto {
   pattern?: string;
 }
 
-export interface PolygonDto {
+export interface PolygonDto extends GraphicProvenance {
   type: "Polygon";
   points: Point[];
   lineColor?: [number, number, number];
@@ -109,7 +132,7 @@ export interface PolygonDto {
   pattern?: string;
 }
 
-export interface TextDto {
+export interface TextDto extends GraphicProvenance {
   type: "Text";
   extent: Extent;
   textString: string;

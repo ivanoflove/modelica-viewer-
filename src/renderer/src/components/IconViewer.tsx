@@ -1,30 +1,56 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   IconDto,
   EditableIconDto,
   EditableGraphic,
-  GraphicItemDto,
   GraphicTransform,
+  Extent,
 } from "../../../shared/modelicaGraphics";
 import { GraphicItem } from "./GraphicItem";
-import { toSvgTransform, boundsOf, applyTransform, type Bounds } from "../../editor/Transform";
-import { clientToModelica } from "../../editor/DragController";
+import {
+  toSvgTransform,
+  boundsOf,
+  applyTransform,
+} from "../../editor/Transform";
+import {
+  clientToModelicaWithInverse,
+  dragDeltaFromStart,
+  transformWithDragPreview,
+  type DragPreview,
+} from "../../editor/DragController";
+import {
+  resizeExtent,
+  resizeHandles,
+  type ResizeHandle,
+  type ResizeSession,
+} from "../../editor/controllers/ResizeController";
+import { HistoryManager } from "../../editor/history/HistoryManager";
 import { useSelection } from "../../editor/Selection";
 import type { SelectionState } from "../../editor/Selection";
+import { GraphicViewport } from "./GraphicViewport";
+import type { SourceEditReason } from "../../../shared/modelica";
 
-type FitMode = "content" | "coordinateSystem";
-type Edit = { start: number; end: number; replacement: string };
+type Edit = {
+  start: number;
+  end: number;
+  expectedText?: string;
+  replacement: string;
+};
 
 interface Props {
   icon: IconDto | null;
   editable?: EditableIconDto | null;
   modelName: string;
-  onEdit?: (edit: Edit) => void;
+  resetKey?: string;
+  onEdit?: (edit: Edit, reason: SourceEditReason) => Promise<boolean>;
 }
 
 interface DragSession {
   id: string;
+  pointerId: number;
   pointerStart: { x: number; y: number };
+  originalGraphic: EditableGraphic["graphic"];
+  inverseScreenToModel: DOMMatrix;
   transformStart: GraphicTransform;
 }
 
@@ -34,66 +60,90 @@ const identity: GraphicTransform = {
   rotate: 0,
 };
 
-function unionBounds(items: GraphicItemDto[]): Bounds | null {
-  const bounds = items.map(boundsOf).filter((b): b is Bounds => b !== null);
-  if (bounds.length === 0) return null;
-  const minX = Math.min(...bounds.map((b) => b.x));
-  const minY = Math.min(...bounds.map((b) => b.y));
-  const maxX = Math.max(...bounds.map((b) => b.x + b.width));
-  const maxY = Math.max(...bounds.map((b) => b.y + b.height));
-  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
-}
-
-function viewBoxFor(icon: IconDto, mode: FitMode): string {
-  const coordinate = icon.coordinateSystem.extent;
-  const coordinateBounds: Bounds = {
-    x: Math.min(coordinate.p1.x, coordinate.p2.x),
-    y: Math.min(coordinate.p1.y, coordinate.p2.y),
-    width: Math.max(Math.abs(coordinate.p2.x - coordinate.p1.x), 1),
-    height: Math.max(Math.abs(coordinate.p2.y - coordinate.p1.y), 1),
-  };
-  if (mode === "coordinateSystem") {
-    return `${coordinateBounds.x} ${coordinateBounds.y} ${coordinateBounds.width} ${coordinateBounds.height}`;
-  }
-  const content = unionBounds(icon.graphics);
-  if (!content) {
-    return `${coordinateBounds.x} ${coordinateBounds.y} ${coordinateBounds.width} ${coordinateBounds.height}`;
-  }
-  const padding = Math.max(8, Math.min(content.width, content.height) * 0.08);
-  return `${content.x - padding} ${content.y - padding} ${Math.max(content.width + padding * 2, 1)} ${Math.max(content.height + padding * 2, 1)}`;
-}
-
-export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
+export function IconViewer({
+  icon,
+  editable,
+  modelName,
+  resetKey = modelName,
+  onEdit,
+}: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<DragSession | null>(null);
+  const resizeRef = useRef<ResizeSession | null>(null);
   const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
   const rafRef = useRef<number | null>(null);
-  const [drag, setDrag] = useState<DragSession | null>(null);
-  const [previewTransforms, setPreviewTransforms] = useState<Map<string, GraphicTransform>>(new Map());
-  const [fitMode, setFitMode] = useState<FitMode>("content");
+  const pendingResizeRef = useRef<{
+    point: { x: number; y: number };
+    shift: boolean;
+    alt: boolean;
+  } | null>(null);
+  const resizeRafRef = useRef<number | null>(null);
+  const historyRef = useRef(new HistoryManager(100));
+  const historyBusyRef = useRef(false);
+  const [dragPreview, setDragPreview] = useState<DragPreview | null>(null);
+  const [resizePreview, setResizePreview] = useState<{
+    graphicId: string;
+    extent: Extent;
+  } | null>(null);
+  const [optimisticGraphics, setOptimisticGraphics] = useState<
+    Map<string, EditableGraphic["graphic"]>
+  >(new Map());
+  const [interactionNotice, setInteractionNotice] = useState<string | null>(
+    null,
+  );
+  const [historyVersion, setHistoryVersion] = useState(0);
   const sel: SelectionState = useSelection();
+
+  // A successful source reload supplies the canonical graphic. Until then,
+  // retain the optimistic graphic so pointerup cannot visibly snap backward.
+  useEffect(() => {
+    setOptimisticGraphics(new Map());
+  }, [editable]);
+
+  useEffect(() => {
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    if (resizeRafRef.current !== null)
+      cancelAnimationFrame(resizeRafRef.current);
+    dragRef.current = null;
+    resizeRef.current = null;
+    pendingPointRef.current = null;
+    pendingResizeRef.current = null;
+    rafRef.current = null;
+    resizeRafRef.current = null;
+    historyRef.current = new HistoryManager(100);
+    setDragPreview(null);
+    setResizePreview(null);
+    setInteractionNotice(null);
+    setHistoryVersion((version) => version + 1);
+  }, [resetKey]);
 
   if (!icon) return <div className="no-icon">No Icon annotation</div>;
 
   const editables = editable?.editables ?? [];
-  const entries = editables.length > 0
-    ? editables.map((ed) => ({ id: ed.id, graphic: ed.graphic, editable: ed }))
-    : icon.graphics.map((graphic, index) => ({ id: `view:${index}`, graphic, editable: undefined }));
-  const viewBox = viewBoxFor(icon, fitMode);
-
-  const transformFor = (id: string): GraphicTransform =>
-    previewTransforms.get(id) ?? editables.find((ed) => ed.id === id)?.transform ?? identity;
-
-  const updatePreview = (session: DragSession, point: { x: number; y: number }) => {
-    const translate = {
-      x: session.transformStart.translate.x + point.x - session.pointerStart.x,
-      y: session.transformStart.translate.y + point.y - session.pointerStart.y,
+  const entries = icon.graphics.map((graphic, index) => {
+    const ed =
+      editables.find(
+        (item) =>
+          item.id === graphic.graphicId ||
+          item.graphic.graphicId === graphic.graphicId,
+      ) ?? (graphic.graphicId ? undefined : editables[index]);
+    return {
+      id: graphic.graphicId ?? ed?.id ?? `view:${index}`,
+      graphic,
+      editable: ed,
     };
-    setPreviewTransforms((previous) => {
-      const next = new Map(previous);
-      next.set(session.id, { ...session.transformStart, translate });
-      return next;
-    });
+  });
+  const transformFor = (id: string): GraphicTransform => {
+    const base = editables.find((ed) => ed.id === id)?.transform ?? identity;
+    return transformWithDragPreview(id, base, dragPreview);
+  };
+
+  const updatePreview = (
+    session: DragSession,
+    point: { x: number; y: number },
+  ) => {
+    const delta = dragDeltaFromStart(session.pointerStart, point);
+    setDragPreview({ graphicId: session.id, dx: delta.x, dy: delta.y });
   };
 
   const schedulePreview = (point: { x: number; y: number }) => {
@@ -112,138 +162,753 @@ export function IconViewer({ icon, editable, modelName, onEdit }: Props) {
     rafRef.current = null;
     pendingPointRef.current = null;
     dragRef.current = null;
-    setDrag(null);
-    setPreviewTransforms(new Map());
+    setDragPreview(null);
+  };
+
+  const clearResize = () => {
+    if (resizeRafRef.current !== null)
+      cancelAnimationFrame(resizeRafRef.current);
+    resizeRafRef.current = null;
+    pendingResizeRef.current = null;
+    resizeRef.current = null;
+    setResizePreview(null);
+  };
+
+  const commitGraphicChange = (
+    ed: EditableGraphic,
+    before: EditableGraphic["graphic"],
+    after: EditableGraphic["graphic"],
+    edit: Edit,
+    reason: SourceEditReason,
+  ) => {
+    setOptimisticGraphics((previous) => {
+      const next = new Map(previous);
+      next.set(ed.id, after);
+      return next;
+    });
+    if (!onEdit) return;
+    void onEdit(edit, reason)
+      .then((success) => {
+        if (success) {
+          historyRef.current.push({ graphicId: ed.id, before, after });
+          setHistoryVersion((version) => version + 1);
+        } else {
+          setOptimisticGraphics((previous) => {
+            const next = new Map(previous);
+            next.delete(ed.id);
+            return next;
+          });
+        }
+      })
+      .catch(() => {
+        setOptimisticGraphics((previous) => {
+          const next = new Map(previous);
+          next.delete(ed.id);
+          return next;
+        });
+      });
+  };
+
+  const handlePropertyEdit = (
+    edit: Edit,
+    after: EditableGraphic["graphic"],
+  ) => {
+    const ed = editables.find((item) => item.id === sel.selectedId);
+    if (!ed) return;
+    const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
+    commitGraphicChange(ed, before, after, edit, "property");
   };
 
   const handlePointerDown = (e: React.PointerEvent, ed: EditableGraphic) => {
+    if (e.button !== 0) return;
+    sel.setSelected(ed.id);
+    if (ed.inherited) {
+      e.preventDefault();
+      e.stopPropagation();
+      setInteractionNotice(
+        `继承图形不可在当前类直接编辑：${ed.ownerQualifiedName ?? "基类"}`,
+      );
+      return;
+    }
+    setInteractionNotice(null);
     const svg = svgRef.current;
     if (!svg) return;
-    const point = clientToModelica(svg, e.clientX, e.clientY);
-    if (!point) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const inverse = svg.getScreenCTM()?.inverse();
+    if (!inverse) return;
+    const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
     e.currentTarget.setPointerCapture(e.pointerId);
-    sel.setSelected(ed.id);
     const session: DragSession = {
       id: ed.id,
+      pointerId: e.pointerId,
       pointerStart: point,
+      originalGraphic: optimisticGraphics.get(ed.id) ?? ed.graphic,
+      inverseScreenToModel: inverse,
       transformStart: ed.transform,
     };
     dragRef.current = session;
-    setDrag(session);
+  };
+
+  const handleReadonlyPointerDown = (
+    e: React.PointerEvent,
+    id: string,
+    owner?: string,
+  ) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    sel.setSelected(id);
+    setInteractionNotice(`继承图形不可在当前类直接编辑：${owner ?? "基类"}`);
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
     const session = dragRef.current;
-    const svg = svgRef.current;
-    if (!session || !svg) return;
-    const point = clientToModelica(svg, e.clientX, e.clientY);
+    if (!session || session.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = clientToModelicaWithInverse(
+      e.clientX,
+      e.clientY,
+      session.inverseScreenToModel,
+    );
     if (point) schedulePreview(point);
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
     const session = dragRef.current;
-    const svg = svgRef.current;
-    if (!session || !svg) {
+    if (!session || session.pointerId !== e.pointerId) {
       clearDrag();
       return;
     }
-    const point = clientToModelica(svg, e.clientX, e.clientY);
+    e.preventDefault();
+    e.stopPropagation();
+    const point = clientToModelicaWithInverse(
+      e.clientX,
+      e.clientY,
+      session.inverseScreenToModel,
+    );
     const ed = editables.find((item) => item.id === session.id);
     if (point && ed && onEdit) {
-      const dx = Math.round((point.x - session.pointerStart.x) / 10) * 10;
-      const dy = Math.round((point.y - session.pointerStart.y) / 10) * 10;
-      if (dx !== 0 || dy !== 0) commitTranslate(ed, dx, dy, onEdit);
+      const raw = dragDeltaFromStart(session.pointerStart, point);
+      const rawDx = raw.x;
+      const rawDy = raw.y;
+      const dx = e.shiftKey ? Math.round(rawDx / 10) * 10 : rawDx;
+      const dy = e.shiftKey ? Math.round(rawDy / 10) * 10 : rawDy;
+      if (dx !== 0 || dy !== 0) {
+        const committed = applyTransform(session.originalGraphic, {
+          translate: { x: dx, y: dy },
+          scale: { x: 1, y: 1 },
+          rotate: 0,
+        });
+        const edit = buildTranslateEdit(ed, session.originalGraphic, dx, dy);
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+        clearDrag();
+        if (edit)
+          commitGraphicChange(
+            ed,
+            session.originalGraphic,
+            committed,
+            edit,
+            "drag",
+          );
+        return;
+      }
     }
     clearDrag();
   };
 
-  return <div className="icon-editor-shell">
-    <div className="icon-viewer-toolbar">
-      <span>Icon 画布</span>
-      <div className="fit-toggle">
-        <button className={fitMode === "content" ? "active" : ""} onClick={() => setFitMode("content")}>Fit Content</button>
-        <button className={fitMode === "coordinateSystem" ? "active" : ""} onClick={() => setFitMode("coordinateSystem")}>Fit CoordinateSystem</button>
-      </div>
-    </div>
-    <div className="icon-canvas-area">
-      <svg ref={svgRef} viewBox={viewBox} className="modelica-icon" preserveAspectRatio="xMidYMid meet"
-        style={{ touchAction: "none" }} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={clearDrag}>
+  const scheduleResize = (
+    point: { x: number; y: number },
+    shift: boolean,
+    alt: boolean,
+  ) => {
+    pendingResizeRef.current = { point, shift, alt };
+    if (resizeRafRef.current !== null) return;
+    resizeRafRef.current = requestAnimationFrame(() => {
+      resizeRafRef.current = null;
+      const session = resizeRef.current;
+      const pending = pendingResizeRef.current;
+      if (!session || !pending) return;
+      const delta = dragDeltaFromStart(
+        session.startPointerModel,
+        pending.point,
+      );
+      setResizePreview({
+        graphicId: session.graphicId,
+        extent: resizeExtent(
+          session.originalExtent,
+          session.handle,
+          delta,
+          pending.shift,
+          pending.alt,
+        ),
+      });
+    });
+  };
+
+  const handleResizeDown = (
+    e: React.PointerEvent,
+    ed: EditableGraphic,
+    handle: ResizeHandle,
+  ) => {
+    if (e.button !== 0 || ed.inherited || !ed.source.extentRange) return;
+    const svg = svgRef.current;
+    const baseGraphic = optimisticGraphics.get(ed.id) ?? ed.graphic;
+    const extent = (baseGraphic as { extent?: Extent }).extent;
+    if (!svg || !extent) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const inverse = svg.getScreenCTM()?.inverse();
+    if (!inverse) return;
+    const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
+    e.currentTarget.setPointerCapture(e.pointerId);
+    sel.setSelected(ed.id);
+    setInteractionNotice(null);
+    setResizePreview(null);
+    resizeRef.current = {
+      graphicId: ed.id,
+      handle,
+      pointerId: e.pointerId,
+      startPointerModel: point,
+      originalExtent: {
+        p1: { ...extent.p1 },
+        p2: { ...extent.p2 },
+      },
+      inverseScreenToModelMatrix: inverse,
+    };
+  };
+
+  const handleResizeMove = (e: React.PointerEvent) => {
+    const session = resizeRef.current;
+    if (!session || session.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = clientToModelicaWithInverse(
+      e.clientX,
+      e.clientY,
+      session.inverseScreenToModelMatrix,
+    );
+    scheduleResize(point, e.shiftKey, e.altKey);
+  };
+
+  const handleResizeUp = (e: React.PointerEvent) => {
+    const session = resizeRef.current;
+    if (!session || session.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const ed = editables.find((item) => item.id === session.graphicId);
+    const point = clientToModelicaWithInverse(
+      e.clientX,
+      e.clientY,
+      session.inverseScreenToModelMatrix,
+    );
+    if (ed && onEdit) {
+      const delta = dragDeltaFromStart(session.startPointerModel, point);
+      const extent = resizeExtent(
+        session.originalExtent,
+        session.handle,
+        delta,
+        e.shiftKey,
+        e.altKey,
+      );
+      const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
+      const committed = { ...before, extent } as EditableGraphic["graphic"];
+      const edit = buildExtentEdit(ed, extent);
+      if (edit) {
+        if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
+        clearResize();
+        commitGraphicChange(ed, before, committed, edit, "resize");
+        return;
+      }
+    }
+    clearResize();
+  };
+
+  const handleResizeCancel = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearResize();
+  };
+
+  const applyHistory = async (direction: "undo" | "redo") => {
+    if (historyBusyRef.current || !onEdit) return;
+    const command =
+      direction === "undo"
+        ? historyRef.current.peekUndo()
+        : historyRef.current.peekRedo();
+    if (!command) return;
+    const ed = editables.find((item) => item.id === command.graphicId);
+    if (!ed) return;
+    const target = direction === "undo" ? command.before : command.after;
+    const edit = buildGraphicEdit(ed, target);
+    if (!edit) return;
+    historyBusyRef.current = true;
+    setOptimisticGraphics((previous) => {
+      const next = new Map(previous);
+      next.set(ed.id, target);
+      return next;
+    });
+    try {
+      const success = await onEdit(edit, direction);
+      if (success) {
+        if (direction === "undo") historyRef.current.acceptUndo();
+        else historyRef.current.acceptRedo();
+        setHistoryVersion((version) => version + 1);
+      } else {
+        setOptimisticGraphics((previous) => {
+          const next = new Map(previous);
+          next.delete(ed.id);
+          return next;
+        });
+      }
+    } catch {
+      setOptimisticGraphics((previous) => {
+        const next = new Map(previous);
+        next.delete(ed.id);
+        return next;
+      });
+    } finally {
+      historyBusyRef.current = false;
+    }
+  };
+
+  const handlePointerCancel = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearDrag();
+  };
+
+  const canUndo = historyVersion >= 0 && historyRef.current.canUndo;
+  const canRedo = historyVersion >= 0 && historyRef.current.canRedo;
+
+  return (
+    <div className="icon-editor-shell">
+      <GraphicViewport
+        icon={icon}
+        resetKey={resetKey}
+        svgRef={svgRef}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+        onUndo={() => void applyHistory("undo")}
+        onRedo={() => void applyHistory("redo")}
+        canUndo={canUndo}
+        canRedo={canRedo}
+      >
         <g transform="scale(1,-1)">
-          {entries.map(({ id, graphic, editable: ed }, index) => {
-            const transform = transformFor(id);
-            const displayGraphic = ed ? applyTransform(graphic, transform) : graphic;
-            const selected = ed ? sel.selectedId === id : false;
-            const hovered = ed ? sel.hoverId === id : false;
-            const bounds = boundsOf(displayGraphic);
-            return <g key={id} onPointerDown={ed ? (e) => handlePointerDown(e, ed) : undefined}
-              onPointerEnter={ed ? () => sel.setHover(id) : undefined}
-              onPointerLeave={ed ? () => sel.setHover(null) : undefined}
-              style={ed ? { cursor: "move" } : undefined}>
-              <g transform={ed ? toSvgTransform(transform) : undefined}>
-                <GraphicItem item={displayGraphic} styleId={`graphic-style-${index}`} />
-              </g>
-              {selected && bounds && <rect className="selection-box" x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} pointerEvents="none" />}
-              {!selected && hovered && bounds && <rect className="hover-outline" x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} pointerEvents="none" />}
-            </g>;
-          })}
+          <g className="modelica-layer">
+            {entries.map(({ id, graphic, editable: ed }, index) => {
+              const transform = transformFor(id);
+              const baseGraphic = ed
+                ? (optimisticGraphics.get(id) ?? graphic)
+                : graphic;
+              const renderGraphic =
+                ed && resizePreview?.graphicId === id && "extent" in baseGraphic
+                  ? { ...baseGraphic, extent: resizePreview.extent }
+                  : baseGraphic;
+              return (
+                <g
+                  key={id}
+                  onPointerDown={
+                    ed
+                      ? (e) => handlePointerDown(e, ed)
+                      : graphic.inherited
+                        ? (e) =>
+                            handleReadonlyPointerDown(
+                              e,
+                              id,
+                              graphic.ownerQualifiedName,
+                            )
+                        : undefined
+                  }
+                  onPointerEnter={() => sel.setHover(id)}
+                  onPointerLeave={() => sel.setHover(null)}
+                  onPointerMove={ed ? handlePointerMove : undefined}
+                  onPointerUp={ed ? handlePointerUp : undefined}
+                  onPointerCancel={ed ? handlePointerCancel : undefined}
+                  style={ed ? { cursor: "move" } : undefined}
+                >
+                  <g transform={ed ? toSvgTransform(transform) : undefined}>
+                    <GraphicItem
+                      item={renderGraphic}
+                      styleId={`graphic-style-${index}`}
+                    />
+                  </g>
+                </g>
+              );
+            })}
+          </g>
+          <g className="selection-layer" pointerEvents="none">
+            {entries.map(({ id, graphic, editable: ed }) => {
+              if (sel.selectedId !== id && sel.hoverId !== id) return null;
+              const baseGraphic = ed
+                ? (optimisticGraphics.get(id) ?? ed.graphic)
+                : graphic;
+              const previewGraphic =
+                resizePreview?.graphicId === id && "extent" in baseGraphic
+                  ? { ...baseGraphic, extent: resizePreview.extent }
+                  : baseGraphic;
+              const bounds = boundsOf(
+                applyTransform(previewGraphic, transformFor(id)),
+              );
+              if (!bounds) return null;
+              const resizable =
+                !!ed &&
+                sel.selectedId === id &&
+                !ed.inherited &&
+                !!ed.source.extentRange &&
+                (ed.graphic.type === "Rectangle" ||
+                  ed.graphic.type === "Ellipse" ||
+                  ed.graphic.type === "Text");
+              return (
+                <g key={`selection:${id}`}>
+                  <rect
+                    className={
+                      sel.selectedId === id ? "selection-box" : "hover-outline"
+                    }
+                    x={bounds.x}
+                    y={bounds.y}
+                    width={bounds.width}
+                    height={bounds.height}
+                  />
+                  {resizable &&
+                    ed &&
+                    resizeHandles.map((handle) => {
+                      const position = handlePosition(handle, bounds);
+                      const size = 6;
+                      return (
+                        <rect
+                          key={`${id}:handle:${handle}`}
+                          className="resize-handle"
+                          x={position.x - size / 2}
+                          y={position.y - size / 2}
+                          width={size}
+                          height={size}
+                          onPointerDown={(e) => handleResizeDown(e, ed, handle)}
+                          onPointerMove={handleResizeMove}
+                          onPointerUp={handleResizeUp}
+                          onPointerCancel={handleResizeCancel}
+                          pointerEvents="all"
+                        />
+                      );
+                    })}
+                </g>
+              );
+            })}
+          </g>
         </g>
-      </svg>
+      </GraphicViewport>
+      {editable && (
+        <GraphicProperties
+          editable={editables.find((ed) => ed.id === sel.selectedId) ?? null}
+          onPropertyEdit={handlePropertyEdit}
+        />
+      )}
+      {interactionNotice && (
+        <div className="icon-interaction-notice">{interactionNotice}</div>
+      )}
     </div>
-    {editable && <GraphicProperties editable={editables.find((ed) => ed.id === sel.selectedId) ?? null} onEdit={onEdit} />}
-    {drag && <span className="drag-status">拖动预览中，松开鼠标后写回源码</span>}
-    <span className="icon-editor-hint">拖动图元移动；松开时按 10 单位网格提交</span>
-  </div>;
+  );
 }
 
-function commitTranslate(ed: EditableGraphic, dx: number, dy: number, onEdit: (edit: Edit) => void) {
-  const source = ed.source;
-  const graphic = ed.graphic as any;
-  const format = (n: number) => Number.isInteger(n) ? String(n) : String(Number(n.toFixed(4)));
-  if (source.originRange && graphic.origin) {
-    onEdit({ start: source.originRange.start, end: source.originRange.end, replacement: `{${format(graphic.origin.x + dx)},${format(graphic.origin.y + dy)}}` });
-  } else if (source.extentRange && graphic.extent) {
-    const e = graphic.extent;
-    onEdit({ start: source.extentRange.start, end: source.extentRange.end, replacement: `{{${format(e.p1.x + dx)},${format(e.p1.y + dy)}},{${format(e.p2.x + dx)},${format(e.p2.y + dy)}}` });
-  } else if (source.pointsRange && graphic.points) {
-    onEdit({ start: source.pointsRange.start, end: source.pointsRange.end, replacement: `{${graphic.points.map((p: { x: number; y: number }) => `{${format(p.x + dx)},${format(p.y + dy)}}`).join(",")}}` });
+function handlePosition(
+  handle: ResizeHandle,
+  bounds: { x: number; y: number; width: number; height: number },
+) {
+  const cx = bounds.x + bounds.width / 2;
+  const cy = bounds.y + bounds.height / 2;
+  const x = handle.includes("w")
+    ? bounds.x
+    : handle.includes("e")
+      ? bounds.x + bounds.width
+      : cx;
+  const y = handle.includes("s")
+    ? bounds.y
+    : handle.includes("n")
+      ? bounds.y + bounds.height
+      : cy;
+  return { x, y };
+}
+
+function buildExtentEdit(ed: EditableGraphic, extent: Extent): Edit | null {
+  if (!ed.source.extentRange) return null;
+  const format = (n: number) =>
+    Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
+  return {
+    start: ed.source.extentRange.start,
+    end: ed.source.extentRange.end,
+    expectedText: ed.source.extentRange.expectedText,
+    replacement: `{{${format(extent.p1.x)},${format(extent.p1.y)}},{${format(extent.p2.x)},${format(extent.p2.y)}}`,
+  };
+}
+
+function buildGraphicEdit(
+  ed: EditableGraphic,
+  graphic: EditableGraphic["graphic"],
+): Edit | null {
+  const g = graphic as any;
+  const format = (n: number) =>
+    Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
+  if (ed.source.originRange && g.origin) {
+    return {
+      start: ed.source.originRange.start,
+      end: ed.source.originRange.end,
+      expectedText: ed.source.originRange.expectedText,
+      replacement: `{${format(g.origin.x)},${format(g.origin.y)}}`,
+    };
   }
+  if (ed.source.extentRange && g.extent) {
+    return {
+      start: ed.source.extentRange.start,
+      end: ed.source.extentRange.end,
+      expectedText: ed.source.extentRange.expectedText,
+      replacement: `{{${format(g.extent.p1.x)},${format(g.extent.p1.y)}},{${format(g.extent.p2.x)},${format(g.extent.p2.y)}}`,
+    };
+  }
+  if (ed.source.pointsRange && g.points) {
+    return {
+      start: ed.source.pointsRange.start,
+      end: ed.source.pointsRange.end,
+      expectedText: ed.source.pointsRange.expectedText,
+      replacement: `{${g.points.map((p: { x: number; y: number }) => `{${format(p.x)},${format(p.y)}}`).join(",")}}`,
+    };
+  }
+  return null;
 }
 
-const linePatterns = ["LinePattern.Solid", "LinePattern.Dash", "LinePattern.Dot", "LinePattern.DashDot", "LinePattern.DashDotDot", "LinePattern.None"];
-const fillPatterns = ["FillPattern.None", "FillPattern.Solid", "FillPattern.Horizontal", "FillPattern.Vertical", "FillPattern.Cross", "FillPattern.Forward", "FillPattern.Backward", "FillPattern.CrossDiag", "FillPattern.HorizontalCylinder", "FillPattern.VerticalCylinder", "FillPattern.Sphere"];
+function buildTranslateEdit(
+  ed: EditableGraphic,
+  graphic: EditableGraphic["graphic"],
+  dx: number,
+  dy: number,
+): Edit | null {
+  const source = ed.source;
+  const g = graphic as any;
+  const format = (n: number) =>
+    Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
+  if (source.originRange && g.origin) {
+    return {
+      start: source.originRange.start,
+      end: source.originRange.end,
+      expectedText: source.originRange.expectedText,
+      replacement: `{${format(g.origin.x + dx)},${format(g.origin.y + dy)}}`,
+    };
+  }
+  if (source.extentRange && g.extent) {
+    const e = g.extent;
+    return {
+      start: source.extentRange.start,
+      end: source.extentRange.end,
+      expectedText: source.extentRange.expectedText,
+      replacement: `{{${format(e.p1.x + dx)},${format(e.p1.y + dy)}},{${format(e.p2.x + dx)},${format(e.p2.y + dy)}}`,
+    };
+  }
+  if (source.pointsRange && g.points) {
+    return {
+      start: source.pointsRange.start,
+      end: source.pointsRange.end,
+      expectedText: source.pointsRange.expectedText,
+      replacement: `{${g.points.map((p: { x: number; y: number }) => `{${format(p.x + dx)},${format(p.y + dy)}}`).join(",")}}`,
+    };
+  }
+  return null;
+}
+
+const linePatterns = [
+  "LinePattern.Solid",
+  "LinePattern.Dash",
+  "LinePattern.Dot",
+  "LinePattern.DashDot",
+  "LinePattern.DashDotDot",
+  "LinePattern.None",
+];
+const fillPatterns = [
+  "FillPattern.None",
+  "FillPattern.Solid",
+  "FillPattern.Horizontal",
+  "FillPattern.Vertical",
+  "FillPattern.Cross",
+  "FillPattern.Forward",
+  "FillPattern.Backward",
+  "FillPattern.CrossDiag",
+  "FillPattern.HorizontalCylinder",
+  "FillPattern.VerticalCylinder",
+  "FillPattern.Sphere",
+];
 
 function colorHex(color?: [number, number, number]): string {
-  return color ? `#${color.map((part) => part.toString(16).padStart(2, "0")).join("")}` : "#000000";
+  return color
+    ? `#${color.map((part) => part.toString(16).padStart(2, "0")).join("")}`
+    : "#000000";
 }
 
 function parseHex(hex: string): [number, number, number] {
-  return [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16)) as [number, number, number];
+  return [1, 3, 5].map((offset) =>
+    parseInt(hex.slice(offset, offset + 2), 16),
+  ) as [number, number, number];
 }
 
-function GraphicProperties({ editable, onEdit }: { editable: EditableGraphic | null; onEdit?: (edit: Edit) => void }) {
-  if (!editable || !onEdit) return <aside className="graphic-properties empty-properties">选择图元查看属性</aside>;
+function GraphicProperties({
+  editable,
+  onPropertyEdit,
+}: {
+  editable: EditableGraphic | null;
+  onPropertyEdit?: (edit: Edit, after: EditableGraphic["graphic"]) => void;
+}) {
+  if (!editable || !onPropertyEdit)
+    return (
+      <aside className="graphic-properties empty-properties">
+        选择图元查看属性
+      </aside>
+    );
   const graphic = editable.graphic;
   const source = editable.source;
-  const patch = (name: string, range: { start: number; end: number } | undefined, value: string) => {
-    const edit = range
-      ? { start: range.start, end: range.end, replacement: value }
-      : { start: source.itemRange.end - 1, end: source.itemRange.end - 1, replacement: `, ${name}=${value}` };
-    onEdit(edit);
+  const patch = (
+    range: { start: number; end: number; expectedText?: string } | undefined,
+    value: string,
+    after: EditableGraphic["graphic"],
+  ) => {
+    if (!range) return;
+    onPropertyEdit(
+      {
+        start: range.start,
+        end: range.end,
+        expectedText: range.expectedText,
+        replacement: value,
+      },
+      after,
+    );
   };
-  const line = graphic.type === "Line" ? graphic.color : graphic.type === "Text" ? graphic.textColor : graphic.lineColor;
-  const fill = graphic.type === "Line" || graphic.type === "Text" ? undefined : graphic.fillColor;
-  const pattern = graphic.type === "Line" || graphic.type === "Text" ? "LinePattern.Solid" : graphic.pattern ?? "LinePattern.Solid";
-  const fillPattern = graphic.type === "Line" || graphic.type === "Text" ? "FillPattern.None" : graphic.fillPattern ?? "FillPattern.None";
-  const thickness = graphic.type === "Line" ? graphic.thickness : graphic.type === "Text" ? undefined : graphic.lineThickness;
-  return <aside className="graphic-properties">
-    <h3>Selected Graphic</h3>
-    <label>Type <strong>{graphic.type}</strong></label>
-    <label>Line Color <input type="color" value={colorHex(line)} onChange={(e) => patch("lineColor", source.lineColorRange, `{${parseHex(e.target.value).join(",")}}`)} /></label>
-    <label>Line Style <select value={pattern} onChange={(e) => patch("pattern", source.patternRange, e.target.value)}>{linePatterns.map((value) => <option key={value}>{value}</option>)}</select></label>
-    <label>Line Thickness <input type="number" min="0" step="0.5" value={thickness ?? 1} onChange={(e) => patch(graphic.type === "Line" ? "thickness" : "lineThickness", graphic.type === "Line" ? source.thicknessRange : source.lineThicknessRange, e.target.value)} /></label>
-    {graphic.type !== "Line" && graphic.type !== "Text" && <>
-      <label>Fill Color <input type="color" value={colorHex(fill)} onChange={(e) => patch("fillColor", source.fillColorRange, `{${parseHex(e.target.value).join(",")}}`)} /></label>
-      <label>Fill Style <select value={fillPattern} onChange={(e) => patch("fillPattern", source.fillPatternRange, e.target.value)}>{fillPatterns.map((value) => <option key={value}>{value}</option>)}</select></label>
-    </>}
-  </aside>;
+  const line =
+    graphic.type === "Line"
+      ? graphic.color
+      : graphic.type === "Text"
+        ? graphic.textColor
+        : graphic.lineColor;
+  const fill =
+    graphic.type === "Line" || graphic.type === "Text"
+      ? undefined
+      : graphic.fillColor;
+  const lineProperty =
+    graphic.type === "Line"
+      ? "color"
+      : graphic.type === "Text"
+        ? "textColor"
+        : "lineColor";
+  const lineRange =
+    graphic.type === "Line"
+      ? source.colorRange
+      : graphic.type === "Text"
+        ? source.textColorRange
+        : source.lineColorRange;
+  const pattern =
+    graphic.type === "Line"
+      ? (graphic.pattern ?? "LinePattern.Solid")
+      : "LinePattern.Solid";
+  const fillPattern =
+    graphic.type === "Line" || graphic.type === "Text"
+      ? "FillPattern.None"
+      : (graphic.fillPattern ?? "FillPattern.None");
+  const thickness =
+    graphic.type === "Line"
+      ? graphic.thickness
+      : graphic.type === "Text"
+        ? undefined
+        : graphic.lineThickness;
+  const thicknessName = graphic.type === "Line" ? "thickness" : "lineThickness";
+  const thicknessRange =
+    graphic.type === "Line" ? source.thicknessRange : source.lineThicknessRange;
+  return (
+    <aside className="graphic-properties">
+      <h3>Selected Graphic</h3>
+      <label>
+        Type <strong>{graphic.type}</strong>
+      </label>
+      <label>
+        Line Color{" "}
+        <input
+          type="color"
+          value={colorHex(line)}
+          onChange={(e) => {
+            const value = parseHex(e.target.value);
+            patch(lineRange, `{${value.join(",")}}`, {
+              ...graphic,
+              [lineProperty]: value,
+            } as EditableGraphic["graphic"]);
+          }}
+        />
+      </label>
+      <label>
+        Line Style{" "}
+        <select
+          value={pattern}
+          onChange={(e) =>
+            patch(source.patternRange, e.target.value, {
+              ...graphic,
+              pattern: e.target.value,
+            } as EditableGraphic["graphic"])
+          }
+        >
+          {linePatterns.map((value) => (
+            <option key={value}>{value}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Line Thickness{" "}
+        <input
+          type="number"
+          min="0"
+          step="0.5"
+          value={thickness ?? 1}
+          onChange={(e) => {
+            const value = Number(e.target.value);
+            patch(thicknessRange, e.target.value, {
+              ...graphic,
+              [thicknessName]: value,
+            } as EditableGraphic["graphic"]);
+          }}
+        />
+      </label>
+      {graphic.type !== "Line" && graphic.type !== "Text" && (
+        <>
+          <label>
+            Fill Color{" "}
+            <input
+              type="color"
+              value={colorHex(fill)}
+              onChange={(e) => {
+                const value = parseHex(e.target.value);
+                patch(source.fillColorRange, `{${value.join(",")}}`, {
+                  ...graphic,
+                  fillColor: value,
+                });
+              }}
+            />
+          </label>
+          <label>
+            Fill Style{" "}
+            <select
+              value={fillPattern}
+              onChange={(e) =>
+                patch(source.fillPatternRange, e.target.value, {
+                  ...graphic,
+                  fillPattern: e.target.value,
+                } as EditableGraphic["graphic"])
+              }
+            >
+              {fillPatterns.map((value) => (
+                <option key={value}>{value}</option>
+              ))}
+            </select>
+          </label>
+        </>
+      )}
+    </aside>
+  );
 }

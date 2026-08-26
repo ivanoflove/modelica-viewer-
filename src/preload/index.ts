@@ -1,5 +1,8 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DirectoryDialogResult, WindowApi } from "../shared/api";
+import type {
+  DirectoryDialogResult,
+  WindowApi,
+} from "../shared/api";
 import type {
   ApplySourceEditResult,
   GetEditableIconResult,
@@ -73,6 +76,14 @@ const api: WindowApi = {
       ) as Promise<ReloadClassRangeResult>,
     reveal: (filePath: string) =>
       ipcRenderer.invoke("modelica:reveal", filePath) as Promise<void>,
+    listLibraries: () =>
+      ipcRenderer.invoke("modelica:listLibraries"),
+    addLibrary: () =>
+      ipcRenderer.invoke("modelica:addLibrary"),
+    removeLibrary: (path: string) =>
+      ipcRenderer.invoke("modelica:removeLibrary", path),
+    rescanLibraries: () =>
+      ipcRenderer.invoke("modelica:rescanLibraries"),
   },
   onAutoOpen: (callback: (dirPath: string) => void) => {
     ipcRenderer.on("modelica:auto-open", (_e, dirPath: string) =>

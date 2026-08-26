@@ -2,21 +2,27 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import type { OpenDialogOptions } from "electron";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile, writeFile } from "node:fs/promises";
-import {
-  loadModelicaFile,
-  PackageLoader,
-} from "./modelica/loader.js";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFileSync, writeFileSync } from "node:fs";
+import { loadModelicaFile, PackageLoader } from "./modelica/loader.js";
 import {
   extractIconFromSlice,
   extractEditableIconFromSlice,
   toAbsoluteEditableRanges,
   findIconAnnotationOffset,
-  findClassByQualifiedName,
+  findIconSourceRange,
+  findClassByQualifiedNameOrUniqueLeaf,
   findClassBySourceRange,
   resolveIconForClass,
 } from "./modelica/iconResolver.js";
 import { parseModelicaFile } from "./modelica/parser.js";
+import { tokenize } from "./modelica/lexer.js";
+import { ModelicaLibraryRegistry } from "./modelica/registry.js";
+import {
+  applySourceTransaction,
+  SourceTransactionError,
+} from "./modelica/sourceTransaction.js";
+import type { SourceEdit } from "../shared/modelica.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -28,6 +34,16 @@ function cliOpenPath(): string | null {
 }
 
 const AUTO_OPEN_PATH = cliOpenPath();
+
+function sourceLocation(source: string, offset: number): string {
+  const safeOffset = Math.max(0, Math.min(offset, source.length));
+  const before = source.slice(0, safeOffset);
+  const line = before.split("\n").length;
+  const lastNewline = before.lastIndexOf("\n");
+  const column = safeOffset - lastNewline;
+  const lineText = source.split("\n")[line - 1]?.trim() ?? "";
+  return `line ${line}, column ${column}${lineText ? ` near ${JSON.stringify(lineText.slice(0, 160))}` : ""}`;
+}
 
 function createWindow(): void {
   const window = new BrowserWindow({
@@ -56,6 +72,41 @@ function createWindow(): void {
 
 function registerIpcHandlers(): void {
   const loader = new PackageLoader();
+  const libraryRegistry = new ModelicaLibraryRegistry();
+  const sourceVersions = new Map<string, number>();
+  const libraryConfigPath = join(
+    app.getPath("userData"),
+    "modelica-libraries.json",
+  );
+  try {
+    const configured = JSON.parse(
+      readFileSync(libraryConfigPath, "utf8"),
+    ) as unknown;
+    if (Array.isArray(configured)) {
+      for (const path of configured) {
+        if (typeof path === "string") {
+          try {
+            libraryRegistry.addRoot(path);
+          } catch {
+            /* stale library path */
+          }
+        }
+      }
+    }
+  } catch {
+    // First run or an invalid settings file: start with no extra libraries.
+  }
+  const persistLibraries = () => {
+    writeFileSync(
+      libraryConfigPath,
+      JSON.stringify(
+        libraryRegistry.listRoots().map((item) => item.path),
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  };
 
   ipcMain.handle("ping", () => "pong");
 
@@ -74,6 +125,7 @@ function registerIpcHandlers(): void {
     try {
       if (!dirPath) return { error: "No directory path provided" };
       const root = loader.load(dirPath);
+      libraryRegistry.registerCurrentPackage(root);
       return { canceled: false, root };
     } catch (e) {
       return { error: (e as Error).message };
@@ -84,6 +136,7 @@ function registerIpcHandlers(): void {
     try {
       if (!filePath) return { error: "No Modelica file path provided" };
       const root = loadModelicaFile(filePath);
+      libraryRegistry.registerCurrentPackage(root);
       return { canceled: false, root };
     } catch (e) {
       return { error: (e as Error).message };
@@ -105,6 +158,7 @@ function registerIpcHandlers(): void {
     }
     try {
       const root = loadModelicaFile(picked.filePaths[0]!);
+      libraryRegistry.registerCurrentPackage(root);
       return { canceled: false, root };
     } catch (e) {
       return { error: (e as Error).message };
@@ -121,10 +175,48 @@ function registerIpcHandlers(): void {
     }
     try {
       const root = loader.load(picked.filePaths[0]!);
+      libraryRegistry.registerCurrentPackage(root);
       return { canceled: false, root };
     } catch (e) {
       return { error: (e as Error).message };
     }
+  });
+
+  ipcMain.handle("modelica:listLibraries", () => libraryRegistry.listRoots());
+
+  ipcMain.handle("modelica:addLibrary", async () => {
+    const win = BrowserWindow.getFocusedWindow();
+    const picked = win
+      ? await dialog.showOpenDialog(win, {
+          title: "添加 Modelica 库",
+          properties: ["openDirectory"],
+        })
+      : await dialog.showOpenDialog({
+          title: "添加 Modelica 库",
+          properties: ["openDirectory"],
+        });
+    if (picked.canceled || picked.filePaths.length === 0)
+      return { error: "canceled" };
+    try {
+      const library = libraryRegistry.addRoot(picked.filePaths[0]!);
+      persistLibraries();
+      return { ok: true, library };
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+  });
+
+  ipcMain.handle("modelica:removeLibrary", (_event, path: string) => {
+    if (!path) return { error: "No library path provided" };
+    libraryRegistry.removeRoot(path);
+    persistLibraries();
+    return { ok: true };
+  });
+
+  ipcMain.handle("modelica:rescanLibraries", () => {
+    const libraries = libraryRegistry.rescan();
+    persistLibraries();
+    return libraries;
   });
 
   ipcMain.handle("modelica:reveal", async (_event, filePath: string) => {
@@ -153,6 +245,7 @@ function registerIpcHandlers(): void {
         if (!filePath) return { error: "No file path provided" };
         const content = await readFile(filePath, "utf-8");
         const parsed = parseModelicaFile(content, filePath);
+        libraryRegistry.registerSource(filePath, content, parsed);
         const target = findClassBySourceRange(parsed.classes, sourceRange);
         if (target) {
           const resolved = resolveIconForClass(
@@ -160,6 +253,8 @@ function registerIpcHandlers(): void {
             parsed.classes,
             content,
             modelName ?? target.name,
+            new Set<string>(),
+            (owner, baseName) => libraryRegistry.resolveFor(owner, baseName),
           );
           return {
             icon: resolved.icon,
@@ -187,19 +282,30 @@ function registerIpcHandlers(): void {
       try {
         if (!filePath) return { error: "No file path provided" };
         const content = await readFile(filePath, "utf-8");
+        const parsed = parseModelicaFile(content, filePath);
+        libraryRegistry.registerSource(filePath, content, parsed);
         const slice = sourceRange
           ? content.slice(sourceRange.start, sourceRange.end)
           : content;
         const sliceBase = sourceRange ? sourceRange.start : 0;
         const annotationIdx = findIconAnnotationOffset(slice);
-        const editable = extractEditableIconFromSlice(slice, modelName ?? "");
+        const target = findClassBySourceRange(parsed.classes, sourceRange);
+        const editable = extractEditableIconFromSlice(
+          slice,
+          modelName ?? target?.name ?? "",
+          target
+            ? {
+                qualifiedName: target.qualifiedName,
+                sourceFile: filePath,
+              }
+            : undefined,
+        );
         if (editable && annotationIdx >= 0) {
           return {
-            editable: toAbsoluteEditableRanges(
-              editable,
-              sliceBase,
-              annotationIdx,
-            ),
+            editable: {
+              ...toAbsoluteEditableRanges(editable, sliceBase, annotationIdx),
+              sourceVersion: sourceVersions.get(filePath) ?? 0,
+            },
           };
         }
         return { editable };
@@ -216,7 +322,10 @@ function registerIpcHandlers(): void {
         if (!filePath || !qualifiedName) return { error: "Missing args" };
         const content = await readFile(filePath, "utf-8");
         const parsed = parseModelicaFile(content, filePath);
-        const found = findClassByQualifiedName(parsed.classes, qualifiedName);
+        const found = findClassByQualifiedNameOrUniqueLeaf(
+          parsed.classes,
+          qualifiedName,
+        );
         return { sourceRange: found ? found.sourceRange : null };
       } catch (e) {
         return { error: (e as Error).message };
@@ -226,29 +335,140 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     "modelica:applySourceEdit",
-    async (
-      _event,
-      filePath: string,
-      edit: { start: number; end: number; replacement: string },
-    ) => {
+    async (_event, filePath: string, edit: SourceEdit) => {
+      let tempPath: string | null = null;
+      let backupPath: string | null = null;
       try {
         if (!filePath || !edit) return { error: "Missing filePath or edit" };
-        const content = await readFile(filePath, "utf-8");
-        if (
-          edit.start < 0 ||
-          edit.end > content.length ||
-          edit.start > edit.end
-        ) {
-          return { error: "Invalid edit range" };
+        if (edit.expectedText === undefined) {
+          return {
+            error:
+              "STALE_SOURCE_RANGE: expectedText is required for source edits",
+          };
         }
-        const updated =
-          content.slice(0, edit.start) +
-          edit.replacement +
-          content.slice(edit.end);
-        await writeFile(filePath, updated, "utf-8");
+        if (edit.sourceVersion === undefined) {
+          return {
+            error:
+              "SOURCE_VERSION_MISMATCH: sourceVersion is required for source edits",
+          };
+        }
+        if (!edit.targetQualifiedName) {
+          return {
+            error:
+              "CLASS_NOT_FOUND: targetQualifiedName is required for source edits",
+          };
+        }
+        const content = await readFile(filePath, "utf-8");
+        const currentVersion = sourceVersions.get(filePath) ?? 0;
+        const updated = applySourceTransaction(
+          content,
+          { filePath, sourceVersion: edit.sourceVersion, edits: [edit] },
+          currentVersion,
+        );
+        let candidate;
+        try {
+          candidate = parseModelicaFile(updated, filePath);
+        } catch (e) {
+          return {
+            error: `SOURCE_PARSE_ERROR: ${(e as Error).message} (${sourceLocation(updated, edit.start)})`,
+          };
+        }
+        const reparsedTarget = findClassByQualifiedNameOrUniqueLeaf(
+          candidate.classes,
+          edit.targetQualifiedName,
+        );
+        const target =
+          reparsedTarget &&
+          reparsedTarget.qualifiedName !== edit.targetQualifiedName
+            ? { ...reparsedTarget, qualifiedName: edit.targetQualifiedName }
+            : reparsedTarget;
+        if (!target)
+          return {
+            error: `TARGET_CLASS_NOT_FOUND: ${edit.targetQualifiedName}`,
+          };
+        const resolved = resolveIconForClass(
+          target,
+          candidate.classes,
+          updated,
+          target.name,
+          new Set<string>(),
+          (owner, baseName) => libraryRegistry.resolveFor(owner, baseName),
+        );
+        if (!resolved.icon) {
+          const targetSlice = updated.slice(
+            target.sourceRange.start,
+            target.sourceRange.end,
+          );
+          const annotationOffset = findIconAnnotationOffset(targetSlice);
+          const tokens = tokenize(targetSlice);
+          const iconToken = tokens.find(
+            (token, index) =>
+              token.value === "Icon" && tokens[index + 1]?.type === "LPAREN",
+          );
+          const hasIconCall = !!iconToken;
+          const iconStart = target.sourceRange.start + (iconToken?.start ?? 0);
+          const iconRange = findIconSourceRange(targetSlice);
+          if (!hasIconCall) {
+            return {
+              error: `OWN_ICON_NOT_FOUND: ${edit.targetQualifiedName} (${sourceLocation(updated, target.sourceRange.start)})`,
+            };
+          }
+          if (annotationOffset < 0) {
+            return {
+              error: `ICON_RANGE_ERROR: Icon range is invalid in ${edit.targetQualifiedName}; iconStart=${iconStart}; iconRange=${JSON.stringify(iconRange)} (${sourceLocation(updated, iconStart)})`,
+            };
+          }
+          return {
+            error: `ICON_RESOLVE_FAILED: ${edit.targetQualifiedName} iconRange=${JSON.stringify(iconRange)} (${sourceLocation(updated, iconStart)})`,
+          };
+        }
+        tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+        await writeFile(tempPath, updated, "utf-8");
+        if (process.platform === "win32") {
+          // Windows rename() cannot replace an existing file. Move the old
+          // file aside, then replace it and restore it if the second move
+          // fails. The temporary file is still fully written before either
+          // rename, so a successful edit never exposes a partial source.
+          backupPath = `${filePath}.bak-${process.pid}-${Date.now()}`;
+          await rename(filePath, backupPath);
+          try {
+            await rename(tempPath, filePath);
+            tempPath = null;
+          } catch (e) {
+            try {
+              await rename(backupPath, filePath);
+              backupPath = null;
+            } catch {
+              // Keep the original error; the backup remains recoverable.
+            }
+            throw e;
+          }
+          try {
+            await unlink(backupPath);
+          } finally {
+            backupPath = null;
+          }
+        } else {
+          await rename(tempPath, filePath);
+          tempPath = null;
+        }
+        sourceVersions.set(filePath, currentVersion + 1);
         return { ok: true };
       } catch (e) {
+        if (e instanceof SourceTransactionError) {
+          return {
+            error: `${e.code}: ${e.message}; target=${edit.targetQualifiedName ?? "unknown"}; range=${edit.start}:${edit.end}; replacement=${JSON.stringify(edit.replacement)}`,
+          };
+        }
         return { error: (e as Error).message };
+      } finally {
+        if (tempPath) {
+          try {
+            await unlink(tempPath);
+          } catch {
+            // Best-effort cleanup of an interrupted temporary write.
+          }
+        }
       }
     },
   );

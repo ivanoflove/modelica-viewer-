@@ -126,4 +126,30 @@ describe("loadModelicaFile", () => {
     expect(resolved.icon?.graphics[0]?.type).toBe("Rectangle");
     expect(resolved.warnings).toEqual([]);
   });
+
+  it("keeps ownership metadata when resolving inherited graphics", () => {
+    const source = `package P
+      model Base
+        annotation(Icon(graphics={Ellipse(extent={{-10,-10},{10,10}})}));
+      end Base;
+      model Child
+        extends Base;
+        annotation(Icon(graphics={Text(extent={{-20,-4},{20,4}}, textString="Child")}));
+      end Child;
+    end P;`;
+    const parsed = parseModelicaFile(source, "ownership.mo");
+    const child = findClassByQualifiedName(parsed.classes, "P.Child")!;
+    const resolved = resolveIconForClass(child, parsed.classes, source, "Child");
+    expect(resolved.icon?.graphics).toHaveLength(2);
+    expect(resolved.icon?.graphics[0]).toMatchObject({
+      ownerQualifiedName: "P.Base",
+      inherited: true,
+      inheritancePath: ["P.Child", "P.Base"],
+    });
+    expect(resolved.icon?.graphics[1]).toMatchObject({
+      ownerQualifiedName: "P.Child",
+      inherited: false,
+      inheritancePath: ["P.Child"],
+    });
+  });
 });

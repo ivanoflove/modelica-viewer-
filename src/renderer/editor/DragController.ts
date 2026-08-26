@@ -10,20 +10,60 @@ export interface DragInfo {
   transformStart: GraphicTransform;
 }
 
+export interface DragPreview {
+  graphicId: string;
+  dx: number;
+  dy: number;
+}
+
+/** Apply a preview only to the graphic that owns the active drag session. */
+export function transformWithDragPreview(
+  graphicId: string,
+  base: GraphicTransform,
+  preview: DragPreview | null,
+): GraphicTransform {
+  if (!preview || preview.graphicId !== graphicId) return base;
+  return {
+    ...base,
+    translate: {
+      x: base.translate.x + preview.dx,
+      y: base.translate.y + preview.dy,
+    },
+  };
+}
+
 /** Convert client/screen coordinates into Modelica SVG coordinates. */
 export function clientToModelica(
   svg: SVGSVGElement,
   clientX: number,
   clientY: number,
 ): { x: number; y: number } | null {
-  const pt = svg.createSVGPoint();
-  pt.x = clientX;
-  pt.y = clientY;
   const ctm = svg.getScreenCTM()?.inverse();
   if (!ctm) return null;
-  const p = pt.matrixTransform(ctm);
+  return clientToModelicaWithInverse(clientX, clientY, ctm);
+}
+
+/** Convert a client point using a matrix captured at drag start. */
+export function clientToModelicaWithInverse(
+  clientX: number,
+  clientY: number,
+  inverse: DOMMatrix,
+): { x: number; y: number } {
+  const p = new DOMPoint(clientX, clientY).matrixTransform(inverse);
   // SVG Y is down; Modelica Y is up
   return { x: p.x, y: -p.y };
+}
+
+/** Calculate a drag delta from the fixed pointer-down position. */
+export function dragDeltaFromStart(
+  start: { x: number; y: number },
+  current: { x: number; y: number },
+  grid?: number,
+): { x: number; y: number } {
+  const dx = current.x - start.x;
+  const dy = current.y - start.y;
+  if (!grid || grid <= 0) return { x: dx, y: dy };
+  return { x: snap(dx, grid), y: snap(dy, grid) };
 }
 
 /** Compute snapped translate from a drag session's current pointer. */
@@ -32,11 +72,10 @@ export function computeDragTranslate(
   current: { x: number; y: number },
   grid = 10,
 ): { x: number; y: number } {
-  const rawDx = current.x - drag.pointerStart.x;
-  const rawDy = current.y - drag.pointerStart.y;
+  const raw = dragDeltaFromStart(drag.pointerStart, current);
   return {
-    x: snap(drag.transformStart.translate.x + rawDx, grid),
-    y: snap(drag.transformStart.translate.y + rawDy, grid),
+    x: snap(drag.transformStart.translate.x + raw.x, grid),
+    y: snap(drag.transformStart.translate.y + raw.y, grid),
   };
 }
 
