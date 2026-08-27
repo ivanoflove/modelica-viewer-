@@ -8,4 +8,4 @@ license.workspace = true
 modelica-core = { path = "../modelica-core" }
 modelica-render = { path = "../modelica-render" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "12ef40c31659ddb879bdb39481b7fc9524ac8ffa" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", rev = "12ef40c31659ddb879bdb39481b7fc9524ac8ffa" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", rev = "12ef40c31659ddb879bdb39481b7fc9524ac8ffa", features = ["wayland", "x11"] }

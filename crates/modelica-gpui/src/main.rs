@@ -94,8 +94,7 @@ impl Render for ModelicaViewer {
             .flex()
             .flex_col()
             .gap_1()
-            .p_2()
-            .overflow_scroll();
+            .p_2();
 
         for (index, row) in self.classes.iter().enumerate() {
             let selected = self.selected == Some(index);
