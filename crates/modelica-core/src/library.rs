@@ -47,6 +47,14 @@ impl PackageLoader {
     pub fn load(&self, root: impl AsRef<Path>) -> Result<PackageNode, Diagnostic> {
         let root = root.as_ref();
         if root.is_file() {
+            if root
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("package.mo"))
+            {
+                if let Some(directory) = root.parent() {
+                    return self.load_package_directory(directory, None);
+                }
+            }
             return self.load_standalone(root);
         }
         let package_file = root.join("package.mo");
@@ -492,6 +500,27 @@ mod tests {
         let root = fixture_root();
         let package = PackageLoader.load(&root).expect("load fixture");
         assert_eq!(package.qualified_name, "Modelica");
+        let mut registry = LibraryRegistry::default();
+        registry.index_package(&package);
+        assert!(
+            registry
+                .resolve("Modelica.Electrical.Analog.Basic.Resistor")
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve("Modelica.Electrical.Analog.Basic.Pin")
+                .is_some()
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn loading_package_mo_scans_its_sibling_package_tree() {
+        let root = fixture_root();
+        let package = PackageLoader
+            .load(root.join("package.mo"))
+            .expect("load package.mo as package directory");
         let mut registry = LibraryRegistry::default();
         registry.index_package(&package);
         assert!(
