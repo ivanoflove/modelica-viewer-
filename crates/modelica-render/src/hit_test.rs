@@ -5,13 +5,20 @@ use modelica_core::scene::{Extent, Graphic, Point};
 /// `Viewport::model_tolerance_for_screen_pixels` so selection does not become
 /// harder when zoomed out.
 pub fn graphic_contains_point(graphic: &Graphic, point: Point, tolerance: f32) -> bool {
-    let local = inverse_graphic_transform(point, graphic_origin(graphic), graphic_rotation(graphic));
+    let local =
+        inverse_graphic_transform(point, graphic_origin(graphic), graphic_rotation(graphic));
     let tolerance = tolerance.max(0.0);
     match graphic {
-        Graphic::Line(item) => polyline_hit(&item.points, local, tolerance.max(item.thickness * 0.5)),
+        Graphic::Line(item) => {
+            polyline_hit(&item.points, local, tolerance.max(item.thickness * 0.5))
+        }
         Graphic::Polygon(item) => {
             point_in_polygon(&item.points, local)
-                || polyline_hit_closed(&item.points, local, tolerance.max(item.line_thickness.unwrap_or(0.25) * 0.5))
+                || polyline_hit_closed(
+                    &item.points,
+                    local,
+                    tolerance.max(item.line_thickness.unwrap_or(0.25) * 0.5),
+                )
         }
         Graphic::Rectangle(item) => extent_contains(item.extent, local, tolerance),
         Graphic::Ellipse(item) => ellipse_contains(item.extent, local, tolerance),
@@ -27,7 +34,9 @@ pub fn hit_test_graphics(graphics: &[Graphic], point: Point, tolerance: f32) -> 
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, graphic)| graphic_contains_point(graphic, point, tolerance).then_some(index))
+        .find_map(|(index, graphic)| {
+            graphic_contains_point(graphic, point, tolerance).then_some(index)
+        })
 }
 
 fn graphic_origin(graphic: &Graphic) -> Point {
@@ -90,8 +99,7 @@ fn point_in_polygon(points: &[Point], point: Point) -> bool {
     for &current in points {
         let crosses = (current.y > point.y) != (previous.y > point.y);
         if crosses {
-            let x = (previous.x - current.x) * (point.y - current.y)
-                / (previous.y - current.y)
+            let x = (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y)
                 + current.x;
             if point.x < x {
                 inside = !inside;
@@ -203,6 +211,9 @@ mod tests {
                 radius: None,
             })
         };
-        assert_eq!(hit_test_graphics(&[make_rect(), make_rect()], point(0.0, 0.0), 1.0), Some(1));
+        assert_eq!(
+            hit_test_graphics(&[make_rect(), make_rect()], point(0.0, 0.0), 1.0),
+            Some(1)
+        );
     }
 }
