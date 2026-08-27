@@ -234,12 +234,7 @@ fn paint_icon_scene(
     }
 }
 
-fn paint_graphic(
-    graphic: &Graphic,
-    map: &SceneMap,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) {
+fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mut gpui::App) {
     match graphic {
         Graphic::Rectangle(graphic) => {
             let points = extent_points(graphic.extent)
@@ -406,9 +401,7 @@ fn paint_closed_polygon(
     if !is_none_pattern(fill_pattern) {
         paint_solid_polygon(window, points, fill_color);
         match fill_pattern {
-            Some("FillPattern.Horizontal") => {
-                paint_horizontal_hatch(window, points, stroke_color)
-            }
+            Some("FillPattern.Horizontal") => paint_horizontal_hatch(window, points, stroke_color),
             Some("FillPattern.Vertical") => paint_vertical_hatch(window, points, stroke_color),
             Some("FillPattern.Cross") => {
                 paint_horizontal_hatch(window, points, stroke_color);
@@ -440,11 +433,7 @@ fn paint_closed_polygon(
     }
 }
 
-fn paint_solid_polygon(
-    window: &mut Window,
-    points: &[gpui::Point<Pixels>],
-    fill_color: [u8; 3],
-) {
+fn paint_solid_polygon(window: &mut Window, points: &[gpui::Point<Pixels>], fill_color: [u8; 3]) {
     let mut builder = PathBuilder::fill();
     builder.move_to(points[0]);
     for point in &points[1..] {
@@ -549,11 +538,7 @@ fn paint_dashed_segment(
     }
 }
 
-fn paint_horizontal_hatch(
-    window: &mut Window,
-    polygon: &[gpui::Point<Pixels>],
-    color: [u8; 3],
-) {
+fn paint_horizontal_hatch(window: &mut Window, polygon: &[gpui::Point<Pixels>], color: [u8; 3]) {
     let (min_y, max_y) = polygon.iter().fold((f32::MAX, f32::MIN), |acc, point| {
         (acc.0.min(f32::from(point.y)), acc.1.max(f32::from(point.y)))
     });
@@ -574,15 +559,8 @@ fn paint_horizontal_hatch(
     }
 }
 
-fn paint_vertical_hatch(
-    window: &mut Window,
-    polygon: &[gpui::Point<Pixels>],
-    color: [u8; 3],
-) {
-    let swapped = polygon
-        .iter()
-        .map(|p| point(p.y, p.x))
-        .collect::<Vec<_>>();
+fn paint_vertical_hatch(window: &mut Window, polygon: &[gpui::Point<Pixels>], color: [u8; 3]) {
+    let swapped = polygon.iter().map(|p| point(p.y, p.x)).collect::<Vec<_>>();
     let (min_x, max_x) = polygon.iter().fold((f32::MAX, f32::MIN), |acc, point| {
         (acc.0.min(f32::from(point.x)), acc.1.max(f32::from(point.x)))
     });
@@ -651,7 +629,10 @@ fn paint_text(
     let height_model = (graphic.extent.p2.y - graphic.extent.p1.y).abs().max(0.1);
     let chars = graphic.text.chars().count().max(1) as f32;
     let auto_font = (height_model * 0.82).min(width_model / (chars * 0.62).max(1.0));
-    let font_model = graphic.font_size.filter(|size| *size > 0.0).unwrap_or(auto_font);
+    let font_model = graphic
+        .font_size
+        .filter(|size| *size > 0.0)
+        .unwrap_or(auto_font);
     let font_px = px((font_model * map.viewport.zoom).max(1.0));
 
     let center_local = modelica_core::scene::Point {
@@ -684,11 +665,15 @@ fn paint_text(
         Some("TextAlignment.Right") => TextAlign::Right,
         _ => TextAlign::Center,
     };
-    let origin = point(
-        center.x,
-        center.y - px(f32::from(font_px) * 0.55),
+    let origin = point(center.x, center.y - px(f32::from(font_px) * 0.55));
+    let _ = line.paint(
+        origin,
+        px(f32::from(font_px) * 1.2),
+        align,
+        None,
+        window,
+        cx,
     );
-    let _ = line.paint(origin, px(f32::from(font_px) * 1.2), align, None, window, cx);
 }
 
 fn paint_selection_overlay(graphic: &Graphic, map: &SceneMap, window: &mut Window) {
@@ -719,7 +704,14 @@ fn paint_selection_overlay(graphic: &Graphic, map: &SceneMap, window: &mut Windo
         point(px(max_x), px(max_y)),
         point(px(min_x), px(max_y)),
     ];
-    paint_polyline_patterned(window, &rect, [108, 92, 231], 1.0, Some("LinePattern.Dash"), true);
+    paint_polyline_patterned(
+        window,
+        &rect,
+        [108, 92, 231],
+        1.0,
+        Some("LinePattern.Dash"),
+        true,
+    );
 
     let handles = [
         (min_x, min_y),
@@ -773,7 +765,14 @@ fn graphic_screen_points(graphic: &Graphic, map: &SceneMap) -> Vec<gpui::Point<P
 }
 
 fn paint_bitmap_placeholder(window: &mut Window, points: &[gpui::Point<Pixels>; 4]) {
-    paint_polyline_patterned(window, points, [123, 135, 153], 1.0, Some("LinePattern.Dash"), true);
+    paint_polyline_patterned(
+        window,
+        points,
+        [123, 135, 153],
+        1.0,
+        Some("LinePattern.Dash"),
+        true,
+    );
     paint_simple_segment(window, points[0], points[2], [123, 135, 153], 1.0);
     paint_simple_segment(window, points[1], points[3], [123, 135, 153], 1.0);
 }

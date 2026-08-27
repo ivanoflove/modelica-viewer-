@@ -7,8 +7,8 @@ use gpui::{
 use gpui_platform::application;
 use icon_view::{SharedIconViewState, new_icon_view_state};
 use modelica_core::{
-    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry, PackageLoader,
-    PackageNode,
+    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry,
+    PackageLoader, PackageNode,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -313,91 +313,92 @@ impl Render for ModelicaViewer {
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
 
-        let tree = uniform_list(
-            "class-tree",
-            visible_count,
-            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                range
-                    .filter_map(|row_index| {
-                        let row = visible_rows.get(row_index)?.clone();
-                        let selected = row
-                            .class_index
-                            .is_some_and(|index| this.selected == Some(index));
-                        let key = row.key.clone();
-                        let class_index = row.class_index;
-                        let has_children = row.has_children;
-                        let toggle = if has_children {
-                            if row.expanded { "▾" } else { "▸" }
-                        } else {
-                            ""
-                        };
-                        let indent = 5.0 + row.depth as f32 * 12.0;
+        let tree =
+            uniform_list(
+                "class-tree",
+                visible_count,
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|row_index| {
+                            let row = visible_rows.get(row_index)?.clone();
+                            let selected = row
+                                .class_index
+                                .is_some_and(|index| this.selected == Some(index));
+                            let key = row.key.clone();
+                            let class_index = row.class_index;
+                            let has_children = row.has_children;
+                            let toggle = if has_children {
+                                if row.expanded { "▾" } else { "▸" }
+                            } else {
+                                ""
+                            };
+                            let indent = 5.0 + row.depth as f32 * 12.0;
 
-                        Some(
-                            div()
-                                .id(format!("tree-row-{row_index}"))
-                                .mx_1()
-                                .w_full()
-                                .h(px(29.0))
-                                .pl(px(indent))
-                                .pr_2()
-                                .rounded_md()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(rgb(if selected {
-                                    palette.selected_text
-                                } else {
-                                    palette.text
-                                }))
-                                .bg(rgb(if selected {
-                                    palette.accent
-                                } else {
-                                    palette.panel_alt
-                                })
-                                .opacity(if selected { 0.95 } else { 0.18 }))
-                                .hover(move |style| {
-                                    style.bg(rgb(if selected {
-                                        palette.accent_hover
+                            Some(
+                                div()
+                                    .id(format!("tree-row-{row_index}"))
+                                    .mx_1()
+                                    .w_full()
+                                    .h(px(29.0))
+                                    .pl(px(indent))
+                                    .pr_2()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(rgb(if selected {
+                                        palette.selected_text
                                     } else {
-                                        palette.card
+                                        palette.text
+                                    }))
+                                    .bg(rgb(if selected {
+                                        palette.accent
+                                    } else {
+                                        palette.panel_alt
                                     })
-                                    .opacity(0.78))
-                                })
-                                .cursor_pointer()
-                                .child(
-                                    div()
-                                        .w(px(14.0))
-                                        .text_color(rgb(palette.subtle))
-                                        .child(toggle),
-                                )
-                                .child(tree_icon(row.kind, selected, palette))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .child(row.label),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if has_children && class_index.is_none() {
-                                        this.toggle_tree(&key);
-                                    } else if let Some(index) = class_index {
-                                        this.select_class(index);
-                                        if has_children {
+                                    .opacity(if selected { 0.95 } else { 0.18 }))
+                                    .hover(move |style| {
+                                        style.bg(rgb(if selected {
+                                            palette.accent_hover
+                                        } else {
+                                            palette.card
+                                        })
+                                        .opacity(0.78))
+                                    })
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .text_color(rgb(palette.subtle))
+                                            .child(toggle),
+                                    )
+                                    .child(tree_icon(row.kind, selected, palette))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(row.label),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if has_children && class_index.is_none() {
                                             this.toggle_tree(&key);
+                                        } else if let Some(index) = class_index {
+                                            this.select_class(index);
+                                            if has_children {
+                                                this.toggle_tree(&key);
+                                            }
                                         }
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .h_full();
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -499,11 +500,15 @@ impl Render for ModelicaViewer {
             .items_end()
             .gap_1()
             .child(
-                tab_chip(DetailTab::Source, self.active_tab == DetailTab::Source, palette)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.active_tab = DetailTab::Source;
-                        cx.notify();
-                    })),
+                tab_chip(
+                    DetailTab::Source,
+                    self.active_tab == DetailTab::Source,
+                    palette,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.active_tab = DetailTab::Source;
+                    cx.notify();
+                })),
             )
             .child(
                 tab_chip(DetailTab::Icon, self.active_tab == DetailTab::Icon, palette).on_click(
@@ -565,44 +570,49 @@ impl Render for ModelicaViewer {
         )
         .h_full();
 
-        let (detail_status, detail_toolbar, detail_body): (String, gpui::AnyElement, gpui::AnyElement) =
-            match self.active_tab {
-                DetailTab::Source => (
-                    if self.selected.is_some() {
-                        format!("{source_line_count} lines · selected class source")
-                    } else {
-                        "Select a class to view source".to_owned()
-                    },
-                    div().into_any_element(),
-                    div()
-                        .size_full()
-                        .bg(rgb(if matches!(self.theme, ThemeMode::System | ThemeMode::Dark) {
+        let (detail_status, detail_toolbar, detail_body): (
+            String,
+            gpui::AnyElement,
+            gpui::AnyElement,
+        ) = match self.active_tab {
+            DetailTab::Source => (
+                if self.selected.is_some() {
+                    format!("{source_line_count} lines · selected class source")
+                } else {
+                    "Select a class to view source".to_owned()
+                },
+                div().into_any_element(),
+                div()
+                    .size_full()
+                    .bg(rgb(
+                        if matches!(self.theme, ThemeMode::System | ThemeMode::Dark) {
                             0x1b1d23
                         } else {
                             0xffffff
-                        }))
-                        .child(source_list)
-                        .into_any_element(),
-                ),
-                DetailTab::Icon => (
-                    format!("{primitive_count} graphics  ·  {diagnostic_count} diagnostics"),
-                    icon_toolbar.into_any_element(),
-                    icon_view::icon_canvas(scene, self.icon_view.clone()).into_any_element(),
-                ),
-                DetailTab::Diagram => (
-                    "Diagram viewer is the next migration stage".to_owned(),
-                    div().into_any_element(),
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(rgb(palette.subtle))
-                        .child("Diagram resolver / component placement not wired in GPUI yet")
-                        .into_any_element(),
-                ),
-            };
+                        },
+                    ))
+                    .child(source_list)
+                    .into_any_element(),
+            ),
+            DetailTab::Icon => (
+                format!("{primitive_count} graphics  ·  {diagnostic_count} diagnostics"),
+                icon_toolbar.into_any_element(),
+                icon_view::icon_canvas(scene, self.icon_view.clone()).into_any_element(),
+            ),
+            DetailTab::Diagram => (
+                "Diagram viewer is the next migration stage".to_owned(),
+                div().into_any_element(),
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(palette.subtle))
+                    .child("Diagram resolver / component placement not wired in GPUI yet")
+                    .into_any_element(),
+            ),
+        };
 
         let detail = div()
             .flex_1()
