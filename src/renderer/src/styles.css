@@ -266,7 +266,15 @@ button { -webkit-app-region: no-drag; }
 .tree-toggle { width: 13px; color: var(--text-tertiary); text-align: center; font-size: 10px; user-select: none; transition: transform 150ms var(--ease); }
 .tree-toggle.expanded { transform: rotate(90deg); color: var(--accent); }
 .tree-toggle.placeholder { visibility: hidden; }
-.node-icon { width: 17px; color: var(--text-secondary); font-size: 12px; text-align: center; }
+.node-icon { display: inline-flex; width: 17px; height: 17px; align-items: center; justify-content: center; color: var(--text-secondary); }
+.node-icon svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.35; }
+.node-icon-package { color: #b27b35; }
+.node-icon-model { color: #3e83b5; }
+.node-icon-block { color: #875bb0; }
+.node-icon-connector, .node-icon-expandable-connector { color: #249a9a; }
+.node-icon-record { color: #748b4f; }
+.node-icon-function { color: #b35b76; }
+.node-icon-type { color: #6f7185; }
 .node-label { min-width: 0; overflow: hidden; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
 .node-kind { margin-left: auto; color: var(--text-tertiary); font: 9px "SFMono-Regular", Consolas, monospace; }
 .load-errors { margin: 13px 3px 0; padding: 10px; border: 1px solid rgb(193 72 90 / 0.14); border-radius: var(--radius-md); background: var(--danger-soft); font-size: 10px; }

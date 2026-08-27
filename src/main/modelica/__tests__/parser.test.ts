@@ -50,6 +50,18 @@ describe("parser", () => {
     expect(file.classes[2]!.isEncapsulated).toBe(true);
   });
 
+  it("should preserve expandable and operator class semantics", () => {
+    const src = `expandable connector Bus end Bus;
+      operator record Value end Value;
+      operator function create end create;`;
+    const file = parseModelicaFile(src, "operators.mo");
+    expect(file.classes.map((cls) => cls.kind)).toEqual([
+      "expandable connector",
+      "operator record",
+      "operator function",
+    ]);
+  });
+
   it("should ignore annotation strings containing package", () => {
     const src = `package MyLibrary annotation(Documentation(info="<html> package ABC end ABC; </html>")); model Resistor end Resistor; end MyLibrary;`;
     const file = parseModelicaFile(src, "test.mo");

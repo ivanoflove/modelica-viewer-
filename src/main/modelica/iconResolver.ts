@@ -553,7 +553,7 @@ function appendPublicConnectorGraphics(
   resolving: Set<string>,
   externalResolver?: ExternalClassResolver,
 ): IconDto {
-  const slice = source.slice(target.sourceRange.start, target.sourceRange.end);
+  const slice = classOwnedSlice(target, source);
   const connectorGraphics: GraphicItemDto[] = [];
   for (const declaration of findComponentAnnotations(slice)) {
     const placement = parsePlacementForIcon(declaration.annotation);
@@ -730,10 +730,9 @@ export function resolveIconForClass(
     };
   }
   const nextResolving = new Set(resolving).add(target.qualifiedName);
-  const ownSlice = source.slice(
-    target.sourceRange.start,
-    target.sourceRange.end,
-  );
+  // Child classes are namespace members, not Icon inheritance. Keep their
+  // offsets out of own-annotation scans while preserving source positions.
+  const ownSlice = classOwnedSlice(target, source);
   const ownMatch = findIconAnnotation(ownSlice);
   const ownRawIcon = ownMatch
     ? (() => {
@@ -827,6 +826,20 @@ export function resolveIconForClass(
       : null,
     warnings,
   };
+}
+
+/** Hide nested class bodies without changing offsets used by source ranges. */
+export function classOwnedSlice(target: ClassNode, source: string): string {
+  const start = target.sourceRange.start;
+  const chars = source.slice(start, target.sourceRange.end).split("");
+  for (const child of target.children) {
+    const childStart = Math.max(0, child.sourceRange.start - start);
+    const childEnd = Math.min(chars.length, child.sourceRange.end - start);
+    for (let index = childStart; index < childEnd; index++) {
+      if (chars[index] !== "\n" && chars[index] !== "\r") chars[index] = " ";
+    }
+  }
+  return chars.join("");
 }
 
 function iconDefinesCoordinateSystem(icon: AnnotationCall): boolean {

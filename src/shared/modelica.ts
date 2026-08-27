@@ -15,7 +15,11 @@ export type ClassKind =
   | "record"
   | "function"
   | "class"
-  | "type";
+  | "type"
+  | "expandable connector"
+  | "operator"
+  | "operator record"
+  | "operator function";
 
 export interface PackageNodeDto {
   name: string;

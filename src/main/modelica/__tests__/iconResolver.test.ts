@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { parseAnnotationSlice, findIconCall } from "../annotation.js";
-import { extractIconFromSlice, resolveIcon } from "../iconResolver.js";
+import { extractIconFromSlice, resolveIcon, resolveIconForClass } from "../iconResolver.js";
+import { parseModelicaFile } from "../parser.js";
 
 function resolveIconFromAnnotation(
   src: string,
@@ -149,6 +150,30 @@ describe("iconResolver", () => {
     const icon = resolveIconFromAnnotation(src)!;
     expect(icon.graphics).toHaveLength(1);
     expect(icon.graphics[0]?.type).toBe("Rectangle");
+  });
+
+  it("does not collect child class Icons into a package Icon", () => {
+    const source = `package P
+      annotation(Icon(graphics={Rectangle(extent={{-10,-10},{10,10}})}));
+      model Child
+        annotation(Icon(graphics={Ellipse(extent={{-90,-90},{90,90}})}));
+      end Child;
+    end P;`;
+    const parsed = parseModelicaFile(source, "P.mo");
+    const resolved = resolveIconForClass(parsed.classes[0]!, parsed.classes, source, "P");
+    expect(resolved.icon?.graphics).toHaveLength(1);
+    expect(resolved.icon?.graphics[0]?.type).toBe("Rectangle");
+  });
+
+  it("returns no package Icon when only descendants define Icons", () => {
+    const source = `package P
+      model Child
+        annotation(Icon(graphics={Ellipse(extent={{-90,-90},{90,90}})}));
+      end Child;
+    end P;`;
+    const parsed = parseModelicaFile(source, "P.mo");
+    const resolved = resolveIconForClass(parsed.classes[0]!, parsed.classes, source, "P");
+    expect(resolved.icon).toBeNull();
   });
 });
 

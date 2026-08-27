@@ -63,48 +63,38 @@ class Parser {
 
   private isClassStartAt(pos: number): {
     isStart: boolean;
-    modifiers: { partial: boolean; encapsulated: boolean };
+    modifiers: { partial: boolean; encapsulated: boolean; expandable: boolean; operator: boolean };
     kind: string | null;
     name: string | null;
   } {
     let p = pos;
     let partial = false;
     let encapsulated = false;
+    let expandable = false;
+    let operator = false;
     const t0 = this.tokens[p];
     if (!t0)
       return {
         isStart: false,
-        modifiers: { partial, encapsulated },
+        modifiers: { partial, encapsulated, expandable, operator },
         kind: null,
         name: null,
       };
-    if (t0.value === "partial") {
-      partial = true;
+    while (true) {
+      const prefix = this.tokens[p]?.value;
+      if (prefix === "partial") partial = true;
+      else if (prefix === "encapsulated") encapsulated = true;
+      else if (prefix === "expandable") expandable = true;
+      else if (prefix === "operator") operator = true;
+      else break;
       p++;
-    }
-    const t1 = this.tokens[p];
-    if (t1?.value === "encapsulated") {
-      encapsulated = true;
-      p++;
-      // encapsulated may be followed by partial
-      if (this.tokens[p]?.value === "partial") {
-        partial = true;
-        p++;
-      }
-    } else if (t1?.value === "partial" && !partial) {
-      partial = true;
-      p++;
-      if (this.tokens[p]?.value === "encapsulated") {
-        encapsulated = true;
-        p++;
-      }
     }
 
     const kindTok = this.tokens[p];
     if (!kindTok || !CLASS_KINDS.has(kindTok.value)) {
       return {
         isStart: false,
-        modifiers: { partial, encapsulated },
+        modifiers: { partial, encapsulated, expandable, operator },
         kind: null,
         name: null,
       };
@@ -113,15 +103,21 @@ class Parser {
     if (!nameTok || nameTok.type !== "IDENT") {
       return {
         isStart: false,
-        modifiers: { partial, encapsulated },
+        modifiers: { partial, encapsulated, expandable, operator },
         kind: null,
         name: null,
       };
     }
+    const baseKind = kindTok.value;
+    const kind = operator
+      ? `operator ${baseKind}`
+      : expandable && baseKind === "connector"
+        ? "expandable connector"
+        : baseKind;
     return {
       isStart: true,
-      modifiers: { partial, encapsulated },
-      kind: kindTok.value,
+      modifiers: { partial, encapsulated, expandable, operator },
+      kind,
       name: nameTok.value,
     };
   }
@@ -137,19 +133,13 @@ class Parser {
     const isEncapsulated = start.modifiers.encapsulated;
     const sourceStart = this.tokens[this.pos]!.start;
 
-    // consume modifiers
-    if (
-      this.peek().value === "partial" ||
-      this.peek().value === "encapsulated"
-    ) {
-      // consume up to 2 modifiers
-      if (this.peek().value === "partial") this.advance();
-      if (this.peek().value === "encapsulated") this.advance();
-      if (this.peek().value === "partial") this.advance();
-      if (this.peek().value === "encapsulated") this.advance();
+    // consume class prefixes in the same order accepted by isClassStartAt
+    while (["partial", "encapsulated", "expandable", "operator"].includes(this.peek().value)) {
+      this.advance();
     }
 
-    const kind = this.advance().value as ClassKind;
+    const kind = start.kind as ClassKind;
+    this.advance(); // base class kind (model, package, connector, ...)
     const name = this.expectIdent();
 
     // qualified name for this class: if parentQualified provided, join; else within handling done outside

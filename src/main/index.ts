@@ -15,6 +15,7 @@ import {
   buildClassIndex,
   findClassBySourceRange,
   resolveIconForClass,
+  classOwnedSlice,
   buildGraphicInsertionEdit,
 } from "./modelica/iconResolver.js";
 import { resolveDiagramForClass } from "./modelica/diagramResolver.js";
@@ -380,9 +381,11 @@ function registerIpcHandlers(): void {
             warnings: resolved.warnings.length ? resolved.warnings : undefined,
           };
         }
-        const slice = sourceRange
-          ? content.slice(sourceRange.start, sourceRange.end)
-          : content;
+        const slice = target
+          ? classOwnedSlice(target, content)
+          : sourceRange
+            ? content.slice(sourceRange.start, sourceRange.end)
+            : content;
         return { icon: extractIconFromSlice(slice, modelName ?? "") };
       } catch (e) {
         return { error: (e as Error).message };
@@ -406,12 +409,14 @@ function registerIpcHandlers(): void {
         const content = await readFile(filePath, "utf-8");
         const parsed = parseModelicaFile(content, filePath);
         libraryRegistry.registerSource(filePath, content, parsed);
+        const target = findClassBySourceRange(parsed.classes, sourceRange);
         const slice = sourceRange
-          ? content.slice(sourceRange.start, sourceRange.end)
+          ? target
+            ? classOwnedSlice(target, content)
+            : content.slice(sourceRange.start, sourceRange.end)
           : content;
         const sliceBase = sourceRange ? sourceRange.start : 0;
         const annotationIdx = findIconAnnotationOffset(slice);
-        const target = findClassBySourceRange(parsed.classes, sourceRange);
         const editable = extractEditableIconFromSlice(
           slice,
           modelName ?? target?.name ?? "",
