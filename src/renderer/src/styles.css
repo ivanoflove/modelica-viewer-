@@ -298,9 +298,13 @@ button { -webkit-app-region: no-drag; }
 .graphic-toolbar-label { margin-right: 4px; color: var(--text-tertiary); font: 9px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .graphic-tool { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; min-height: 30px; padding: 5px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-secondary); cursor: grab; font-size: 11px; }
 .graphic-tool:hover { border-color: rgb(var(--accent-rgb) / .16); background: var(--accent-soft); color: var(--text-primary); }
+.graphic-tool[data-active="true"] { border-color: rgb(var(--accent-rgb) / .28); background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
 .graphic-tool:disabled { opacity: .45; cursor: not-allowed; }
 .graphic-tool:active, .graphic-tool.is-dragging { cursor: grabbing; border-color: rgb(var(--accent-rgb) / .28); color: var(--accent); }
 .graphic-tool svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+.drawing-preview-layer { opacity: .62; pointer-events: none; }
+.drawing-preview-layer path, .drawing-preview-layer rect, .drawing-preview-layer ellipse, .drawing-preview-layer polyline, .drawing-preview-layer polygon { stroke-dasharray: 6 4; }
+.drawing-preview-point { fill: var(--accent); stroke: var(--surface); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .graphic-viewport { grid-column: 1; grid-row: 2; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; outline: none; overflow: hidden; overscroll-behavior: none; touch-action: none; user-select: none; }
 .icon-viewer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 13px; color: var(--text-secondary); font-size: 11px; pointer-events: auto; }
 .icon-viewer-toolbar > span { padding: 5px 8px; border: 1px solid var(--border-subtle); border-radius: var(--radius-pill); background: var(--surface-soft); font: 10px "SFMono-Regular", Consolas, monospace; }

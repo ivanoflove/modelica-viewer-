@@ -27,7 +27,11 @@ import type {
   CreateGraphicRequest,
   SourceEdit,
 } from "../shared/modelica.js";
-import type { GraphicToolType } from "../shared/modelicaGraphics.js";
+import type {
+  GraphicItemDto,
+  GraphicToolType,
+  Point,
+} from "../shared/modelicaGraphics.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -52,6 +56,44 @@ function sourceLocation(source: string, offset: number): string {
 
 function formatModelicaNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(6)));
+}
+
+function formatPoint(point: Point): string {
+  return `{${formatModelicaNumber(point.x)},${formatModelicaNumber(point.y)}}`;
+}
+
+function formatExtent(extent: { p1: Point; p2: Point }): string {
+  return `{${formatPoint(extent.p1)},${formatPoint(extent.p2)}}`;
+}
+
+function formatPoints(points: Point[]): string {
+  return `{${points.map(formatPoint).join(",")}}`;
+}
+
+function formatColor(color: [number, number, number]): string {
+  return `{${color.join(",")}}`;
+}
+
+function quoteModelicaString(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function serializeCreatedGraphic(graphic: GraphicItemDto): string {
+  const origin = graphic.origin ? `origin=${formatPoint(graphic.origin)}, ` : "";
+  switch (graphic.type) {
+    case "Line":
+      return `Line(${origin}points=${formatPoints(graphic.points)}, color=${formatColor(graphic.color ?? [0, 0, 0])}, thickness=${formatModelicaNumber(graphic.thickness ?? 0.25)})`;
+    case "Polygon":
+      return `Polygon(${origin}points=${formatPoints(graphic.points)}, lineColor=${formatColor(graphic.lineColor ?? [0, 0, 0])}, fillColor=${formatColor(graphic.fillColor ?? [255, 255, 255])}, fillPattern=${graphic.fillPattern ?? "FillPattern.None"})`;
+    case "Rectangle":
+      return `Rectangle(${origin}extent=${formatExtent(graphic.extent)}, lineColor=${formatColor(graphic.lineColor ?? [0, 0, 0])}, fillColor=${formatColor(graphic.fillColor ?? [255, 255, 255])}, fillPattern=${graphic.fillPattern ?? "FillPattern.None"})`;
+    case "Ellipse":
+      return `Ellipse(${origin}extent=${formatExtent(graphic.extent)}, lineColor=${formatColor(graphic.lineColor ?? [0, 0, 0])}, fillColor=${formatColor(graphic.fillColor ?? [255, 255, 255])}, fillPattern=${graphic.fillPattern ?? "FillPattern.None"})`;
+    case "Text":
+      return `Text(${origin}extent=${formatExtent(graphic.extent)}, textString=${quoteModelicaString(graphic.textString)}, textColor=${formatColor(graphic.textColor ?? [0, 0, 0])})`;
+    case "Bitmap":
+      return `Bitmap(${origin}extent=${formatExtent(graphic.extent)})`;
+  }
 }
 
 function defaultGraphicText(type: GraphicToolType, x: number, y: number): string {
@@ -561,11 +603,12 @@ function registerIpcHandlers(): void {
         );
         if (!target) return { error: `TARGET_CLASS_NOT_FOUND: ${request.targetQualifiedName}` };
         const classSlice = content.slice(target.sourceRange.start, target.sourceRange.end);
-        const graphicText = defaultGraphicText(
-          request.graphicType,
-          request.position.x,
-          request.position.y,
-        );
+        if (request.graphic && request.graphic.type !== request.graphicType) {
+          return { error: "INVALID_GRAPHIC: graphic type does not match tool" };
+        }
+        const graphicText = request.graphic
+          ? serializeCreatedGraphic(request.graphic)
+          : defaultGraphicText(request.graphicType, request.position.x, request.position.y);
         const insertion = buildGraphicInsertionEdit(classSlice, graphicText);
         if (!insertion) {
           return { error: `ICON_RANGE_ERROR: unable to locate an annotation insertion point in ${request.targetQualifiedName}` };

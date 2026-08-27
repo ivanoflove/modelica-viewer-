@@ -2,6 +2,7 @@ import type {
   IconDto,
   EditableIconDto,
   GraphicToolType,
+  GraphicItemDto,
   Point,
 } from "./modelicaGraphics.js";
 
@@ -86,6 +87,7 @@ export interface CreateGraphicRequest {
   graphicType: GraphicToolType;
   position: Point;
   sourceVersion?: number;
+  graphic?: GraphicItemDto;
 }
 
 export type CreateGraphicResult =

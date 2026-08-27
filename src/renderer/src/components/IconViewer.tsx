@@ -12,6 +12,7 @@ import type {
   IconDto,
   EditableIconDto,
   EditableGraphic,
+  GraphicItemDto,
   GraphicTransform,
   Extent,
   LineDto,
@@ -81,7 +82,28 @@ interface Props {
   onCreateGraphic?: (
     graphicType: GraphicToolType,
     position: Point,
+    graphic?: GraphicItemDto,
   ) => Promise<CreateGraphicResult>;
+}
+
+type DrawingTool = "select" | GraphicToolType;
+
+interface DrawingSession {
+  tool: GraphicToolType;
+  pointerId: number;
+  points: Point[];
+  startPoint?: Point;
+  currentPoint?: Point;
+  shift: boolean;
+  alt: boolean;
+}
+
+interface DrawingPreviewState {
+  tool: GraphicToolType;
+  points: Point[];
+  currentPoint?: Point;
+  shift: boolean;
+  alt: boolean;
 }
 
 interface DragSession {
@@ -185,6 +207,11 @@ export function IconViewer({
     null,
   );
   const [historyVersion, setHistoryVersion] = useState(0);
+  const [drawingTool, setDrawingTool] = useState<DrawingTool>("select");
+  const [drawingPreview, setDrawingPreview] = useState<DrawingPreviewState | null>(null);
+  const drawingRef = useRef<DrawingSession | null>(null);
+  const drawingRafRef = useRef<number | null>(null);
+  const drawingKeyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
   const sel: SelectionState = useSelection();
 
   // A successful source reload supplies the canonical graphic. Until then,
@@ -219,19 +246,31 @@ export function IconViewer({
     historyRef.current = new HistoryManager(100);
     setResizePreview(null);
     setVertexSelection(null);
+    drawingRef.current = null;
+    if (drawingRafRef.current !== null) cancelAnimationFrame(drawingRafRef.current);
+    drawingRafRef.current = null;
+    setDrawingPreview(null);
+    setDrawingTool("select");
     setInteractionNotice(null);
     setHistoryVersion((version) => version + 1);
   }, [resetKey]);
 
   useEffect(() => {
     screenOverlayUpdateRef.current();
-  }, [sel.selectedId, icon, editable, optimisticGraphics, resizePreview, resetKey]);
+  }, [sel.selectedId, icon, editable, optimisticGraphics, resizePreview, drawingPreview, resetKey]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        if (drawingRef.current || drawingTool !== "select") {
+          drawingKeyHandlerRef.current(event);
+          return;
+        }
         setContextMenu(null);
         setPropertiesGraphicId(null);
+      }
+      if (drawingRef.current && (event.key === "Enter" || event.key === "Backspace")) {
+        drawingKeyHandlerRef.current(event);
       }
     };
     const onPointerDown = () => setContextMenu(null);
@@ -241,9 +280,271 @@ export function IconViewer({
       window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, []);
+  }, [drawingTool]);
 
   if (!icon) return <div className="no-icon">No Icon annotation</div>;
+
+  const drawingViewportPoint = (event: PointerEvent<SVGSVGElement>): Point | null => {
+    const svg = svgRef.current;
+    const viewport = viewportStateRef.current;
+    return svg && viewport
+      ? clientToModelicaWithViewport(svg, event.clientX, event.clientY, viewport)
+      : null;
+  };
+
+  const normalizeDrawingExtent = (
+    start: Point,
+    current: Point,
+    shift: boolean,
+    alt: boolean,
+  ): Extent => {
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    if (shift) {
+      const size = Math.max(Math.abs(dx), Math.abs(dy));
+      dx = Math.sign(dx || 1) * size;
+      dy = Math.sign(dy || 1) * size;
+    }
+    return alt
+      ? { p1: { x: start.x - Math.abs(dx), y: start.y - Math.abs(dy) }, p2: { x: start.x + Math.abs(dx), y: start.y + Math.abs(dy) } }
+      : { p1: { x: Math.min(start.x, start.x + dx), y: Math.min(start.y, start.y + dy) }, p2: { x: Math.max(start.x, start.x + dx), y: Math.max(start.y, start.y + dy) } };
+  };
+
+  const drawingGraphic = (session: DrawingSession, final = false): GraphicItemDto | null => {
+    const start = session.startPoint;
+    const current = session.currentPoint;
+    if (session.tool === "Line") {
+      if (!start || !current) return null;
+      return { type: "Line", points: [start, current], color: [0, 0, 0], thickness: 0.25 };
+    }
+    if (session.tool === "Polygon") {
+      const points = session.points.map((point) => ({ ...point }));
+      if (!final && current && (points.length === 0 || points[points.length - 1]!.x !== current.x || points[points.length - 1]!.y !== current.y)) points.push({ ...current });
+      if (final && points.length >= 3) {
+        const first = points[0]!;
+        const last = points[points.length - 1]!;
+        if (first.x !== last.x || first.y !== last.y) points.push({ ...first });
+      }
+      return points.length >= 2
+        ? { type: "Polygon", points, lineColor: [0, 0, 0], fillColor: [255, 255, 255], fillPattern: "FillPattern.None" }
+        : null;
+    }
+    if (!start || !current) return null;
+    const extent = normalizeDrawingExtent(start, current, session.shift, session.alt);
+    if (session.tool === "Rectangle") return { type: "Rectangle", extent, lineColor: [0, 0, 0], fillColor: [255, 255, 255], fillPattern: "FillPattern.None" };
+    if (session.tool === "Ellipse") return { type: "Ellipse", extent, lineColor: [0, 0, 0], fillColor: [255, 255, 255], fillPattern: "FillPattern.None" };
+    if (session.tool === "Text") return { type: "Text", extent, textString: "Text", textColor: [0, 0, 0] };
+    return { type: "Bitmap", extent };
+  };
+
+  const scheduleDrawingPreview = () => {
+    if (drawingRafRef.current !== null) return;
+    drawingRafRef.current = requestAnimationFrame(() => {
+      drawingRafRef.current = null;
+      const session = drawingRef.current;
+      setDrawingPreview(session ? { tool: session.tool, points: session.points.map((point) => ({ ...point })), currentPoint: session.currentPoint ? { ...session.currentPoint } : undefined, shift: session.shift, alt: session.alt } : null);
+    });
+  };
+
+  const cancelDrawing = () => {
+    const session = drawingRef.current;
+    if (session && session.tool !== "Polygon") releasePointer(session.pointerId);
+    drawingRef.current = null;
+    if (drawingRafRef.current !== null) cancelAnimationFrame(drawingRafRef.current);
+    drawingRafRef.current = null;
+    setDrawingPreview(null);
+    setDrawingTool("select");
+    setInteractionNotice(null);
+  };
+
+  const pushCreateHistory = (result: CreateGraphicResult) => {
+    if ("error" in result) {
+      setInteractionNotice(`创建未保存：${result.error}`);
+      return;
+    }
+    historyRef.current.push({
+      type: "create",
+      target: {
+        ownerQualifiedName: result.graphicId.split(":Icon.graphics:")[0] ?? modelName,
+        graphicPath: result.graphicPath,
+        property: "item",
+      },
+      before: "",
+      after: result.graphicText,
+    });
+    setHistoryVersion((version) => version + 1);
+    sel.setSelected(result.graphicId);
+    setVertexSelection(null);
+    setInteractionNotice(null);
+  };
+
+  const commitCreatedGraphic = async (
+    graphicType: GraphicToolType,
+    position: Point,
+    graphic?: GraphicItemDto,
+  ) => {
+    if (!onCreateGraphic) return;
+    try {
+      pushCreateHistory(await onCreateGraphic(graphicType, position, graphic));
+    } catch (error) {
+      setInteractionNotice(`创建未保存：${error instanceof Error ? error.message : "未知错误"}`);
+    }
+  };
+
+  const selectDrawingTool = (type: GraphicToolType) => {
+    cancelDrawing();
+    setDrawingTool((current) => current === type ? "select" : type);
+  };
+
+  const beginDrawing = (event: PointerEvent<SVGSVGElement>, point: Point) => {
+    if (drawingTool === "select" || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    sel.setSelected(null);
+    setPropertiesGraphicId(null);
+    setVertexSelection(null);
+    setInteractionNotice(null);
+    const tool = drawingTool;
+    const session = drawingRef.current;
+    if (tool === "Line" && session?.tool === "Line" && session.points.length === 1) {
+      const start = session.points[0]!;
+      if (!drawingIsLargeEnough(start, point)) {
+        session.currentPoint = { ...point };
+        scheduleDrawingPreview();
+        return;
+      }
+      session.points.push({ ...point });
+      session.currentPoint = { ...point };
+      const graphic = drawingGraphic(session, true);
+      drawingRef.current = null;
+      setDrawingPreview(null);
+      setDrawingTool("select");
+      void commitCreatedGraphic("Line", start, graphic ?? undefined);
+      return;
+    }
+    if (tool === "Polygon" && session?.tool === "Polygon") {
+      session.points.push({ ...point });
+      session.currentPoint = { ...point };
+      scheduleDrawingPreview();
+      return;
+    }
+    const next: DrawingSession = {
+      tool,
+      pointerId: event.pointerId,
+      points: tool === "Polygon" || tool === "Line" ? [{ ...point }] : [],
+      startPoint: tool === "Polygon" ? undefined : { ...point },
+      currentPoint: { ...point },
+      shift: event.shiftKey,
+      alt: event.altKey,
+    };
+    drawingRef.current = next;
+    if (tool !== "Polygon" && tool !== "Line") capturePointer(event.pointerId);
+    scheduleDrawingPreview();
+  };
+
+  const handleCanvasPointerDownCapture = (event: PointerEvent<SVGSVGElement>) => {
+    const point = drawingViewportPoint(event);
+    if (point) beginDrawing(event, point);
+  };
+
+  const handleDrawingPointerMove = (event: PointerEvent<SVGSVGElement>) => {
+    const session = drawingRef.current;
+    if (!session) return;
+    const point = drawingViewportPoint(event);
+    if (!point) return;
+    if (session.tool !== "Polygon" && session.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    session.currentPoint = point;
+    session.shift = event.shiftKey;
+    session.alt = event.altKey;
+    scheduleDrawingPreview();
+  };
+
+  const drawingIsLargeEnough = (a: Point, b: Point) => {
+    const viewport = viewportStateRef.current;
+    return viewport ? Math.hypot(modelToViewportRoot(a, viewport).x - modelToViewportRoot(b, viewport).x, modelToViewportRoot(a, viewport).y - modelToViewportRoot(b, viewport).y) >= 4 : false;
+  };
+
+  const finishPolygon = () => {
+    const session = drawingRef.current;
+    if (!session || session.tool !== "Polygon" || session.points.length < 3) return;
+    const graphic = drawingGraphic(session, true);
+    if (!graphic) return;
+    const position = session.points[0]!;
+    drawingRef.current = null;
+    setDrawingPreview(null);
+    setDrawingTool("select");
+    void commitCreatedGraphic("Polygon", position, graphic);
+  };
+
+  const handleCanvasDoubleClick = (event: MouseEvent<SVGSVGElement>) => {
+    if (drawingRef.current?.tool !== "Polygon") return;
+    event.preventDefault();
+    event.stopPropagation();
+    finishPolygon();
+  };
+
+  const handleDrawingPointerUp = (event: PointerEvent<SVGSVGElement>) => {
+    const session = drawingRef.current;
+    if (!session || session.tool === "Line" || session.tool === "Polygon" || session.pointerId !== event.pointerId) return;
+    const point = drawingViewportPoint(event);
+    const start = session.startPoint;
+    const graphic = point && start ? drawingGraphic({ ...session, currentPoint: point }, true) : null;
+    event.preventDefault();
+    event.stopPropagation();
+    releasePointer(event.pointerId);
+    drawingRef.current = null;
+    setDrawingPreview(null);
+    setDrawingTool("select");
+    if (point && start && drawingIsLargeEnough(start, point) && graphic) {
+      void commitCreatedGraphic(session.tool, start, graphic);
+    }
+  };
+
+  const handleDrawingPointerCancel = (event: PointerEvent<SVGSVGElement>) => {
+    const session = drawingRef.current;
+    if (!session || session.pointerId !== event.pointerId || session.tool === "Polygon" || session.tool === "Line") return;
+    event.preventDefault();
+    event.stopPropagation();
+    cancelDrawing();
+  };
+
+  drawingKeyHandlerRef.current = (event) => {
+    const session = drawingRef.current;
+    if (!session) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDrawingTool("select");
+        setDrawingPreview(null);
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelDrawing();
+      return;
+    }
+    if (event.key === "Backspace" && session.tool === "Polygon") {
+      event.preventDefault();
+      session.points.pop();
+      session.currentPoint = session.points[session.points.length - 1];
+      scheduleDrawingPreview();
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (session.tool === "Polygon") finishPolygon();
+      else if (session.tool === "Line" && session.points.length >= 2) {
+        const graphic = drawingGraphic(session, true);
+        const position = session.points[0]!;
+        drawingRef.current = null;
+        setDrawingPreview(null);
+        setDrawingTool("select");
+        void commitCreatedGraphic("Line", position, graphic ?? undefined);
+      }
+    }
+  };
 
   const handleCanvasPointerDown = (e: PointerEvent<SVGSVGElement>) => {
     if (e.button !== 0 || e.target !== e.currentTarget) return;
@@ -518,28 +819,7 @@ export function IconViewer({
     if (!svg || !viewport) return;
     const position = clientToModelicaWithViewport(svg, event.clientX, event.clientY, viewport);
     if (!position) return;
-    void onCreateGraphic(graphicType, position).then((result) => {
-      if ("error" in result) {
-        setInteractionNotice(`创建未保存：${result.error}`);
-        return;
-      }
-      historyRef.current.push({
-        type: "create",
-        target: {
-          ownerQualifiedName: result.graphicId.split(":Icon.graphics:")[0] ?? modelName,
-          graphicPath: result.graphicPath,
-          property: "item",
-        },
-        before: "",
-        after: result.graphicText,
-      });
-      setHistoryVersion((version) => version + 1);
-      sel.setSelected(result.graphicId);
-      setVertexSelection(null);
-      setInteractionNotice(null);
-    }).catch((error: unknown) => {
-      setInteractionNotice(`创建未保存：${error instanceof Error ? error.message : "未知错误"}`);
-    });
+    void commitCreatedGraphic(graphicType, position);
   };
 
   const handlePropertyEdit = (
@@ -1183,12 +1463,12 @@ export function IconViewer({
     const overlay = screenOverlayRef.current;
     const svg = svgRef.current;
     const viewport = viewportStateRef.current;
-    if (!overlay || !svg || !viewport || !selectedBounds) {
+    if (!overlay || !svg || !viewport) {
       return;
     }
     const rootScale = svgRootPixelScale(svg, viewport.base);
     const dragDelta = dragPreviewDeltaRef.current;
-    for (const handle of resizeHandles) {
+    if (selectedBounds) for (const handle of resizeHandles) {
       const modelPoint = handlePosition(handle, selectedBounds);
       const point = modelToViewportRoot(
         dragDelta
@@ -1231,6 +1511,16 @@ export function IconViewer({
           hit?.setAttribute("r", String(VERTEX_HIT_RADIUS_PX / rootScale));
       });
     }
+    const drawingPoints = drawingPreview
+      ? [...drawingPreview.points, ...(drawingPreview.currentPoint && (drawingPreview.points.length === 0 || drawingPreview.points[drawingPreview.points.length - 1]!.x !== drawingPreview.currentPoint.x || drawingPreview.points[drawingPreview.points.length - 1]!.y !== drawingPreview.currentPoint.y) ? [drawingPreview.currentPoint] : [])]
+      : [];
+    drawingPoints.forEach((modelPoint, index) => {
+      const point = modelToViewportRoot(modelPoint, viewport);
+      const marker = overlay.querySelector<SVGCircleElement>(`[data-drawing-point="${index}"]`);
+      marker?.setAttribute("cx", String(point.x));
+      marker?.setAttribute("cy", String(point.y));
+      marker?.setAttribute("r", String(4 / rootScale));
+    });
   };
 
   const resizeOverlay = canResizeSelected && selectedBounds && selectedEditable
@@ -1275,7 +1565,23 @@ export function IconViewer({
       ))
     : null;
 
-  const screenOverlay = <>{resizeOverlay}{vertexOverlay}</>;
+  const drawingOverlayPoints = drawingPreview
+    ? [...drawingPreview.points, ...(drawingPreview.currentPoint && (drawingPreview.points.length === 0 || drawingPreview.points[drawingPreview.points.length - 1]!.x !== drawingPreview.currentPoint.x || drawingPreview.points[drawingPreview.points.length - 1]!.y !== drawingPreview.currentPoint.y) ? [drawingPreview.currentPoint] : [])]
+    : [];
+  const drawingPreviewGraphic = drawingPreview
+    ? drawingGraphic({
+        tool: drawingPreview.tool,
+        pointerId: 0,
+        points: drawingPreview.points,
+        currentPoint: drawingPreview.currentPoint,
+        shift: drawingPreview.shift,
+        alt: drawingPreview.alt,
+      })
+    : null;
+  const drawingOverlay = drawingOverlayPoints.map((_, index) => (
+    <circle key={`drawing-point:${index}`} data-drawing-point={index} className="drawing-preview-point" cx={0} cy={0} r={4} />
+  ));
+  const screenOverlay = <>{resizeOverlay}{vertexOverlay}{drawingOverlay}</>;
 
   screenOverlayUpdateRef.current = updateScreenOverlay;
 
@@ -1304,7 +1610,11 @@ export function IconViewer({
 
   return (
     <div ref={shellRef} className="icon-editor-shell">
-      <GraphicToolbar enabled={!!onCreateGraphic} />
+      <GraphicToolbar
+        enabled={!!onCreateGraphic}
+        activeTool={drawingTool === "select" ? null : drawingTool}
+        onToolSelect={selectDrawingTool}
+      />
       <GraphicViewport
         icon={icon}
         resetKey={resetKey}
@@ -1317,23 +1627,29 @@ export function IconViewer({
         }}
         overlay={screenOverlay}
         onCanvasPointerDown={handleCanvasPointerDown}
+        onCanvasPointerDownCapture={handleCanvasPointerDownCapture}
         onCanvasContextMenu={(event) => {
           event.preventDefault();
           closeContextMenu();
         }}
         onCanvasDragOver={handleCanvasDragOver}
         onCanvasDrop={handleCanvasDrop}
+        onCanvasDoubleClick={handleCanvasDoubleClick}
+        canvasCursor={drawingTool === "select" ? undefined : "crosshair"}
         onPointerMove={(event) => {
+          handleDrawingPointerMove(event);
           handleVertexMove(event);
           handlePointerMove(event);
           handleResizeMove(event);
         }}
         onPointerUp={(event) => {
+          handleDrawingPointerUp(event);
           handleVertexUp(event);
           handlePointerUp(event);
           handleResizeUp(event);
         }}
         onPointerCancel={(event) => {
+          handleDrawingPointerCancel(event);
           handleVertexCancel(event);
           handlePointerCancel(event);
         }}
@@ -1390,7 +1706,12 @@ export function IconViewer({
               );
             })}
           </GraphicLayer>
-          <g className="hit-layer">
+          {drawingPreviewGraphic && (
+            <g className="drawing-preview-layer">
+              <GraphicItem item={drawingPreviewGraphic} styleId="drawing-preview-style" />
+            </g>
+          )}
+          <g className="hit-layer" pointerEvents={drawingTool === "select" ? "auto" : "none"}>
             {entries.map(({ id, graphic, editable: ed }) => {
               if (!isPointBasedGraphic(graphic)) return null;
               return (

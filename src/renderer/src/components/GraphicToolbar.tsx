@@ -1,4 +1,4 @@
-import type { DragEvent } from "react";
+import { useRef, type DragEvent } from "react";
 import type { GraphicToolType } from "../../../shared/modelicaGraphics";
 
 const tools: Array<{ type: GraphicToolType; label: string }> = [
@@ -21,13 +21,23 @@ function ToolGlyph({ type }: { type: GraphicToolType }) {
 
 export const GRAPHIC_DRAG_MIME = "application/x-modelica-graphic";
 
-export function GraphicToolbar({ enabled = true }: { enabled?: boolean }) {
+export function GraphicToolbar({
+  enabled = true,
+  activeTool = null,
+  onToolSelect,
+}: {
+  enabled?: boolean;
+  activeTool?: GraphicToolType | null;
+  onToolSelect?: (type: GraphicToolType) => void;
+}) {
+  const dragStarted = useRef(false);
   const handleDragStart = (event: DragEvent<HTMLButtonElement>, type: GraphicToolType) => {
     event.dataTransfer.effectAllowed = "copy";
     event.dataTransfer.setData(
       GRAPHIC_DRAG_MIME,
       JSON.stringify({ type: "create-modelica-graphic", graphicType: type }),
     );
+    dragStarted.current = true;
     event.currentTarget.classList.add("is-dragging");
   };
 
@@ -39,11 +49,19 @@ export function GraphicToolbar({ enabled = true }: { enabled?: boolean }) {
           key={tool.type}
           type="button"
           className="graphic-tool"
+          data-active={activeTool === tool.type ? "true" : undefined}
           draggable={enabled}
           disabled={!enabled}
           title={`拖动 ${tool.label} 到 Icon 画布`}
           onDragStart={(event) => handleDragStart(event, tool.type)}
-          onDragEnd={(event) => event.currentTarget.classList.remove("is-dragging")}
+          onDragEnd={(event) => {
+            event.currentTarget.classList.remove("is-dragging");
+            window.setTimeout(() => { dragStarted.current = false; }, 0);
+          }}
+          onClick={() => {
+            if (dragStarted.current) return;
+            onToolSelect?.(tool.type);
+          }}
         >
           <ToolGlyph type={tool.type} />
           <span>{tool.label}</span>

@@ -6,7 +6,7 @@ import type {
   SourceEditReason,
 } from "../../shared/modelica";
 import type { LibraryInfo } from "../../shared/api";
-import type { IconDto, EditableIconDto, GraphicToolType, Point } from "../../shared/modelicaGraphics";
+import type { IconDto, EditableIconDto, GraphicItemDto, GraphicToolType, Point } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
 import { AppearancePopover } from "./components/AppearancePopover";
@@ -335,6 +335,7 @@ function App(): JSX.Element {
   const handleCreateGraphic = async (
     graphicType: GraphicToolType,
     position: Point,
+    graphic?: GraphicItemDto,
   ): Promise<CreateGraphicResult> => {
     if (!selected || !window.api) return { error: "当前没有可编辑的 Modelica 类" };
     try {
@@ -342,6 +343,7 @@ function App(): JSX.Element {
         targetQualifiedName: selected.node.qualifiedName,
         graphicType,
         position,
+        graphic,
         sourceVersion: editableIcon?.sourceVersion,
       });
       if ("error" in result) {

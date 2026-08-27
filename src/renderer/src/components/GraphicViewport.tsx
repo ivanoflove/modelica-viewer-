@@ -91,7 +91,10 @@ interface Props {
   onPointerUp: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerCancel: (event: PointerEvent<SVGSVGElement>) => void;
   onCanvasPointerDown?: (event: PointerEvent<SVGSVGElement>) => void;
+  onCanvasPointerDownCapture?: (event: PointerEvent<SVGSVGElement>) => void;
   onCanvasContextMenu?: (event: MouseEvent<SVGSVGElement>) => void;
+  onCanvasDoubleClick?: (event: MouseEvent<SVGSVGElement>) => void;
+  canvasCursor?: string;
   onCanvasDragOver?: (event: React.DragEvent<HTMLDivElement>) => void;
   onCanvasDrop?: (event: React.DragEvent<HTMLDivElement>) => void;
   onUndo?: () => void;
@@ -216,7 +219,10 @@ export function GraphicViewport({
   onPointerUp,
   onPointerCancel,
   onCanvasPointerDown,
+  onCanvasPointerDownCapture,
   onCanvasContextMenu,
+  onCanvasDoubleClick,
+  canvasCursor,
   onCanvasDragOver,
   onCanvasDrop,
   onUndo,
@@ -484,8 +490,11 @@ export function GraphicViewport({
           viewBox={toViewBoxString(baseViewBox)}
           className="modelica-icon"
           preserveAspectRatio="xMidYMid meet"
-          style={{ touchAction: "none", cursor: isPanning ? "grabbing" : "default" }}
-          onPointerDownCapture={startPan}
+          style={{ touchAction: "none", cursor: isPanning ? "grabbing" : canvasCursor ?? "default" }}
+          onPointerDownCapture={(event) => {
+            startPan(event);
+            onCanvasPointerDownCapture?.(event);
+          }}
           onPointerDown={(event) => onCanvasPointerDown?.(event)}
           onPointerMove={(event) => {
             handlePanMove(event);
@@ -501,6 +510,8 @@ export function GraphicViewport({
           }}
           onContextMenu={onCanvasContextMenu}
           onDoubleClick={(event) => {
+            onCanvasDoubleClick?.(event);
+            if (event.defaultPrevented) return;
             if (event.target === event.currentTarget) fit();
           }}
           onFocus={() => undefined}
