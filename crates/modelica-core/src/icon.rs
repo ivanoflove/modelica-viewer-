@@ -134,11 +134,16 @@ fn find_own_icon(class: &Class, source: &str) -> Option<(bool, AnnotationCall, I
         }
         let close_index = matching_paren(&tokens, open_index)?;
         let call_source = owned.get(token.start..tokens[close_index].end)?;
-        let annotation = parse_call(call_source).ok()?;
-        let icon = annotation
+        let Ok(annotation) = parse_call(call_source) else {
+            continue;
+        };
+        let Some(icon) = annotation
             .args
             .iter()
-            .find_map(|entry| entry.value.as_call().filter(|call| call.name == "Icon"))?;
+            .find_map(|entry| entry.value.as_call().filter(|call| call.name == "Icon"))
+        else {
+            continue;
+        };
         let has_coordinate_system = icon.named("coordinateSystem").is_some()
             || icon.named("extent").is_some()
             || icon.args.iter().any(|entry| {
@@ -258,6 +263,24 @@ mod tests {
         let scene = IconResolver::new(&mut registry).resolve(&class, &source);
         assert_eq!(scene.graphics.len(), 1);
         assert!(scene.diagnostics.is_empty(), "{:?}", scene.diagnostics);
+    }
+
+    #[test]
+    fn skips_non_icon_annotations_before_class_icon() {
+        let source = r#"model WithDialog
+  parameter Real value = 1 annotation(Dialog(tab = "General"));
+  annotation(
+    Documentation(info = "metadata"),
+    Icon(graphics={Rectangle(extent={{-10,-10},{10,10}})})
+  );
+end WithDialog;"#;
+        let file = parse(source, "WithDialog.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("WithDialog.mo", source)
+            .expect("index source");
+        let scene = IconResolver::new(&mut registry).resolve(&file.classes[0], source);
+        assert_eq!(scene.graphics.len(), 1);
     }
 
     #[test]
