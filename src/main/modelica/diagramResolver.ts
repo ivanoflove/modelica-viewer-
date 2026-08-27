@@ -10,8 +10,10 @@ import {
   resolveGraphicCall,
   resolveGraphicsFromCall,
   resolveIconForClass,
+  resolveDiagramLayerForClass,
   type ExternalClassResolver,
 } from "./iconResolver.js";
+import { typeNameCandidates } from "./registry.js";
 import type { ClassNode } from "./types.js";
 import type {
   ComponentInstanceDto,
@@ -102,6 +104,11 @@ function parsePlacement(annotation: AnnotationCall): PlacementDto | undefined {
       callValue(getArg(placement, "transformation"), "transformation") ??
         callValue(getPositionalArg(placement, 0), "transformation"),
     ),
+    iconTransformation: parseTransformation(
+      callValue(getArg(placement, "iconTransformation"), "transformation") ??
+        callValue(getPositionalArg(placement, 1), "iconTransformation"),
+    ),
+    iconVisible: asBoolean(getArg(placement, "iconVisible")),
   };
 }
 
@@ -112,7 +119,8 @@ const declarationPrefixes = new Set([
 
 function qualifiedNameAt(tokens: Token[], start: number): { name: string; end: number } | undefined {
   const first = tokens[start];
-  if (!first || first.type !== "IDENT" || declarationPrefixes.has(first.value)) return undefined;
+  const classHeader = new Set(["package", "model", "block", "connector", "record", "function", "class", "type"]);
+  if (!first || first.type !== "IDENT" || declarationPrefixes.has(first.value) || classHeader.has(tokens[start - 1]?.value ?? "")) return undefined;
   const parts = [first.value];
   let end = start;
   while (tokens[end + 1]?.type === "DOT" && tokens[end + 2]?.type === "IDENT") {
@@ -219,6 +227,7 @@ function componentFromAnnotation(
     id: `${classNode.qualifiedName}:component:${declaration.name}:${componentIndex}`,
     name: declaration.name,
     typeName: declaration.typeName,
+    declaredTypeName: declaration.typeName,
     sourceRange: {
       start: classNode.sourceRange.start + declaration.start,
       end: classNode.sourceRange.start + end,
@@ -234,12 +243,37 @@ function componentFromAnnotation(
   };
   const location = resolver(classNode, declaration.typeName);
   if (!location) {
-    return { component, diagnostic: `${declaration.name}: type ${declaration.typeName} could not be resolved` };
+    return {
+      component,
+      diagnostic: `COMPONENT_TYPE_UNRESOLVED: ${declaration.name}: declaredTypeName=${JSON.stringify(declaration.typeName)}, lexicalScope=${JSON.stringify(classNode.qualifiedName)}, triedCandidates=${JSON.stringify(typeNameCandidates(classNode, declaration.typeName))}`,
+    };
   }
   component.classKind = location.target.kind;
   if (location.target.kind === "connector") {
-    return { component, diagnostic: `${declaration.name}: connector Diagram layer is not implemented yet` };
+    const resolved = resolveIconForClass(
+      location.target,
+      location.allClasses,
+      location.source,
+      declaration.name,
+      new Set<string>(),
+      resolver,
+    );
+    component.resolvedTypeQualifiedName = location.target.qualifiedName;
+    if (resolved.icon) component.resolvedIcon = resolved.icon;
+    const diagram = resolveDiagramLayerForClass(
+      location.target,
+      location.source,
+      declaration.name,
+    );
+    if (diagram) component.resolvedDiagram = diagram;
+    return {
+      component,
+      diagnostic: diagram
+        ? undefined
+        : `${declaration.name}: connector has no Diagram layer; using Icon compatibility fallback`,
+    };
   }
+  component.resolvedTypeQualifiedName = location.target.qualifiedName;
   const resolved = resolveIconForClass(
     location.target,
     location.allClasses,
@@ -482,6 +516,7 @@ export function resolveDiagramForClass(
       id: `${classNode.qualifiedName}:component:${declaration.name}:${componentIndex}`,
       name: declaration.name,
       typeName: declaration.typeName,
+      declaredTypeName: declaration.typeName,
       sourceRange: {
         start: classNode.sourceRange.start + declaration.start,
         end: classNode.sourceRange.start + tokens[index]!.end,
@@ -490,6 +525,7 @@ export function resolveDiagramForClass(
     componentIndex++;
     placedNames.add(component.name);
     component.classKind = location.target.kind;
+    component.resolvedTypeQualifiedName = location.target.qualifiedName;
     if (location.target.kind === "connector") {
       diagnostics.push(`${component.name}: connector Diagram layer is not implemented yet`);
     } else {

@@ -53,15 +53,17 @@ function ComponentRenderer({
   const placement = component.placement;
   const transformation = placement?.transformation;
   if (!placement?.visible || !transformation) return null;
-  const icon = component.resolvedIcon;
+  const icon = component.classKind === "connector"
+    ? (component.resolvedDiagram ?? component.resolvedIcon)
+    : component.resolvedIcon;
   const textReflection = icon ? placementScale(icon.coordinateSystem, transformation) : null;
   const renderGraphic = (graphic: GraphicItemDto, graphicIndex: number) => {
     const item = graphic.type === "Text" && icon
       ? {
           ...graphic,
           textString: resolveModelicaTextString(graphic.textTemplate ?? graphic.textString, {
-            classQualifiedName: component.typeName,
-            className: component.typeName.split(".").pop(),
+            classQualifiedName: component.resolvedTypeQualifiedName ?? component.typeName,
+            className: (component.resolvedTypeQualifiedName ?? component.typeName).split(".").pop(),
             instanceName: component.name,
             parameterBindings: component.parameterBindings,
             parameterDefaults: icon.parameterDefaults,
@@ -96,7 +98,7 @@ function ComponentRenderer({
   };
   return (
     <g className="diagram-component" data-component-id={component.id}>
-      {icon && component.classKind !== "connector" ? (
+      {icon ? (
         <g transform={computePlacementTransform(icon.coordinateSystem, transformation)}>
           {icon.graphics.map(renderGraphic)}
         </g>

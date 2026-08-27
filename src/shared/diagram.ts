@@ -1,4 +1,4 @@
-import type { CoordinateSystemDto, Point } from "./modelicaGraphics.js";
+import type { CoordinateSystemDto, GraphicItemDto, Point } from "./modelicaGraphics.js";
 import type { TransformationDto } from "./modelica.js";
 
 /** Map an Icon coordinate system into one component Placement transform. */
@@ -43,4 +43,45 @@ export function transformPlacementPoint(
     x: transformation.origin.x + translated.x * Math.cos(angle) - translated.y * Math.sin(angle),
     y: transformation.origin.y + translated.x * Math.sin(angle) + translated.y * Math.cos(angle),
   };
+}
+
+/** Bake one child graphic into its parent's model space for nested Icon layers. */
+export function transformGraphicByPlacement(
+  graphic: GraphicItemDto,
+  childCoordinateSystem: CoordinateSystemDto,
+  transformation: TransformationDto,
+): GraphicItemDto {
+  const origin = "origin" in graphic ? graphic.origin ?? { x: 0, y: 0 } : { x: 0, y: 0 };
+  const map = (point: Point) => transformPlacementPoint(
+    { x: point.x + origin.x, y: point.y + origin.y },
+    childCoordinateSystem,
+    transformation,
+  );
+  if ("points" in graphic) {
+    return {
+      ...graphic,
+      points: graphic.points.map(map),
+      origin: undefined,
+    } as GraphicItemDto;
+  }
+  const corners = [
+    graphic.extent.p1,
+    { x: graphic.extent.p1.x, y: graphic.extent.p2.y },
+    { x: graphic.extent.p2.x, y: graphic.extent.p1.y },
+    graphic.extent.p2,
+  ].map(map);
+  const xs = corners.map((point) => point.x);
+  const ys = corners.map((point) => point.y);
+  const transformed = {
+    ...graphic,
+    extent: {
+      p1: { x: Math.min(...xs), y: Math.min(...ys) },
+      p2: { x: Math.max(...xs), y: Math.max(...ys) },
+    },
+    origin: undefined,
+  } as GraphicItemDto;
+  if (transformation.rotation !== 0 && transformed.type === "Text") {
+    transformed.rotation = (transformed.rotation ?? 0) + transformation.rotation;
+  }
+  return transformed;
 }

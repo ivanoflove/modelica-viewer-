@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { parseModelicaFile } from "../parser.js";
 import { resolveDiagramForClass } from "../diagramResolver.js";
-import { buildClassIndex, resolveIconForClass } from "../iconResolver.js";
+import { buildClassIndex, resolveDiagramLayerForClass, resolveIconForClass } from "../iconResolver.js";
 import { ModelicaLibraryRegistry } from "../registry.js";
 import { computePlacementTransform, transformPlacementPoint } from "../../../shared/diagram.js";
 import { resolveModelicaTextString } from "../../../shared/modelicaText.js";
@@ -36,6 +36,53 @@ describe("Diagram M1 resolver", () => {
     expect(scene.components[0]?.name).toBe("pump");
     expect(scene.components[0]?.resolvedIcon?.graphics[0]?.type).toBe("Ellipse");
     expect(scene.components[0]?.placement?.transformation?.rotation).toBe(90);
+  });
+
+  it("resolves relative connector types and keeps Icon/Diagram placements separate", () => {
+    const source = `within IEH_CPP;
+      package Interfaces
+        package FluidInterfaces
+          connector FluidPortIN
+            annotation(
+              Icon(coordinateSystem(extent={{-100,-100},{100,100}}), graphics={Ellipse(extent={{-100,-100},{100,100}}, fillColor={0,0,255})}),
+              Diagram(coordinateSystem(extent={{-100,-100},{100,100}}), graphics={Rectangle(extent={{-100,-100},{100,100}})}));
+          end FluidPortIN;
+        end FluidInterfaces;
+      end Interfaces;
+      package FluidUnits
+        model Boundary
+          Interfaces.FluidInterfaces.FluidPortIN port
+            annotation(Placement(
+              transformation(origin={48,-2}, extent={{-10,-10},{10,10}}),
+              iconTransformation(origin={50,0}, extent={{-10,-10},{10,10}})));
+          annotation(Icon(graphics={Rectangle(extent={{-60,-10},{60,10}})}));
+        end Boundary;
+      end FluidUnits;`;
+    const parsed = parseModelicaFile(source, "IEH_CPP.mo");
+    const index = buildClassIndex(parsed.classes);
+    const boundary = index.get("IEH_CPP.FluidUnits.Boundary")!;
+    const registry = new ModelicaLibraryRegistry();
+    registry.registerSource("IEH_CPP.mo", source, parsed);
+    const scene = resolveDiagramForClass(boundary, source, (owner, typeName) =>
+      registry.resolveFor(owner, typeName),
+    );
+    const component = scene.components[0]!;
+    expect(component.resolvedTypeQualifiedName).toBe("IEH_CPP.Interfaces.FluidInterfaces.FluidPortIN");
+    expect(component.classKind).toBe("connector");
+    expect(component.placement?.transformation?.origin).toEqual({ x: 48, y: -2 });
+    expect(component.placement?.iconTransformation?.origin).toEqual({ x: 50, y: 0 });
+    expect(component.resolvedDiagram?.graphics[0]?.type).toBe("Rectangle");
+
+    const icon = resolveIconForClass(boundary, parsed.classes, source, "Boundary", new Set(), (owner, typeName) =>
+      registry.resolveFor(owner, typeName),
+    ).icon!;
+    const connector = icon.graphics.find((graphic) =>
+      graphic.type === "Ellipse" && graphic.fillColor?.[2] === 255,
+    );
+    expect(connector).toMatchObject({
+      extent: { p1: { x: 40, y: -10 }, p2: { x: 60, y: 10 } },
+    });
+    expect(scene.diagnostics).not.toContain("port: connector Diagram layer is not implemented yet");
   });
 
   it("maps icon coordinates into a placement extent and rotation", () => {

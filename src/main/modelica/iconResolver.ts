@@ -25,6 +25,7 @@ import type {
 } from "../../shared/modelicaGraphics.js";
 import { identityTransform } from "../../shared/modelicaGraphics.js";
 import { resolveModelicaTextString } from "../../shared/modelicaText.js";
+import { transformGraphicByPlacement } from "../../shared/diagram.js";
 import type { ClassNode } from "./types.js";
 
 function asNumber(v: AnnotationValue | undefined): number | undefined {
@@ -34,6 +35,15 @@ function asNumber(v: AnnotationValue | undefined): number | undefined {
 
 function asString(v: AnnotationValue | undefined): string | undefined {
   if (v && v.type === "string") return v.value;
+  return undefined;
+}
+
+function asBoolean(v: AnnotationValue | undefined): boolean | undefined {
+  if (v?.type === "boolean") return v.value;
+  if (v?.type === "identifier") {
+    if (v.name === "true") return true;
+    if (v.name === "false") return false;
+  }
   return undefined;
 }
 
@@ -419,6 +429,183 @@ export type ExternalClassResolver = (
   baseName: string,
 ) => IconClassLocation | null;
 
+const declarationPrefixes = new Set([
+  "input", "output", "parameter", "constant", "discrete", "flow", "stream",
+  "inner", "outer", "replaceable", "final", "each", "protected", "public",
+]);
+
+function qualifiedNameAt(tokens: ReturnType<typeof tokenize>, start: number): { name: string; end: number } | undefined {
+  const first = tokens[start];
+  const classHeader = new Set(["package", "model", "block", "connector", "record", "function", "class", "type"]);
+  if (!first || first.type !== "IDENT" || declarationPrefixes.has(first.value) || classHeader.has(tokens[start - 1]?.value ?? "")) return undefined;
+  const parts = [first.value];
+  let end = start;
+  while (tokens[end + 1]?.type === "DOT" && tokens[end + 2]?.type === "IDENT") {
+    parts.push(tokens[end + 2]!.value);
+    end += 2;
+  }
+  return { name: parts.join("."), end };
+}
+
+function declarationFromStatement(tokens: ReturnType<typeof tokenize>): { typeName: string; name: string } | undefined {
+  for (let index = 0; index < tokens.length; index++) {
+    const type = qualifiedNameAt(tokens, index);
+    if (!type) continue;
+    const name = tokens[type.end + 1];
+    if (!name || name.type !== "IDENT" || tokens[type.end + 2]?.type === "IDENT") continue;
+    return { typeName: type.name, name: name.value };
+  }
+  return undefined;
+}
+
+function annotationOwner(tokens: ReturnType<typeof tokenize>, annotationIndex: number): "class" | "component" | "other" {
+  let start = annotationIndex - 1;
+  while (start >= 0 && tokens[start]!.type !== "SEMICOLON") start--;
+  const statement = tokens.slice(start + 1, annotationIndex);
+  if (declarationFromStatement(statement)) return "component";
+  if (statement.length === 0) return "class";
+  return "other";
+}
+
+function findClassAnnotation(slice: string, name: string): AnnotationCall | null {
+  const tokens = tokenize(slice);
+  for (let index = 0; index < tokens.length - 1; index++) {
+    if (tokens[index]!.value !== "annotation" || tokens[index + 1]!.type !== "LPAREN") continue;
+    const annotation = parseAnnotationSlice(slice.slice(tokens[index]!.start));
+    if (!annotation) continue;
+    const value = annotation.arguments.find((argument) =>
+      argument.value.type === "call" && argument.value.call.name === name,
+    )?.value;
+    if (value?.type === "call") return value.call;
+  }
+  return null;
+}
+
+function findComponentAnnotations(slice: string): Array<{ typeName: string; name: string; annotation: AnnotationCall }> {
+  const tokens = tokenize(slice);
+  const result: Array<{ typeName: string; name: string; annotation: AnnotationCall }> = [];
+  for (let index = 0; index < tokens.length - 1; index++) {
+    if (tokens[index]!.value !== "annotation" || tokens[index + 1]!.type !== "LPAREN") continue;
+    if (annotationOwner(tokens, index) !== "component") continue;
+    let start = index - 1;
+    while (start >= 0 && tokens[start]!.type !== "SEMICOLON") start--;
+    const statement = tokens.slice(start + 1, index);
+    if (statement.some((token) => token.value === "protected")) continue;
+    const declaration = declarationFromStatement(statement);
+    const annotation = parseAnnotationSlice(slice.slice(tokens[index]!.start));
+    if (declaration && annotation) result.push({ ...declaration, annotation });
+  }
+  return result;
+}
+
+function findCallArgument(call: AnnotationCall, name: string): AnnotationCall | undefined {
+  const value = getArg(call, name);
+  if (value?.type === "call") return value.call;
+  const positional = call.arguments.find((argument) =>
+    !argument.name && argument.value.type === "call" && argument.value.call.name === name,
+  )?.value;
+  return positional?.type === "call" ? positional.call : undefined;
+}
+
+function parsePlacementForIcon(annotation: AnnotationCall): {
+  visible: boolean;
+  iconVisible?: boolean;
+  transformation?: import("../../shared/modelica.js").TransformationDto;
+  iconTransformation?: import("../../shared/modelica.js").TransformationDto;
+} | undefined {
+  const placement = findCallArgument(annotation, "Placement");
+  if (!placement) return undefined;
+  const parseTransform = (call: AnnotationCall | undefined) => call ? {
+    origin: parsePoint(getArg(call, "origin")) ?? { x: 0, y: 0 },
+    extent: parseExtent(getArg(call, "extent")) ?? { p1: { x: -10, y: -10 }, p2: { x: 10, y: 10 } },
+    rotation: asNumber(getArg(call, "rotation")) ?? 0,
+  } : undefined;
+  return {
+    visible: asBoolean(getArg(placement, "visible")) ?? true,
+    iconVisible: asBoolean(getArg(placement, "iconVisible")),
+    transformation: parseTransform(findCallArgument(placement, "transformation")),
+    iconTransformation: parseTransform(findCallArgument(placement, "iconTransformation")),
+  };
+}
+
+function relativeClass(
+  target: ClassNode,
+  typeName: string,
+  allClasses: ClassNode[],
+): ClassNode | null {
+  const exact = findClassByQualifiedName(allClasses, typeName);
+  if (exact) return exact;
+  const namespace = target.qualifiedName.split(".").slice(0, -1);
+  for (let length = namespace.length; length >= 0; length--) {
+    const prefix = namespace.slice(0, length).join(".");
+    const candidate = prefix ? `${prefix}.${typeName}` : typeName;
+    const found = findClassByQualifiedName(allClasses, candidate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function appendPublicConnectorGraphics(
+  icon: IconDto,
+  target: ClassNode,
+  allClasses: ClassNode[],
+  source: string,
+  resolving: Set<string>,
+  externalResolver?: ExternalClassResolver,
+): IconDto {
+  const slice = source.slice(target.sourceRange.start, target.sourceRange.end);
+  const connectorGraphics: GraphicItemDto[] = [];
+  for (const declaration of findComponentAnnotations(slice)) {
+    const placement = parsePlacementForIcon(declaration.annotation);
+    if (!placement?.visible || placement.iconVisible === false) continue;
+    const transform = placement.iconTransformation ?? placement.transformation;
+    if (!transform) continue;
+    const location = externalResolver?.(target, declaration.typeName) ?? (() => {
+      const local = relativeClass(target, declaration.typeName, allClasses);
+      return local ? { target: local, allClasses, source } : null;
+    })();
+    if (!location || location.target.kind !== "connector") continue;
+    const child = resolveIconForClass(
+      location.target,
+      location.allClasses,
+      location.source,
+      declaration.name,
+      resolving,
+      externalResolver,
+    );
+    if (!child.icon) continue;
+    connectorGraphics.push(...child.icon.graphics.map((graphic) =>
+      transformGraphicByPlacement(graphic, child.icon!.coordinateSystem, transform),
+    ));
+  }
+  return connectorGraphics.length === 0
+    ? icon
+    : { ...icon, graphics: [...icon.graphics, ...connectorGraphics] };
+}
+
+/** Resolve a class's Diagram layer for connector instances. */
+export function resolveDiagramLayerForClass(
+  target: ClassNode,
+  source: string,
+  modelName: string,
+): IconDto | null {
+  const diagram = findClassAnnotation(
+    source.slice(target.sourceRange.start, target.sourceRange.end),
+    "Diagram",
+  );
+  if (!diagram) return null;
+  const positionalCoordinateSystem = diagram.arguments.find((argument) =>
+    !argument.name && argument.value.type === "call" && argument.value.call.name === "coordinateSystem",
+  )?.value;
+  const coordinateSystemCall = findCallArgument(diagram, "coordinateSystem") ??
+    (positionalCoordinateSystem?.type === "call" ? positionalCoordinateSystem.call : undefined);
+  const coordinateSystem = parseCoordinateSystem(coordinateSystemCall);
+  return {
+    coordinateSystem,
+    graphics: resolveGraphicsFromCall(diagram, modelName),
+  };
+}
+
 function fallbackBaseIcon(baseName: string): IconDto | null {
   if (!baseName.startsWith("Modelica.Icons.")) return null;
   return {
@@ -613,19 +800,31 @@ export function resolveIconForClass(
   }
 
   if (!ownIcon && !inherited) return { icon: null, warnings };
-  if (!ownIcon) return { icon: inherited, warnings };
-  if (!inherited) return { icon: ownIcon, warnings };
+  const composed = !ownIcon
+    ? inherited
+    : !inherited
+      ? ownIcon
+      : {
+          coordinateSystem: ownDefinesCoordinateSystem
+            ? ownIcon.coordinateSystem
+            : inherited.coordinateSystem,
+          graphics: [...inherited.graphics, ...ownIcon.graphics],
+          parameterDefaults: {
+            ...(inherited.parameterDefaults ?? {}),
+            ...(ownIcon.parameterDefaults ?? {}),
+          },
+        };
   return {
-    icon: {
-      coordinateSystem: ownDefinesCoordinateSystem
-        ? ownIcon.coordinateSystem
-        : inherited.coordinateSystem,
-      graphics: [...inherited.graphics, ...ownIcon.graphics],
-      parameterDefaults: {
-        ...(inherited.parameterDefaults ?? {}),
-        ...(ownIcon.parameterDefaults ?? {}),
-      },
-    },
+    icon: composed
+      ? appendPublicConnectorGraphics(
+          composed,
+          target,
+          allClasses,
+          source,
+          nextResolving,
+          externalResolver,
+        )
+      : null,
     warnings,
   };
 }

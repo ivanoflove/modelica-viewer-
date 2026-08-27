@@ -115,20 +115,7 @@ export class ModelicaLibraryRegistry {
   }
 
   resolveFor(target: ClassNode, baseName: string): ClassLocation | null {
-    const namespace = target.qualifiedName.split(".").slice(0, -1);
-    // A qualified name may still be relative to the current package. Try an
-    // exact library key first, then progressively enclosing namespaces:
-    // `FluidUnits.Boundary` inside `IEH_CPP.Converter.Cases` must resolve to
-    // `IEH_CPP.FluidUnits.Boundary`, while `Modelica.Blocks.X` resolves by
-    // its exact key.
-    const candidates = [
-      baseName,
-      ...[...Array(namespace.length + 1)].map((_, index) => {
-        const prefix = namespace.slice(0, namespace.length - index).join(".");
-        return prefix ? `${prefix}.${baseName}` : baseName;
-      }),
-    ];
-    for (const candidate of candidates) {
+    for (const candidate of typeNameCandidates(target, baseName)) {
       const location = this.resolve(candidate);
       if (location) return location;
     }
@@ -145,4 +132,15 @@ export class ModelicaLibraryRegistry {
       this.registerSource(cached.sourceFile, cached.source, cached.parsed);
     }
   }
+}
+
+/** Candidates for a Modelica type reference, from exact to enclosing scope. */
+export function typeNameCandidates(target: ClassNode, typeName: string): string[] {
+  const namespace = target.qualifiedName.split(".").slice(0, -1);
+  const candidates = new Set<string>([typeName]);
+  for (let length = namespace.length; length >= 0; length--) {
+    const prefix = namespace.slice(0, length).join(".");
+    candidates.add(prefix ? `${prefix}.${typeName}` : typeName);
+  }
+  return Array.from(candidates);
 }

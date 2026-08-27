@@ -71,16 +71,21 @@ export interface TransformationDto {
 export interface PlacementDto {
   visible: boolean;
   transformation?: TransformationDto;
+  iconTransformation?: TransformationDto;
+  iconVisible?: boolean;
 }
 
 export interface ComponentInstanceDto {
   id: string;
   name: string;
   typeName: string;
+  declaredTypeName?: string;
+  resolvedTypeQualifiedName?: string;
   classKind?: ClassKind;
   sourceRange: SourceRangeDto;
   placement?: PlacementDto;
   resolvedIcon?: IconDto;
+  resolvedDiagram?: IconDto;
   parameterBindings?: Record<string, string>;
 }
 

@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { parseModelicaFile } from "../parser.js";
-import { ModelicaLibraryRegistry } from "../registry.js";
-import { resolveIconForClass } from "../iconResolver.js";
+import { ModelicaLibraryRegistry, typeNameCandidates } from "../registry.js";
+import { buildClassIndex, resolveIconForClass } from "../iconResolver.js";
 
 describe("ModelicaLibraryRegistry", () => {
+  it("resolves relative type names from enclosing package scopes", () => {
+    const source = `within IEH_CPP;
+      package Interfaces package FluidInterfaces connector FluidPortIN end FluidPortIN; end FluidInterfaces; end Interfaces;
+      package FluidUnits model Boundary Interfaces.FluidInterfaces.FluidPortIN port; end Boundary; end FluidUnits;`;
+    const parsed = parseModelicaFile(source, "IEH_CPP.mo");
+    const registry = new ModelicaLibraryRegistry();
+    registry.registerSource("IEH_CPP.mo", source, parsed);
+    const boundary = buildClassIndex(parsed.classes).get("IEH_CPP.FluidUnits.Boundary")!;
+    expect(typeNameCandidates(boundary, "Interfaces.FluidInterfaces.FluidPortIN")).toContain("IEH_CPP.Interfaces.FluidInterfaces.FluidPortIN");
+    expect(registry.resolveFor(boundary, "Interfaces.FluidInterfaces.FluidPortIN")?.target.qualifiedName).toBe("IEH_CPP.Interfaces.FluidInterfaces.FluidPortIN");
+  });
+
   it("resolves a base Icon from a separately registered library source", () => {
     const standard = `within Modelica.Icons;
       partial package Example
