@@ -20,6 +20,10 @@ export interface DirectoryDialogResult {
 export interface LibraryInfo {
   path: string;
   classCount: number;
+  name?: string;
+  version?: string;
+  builtin?: boolean;
+  readOnly?: boolean;
 }
 
 export type LibraryMutationResult =

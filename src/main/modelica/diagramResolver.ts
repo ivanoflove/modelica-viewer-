@@ -487,7 +487,6 @@ export function resolveDiagramForClass(
   const annotations = collectAnnotations(classSlice, tokens);
   const components: ComponentInstanceDto[] = [];
   const diagnostics: string[] = [];
-  const placedNames = new Set<string>();
   let componentIndex = 0;
 
   for (const record of annotations) {
@@ -495,52 +494,8 @@ export function resolveDiagramForClass(
     const parsed = componentFromAnnotation(classSlice, tokens, record, classNode, componentIndex, resolver);
     if (!parsed.component) continue;
     componentIndex++;
-    placedNames.add(parsed.component.name);
     components.push(parsed.component);
     if (parsed.diagnostic) diagnostics.push(parsed.diagnostic);
-  }
-
-  // Keep resolvable declarations without Placement in the scene for
-  // diagnostics, but never render them at an invented origin.
-  let statementStart = 0;
-  for (let index = 0; index < tokens.length; index++) {
-    if (tokens[index]!.type !== "SEMICOLON") continue;
-    const statement = tokens.slice(statementStart, index);
-    statementStart = index + 1;
-    if (statement.some((token) => token.value === "annotation" || token.value === "connect")) continue;
-    const declaration = parseDeclaration(statement);
-    if (!declaration || placedNames.has(declaration.name)) continue;
-    const location = resolver(classNode, declaration.typeName);
-    if (!location) continue;
-    const component: ComponentInstanceDto = {
-      id: `${classNode.qualifiedName}:component:${declaration.name}:${componentIndex}`,
-      name: declaration.name,
-      typeName: declaration.typeName,
-      declaredTypeName: declaration.typeName,
-      sourceRange: {
-        start: classNode.sourceRange.start + declaration.start,
-        end: classNode.sourceRange.start + tokens[index]!.end,
-      },
-    };
-    componentIndex++;
-    placedNames.add(component.name);
-    component.classKind = location.target.kind;
-    component.resolvedTypeQualifiedName = location.target.qualifiedName;
-    if (location.target.kind === "connector") {
-      diagnostics.push(`${component.name}: connector Diagram layer is not implemented yet`);
-    } else {
-      const resolved = resolveIconForClass(
-        location.target,
-        location.allClasses,
-        location.source,
-        declaration.name,
-        new Set<string>(),
-        resolver,
-      );
-      if (resolved.icon) component.resolvedIcon = resolved.icon;
-    }
-    components.push(component);
-    diagnostics.push(`${component.name}: Component has no Placement annotation`);
   }
 
   const diagram = parseDiagramAnnotation(annotations);

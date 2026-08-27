@@ -22,6 +22,11 @@ import { parseModelicaFile } from "./modelica/parser.js";
 import { tokenize } from "./modelica/lexer.js";
 import { ModelicaLibraryRegistry } from "./modelica/registry.js";
 import {
+  BUILTIN_MODELICA_NAME,
+  BUILTIN_MODELICA_VERSION,
+  findBuiltinModelicaRoot,
+} from "./modelica/builtinLibrary.js";
+import {
   applySourceTransaction,
   SourceTransactionError,
 } from "./modelica/sourceTransaction.js";
@@ -170,6 +175,23 @@ function createWindow(): void {
 function registerIpcHandlers(): void {
   const loader = new PackageLoader();
   const libraryRegistry = new ModelicaLibraryRegistry();
+  const builtinModelicaRoot = findBuiltinModelicaRoot(
+    process.resourcesPath,
+    app.getAppPath(),
+    app.isPackaged,
+  );
+  if (builtinModelicaRoot) {
+    try {
+      libraryRegistry.addRoot(builtinModelicaRoot, {
+        name: BUILTIN_MODELICA_NAME,
+        version: BUILTIN_MODELICA_VERSION,
+        builtin: true,
+        readOnly: true,
+      });
+    } catch (error) {
+      console.warn("[BUILTIN_LIBRARY_LOAD_FAILED]", error);
+    }
+  }
   const sourceVersions = new Map<string, number>();
   const libraryConfigPath = join(
     app.getPath("userData"),
@@ -197,7 +219,7 @@ function registerIpcHandlers(): void {
     writeFileSync(
       libraryConfigPath,
       JSON.stringify(
-        libraryRegistry.listRoots().map((item) => item.path),
+        libraryRegistry.listRoots().filter((item) => !item.builtin).map((item) => item.path),
         null,
         2,
       ),
@@ -378,6 +400,9 @@ function registerIpcHandlers(): void {
     ) => {
       try {
         if (!filePath) return { error: "No file path provided" };
+        if (libraryRegistry.isReadOnlyPath(filePath)) {
+          return { editable: null };
+        }
         const content = await readFile(filePath, "utf-8");
         const parsed = parseModelicaFile(content, filePath);
         libraryRegistry.registerSource(filePath, content, parsed);
@@ -470,6 +495,9 @@ function registerIpcHandlers(): void {
       let backupPath: string | null = null;
       try {
         if (!filePath || !edit) return { error: "Missing filePath or edit" };
+        if (libraryRegistry.isReadOnlyPath(filePath)) {
+          return { error: "READ_ONLY_LIBRARY: built-in Modelica Standard Library is read-only" };
+        }
         if (edit.expectedText === undefined) {
           return {
             error:
@@ -622,6 +650,9 @@ function registerIpcHandlers(): void {
       try {
         if (!filePath || !request?.targetQualifiedName) {
           return { error: "Missing filePath or create request" };
+        }
+        if (libraryRegistry.isReadOnlyPath(filePath)) {
+          return { error: "READ_ONLY_LIBRARY: built-in Modelica Standard Library is read-only" };
         }
         if (!Number.isFinite(request.position.x) || !Number.isFinite(request.position.y)) {
           return { error: "INVALID_DROP_POSITION: graphic position is not finite" };

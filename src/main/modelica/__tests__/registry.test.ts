@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { parseModelicaFile } from "../parser.js";
 import { ModelicaLibraryRegistry, typeNameCandidates } from "../registry.js";
-import { buildClassIndex, resolveIconForClass } from "../iconResolver.js";
+import { buildClassIndex, resolveDiagramLayerForClass, resolveIconForClass } from "../iconResolver.js";
 
 describe("ModelicaLibraryRegistry", () => {
   it("resolves relative type names from enclosing package scopes", () => {
@@ -51,5 +53,29 @@ describe("ModelicaLibraryRegistry", () => {
     const resolved = resolveIconForClass(parsed.classes[0]!, parsed.classes, source, "Pump");
     expect(resolved.icon?.graphics.map((item) => item.type)).toEqual(["Rectangle", "Text"]);
     expect(resolved.warnings).toContain("Base icon not resolved: Modelica.Icons.Example");
+  });
+
+  it("resolves core classes from the bundled Modelica 4.1.0 library", () => {
+    const root = join(process.cwd(), "resources/modelica/msl-4.1.0/Modelica");
+    if (!existsSync(join(root, "package.mo"))) return;
+    const registry = new ModelicaLibraryRegistry();
+    const info = registry.addRoot(root, {
+      name: "Modelica",
+      version: "4.1.0",
+      builtin: true,
+      readOnly: true,
+    });
+    expect(info).toMatchObject({ name: "Modelica", version: "4.1.0", builtin: true, readOnly: true });
+    const realInput = registry.resolve("Modelica.Blocks.Interfaces.RealInput");
+    const realOutput = registry.resolve("Modelica.Blocks.Interfaces.RealOutput");
+    const constant = registry.resolve("Modelica.Blocks.Sources.Constant");
+    expect(realInput?.target.kind).toBe("connector");
+    expect(realOutput?.target.kind).toBe("connector");
+    expect(constant?.target.kind).toBe("block");
+    expect(registry.resolve("Modelica.Icons.Example")?.target).toBeDefined();
+    expect(realInput && resolveIconForClass(realInput.target, realInput.allClasses, realInput.source, "u").icon?.graphics.length).toBeGreaterThan(0);
+    expect(realInput && resolveDiagramLayerForClass(realInput.target, realInput.source, "u")?.graphics.length).toBeGreaterThan(0);
+    expect(constant && resolveIconForClass(constant.target, constant.allClasses, constant.source, "const").icon?.graphics.length).toBeGreaterThan(0);
+    expect(registry.isReadOnlyPath(join(root, "Blocks/Interfaces.mo"))).toBe(true);
   });
 });

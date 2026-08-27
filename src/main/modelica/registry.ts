@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { parseModelicaFile } from "./parser.js";
 import type { ClassNode, ModelicaFile, PackageNode } from "./types.js";
 import { PackageLoader } from "./loader.js";
@@ -13,6 +13,10 @@ export interface ClassLocation {
 export interface LibraryInfo {
   path: string;
   classCount: number;
+  name?: string;
+  version?: string;
+  builtin?: boolean;
+  readOnly?: boolean;
 }
 
 function flatten(classes: ClassNode[], result: ClassNode[] = []): ClassNode[] {
@@ -72,7 +76,10 @@ export class ModelicaLibraryRegistry {
     }
   }
 
-  addRoot(rootPath: string): LibraryInfo {
+  addRoot(
+    rootPath: string,
+    metadata: Pick<LibraryInfo, "name" | "version" | "builtin" | "readOnly"> = {},
+  ): LibraryInfo {
     if (!rootPath || !existsSync(join(rootPath, "package.mo"))) {
       throw new Error("Modelica library root must contain package.mo");
     }
@@ -91,14 +98,32 @@ export class ModelicaLibraryRegistry {
         // A broken optional file should not prevent the rest of a library loading.
       }
     }
-    const info = { path: rootPath, classCount };
+    const info = {
+      path: rootPath,
+      classCount,
+      name: metadata.name ?? basename(rootPath),
+      version: metadata.version,
+      builtin: metadata.builtin ?? false,
+      readOnly: metadata.readOnly ?? false,
+    };
     this.roots.set(rootPath, info);
     return info;
   }
 
   removeRoot(rootPath: string): void {
+    if (this.roots.get(rootPath)?.builtin) return;
     this.roots.delete(rootPath);
     this.rebuildLocations();
+  }
+
+  isReadOnlyPath(filePath: string): boolean {
+    const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const candidate = normalize(filePath);
+    for (const [rootPath, info] of Array.from(this.roots.entries())) {
+      const root = normalize(rootPath);
+      if (info.readOnly && (candidate === root || candidate.startsWith(`${root}/`))) return true;
+    }
+    return false;
   }
 
   rescan(): LibraryInfo[] {
@@ -115,18 +140,33 @@ export class ModelicaLibraryRegistry {
   }
 
   resolveFor(target: ClassNode, baseName: string): ClassLocation | null {
-    for (const candidate of typeNameCandidates(target, baseName)) {
+    const candidates = this.hasTopLevelLibrary(baseName)
+      ? [baseName]
+      : typeNameCandidates(target, baseName);
+    for (const candidate of candidates) {
       const location = this.resolve(candidate);
       if (location) return location;
     }
     return null;
   }
 
+  private hasTopLevelLibrary(typeName: string): boolean {
+    const root = typeName.split(".")[0];
+    if (!root) return false;
+    for (const qualifiedName of Array.from(this.locations.keys())) {
+      if (qualifiedName.split(".")[0] === root) return true;
+    }
+    return false;
+  }
+
   private rebuildLocations(): void {
     const cachedSources = Array.from(this.sources.values());
     this.locations.clear();
     for (const root of Array.from(this.roots.keys())) {
-      try { this.addRoot(root); } catch { /* stale root is ignored */ }
+      try {
+        const metadata = this.roots.get(root);
+        this.addRoot(root, metadata ?? {});
+      } catch { /* stale root is ignored */ }
     }
     for (const cached of cachedSources) {
       this.registerSource(cached.sourceFile, cached.source, cached.parsed);
@@ -136,6 +176,9 @@ export class ModelicaLibraryRegistry {
 
 /** Candidates for a Modelica type reference, from exact to enclosing scope. */
 export function typeNameCandidates(target: ClassNode, typeName: string): string[] {
+  // A root-qualified standard library reference must not be prefixed with
+  // the lexical package (for example IEH_CPP.Modelica.Blocks...).
+  if (typeName === "Modelica" || typeName.startsWith("Modelica.")) return [typeName];
   const namespace = target.qualifiedName.split(".").slice(0, -1);
   const candidates = new Set<string>([typeName]);
   for (let length = namespace.length; length >= 0; length--) {

@@ -193,6 +193,11 @@ export function tokenize(input: string, options: TokenizeOptions = {}): Token[] 
       advance(); // opening "
       let str = "";
       while (i < input.length) {
+        if (input[i] === "\\" && peek(1) === '"') {
+          str += '"';
+          advance(2);
+          continue;
+        }
         if (input[i] === '"') {
           if (peek(1) === '"') {
             str += '"';

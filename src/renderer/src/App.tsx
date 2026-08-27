@@ -477,6 +477,9 @@ function App(): JSX.Element {
               </button>
             </div>
           </div>
+          <div className="library-license">
+            Modelica Standard Library 4.1.0 · BSD 3-Clause · 内置只读
+          </div>
           {libraryError && <div className="library-error">{libraryError}</div>}
           {libraries.length === 0 ? (
             <div className="library-empty">
@@ -487,14 +490,20 @@ function App(): JSX.Element {
               {libraries.map((library) => (
                 <li key={library.path}>
                   <span title={library.path}>
-                    {library.path} <small>({library.classCount} classes)</small>
+                    {library.name ?? library.path}
+                    {library.version && <small> {library.version}</small>}
+                    <small> ({library.classCount} classes{library.builtin ? ", built-in" : ""})</small>
                   </span>
-                  <button
-                    className="library-remove"
-                    onClick={() => void removeLibrary(library.path)}
-                  >
-                    移除
-                  </button>
+                  {library.builtin ? (
+                    <small className="library-readonly">只读</small>
+                  ) : (
+                    <button
+                      className="library-remove"
+                      onClick={() => void removeLibrary(library.path)}
+                    >
+                      移除
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>

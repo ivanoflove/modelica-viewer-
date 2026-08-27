@@ -95,7 +95,7 @@ describe("Diagram M1 resolver", () => {
     expect(transformPlacementPoint({ x: 0, y: -100 }, icon, transformation)).toEqual({ x: 60, y: 20 });
   });
 
-  it("reports resolvable components without Placement without rendering them", () => {
+  it("silently skips resolvable members without Placement", () => {
     const source = "model Pump annotation(Icon(graphics={})); end Pump; model System Pump pump; end System;";
     const parsed = parseModelicaFile(source, "demo.mo");
     const pump = parsed.classes.find((item) => item.name === "Pump")!;
@@ -103,8 +103,8 @@ describe("Diagram M1 resolver", () => {
     const scene = resolveDiagramForClass(system, source, (_owner, typeName) =>
       typeName === "Pump" ? { target: pump, allClasses: parsed.classes, source } : null,
     );
-    expect(scene.components[0]?.placement).toBeUndefined();
-    expect(scene.diagnostics[0]).toContain("no Placement");
+    expect(scene.components).toEqual([]);
+    expect(scene.diagnostics).toEqual([]);
   });
 
   it("inherits the base Icon coordinateSystem when the derived Icon omits it", () => {
