@@ -1,6 +1,6 @@
 use gpui::{
     Anchor, App, Bounds, Context, PathBuilder, Pixels, Render, Window, WindowBounds, WindowOptions,
-    anchored, canvas, deferred, div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px,
+    anchored, canvas, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
     rgb, size, uniform_list,
 };
 use gpui_platform::application;
@@ -238,92 +238,97 @@ impl ModelicaViewer {
 impl Render for ModelicaViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = palette(self.theme, self.accent);
-        let glass_alpha = if self.glass == GlassMode::On { 0.78 } else { 0.96 };
+        let glass_alpha = if self.glass == GlassMode::On {
+            0.78
+        } else {
+            0.96
+        };
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
 
-        let tree = uniform_list(
-            "class-tree",
-            visible_count,
-            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                range
-                    .filter_map(|row_index| {
-                        let row = visible_rows.get(row_index)?.clone();
-                        let selected = row.class_index == this.selected;
-                        let key = row.key.clone();
-                        let class_index = row.class_index;
-                        let has_children = row.has_children;
-                        let toggle = if has_children {
-                            if row.expanded { "▾" } else { "▸" }
-                        } else {
-                            ""
-                        };
-                        let indent = 5.0 + row.depth as f32 * 12.0;
+        let tree =
+            uniform_list(
+                "class-tree",
+                visible_count,
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|row_index| {
+                            let row = visible_rows.get(row_index)?.clone();
+                            let selected = row.class_index == this.selected;
+                            let key = row.key.clone();
+                            let class_index = row.class_index;
+                            let has_children = row.has_children;
+                            let toggle = if has_children {
+                                if row.expanded { "▾" } else { "▸" }
+                            } else {
+                                ""
+                            };
+                            let indent = 5.0 + row.depth as f32 * 12.0;
 
-                        Some(
-                            div()
-                                .id(format!("tree-row-{row_index}"))
-                                .mx_1()
-                                .h(px(29.0))
-                                .pl(px(indent))
-                                .pr_2()
-                                .rounded_md()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(rgb(if selected {
-                                    palette.selected_text
-                                } else {
-                                    palette.text
-                                }))
-                                .bg(rgb(if selected {
-                                    palette.accent
-                                } else {
-                                    palette.panel_alt
-                                })
-                                .opacity(if selected { 0.95 } else { 0.18 }))
-                                .hover(move |style| {
-                                    style.bg(rgb(if selected {
-                                        palette.accent_hover
+                            Some(
+                                div()
+                                    .id(format!("tree-row-{row_index}"))
+                                    .mx_1()
+                                    .h(px(29.0))
+                                    .pl(px(indent))
+                                    .pr_2()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(rgb(if selected {
+                                        palette.selected_text
                                     } else {
-                                        palette.card
+                                        palette.text
+                                    }))
+                                    .bg(rgb(if selected {
+                                        palette.accent
+                                    } else {
+                                        palette.panel_alt
                                     })
-                                    .opacity(0.78))
-                                })
-                                .cursor_pointer()
-                                .child(
-                                    div()
-                                        .w(px(14.0))
-                                        .text_color(rgb(palette.subtle))
-                                        .child(toggle),
-                                )
-                                .child(tree_icon(row.kind, selected, palette))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .child(row.label),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if has_children && class_index.is_none() {
-                                        this.toggle_tree(&key);
-                                    } else if let Some(index) = class_index {
-                                        this.select_class(index);
-                                        if has_children {
+                                    .opacity(if selected { 0.95 } else { 0.18 }))
+                                    .hover(move |style| {
+                                        style.bg(rgb(if selected {
+                                            palette.accent_hover
+                                        } else {
+                                            palette.card
+                                        })
+                                        .opacity(0.78))
+                                    })
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .text_color(rgb(palette.subtle))
+                                            .child(toggle),
+                                    )
+                                    .child(tree_icon(row.kind, selected, palette))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(row.label),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if has_children && class_index.is_none() {
                                             this.toggle_tree(&key);
+                                        } else if let Some(index) = class_index {
+                                            this.select_class(index);
+                                            if has_children {
+                                                this.toggle_tree(&key);
+                                            }
                                         }
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .h_full();
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -615,11 +620,13 @@ fn appearance_control(
             .rounded_lg()
             .border_1()
             .border_color(rgb(palette.border).opacity(0.78))
-            .bg(rgb(palette.panel).opacity(if viewer.glass == GlassMode::On {
-                0.92
-            } else {
-                0.99
-            }))
+            .bg(
+                rgb(palette.panel).opacity(if viewer.glass == GlassMode::On {
+                    0.92
+                } else {
+                    0.99
+                }),
+            )
             .shadow_xl()
             .flex()
             .flex_col()
@@ -630,12 +637,7 @@ fn appearance_control(
                     .items_center()
                     .justify_between()
                     .child(div().text_sm().child("Appearance"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(palette.subtle))
-                            .child("UI"),
-                    ),
+                    .child(div().text_xs().text_color(rgb(palette.subtle)).child("UI")),
             )
             .child(setting_group("Theme", theme_choices, palette))
             .child(setting_group("Accent", accent_choices, palette))
@@ -676,7 +678,11 @@ fn tree_icon(kind: ClassKind, selected: bool, palette: Palette) -> gpui::Div {
         .h(px(18.0))
         .rounded_md()
         .bg(rgb(tint).opacity(if selected { 0.22 } else { 0.10 }))
-        .text_color(rgb(if selected { palette.selected_text } else { tint }))
+        .text_color(rgb(if selected {
+            palette.selected_text
+        } else {
+            tint
+        }))
         .flex()
         .items_center()
         .justify_center()
@@ -695,12 +701,14 @@ fn choice_chip(
         .h(px(25.0))
         .rounded_md()
         .border_1()
-        .border_color(rgb(if active {
-            palette.accent
-        } else {
-            palette.border
-        })
-        .opacity(0.78))
+        .border_color(
+            rgb(if active {
+                palette.accent
+            } else {
+                palette.border
+            })
+            .opacity(0.78),
+        )
         .bg(rgb(if active {
             palette.accent
         } else {
@@ -747,11 +755,7 @@ fn tab_chip(label: &str, active: bool, palette: Palette) -> gpui::Div {
             rgb(palette.panel).opacity(0.0)
         })
         .text_xs()
-        .text_color(rgb(if active {
-            palette.text
-        } else {
-            palette.muted
-        }))
+        .text_color(rgb(if active { palette.text } else { palette.muted }))
         .flex()
         .items_center()
         .child(label.to_owned())
