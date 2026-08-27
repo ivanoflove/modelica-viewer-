@@ -5,6 +5,8 @@ import type {
 } from "../shared/api";
 import type {
   ApplySourceEditResult,
+  CreateGraphicRequest,
+  CreateGraphicResult,
   GetEditableIconResult,
   GetIconResult,
   LoadPackageResult,
@@ -68,6 +70,12 @@ const api: WindowApi = {
         filePath,
         edit,
       ) as Promise<ApplySourceEditResult>,
+    createGraphic: (filePath: string, request: CreateGraphicRequest) =>
+      ipcRenderer.invoke(
+        "modelica:createGraphic",
+        filePath,
+        request,
+      ) as Promise<CreateGraphicResult>,
     reloadClassRange: (filePath: string, qualifiedName: string) =>
       ipcRenderer.invoke(
         "modelica:reloadClassRange",

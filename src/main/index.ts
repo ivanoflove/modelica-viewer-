@@ -14,6 +14,7 @@ import {
   findClassByQualifiedNameOrUniqueLeaf,
   findClassBySourceRange,
   resolveIconForClass,
+  buildGraphicInsertionEdit,
 } from "./modelica/iconResolver.js";
 import { parseModelicaFile } from "./modelica/parser.js";
 import { tokenize } from "./modelica/lexer.js";
@@ -22,7 +23,11 @@ import {
   applySourceTransaction,
   SourceTransactionError,
 } from "./modelica/sourceTransaction.js";
-import type { SourceEdit } from "../shared/modelica.js";
+import type {
+  CreateGraphicRequest,
+  SourceEdit,
+} from "../shared/modelica.js";
+import type { GraphicToolType } from "../shared/modelicaGraphics.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -43,6 +48,54 @@ function sourceLocation(source: string, offset: number): string {
   const column = safeOffset - lastNewline;
   const lineText = source.split("\n")[line - 1]?.trim() ?? "";
   return `line ${line}, column ${column}${lineText ? ` near ${JSON.stringify(lineText.slice(0, 160))}` : ""}`;
+}
+
+function formatModelicaNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(6)));
+}
+
+function defaultGraphicText(type: GraphicToolType, x: number, y: number): string {
+  const origin = `{${formatModelicaNumber(x)},${formatModelicaNumber(y)}}`;
+  switch (type) {
+    case "Line":
+      return `Line(origin=${origin}, points={{-20,0},{20,0}}, color={0,0,0}, thickness=0.25)`;
+    case "Polygon":
+      return `Polygon(origin=${origin}, points={{-20,-15},{20,-15},{0,20},{-20,-15}}, lineColor={0,0,0}, fillColor={255,255,255}, fillPattern=FillPattern.None)`;
+    case "Rectangle":
+      return `Rectangle(origin=${origin}, extent={{-20,-15},{20,15}}, lineColor={0,0,0}, fillColor={255,255,255}, fillPattern=FillPattern.None)`;
+    case "Ellipse":
+      return `Ellipse(origin=${origin}, extent={{-20,-20},{20,20}}, lineColor={0,0,0}, fillColor={255,255,255}, fillPattern=FillPattern.None)`;
+    case "Text":
+      return `Text(origin=${origin}, extent={{-30,-12},{30,12}}, textString="Text", textColor={0,0,0})`;
+    case "Bitmap":
+      return `Bitmap(origin=${origin}, extent={{-30,-30},{30,30}})`;
+  }
+}
+
+async function replaceSourceFile(filePath: string, updated: string): Promise<void> {
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  let backupPath: string | null = null;
+  try {
+    await writeFile(tempPath, updated, "utf-8");
+    if (process.platform === "win32") {
+      backupPath = `${filePath}.bak-${process.pid}-${Date.now()}`;
+      await rename(filePath, backupPath);
+      try {
+        await rename(tempPath, filePath);
+      } catch (error) {
+        try { await rename(backupPath, filePath); backupPath = null; } catch { /* preserve original error */ }
+        throw error;
+      }
+      try { await unlink(backupPath); } finally { backupPath = null; }
+    } else {
+      await rename(tempPath, filePath);
+    }
+  } finally {
+    try { await unlink(tempPath); } catch { /* already moved or best effort */ }
+    if (backupPath) {
+      try { await rename(backupPath, filePath); } catch { /* recoverable backup remains */ }
+    }
+  }
 }
 
 function createWindow(): void {
@@ -482,6 +535,87 @@ function registerIpcHandlers(): void {
             // Best-effort cleanup of an interrupted temporary write.
           }
         }
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelica:createGraphic",
+    async (_event, filePath: string, request: CreateGraphicRequest) => {
+      try {
+        if (!filePath || !request?.targetQualifiedName) {
+          return { error: "Missing filePath or create request" };
+        }
+        if (!Number.isFinite(request.position.x) || !Number.isFinite(request.position.y)) {
+          return { error: "INVALID_DROP_POSITION: graphic position is not finite" };
+        }
+        if (request.sourceVersion === undefined) {
+          return { error: "SOURCE_VERSION_MISMATCH: sourceVersion is required" };
+        }
+        const content = await readFile(filePath, "utf-8");
+        const currentVersion = sourceVersions.get(filePath) ?? 0;
+        const parsed = parseModelicaFile(content, filePath);
+        const target = findClassByQualifiedNameOrUniqueLeaf(
+          parsed.classes,
+          request.targetQualifiedName,
+        );
+        if (!target) return { error: `TARGET_CLASS_NOT_FOUND: ${request.targetQualifiedName}` };
+        const classSlice = content.slice(target.sourceRange.start, target.sourceRange.end);
+        const graphicText = defaultGraphicText(
+          request.graphicType,
+          request.position.x,
+          request.position.y,
+        );
+        const insertion = buildGraphicInsertionEdit(classSlice, graphicText);
+        if (!insertion) {
+          return { error: `ICON_RANGE_ERROR: unable to locate an annotation insertion point in ${request.targetQualifiedName}` };
+        }
+        const edit: SourceEdit = {
+          start: target.sourceRange.start + insertion.start,
+          end: target.sourceRange.start + insertion.end,
+          expectedText: insertion.expectedText,
+          replacement: insertion.replacement,
+          sourceVersion: request.sourceVersion,
+          targetQualifiedName: request.targetQualifiedName,
+        };
+        const updated = applySourceTransaction(
+          content,
+          { filePath, sourceVersion: request.sourceVersion, edits: [edit] },
+          currentVersion,
+        );
+        let candidate;
+        try {
+          candidate = parseModelicaFile(updated, filePath);
+        } catch (error) {
+          return { error: `SOURCE_PARSE_ERROR: ${(error as Error).message} (${sourceLocation(updated, edit.start)})` };
+        }
+        const candidateTarget = findClassByQualifiedNameOrUniqueLeaf(
+          candidate.classes,
+          request.targetQualifiedName,
+        );
+        if (!candidateTarget) return { error: `TARGET_CLASS_NOT_FOUND: ${request.targetQualifiedName}` };
+        const candidateSlice = updated.slice(candidateTarget.sourceRange.start, candidateTarget.sourceRange.end);
+        const candidateEditable = extractEditableIconFromSlice(candidateSlice, candidateTarget.name);
+        if (!candidateEditable?.icon) {
+          return { error: `ICON_PARSE_ERROR: created graphic could not be resolved in ${request.targetQualifiedName}` };
+        }
+        const graphicIndex = candidateEditable.editables.length - 1;
+        if (graphicIndex < 0 || candidateEditable.editables[graphicIndex]?.graphic.type !== request.graphicType) {
+          return { error: `ICON_PARSE_ERROR: created ${request.graphicType} is missing after validation` };
+        }
+        await replaceSourceFile(filePath, updated);
+        sourceVersions.set(filePath, currentVersion + 1);
+        return {
+          ok: true,
+          graphicId: `${request.targetQualifiedName}:Icon.graphics:${graphicIndex}`,
+          graphicPath: `Icon.graphics:${graphicIndex}`,
+          graphicText,
+        };
+      } catch (error) {
+        if (error instanceof SourceTransactionError) {
+          return { error: `${error.code}: ${error.message}` };
+        }
+        return { error: (error as Error).message };
       }
     },
   );

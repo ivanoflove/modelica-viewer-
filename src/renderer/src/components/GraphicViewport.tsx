@@ -11,16 +11,71 @@ import type { IconDto } from "../../../shared/modelicaGraphics";
 import { boundsOf, type Bounds } from "../../editor/Transform";
 import { recordViewerPerformance } from "../performance";
 
-interface ViewBox {
+export interface ViewBox {
   x: number;
   y: number;
   width: number;
   height: number;
 }
 
-interface ViewportState {
+export interface ViewportStateSnapshot {
   base: ViewBox;
   viewBox: ViewBox;
+}
+
+export function modelToViewportRoot(
+  point: { x: number; y: number },
+  viewport: ViewportStateSnapshot,
+): { x: number; y: number } {
+  const scaleX = viewport.base.width / Math.max(viewport.viewBox.width, 1e-9);
+  const scaleY = viewport.base.height / Math.max(viewport.viewBox.height, 1e-9);
+  const translateX = viewport.base.x - viewport.viewBox.x * scaleX;
+  const translateY = viewport.base.y - viewport.viewBox.y * scaleY;
+  // The model layer is wrapped in scale(1,-1) before the viewport group.
+  return {
+    x: point.x * scaleX + translateX,
+    y: -point.y * scaleY + translateY,
+  };
+}
+
+/** Convert a client point to root SVG user coordinates without querying CTM. */
+export function clientToViewportRoot(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  base: ViewBox,
+): { x: number; y: number } | null {
+  const rect = svg.getBoundingClientRect();
+  const scale = Math.min(
+    rect.width / Math.max(base.width, 1e-9),
+    rect.height / Math.max(base.height, 1e-9),
+  );
+  if (!Number.isFinite(scale) || scale <= 0) return null;
+  const offsetX = (rect.width - base.width * scale) / 2;
+  const offsetY = (rect.height - base.height * scale) / 2;
+  return {
+    x: base.x + (clientX - rect.left - offsetX) / scale,
+    y: base.y + (clientY - rect.top - offsetY) / scale,
+  };
+}
+
+/** Convert a client point to Modelica coordinates using a captured viewport. */
+export function clientToModelicaWithViewport(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  viewport: ViewportStateSnapshot,
+): { x: number; y: number } | null {
+  const root = clientToViewportRoot(svg, clientX, clientY, viewport.base);
+  if (!root) return null;
+  const scaleX = viewport.base.width / Math.max(viewport.viewBox.width, 1e-9);
+  const scaleY = viewport.base.height / Math.max(viewport.viewBox.height, 1e-9);
+  const translateX = viewport.base.x - viewport.viewBox.x * scaleX;
+  const translateY = viewport.base.y - viewport.viewBox.y * scaleY;
+  return {
+    x: (root.x - translateX) / scaleX,
+    y: -(root.y - translateY) / scaleY,
+  };
 }
 
 interface Props {
@@ -31,12 +86,14 @@ interface Props {
   overlay?: ReactNode;
   viewportGroupRef?: RefObject<SVGGElement>;
   screenOverlayRef?: RefObject<SVGGElement>;
-  onViewportTransform?: () => void;
+  onViewportTransform?: (viewport: ViewportStateSnapshot) => void;
   onPointerMove: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerUp: (event: PointerEvent<SVGSVGElement>) => void;
   onPointerCancel: (event: PointerEvent<SVGSVGElement>) => void;
   onCanvasPointerDown?: (event: PointerEvent<SVGSVGElement>) => void;
   onCanvasContextMenu?: (event: MouseEvent<SVGSVGElement>) => void;
+  onCanvasDragOver?: (event: React.DragEvent<HTMLDivElement>) => void;
+  onCanvasDrop?: (event: React.DragEvent<HTMLDivElement>) => void;
   onUndo?: () => void;
   onRedo?: () => void;
   canUndo?: boolean;
@@ -130,26 +187,13 @@ export function wheelZoomFactor(
   return ctrlKey ? Math.exp(-deltaY * 0.0015) : null;
 }
 
-function pointInSvg(
-  svg: SVGSVGElement,
-  clientX: number,
-  clientY: number,
-): { x: number; y: number } | null {
-  const point = svg.createSVGPoint();
-  point.x = clientX;
-  point.y = clientY;
-  const inverse = svg.getScreenCTM()?.inverse();
-  if (!inverse) return null;
-  return point.matrixTransform(inverse);
-}
-
 function pointInCurrentView(
   svg: SVGSVGElement,
   clientX: number,
   clientY: number,
-  viewport: ViewportState,
+  viewport: ViewportStateSnapshot,
 ): { x: number; y: number } | null {
-  const basePoint = pointInSvg(svg, clientX, clientY);
+  const basePoint = clientToViewportRoot(svg, clientX, clientY, viewport.base);
   if (!basePoint) return null;
   const scaleX = viewport.base.width / Math.max(viewport.viewBox.width, 1e-9);
   const scaleY = viewport.base.height / Math.max(viewport.viewBox.height, 1e-9);
@@ -173,6 +217,8 @@ export function GraphicViewport({
   onPointerCancel,
   onCanvasPointerDown,
   onCanvasContextMenu,
+  onCanvasDragOver,
+  onCanvasDrop,
   onUndo,
   onRedo,
   canUndo = false,
@@ -192,7 +238,7 @@ export function GraphicViewport({
   );
   const [viewBox, setViewBox] = useState<ViewBox>(() => contentViewBox(icon));
   const [isPanning, setIsPanning] = useState(false);
-  const viewportRef = useRef<ViewportState>({
+  const viewportRef = useRef<ViewportStateSnapshot>({
     base: coordinateViewBox(icon),
     viewBox: contentViewBox(icon),
   });
@@ -215,7 +261,10 @@ export function GraphicViewport({
       renderRafRef.current = null;
       recordViewerPerformance("viewportRafUpdates");
       applyViewportTransform();
-      onViewportTransformRef.current?.();
+      onViewportTransformRef.current?.({
+        base: { ...viewportRef.current.base },
+        viewBox: { ...viewportRef.current.viewBox },
+      });
     });
   };
 
@@ -241,11 +290,19 @@ export function GraphicViewport({
     viewportRef.current = { base, viewBox: initial };
     setFitMode("content");
     setViewBox(initial);
+    onViewportTransformRef.current?.({
+      base: { ...base },
+      viewBox: { ...initial },
+    });
     scheduleViewportRender();
   }, [resetKey]);
 
   useEffect(() => {
     applyViewportTransform();
+    onViewportTransformRef.current?.({
+      base: { ...viewportRef.current.base },
+      viewBox: { ...viewportRef.current.viewBox },
+    });
     return () => {
       if (renderRafRef.current !== null) {
         cancelAnimationFrame(renderRafRef.current);
@@ -416,7 +473,12 @@ export function GraphicViewport({
           <button onClick={onRedo} disabled={!canRedo} aria-label="Redo">Redo</button>
         </div>
       </div>
-      <div ref={canvasRef} className="icon-canvas-area">
+      <div
+        ref={canvasRef}
+        className="icon-canvas-area"
+        onDragOver={onCanvasDragOver}
+        onDrop={onCanvasDrop}
+      >
         <svg
           ref={svgRef}
           viewBox={toViewBoxString(baseViewBox)}

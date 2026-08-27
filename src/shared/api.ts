@@ -1,5 +1,7 @@
 import type {
   ApplySourceEditResult,
+  CreateGraphicRequest,
+  CreateGraphicResult,
   GetEditableIconResult,
   GetIconResult,
   LoadPackageResult,
@@ -46,6 +48,10 @@ export interface WindowApi {
       filePath: string,
       edit: SourceEdit,
     ) => Promise<ApplySourceEditResult>;
+    createGraphic: (
+      filePath: string,
+      request: CreateGraphicRequest,
+    ) => Promise<CreateGraphicResult>;
     reloadClassRange: (
       filePath: string,
       qualifiedName: string,

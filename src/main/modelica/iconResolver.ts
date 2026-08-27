@@ -17,6 +17,7 @@ import type {
   LineDto,
   PolygonDto,
   TextDto,
+  BitmapDto,
   EditableGraphic,
   EditableIconDto,
   GraphicProvenance,
@@ -192,6 +193,18 @@ function resolveText(call: AnnotationCall, modelName: string): TextDto | null {
   };
 }
 
+function resolveBitmap(call: AnnotationCall): BitmapDto | null {
+  const extent = parseExtent(getArg(call, "extent"));
+  if (!extent) return null;
+  return {
+    type: "Bitmap",
+    extent,
+    origin: parseOrigin(call),
+    fileName: asString(getArg(call, "fileName")),
+    imageSource: asString(getArg(call, "imageSource")),
+  };
+}
+
 function resolveGraphic(
   call: AnnotationCall,
   modelName: string,
@@ -207,6 +220,8 @@ function resolveGraphic(
       return resolvePolygon(call);
     case "Text":
       return resolveText(call, modelName);
+    case "Bitmap":
+      return resolveBitmap(call);
     default:
       return null;
   }
@@ -585,6 +600,100 @@ export function findIconSourceRange(
   return null;
 }
 
+export interface GraphicInsertionEdit {
+  start: number;
+  end: number;
+  expectedText: string;
+  replacement: string;
+  graphicIndex: number;
+}
+
+/**
+ * Build an insertion from token/annotation ranges. This deliberately does
+ * not search for parentheses with a regular expression: strings, comments,
+ * nested classes and nested annotation calls are all handled by the lexer.
+ */
+export function buildGraphicInsertionEdit(
+  classSlice: string,
+  graphicText: string,
+): GraphicInsertionEdit | null {
+  const tokens = tokenize(classSlice);
+  let annotationMatch: { annotation: AnnotationCall; offset: number } | null = null;
+  let iconMatch: IconAnnotationMatch | null = null;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const token = tokens[i]!;
+    if (token.type !== "KEYWORD" || token.value !== "annotation") continue;
+    if (tokens[i + 1]!.type !== "LPAREN") continue;
+    const annotation = parseAnnotationSlice(classSlice.slice(token.start));
+    if (!annotation) continue;
+    annotationMatch ??= { annotation, offset: token.start };
+    const icon = findIconCall(annotation);
+    if (icon) {
+      iconMatch = { annotation, icon, offset: token.start };
+      break;
+    }
+  }
+
+  if (iconMatch) {
+    const icon = iconMatch.icon;
+    const graphicsArg = getArgWithRange(icon, "graphics");
+    if (graphicsArg?.value.type === "array") {
+      const range = {
+        start: iconMatch.offset + graphicsArg.value.range.start,
+        end: iconMatch.offset + graphicsArg.value.range.end,
+      };
+      const body = classSlice.slice(range.start + 1, range.end - 1);
+      const whitespace = body.match(/\s*$/)?.[0] ?? "";
+      const start = range.end - 1 - whitespace.length;
+      return {
+        start,
+        end: start,
+        expectedText: "",
+        replacement: body.trim() ? `, ${graphicText}` : graphicText,
+        graphicIndex: graphicsArg.value.items.length,
+      };
+    }
+    const close = iconMatch.offset + icon.sourceRange.end - 1;
+    return {
+      start: close,
+      end: close,
+      expectedText: "",
+      replacement: icon.arguments.length
+        ? `, graphics={${graphicText}}`
+        : `graphics={${graphicText}}`,
+      graphicIndex: 0,
+    };
+  }
+
+  if (annotationMatch) {
+    const annotationStart = annotationMatch.offset + annotationMatch.annotation.sourceRange.start;
+    const annotationText = classSlice.slice(annotationStart, annotationMatch.offset + annotationMatch.annotation.sourceRange.end);
+    const annotationTokens = tokenize(annotationText);
+    const open = annotationTokens.find((token) => token.type === "LPAREN");
+    if (!open) return null;
+    const start = annotationStart + open.end;
+    return {
+      start,
+      end: start,
+      expectedText: "",
+      replacement: annotationMatch.annotation.arguments.length
+        ? `Icon(graphics={${graphicText}}), `
+        : `Icon(graphics={${graphicText}})`,
+      graphicIndex: 0,
+    };
+  }
+
+  const endToken = [...tokens].reverse().find((token) => token.type === "KEYWORD" && token.value === "end");
+  if (!endToken) return null;
+  return {
+    start: endToken.start,
+    end: endToken.start,
+    expectedText: "",
+    replacement: `annotation(Icon(graphics={${graphicText}}));\n  `,
+    graphicIndex: 0,
+  };
+}
+
 // Editable helpers
 export interface EditableOwnerMetadata {
   qualifiedName: string;
@@ -622,9 +731,11 @@ export function resolveEditableIcon(
   // need to map graphics items to their source ranges
   const graphicsArg = getArgWithRange(iconCall, "graphics");
   let graphicsItems: AnnotationValue[] | undefined;
+  let graphicsRange: { start: number; end: number } | undefined;
   const graphicsRangeMap = new Map<number, { start: number; end: number }>();
   if (graphicsArg && graphicsArg.value.type === "array") {
     graphicsItems = graphicsArg.value.items;
+    graphicsRange = (graphicsArg.value as { range?: { start: number; end: number } }).range;
     // map each call's range
     graphicsArg.value.items.forEach((item, idx) => {
       if (item.type === "call") {
@@ -638,6 +749,7 @@ export function resolveEditableIcon(
         const hasGraphics = arg.value.items.some((i) => i.type === "call");
         if (hasGraphics) {
           graphicsItems = arg.value.items;
+          graphicsRange = (arg.value as { range?: { start: number; end: number } }).range;
           arg.value.items.forEach((item, idx) => {
             if (item.type === "call") graphicsRangeMap.set(idx, item.range);
           });
@@ -709,7 +821,7 @@ export function resolveEditableIcon(
       },
     });
   }
-  return { icon: base, editables };
+  return { icon: base, editables, graphicsRange };
 }
 
 export function extractEditableIconFromSlice(
@@ -735,6 +847,7 @@ export function extractEditableIconFromSlice(
         : undefined;
     return {
       ...editable,
+      graphicsRange: withExpectedText(editable.graphicsRange),
       editables: editable.editables.map((item) => ({
         ...item,
         source: {
@@ -771,9 +884,9 @@ export function toAbsoluteEditableRanges(
   annotationIdx: number,
 ): EditableIconDto {
   const shift = sliceBase + annotationIdx;
+  const shiftRange = (r?: SourceRangeRef): SourceRangeRef | undefined =>
+    r ? { ...r, start: r.start + shift, end: r.end + shift } : undefined;
   const editables = editable.editables.map((e) => {
-    const shiftRange = (r?: SourceRangeRef): SourceRangeRef | undefined =>
-      r ? { ...r, start: r.start + shift, end: r.end + shift } : undefined;
     return {
       ...e,
       source: {
@@ -795,7 +908,11 @@ export function toAbsoluteEditableRanges(
       },
     };
   });
-  return { icon: editable.icon, editables };
+  return {
+    icon: editable.icon,
+    graphicsRange: shiftRange(editable.graphicsRange)!,
+    editables,
+  };
 }
 
 // Recursively locate a class by its qualified name inside parsed classes.

@@ -1,5 +1,10 @@
 import type { Extent, Point } from "../../../shared/modelicaGraphics.js";
 
+export interface ResizeViewportState {
+  base: { x: number; y: number; width: number; height: number };
+  viewBox: { x: number; y: number; width: number; height: number };
+}
+
 export const resizeHandles = [
   "nw", "n", "ne", "w", "e", "sw", "s", "se",
 ] as const;
@@ -12,7 +17,7 @@ export interface ResizeSession {
   pointerId: number;
   startPointerModel: Point;
   originalExtent: Extent;
-  inverseScreenToModelMatrix: DOMMatrix;
+  viewport: ResizeViewportState;
 }
 
 function normalized(extent: Extent): { left: number; right: number; bottom: number; top: number } {

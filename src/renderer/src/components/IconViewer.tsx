@@ -18,6 +18,11 @@ import type {
   PolygonDto,
   Point,
 } from "../../../shared/modelicaGraphics";
+import type {
+  GraphicHistoryCommand,
+  GraphicHistoryProperty,
+  GraphicHistoryType,
+} from "../../editor/history/HistoryManager";
 import { GraphicItem } from "./GraphicItem";
 import {
   toSvgTransform,
@@ -25,7 +30,6 @@ import {
   applyTransform,
 } from "../../editor/Transform";
 import {
-  clientToModelicaWithInverse,
   dragDeltaFromStart,
 } from "../../editor/DragController";
 import {
@@ -44,8 +48,15 @@ import {
 import { HistoryManager } from "../../editor/history/HistoryManager";
 import { useSelection } from "../../editor/Selection";
 import type { SelectionState } from "../../editor/Selection";
-import { GraphicViewport } from "./GraphicViewport";
-import type { SourceEditReason } from "../../../shared/modelica";
+import {
+  GraphicViewport,
+  clientToModelicaWithViewport,
+  modelToViewportRoot,
+  type ViewportStateSnapshot,
+} from "./GraphicViewport";
+import type { CreateGraphicResult, SourceEditReason } from "../../../shared/modelica";
+import type { GraphicToolType } from "../../../shared/modelicaGraphics";
+import { GRAPHIC_DRAG_MIME, GraphicToolbar } from "./GraphicToolbar";
 import { recordViewerPerformance } from "../performance";
 
 type Edit = {
@@ -55,7 +66,10 @@ type Edit = {
   replacement: string;
 };
 
-type DeleteEdit = Edit & { deletedText: string };
+type DeleteEdit = Edit & {
+  deletedText: string;
+  graphicText: string;
+};
 
 interface Props {
   icon: IconDto | null;
@@ -64,6 +78,10 @@ interface Props {
   resetKey?: string;
   sourceText?: string;
   onEdit?: (edit: Edit, reason: SourceEditReason) => Promise<boolean>;
+  onCreateGraphic?: (
+    graphicType: GraphicToolType,
+    position: Point,
+  ) => Promise<CreateGraphicResult>;
 }
 
 interface DragSession {
@@ -71,8 +89,7 @@ interface DragSession {
   pointerId: number;
   pointerStart: { x: number; y: number };
   originalGraphic: EditableGraphic["graphic"];
-  inverseScreenToModel: DOMMatrix;
-  transformStart: GraphicTransform;
+  viewport: ViewportStateSnapshot;
 }
 
 interface VertexDragSession {
@@ -82,7 +99,8 @@ interface VertexDragSession {
   originalGraphic: LineDto | PolygonDto;
   originalPoints: Point[];
   startPointerLocal: Point;
-  inverseScreenToLocal: DOMMatrix;
+  viewport: ViewportStateSnapshot;
+  transform: GraphicTransform;
 }
 
 const identity: GraphicTransform = {
@@ -98,16 +116,18 @@ export function IconViewer({
   resetKey = modelName,
   sourceText = "",
   onEdit,
+  onCreateGraphic,
 }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<DragSession | null>(null);
   const viewportGroupRef = useRef<SVGGElement>(null);
   const graphicGroupRefs = useRef(new Map<string, SVGGElement>());
   const hitGraphicGroupRefs = useRef(new Map<string, SVGGElement>());
-  const localGroupRefs = useRef(new Map<string, SVGGElement>());
   const selectionGroupRefs = useRef(new Map<string, SVGGElement>());
   const screenOverlayRef = useRef<SVGGElement>(null);
   const screenOverlayUpdateRef = useRef<() => void>(() => undefined);
+  const viewportStateRef = useRef<ViewportStateSnapshot | null>(null);
+  const dragPreviewDeltaRef = useRef<Point | null>(null);
   const resizeRef = useRef<ResizeSession | null>(null);
   const vertexRef = useRef<VertexDragSession | null>(null);
   const pendingPointRef = useRef<{ x: number; y: number } | null>(null);
@@ -254,21 +274,6 @@ export function IconViewer({
     return base;
   };
 
-  const modelDeltaToRootTransform = (dx: number, dy: number) => {
-    const svg = svgRef.current;
-    const viewport = viewportGroupRef.current;
-    const rootInverse = svg?.getScreenCTM()?.inverse();
-    const viewportMatrix = viewport?.getScreenCTM();
-    if (!rootInverse || !viewportMatrix) return "translate(0,0)";
-    const origin = new DOMPoint(0, 0)
-      .matrixTransform(viewportMatrix)
-      .matrixTransform(rootInverse);
-    const moved = new DOMPoint(dx, -dy)
-      .matrixTransform(viewportMatrix)
-      .matrixTransform(rootInverse);
-    return `translate(${moved.x - origin.x},${moved.y - origin.y})`;
-  };
-
   const applyDragPreview = (
     session: DragSession,
     point: { x: number; y: number },
@@ -281,10 +286,8 @@ export function IconViewer({
     graphicGroup?.setAttribute("transform", transform);
     hitGraphicGroup?.setAttribute("transform", transform);
     selectionGroup?.setAttribute("transform", transform);
-    screenOverlayRef.current?.setAttribute(
-      "transform",
-      modelDeltaToRootTransform(delta.x, delta.y),
-    );
+    dragPreviewDeltaRef.current = { x: delta.x, y: delta.y };
+    screenOverlayUpdateRef.current();
     recordViewerPerformance("dragPreviewRafUpdates");
   };
 
@@ -311,7 +314,7 @@ export function IconViewer({
         .get(session.id)
         ?.removeAttribute("transform");
     }
-    screenOverlayRef.current?.removeAttribute("transform");
+    dragPreviewDeltaRef.current = null;
     dragRef.current = null;
   };
 
@@ -343,18 +346,15 @@ export function IconViewer({
 
   const updateVertexHandle = (session: VertexDragSession, point: Point) => {
     const svg = svgRef.current;
-    const localGroup = localGroupRefs.current.get(session.graphicId);
-    const rootInverse = svg?.getScreenCTM()?.inverse();
-    const localMatrix = localGroup?.getScreenCTM();
-    if (!svg || !rootInverse || !localMatrix) return;
-    const rootPoint = new DOMPoint(point.x, point.y)
-      .matrixTransform(localMatrix)
-      .matrixTransform(rootInverse);
-    const rootMatrix = svg.getScreenCTM();
-    const rootScale = Math.max(
-      rootMatrix ? Math.hypot(rootMatrix.a, rootMatrix.b) : 1,
-      1e-6,
+    const viewport = viewportStateRef.current;
+    if (!svg || !viewport) return;
+    const rootPoint = graphicLocalToRoot(
+      session.originalGraphic,
+      point,
+      transformFor(session.graphicId),
+      viewport,
     );
+    const rootScale = svgRootPixelScale(svg, viewport.base);
     const handle = screenOverlayRef.current?.querySelector<SVGCircleElement>(
       `[data-vertex-handle="${session.vertexIndex}"] .vertex-handle`,
     );
@@ -452,11 +452,11 @@ export function IconViewer({
 
   const commitGraphicChange = (
     ed: EditableGraphic,
-    before: EditableGraphic["graphic"],
     after: EditableGraphic["graphic"],
     edit: Edit,
     reason: SourceEditReason,
   ) => {
+    const command = buildHistoryCommand(ed, edit, reason);
     setOptimisticGraphics((previous) => {
       const next = new Map(previous);
       next.set(ed.id, after);
@@ -465,10 +465,10 @@ export function IconViewer({
     if (!onEdit) return;
     void onEdit(edit, reason)
       .then((success) => {
-        if (success) {
-          historyRef.current.push({ graphicId: ed.id, before, after });
+        if (success && command) {
+          historyRef.current.push(command);
           setHistoryVersion((version) => version + 1);
-        } else {
+        } else if (!success) {
           setInteractionNotice("修改未保存：源文件内容已变化，请重新选择图元后重试");
           setOptimisticGraphics((previous) => {
             const next = new Map(previous);
@@ -489,14 +489,66 @@ export function IconViewer({
       });
   };
 
+  const decodeGraphicDrop = (event: React.DragEvent): GraphicToolType | null => {
+    const raw = event.dataTransfer.getData(GRAPHIC_DRAG_MIME);
+    if (!raw) return null;
+    try {
+      const payload = JSON.parse(raw) as { type?: string; graphicType?: GraphicToolType };
+      const types: GraphicToolType[] = ["Line", "Polygon", "Rectangle", "Text", "Ellipse", "Bitmap"];
+      return payload.type === "create-modelica-graphic" && payload.graphicType && types.includes(payload.graphicType)
+        ? payload.graphicType
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const handleCanvasDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!decodeGraphicDrop(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleCanvasDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    const graphicType = decodeGraphicDrop(event);
+    if (!graphicType || !onCreateGraphic) return;
+    event.preventDefault();
+    const svg = svgRef.current;
+    const viewport = viewportStateRef.current;
+    if (!svg || !viewport) return;
+    const position = clientToModelicaWithViewport(svg, event.clientX, event.clientY, viewport);
+    if (!position) return;
+    void onCreateGraphic(graphicType, position).then((result) => {
+      if ("error" in result) {
+        setInteractionNotice(`创建未保存：${result.error}`);
+        return;
+      }
+      historyRef.current.push({
+        type: "create",
+        target: {
+          ownerQualifiedName: result.graphicId.split(":Icon.graphics:")[0] ?? modelName,
+          graphicPath: result.graphicPath,
+          property: "item",
+        },
+        before: "",
+        after: result.graphicText,
+      });
+      setHistoryVersion((version) => version + 1);
+      sel.setSelected(result.graphicId);
+      setVertexSelection(null);
+      setInteractionNotice(null);
+    }).catch((error: unknown) => {
+      setInteractionNotice(`创建未保存：${error instanceof Error ? error.message : "未知错误"}`);
+    });
+  };
+
   const handlePropertyEdit = (
     edit: Edit,
     after: EditableGraphic["graphic"],
   ) => {
     const ed = editables.find((item) => item.id === propertiesGraphicId);
     if (!ed) return;
-    const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
-    commitGraphicChange(ed, before, after, edit, "property");
+    commitGraphicChange(ed, after, edit, "property");
   };
 
   const handleGraphicContextMenu = (
@@ -653,10 +705,10 @@ export function IconViewer({
           return;
         }
         historyRef.current.push({
-          graphicId: ed.id,
-          before,
-          after: null,
-          deletion: { start: edit.start, deletedText: edit.deletedText },
+          type: "delete",
+          target: historyTarget(ed, "item"),
+          before: edit.graphicText,
+          after: "",
         });
         sel.setSelected(null);
         setPropertiesGraphicId(null);
@@ -701,20 +753,24 @@ export function IconViewer({
     }
     setInteractionNotice(null);
     const svg = svgRef.current;
-    if (!svg) return;
+    const viewport = viewportStateRef.current;
+    if (!svg || !viewport) return;
     e.preventDefault();
     e.stopPropagation();
-    const inverse = svg.getScreenCTM()?.inverse();
-    if (!inverse) return;
-    const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
+    const point = clientToModelicaWithViewport(
+      svg,
+      e.clientX,
+      e.clientY,
+      viewport,
+    );
+    if (!point) return;
     capturePointer(e.pointerId);
     const session: DragSession = {
       id: ed.id,
       pointerId: e.pointerId,
       pointerStart: point,
       originalGraphic: optimisticGraphics.get(ed.id) ?? ed.graphic,
-      inverseScreenToModel: inverse,
-      transformStart: ed.transform,
+      viewport: { base: { ...viewport.base }, viewBox: { ...viewport.viewBox } },
     };
     dragRef.current = session;
   };
@@ -737,10 +793,11 @@ export function IconViewer({
     if (!session || session.pointerId !== e.pointerId) return;
     e.preventDefault();
     e.stopPropagation();
-    const point = clientToModelicaWithInverse(
+    const point = clientToModelicaWithViewport(
+      svgRef.current!,
       e.clientX,
       e.clientY,
-      session.inverseScreenToModel,
+      session.viewport,
     );
     if (point) schedulePreview(point);
   };
@@ -754,10 +811,11 @@ export function IconViewer({
     }
     e.preventDefault();
     e.stopPropagation();
-    const point = clientToModelicaWithInverse(
+    const point = clientToModelicaWithViewport(
+      svgRef.current!,
       e.clientX,
       e.clientY,
-      session.inverseScreenToModel,
+      session.viewport,
     );
     const ed = editables.find((item) => item.id === session.id);
     if (point && ed && onEdit) {
@@ -778,7 +836,6 @@ export function IconViewer({
         if (edit)
           commitGraphicChange(
             ed,
-            session.originalGraphic,
             committed,
             edit,
             "drag",
@@ -797,12 +854,20 @@ export function IconViewer({
   ) => {
     const graphic = optimisticGraphics.get(ed.id) ?? ed.graphic;
     if (!isPointBasedGraphic(graphic) || !ed.source.pointsRange) return;
-    const localGroup = localGroupRefs.current.get(ed.id);
-    const inverse = localGroup?.getScreenCTM()?.inverse();
-    if (!inverse || !graphic.points[vertexIndex]) return;
+    const svg = svgRef.current;
+    const viewport = viewportStateRef.current;
+    const transform = transformFor(ed.id);
+    if (!svg || !viewport || !graphic.points[vertexIndex]) return;
     e.preventDefault();
     e.stopPropagation();
-    const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(inverse);
+    const modelPoint = clientToModelicaWithViewport(
+      svg,
+      e.clientX,
+      e.clientY,
+      viewport,
+    );
+    if (!modelPoint) return;
+    const point = modelToGraphicLocal(modelPoint, graphic, transform);
     setVertexSelection({ graphicId: ed.id, vertexIndex });
     setPropertiesGraphicId(null);
     setInteractionNotice(null);
@@ -814,7 +879,8 @@ export function IconViewer({
       originalGraphic: graphic,
       originalPoints: graphic.points.map((item) => ({ ...item })),
       startPointerLocal: { x: point.x, y: point.y },
-      inverseScreenToLocal: inverse,
+      viewport: { base: { ...viewport.base }, viewBox: { ...viewport.viewBox } },
+      transform: { ...transform, translate: { ...transform.translate }, scale: { ...transform.scale } },
     };
   };
 
@@ -823,8 +889,19 @@ export function IconViewer({
     if (!session || session.pointerId !== e.pointerId) return;
     e.preventDefault();
     e.stopPropagation();
-    const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(
-      session.inverseScreenToLocal,
+    const svg = svgRef.current;
+    if (!svg) return;
+    const modelPoint = clientToModelicaWithViewport(
+      svg,
+      e.clientX,
+      e.clientY,
+      session.viewport,
+    );
+    if (!modelPoint) return;
+    const point = modelToGraphicLocal(
+      modelPoint,
+      session.originalGraphic,
+      session.transform,
     );
     scheduleVertexPreview({ x: point.x, y: point.y });
   };
@@ -834,8 +911,19 @@ export function IconViewer({
     if (!session || session.pointerId !== e.pointerId) return;
     e.preventDefault();
     e.stopPropagation();
-    const point = new DOMPoint(e.clientX, e.clientY).matrixTransform(
-      session.inverseScreenToLocal,
+    const svg = svgRef.current;
+    if (!svg) return;
+    const modelPoint = clientToModelicaWithViewport(
+      svg,
+      e.clientX,
+      e.clientY,
+      session.viewport,
+    );
+    if (!modelPoint) return;
+    const point = modelToGraphicLocal(
+      modelPoint,
+      session.originalGraphic,
+      session.transform,
     );
     const ed = editables.find((item) => item.id === session.graphicId);
     if (ed) {
@@ -852,7 +940,6 @@ export function IconViewer({
         clearVertex(false);
         commitGraphicChange(
           ed,
-          session.originalGraphic,
           { ...session.originalGraphic, points: next },
           edit,
           "vertex",
@@ -908,14 +995,19 @@ export function IconViewer({
   ) => {
     if (e.button !== 0 || ed.inherited || !ed.source.extentRange) return;
     const svg = svgRef.current;
+    const viewport = viewportStateRef.current;
     const baseGraphic = optimisticGraphics.get(ed.id) ?? ed.graphic;
     const extent = (baseGraphic as { extent?: Extent }).extent;
-    if (!svg || !extent) return;
+    if (!svg || !viewport || !extent) return;
     e.preventDefault();
     e.stopPropagation();
-    const inverse = svg.getScreenCTM()?.inverse();
-    if (!inverse) return;
-    const point = clientToModelicaWithInverse(e.clientX, e.clientY, inverse);
+    const point = clientToModelicaWithViewport(
+      svg,
+      e.clientX,
+      e.clientY,
+      viewport,
+    );
+    if (!point) return;
     capturePointer(e.pointerId);
     sel.setSelected(ed.id);
     setPropertiesGraphicId(null);
@@ -930,7 +1022,7 @@ export function IconViewer({
         p1: { ...extent.p1 },
         p2: { ...extent.p2 },
       },
-      inverseScreenToModelMatrix: inverse,
+      viewport: { base: { ...viewport.base }, viewBox: { ...viewport.viewBox } },
     };
   };
 
@@ -939,11 +1031,15 @@ export function IconViewer({
     if (!session || session.pointerId !== e.pointerId) return;
     e.preventDefault();
     e.stopPropagation();
-    const point = clientToModelicaWithInverse(
+    const svg = svgRef.current;
+    if (!svg) return;
+    const point = clientToModelicaWithViewport(
+      svg,
       e.clientX,
       e.clientY,
-      session.inverseScreenToModelMatrix,
+      session.viewport,
     );
+    if (!point) return;
     scheduleResize(point, e.shiftKey, e.altKey);
   };
 
@@ -953,11 +1049,15 @@ export function IconViewer({
     e.preventDefault();
     e.stopPropagation();
     const ed = editables.find((item) => item.id === session.graphicId);
-    const point = clientToModelicaWithInverse(
+    const svg = svgRef.current;
+    if (!svg) return;
+    const point = clientToModelicaWithViewport(
+      svg,
       e.clientX,
       e.clientY,
-      session.inverseScreenToModelMatrix,
+      session.viewport,
     );
+    if (!point) return;
     if (ed && onEdit) {
       const delta = dragDeltaFromStart(session.startPointerModel, point);
       const extent = resizeExtent(
@@ -973,7 +1073,7 @@ export function IconViewer({
       if (edit) {
         releasePointer(e.pointerId);
         clearResize();
-        commitGraphicChange(ed, before, committed, edit, "resize");
+        commitGraphicChange(ed, committed, edit, "resize");
         return;
       }
     }
@@ -988,66 +1088,55 @@ export function IconViewer({
         ? historyRef.current.peekUndo()
         : historyRef.current.peekRedo();
     if (!command) return;
-    if (command.deletion) {
-      const { start, deletedText } = command.deletion;
-      const edit: Edit =
-        direction === "undo"
-          ? {
-              start,
-              end: start,
-              expectedText: "",
-              replacement: deletedText,
-            }
-          : {
-              start,
-              end: start + deletedText.length,
-              expectedText: deletedText,
-              replacement: "",
-            };
-      historyBusyRef.current = true;
-      try {
-        const success = await onEdit(edit, direction);
-        if (success) {
-          if (direction === "undo") historyRef.current.acceptUndo();
-          else historyRef.current.acceptRedo();
-          setHistoryVersion((version) => version + 1);
-        }
-      } finally {
-        historyBusyRef.current = false;
-      }
-      return;
-    }
-    const ed = editables.find((item) => item.id === command.graphicId);
-    if (!ed) return;
-    const target = direction === "undo" ? command.before : command.after;
-    if (!target) return;
-    const edit = buildGraphicEdit(ed, target);
+    const ed = editables.find((item) =>
+      historyTargetMatches(item, command.target),
+    );
+    const edit = ed
+      ? buildHistoryEdit(ed, command, direction, sourceText)
+      : ((direction === "undo" && command.type === "delete") ||
+          (direction === "redo" && command.type === "create")) && editable
+        ? buildRestoreDeletedEdit(
+            command,
+            direction === "undo" ? command.before : command.after,
+            editable,
+            sourceText,
+          )
+        : null;
     if (!edit) return;
     historyBusyRef.current = true;
-    setOptimisticGraphics((previous) => {
-      const next = new Map(previous);
-      next.set(ed.id, target);
-      return next;
-    });
-    try {
-      const success = await onEdit(edit, direction);
-      if (success) {
-        if (direction === "undo") historyRef.current.acceptUndo();
-        else historyRef.current.acceptRedo();
-        setHistoryVersion((version) => version + 1);
-      } else {
-        setOptimisticGraphics((previous) => {
-          const next = new Map(previous);
-          next.delete(ed.id);
-          return next;
-        });
-      }
-    } catch {
+    if (ed && command.target.property !== "item") {
       setOptimisticGraphics((previous) => {
         const next = new Map(previous);
         next.delete(ed.id);
         return next;
       });
+    }
+    try {
+      const success = await onEdit(edit, direction);
+      if (success) {
+        if (direction === "undo") historyRef.current.acceptUndo();
+        else historyRef.current.acceptRedo();
+        if (command.type === "delete" || command.type === "create") {
+          const id = `${command.target.ownerQualifiedName}:${command.target.graphicPath}`;
+          const shouldExist = command.type === "delete"
+            ? direction === "undo"
+            : direction === "redo";
+          if (shouldExist) {
+            setHiddenGraphicIds((current) => {
+              const next = new Set(current);
+              next.delete(id);
+              return next;
+            });
+            sel.setSelected(id);
+          } else {
+            setHiddenGraphicIds((current) => new Set(current).add(id));
+            sel.setSelected(null);
+          }
+        }
+        setHistoryVersion((version) => version + 1);
+      }
+    } catch {
+      setInteractionNotice("历史操作未保存：源文件内容已变化，请重新选择图元后重试");
     } finally {
       historyBusyRef.current = false;
     }
@@ -1069,8 +1158,18 @@ export function IconViewer({
       ? (optimisticGraphics.get(selectedEditable.id) ?? selectedEditable.graphic)
       : selectedEntry.graphic
     : null;
+  const selectedPreviewGraphic = selectedEditable && selectedGraphic &&
+    resizePreview?.graphicId === selectedEditable.id &&
+    "extent" in selectedGraphic
+    ? { ...selectedGraphic, extent: resizePreview.extent }
+    : selectedGraphic;
   const selectedBounds = selectedEditable && selectedGraphic
-    ? boundsOf(applyTransform(selectedGraphic, transformFor(selectedEditable.id)))
+    ? boundsOf(
+        applyTransform(
+          selectedPreviewGraphic ?? selectedGraphic,
+          transformFor(selectedEditable.id),
+        ),
+      )
     : null;
   const canResizeSelected =
     !!selectedEditable &&
@@ -1080,30 +1179,23 @@ export function IconViewer({
       selectedEditable.graphic.type === "Ellipse" ||
       selectedEditable.graphic.type === "Text");
 
-  const modelPointToRoot = (point: { x: number; y: number }) => {
-    const svg = svgRef.current;
-    const viewport = viewportGroupRef.current;
-    const rootInverse = svg?.getScreenCTM()?.inverse();
-    const viewportMatrix = viewport?.getScreenCTM();
-    if (!rootInverse || !viewportMatrix) return null;
-    return new DOMPoint(point.x, -point.y)
-      .matrixTransform(viewportMatrix)
-      .matrixTransform(rootInverse);
-  };
-
   const updateScreenOverlay = () => {
     const overlay = screenOverlayRef.current;
     const svg = svgRef.current;
-    if (!overlay || !svg || !selectedBounds) {
-      overlay?.removeAttribute("transform");
+    const viewport = viewportStateRef.current;
+    if (!overlay || !svg || !viewport || !selectedBounds) {
       return;
     }
-    const rootMatrix = svg.getScreenCTM();
-    if (!rootMatrix) return;
-    const rootScale = Math.max(Math.hypot(rootMatrix.a, rootMatrix.b), 1e-6);
+    const rootScale = svgRootPixelScale(svg, viewport.base);
+    const dragDelta = dragPreviewDeltaRef.current;
     for (const handle of resizeHandles) {
-      const point = modelPointToRoot(handlePosition(handle, selectedBounds));
-      if (!point) continue;
+      const modelPoint = handlePosition(handle, selectedBounds);
+      const point = modelToViewportRoot(
+        dragDelta
+          ? { x: modelPoint.x + dragDelta.x, y: modelPoint.y + dragDelta.y }
+          : modelPoint,
+        viewport,
+      );
       const visual = overlay.querySelector<SVGCircleElement>(
         `[data-screen-handle="${handle}"] .resize-handle`,
       );
@@ -1118,15 +1210,13 @@ export function IconViewer({
       hit?.setAttribute("r", String(9 / rootScale));
     }
     if (selectedEditable && selectedGraphic && isPointBasedGraphic(selectedGraphic)) {
-      const localMatrix = localGroupRefs.current
-        .get(selectedEditable.id)
-        ?.getScreenCTM();
-      const rootInverse = svg.getScreenCTM()?.inverse();
-      if (localMatrix && rootInverse) {
-        selectedGraphic.points.forEach((point, index) => {
-          const rootPoint = new DOMPoint(point.x, point.y)
-            .matrixTransform(localMatrix)
-            .matrixTransform(rootInverse);
+      selectedGraphic.points.forEach((point, index) => {
+          const rootPoint = graphicLocalToRoot(
+            selectedGraphic,
+            point,
+            transformFor(selectedEditable.id),
+            viewport,
+          );
           const visual = overlay.querySelector<SVGCircleElement>(
             `[data-vertex-handle="${index}"] .vertex-handle`,
           );
@@ -1139,8 +1229,7 @@ export function IconViewer({
           hit?.setAttribute("cx", String(rootPoint.x));
           hit?.setAttribute("cy", String(rootPoint.y));
           hit?.setAttribute("r", String(VERTEX_HIT_RADIUS_PX / rootScale));
-        });
-      }
+      });
     }
   };
 
@@ -1215,19 +1304,25 @@ export function IconViewer({
 
   return (
     <div ref={shellRef} className="icon-editor-shell">
+      <GraphicToolbar enabled={!!onCreateGraphic} />
       <GraphicViewport
         icon={icon}
         resetKey={resetKey}
         svgRef={svgRef}
         viewportGroupRef={viewportGroupRef}
         screenOverlayRef={screenOverlayRef}
-        onViewportTransform={updateScreenOverlay}
+        onViewportTransform={(viewport) => {
+          viewportStateRef.current = viewport;
+          updateScreenOverlay();
+        }}
         overlay={screenOverlay}
         onCanvasPointerDown={handleCanvasPointerDown}
         onCanvasContextMenu={(event) => {
           event.preventDefault();
           closeContextMenu();
         }}
+        onCanvasDragOver={handleCanvasDragOver}
+        onCanvasDrop={handleCanvasDrop}
         onPointerMove={(event) => {
           handleVertexMove(event);
           handlePointerMove(event);
@@ -1286,18 +1381,6 @@ export function IconViewer({
                   style={ed ? { cursor: "move" } : undefined}
                 >
                   <g transform={ed ? toSvgTransform(transform) : undefined}>
-                    <g
-                      ref={(node) => {
-                        if (node) localGroupRefs.current.set(id, node);
-                        else localGroupRefs.current.delete(id);
-                      }}
-                      transform={
-                        graphic.origin
-                          ? `translate(${graphic.origin.x},${graphic.origin.y})`
-                          : undefined
-                      }
-                      pointerEvents="none"
-                    />
                     <GraphicItem
                       item={renderGraphic}
                       styleId={`graphic-style-${index}`}
@@ -1494,6 +1577,60 @@ function handlePosition(
   return { x, y };
 }
 
+function svgRootPixelScale(svg: SVGSVGElement, base: { width: number; height: number }): number {
+  const rect = svg.getBoundingClientRect();
+  return Math.max(
+    Math.min(rect.width / Math.max(base.width, 1e-9), rect.height / Math.max(base.height, 1e-9)),
+    1e-6,
+  );
+}
+
+function graphicLocalToRoot(
+  graphic: EditableGraphic["graphic"],
+  localPoint: Point,
+  transform: GraphicTransform,
+  viewport: ViewportStateSnapshot,
+): Point {
+  const origin = graphic.origin ?? { x: 0, y: 0 };
+  const scaled = {
+    x: localPoint.x * transform.scale.x,
+    y: localPoint.y * transform.scale.y,
+  };
+  const angle = (transform.rotate * Math.PI) / 180;
+  const rotated = {
+    x: scaled.x * Math.cos(angle) - scaled.y * Math.sin(angle),
+    y: scaled.x * Math.sin(angle) + scaled.y * Math.cos(angle),
+  };
+  return modelToViewportRoot(
+    {
+      x: rotated.x + origin.x + transform.translate.x,
+      y: rotated.y + origin.y + transform.translate.y,
+    },
+    viewport,
+  );
+}
+
+function modelToGraphicLocal(
+  modelPoint: Point,
+  graphic: EditableGraphic["graphic"],
+  transform: GraphicTransform,
+): Point {
+  const origin = graphic.origin ?? { x: 0, y: 0 };
+  const translated = {
+    x: modelPoint.x - origin.x - transform.translate.x,
+    y: modelPoint.y - origin.y - transform.translate.y,
+  };
+  const angle = (-transform.rotate * Math.PI) / 180;
+  const unrotated = {
+    x: translated.x * Math.cos(angle) - translated.y * Math.sin(angle),
+    y: translated.x * Math.sin(angle) + translated.y * Math.cos(angle),
+  };
+  return {
+    x: unrotated.x / Math.max(Math.abs(transform.scale.x), 1e-9) * Math.sign(transform.scale.x || 1),
+    y: unrotated.y / Math.max(Math.abs(transform.scale.y), 1e-9) * Math.sign(transform.scale.y || 1),
+  };
+}
+
 function formatModelicaNumber(n: number): string {
   return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
 }
@@ -1501,6 +1638,82 @@ function formatModelicaNumber(n: number): string {
 /** Serialize a Modelica extent, including both the point and array braces. */
 export function formatModelicaExtent(extent: Extent): string {
   return `{{${formatModelicaNumber(extent.p1.x)},${formatModelicaNumber(extent.p1.y)}},{${formatModelicaNumber(extent.p2.x)},${formatModelicaNumber(extent.p2.y)}}}`;
+}
+
+function graphicPathForId(id: string): string {
+  const marker = ":Icon.graphics:";
+  const markerIndex = id.indexOf(marker);
+  return markerIndex >= 0 ? `Icon.graphics:${id.slice(markerIndex + marker.length)}` : id;
+}
+
+function historyTarget(
+  ed: EditableGraphic,
+  property: GraphicHistoryProperty,
+): GraphicHistoryCommand["target"] {
+  return {
+    ownerQualifiedName: ed.ownerQualifiedName ?? ed.graphic.ownerQualifiedName ?? "",
+    graphicPath: graphicPathForId(ed.id),
+    property,
+  };
+}
+
+function historyType(reason: SourceEditReason): GraphicHistoryType | null {
+  if (reason === "undo" || reason === "redo") return null;
+  return reason === "drag" ? "move" : reason;
+}
+
+function sourceRangeForProperty(
+  ed: EditableGraphic,
+  property: GraphicHistoryProperty,
+) {
+  switch (property) {
+    case "item": return ed.source.itemRange;
+    case "origin": return ed.source.originRange;
+    case "extent": return ed.source.extentRange;
+    case "points": return ed.source.pointsRange;
+    case "lineColor": return ed.source.lineColorRange;
+    case "color": return ed.source.colorRange;
+    case "textColor": return ed.source.textColorRange;
+    case "fillColor": return ed.source.fillColorRange;
+    case "textString": return ed.source.textStringRange;
+    case "fontSize": return ed.source.fontSizeRange;
+    case "textStyle": return ed.source.textStyleRange;
+    case "lineThickness": return ed.source.lineThicknessRange;
+    case "thickness": return ed.source.thicknessRange;
+    case "pattern": return ed.source.patternRange;
+    case "fillPattern": return ed.source.fillPatternRange;
+  }
+}
+
+function propertyForEdit(
+  ed: EditableGraphic,
+  edit: Edit,
+): GraphicHistoryProperty | null {
+  const properties: GraphicHistoryProperty[] = [
+    "item", "origin", "extent", "points", "lineColor", "color",
+    "textColor", "fillColor", "textString", "fontSize", "textStyle",
+    "lineThickness", "thickness", "pattern", "fillPattern",
+  ];
+  return properties.find((property) => {
+    const range = sourceRangeForProperty(ed, property);
+    return range?.start === edit.start && range.end === edit.end;
+  }) ?? null;
+}
+
+function buildHistoryCommand(
+  ed: EditableGraphic,
+  edit: Edit,
+  reason: SourceEditReason,
+): GraphicHistoryCommand | null {
+  const type = historyType(reason);
+  const property = propertyForEdit(ed, edit);
+  if (!type || !property) return null;
+  return {
+    type,
+    target: historyTarget(ed, property),
+    before: edit.expectedText ?? "",
+    after: edit.replacement,
+  };
 }
 
 function buildExtentEdit(ed: EditableGraphic, extent: Extent): Edit | null {
@@ -1543,40 +1756,76 @@ export function buildDeleteEdit(
     expectedText: deletedText,
     replacement: "",
     deletedText,
+    graphicText: sourceText.slice(start, end),
   };
 }
 
-function buildGraphicEdit(
+function historyTargetMatches(
   ed: EditableGraphic,
-  graphic: EditableGraphic["graphic"],
+  target: GraphicHistoryCommand["target"],
+): boolean {
+  return (
+    ed.ownerQualifiedName === target.ownerQualifiedName &&
+    graphicPathForId(ed.id) === target.graphicPath
+  );
+}
+
+function graphicIndexFromPath(path: string): number | null {
+  const match = path.match(/^Icon\.graphics:(\d+)$/);
+  return match ? Number(match[1]) : null;
+}
+
+function buildRestoreDeletedEdit(
+  command: GraphicHistoryCommand,
+  value: string,
+  currentEditable: EditableIconDto,
+  sourceText: string,
 ): Edit | null {
-  const g = graphic as any;
-  const format = formatModelicaNumber;
-  if (ed.source.originRange && g.origin) {
+  if (!value || !currentEditable.graphicsRange) return null;
+  const index = graphicIndexFromPath(command.target.graphicPath);
+  if (index === null) return null;
+  const itemAtIndex = currentEditable.editables[index];
+  if (itemAtIndex) {
     return {
-      start: ed.source.originRange.start,
-      end: ed.source.originRange.end,
-      expectedText: ed.source.originRange.expectedText,
-      replacement: `{${format(g.origin.x)},${format(g.origin.y)}}`,
+      start: itemAtIndex.source.itemRange.start,
+      end: itemAtIndex.source.itemRange.start,
+      expectedText: "",
+        replacement: `${value},`,
     };
   }
-  if (ed.source.extentRange && g.extent) {
-    return {
-      start: ed.source.extentRange.start,
-      end: ed.source.extentRange.end,
-      expectedText: ed.source.extentRange.expectedText,
-      replacement: formatModelicaExtent(g.extent),
-    };
+  const range = currentEditable.graphicsRange;
+  const bodyEnd = Math.max(range.start, range.end - 1);
+  const body = sourceText.slice(range.start, bodyEnd);
+  const trailingWhitespace = body.match(/\s*$/)?.[0] ?? "";
+  const insertAt = bodyEnd - trailingWhitespace.length;
+  return {
+    start: insertAt,
+    end: insertAt,
+    expectedText: "",
+    replacement: currentEditable.editables.length > 0
+      ? `, ${value}`
+      : value,
+  };
+}
+
+function buildHistoryEdit(
+  ed: EditableGraphic,
+  command: GraphicHistoryCommand,
+  direction: "undo" | "redo",
+  sourceText: string,
+): Edit | null {
+  const value = direction === "undo" ? command.before : command.after;
+  if (command.target.property === "item" && value === "") {
+    return buildDeleteEdit(ed, sourceText);
   }
-  if (ed.source.pointsRange && g.points) {
-    return {
-      start: ed.source.pointsRange.start,
-      end: ed.source.pointsRange.end,
-      expectedText: ed.source.pointsRange.expectedText,
-      replacement: `{${g.points.map((p: { x: number; y: number }) => `{${format(p.x)},${format(p.y)}}`).join(",")}}`,
-    };
-  }
-  return null;
+  const range = sourceRangeForProperty(ed, command.target.property);
+  if (!range) return null;
+  return {
+    start: range.start,
+    end: range.end,
+    expectedText: range.expectedText,
+    replacement: value,
+  };
 }
 
 function buildTranslateEdit(

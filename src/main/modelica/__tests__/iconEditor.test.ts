@@ -12,6 +12,7 @@ import {
   extractEditableIconFromSlice,
   findClassByQualifiedNameOrUniqueLeaf,
   findIconSourceRange,
+  buildGraphicInsertionEdit,
 } from "../iconResolver.js";
 import { parseModelicaFile } from "../parser.js";
 
@@ -22,6 +23,29 @@ function editableFrom(src: string, modelName = "MyModel") {
 }
 
 describe("iconEditor: editable ranges", () => {
+  it("inserts a graphic at the end of an existing graphics array", () => {
+    const source = "model M annotation(Icon(graphics={Rectangle(extent={{-1,-1},{1,1}})})); end M;";
+    const target = parseModelicaFile(source, "M.mo").classes[0]!;
+    const slice = source.slice(target.sourceRange.start, target.sourceRange.end);
+    const insertion = buildGraphicInsertionEdit(slice, "Ellipse(extent={{-2,-2},{2,2}})")!;
+    const updated = source.slice(0, target.sourceRange.start + insertion.start) + insertion.replacement + source.slice(target.sourceRange.start + insertion.end);
+    expect(updated).toContain("Rectangle(extent={{-1,-1},{1,1}}), Ellipse(extent={{-2,-2},{2,2}})");
+    expect(parseModelicaFile(updated, "M.mo").classes).toHaveLength(1);
+  });
+
+  it.each([
+    ["model M annotation(Icon(graphics={})); end M;", "Icon(graphics={Rectangle(extent={{-20,-15},{20,15}})})"],
+    ["model M annotation(Placement(transformation(extent={{-1,-1},{1,1}}))); end M;", "Icon(graphics={Rectangle(extent={{-20,-15},{20,15}})})"],
+    ["model M end M;", "Icon(graphics={Rectangle(extent={{-20,-15},{20,15}})})"],
+  ])("creates a structurally valid insertion for a %s class", (source, expected) => {
+    const target = parseModelicaFile(source, "M.mo").classes[0]!;
+    const slice = source.slice(target.sourceRange.start, target.sourceRange.end);
+    const insertion = buildGraphicInsertionEdit(slice, "Rectangle(extent={{-20,-15},{20,15}})")!;
+    const updated = source.slice(0, target.sourceRange.start + insertion.start) + insertion.replacement + source.slice(target.sourceRange.start + insertion.end);
+    expect(updated).toContain(expected);
+    expect(parseModelicaFile(updated, "M.mo").classes).toHaveLength(1);
+  });
+
   it("keeps Icon range separate from the enclosing class range", () => {
     const source = `model HeatXNTU "description"
   annotation(Icon(graphics={Rectangle(extent={{-1,-1},{1,1}})}));
@@ -70,6 +94,10 @@ end HeatXNTU;`;
       e.source.itemRange.end,
     );
     expect(itemText).toContain("Rectangle");
+    expect(ed.graphicsRange).toBeDefined();
+    expect(src.slice(ed.graphicsRange!.start, ed.graphicsRange!.end)).toBe(
+      "{Rectangle(extent={{-80,-50},{80,50}}, lineColor={0,0,255})}",
+    );
   });
 
   it("should capture points range for Line", () => {

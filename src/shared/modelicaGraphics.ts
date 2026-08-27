@@ -79,15 +79,26 @@ export interface EditableGraphic {
 export interface EditableIconDto {
   icon: IconDto;
   editables: EditableGraphic[];
+  /** Source range of the Icon.graphics array, used for logical delete undo. */
+  graphicsRange?: SourceRangeRef;
   sourceVersion?: number;
 }
+
+export type GraphicToolType =
+  | "Line"
+  | "Polygon"
+  | "Rectangle"
+  | "Text"
+  | "Ellipse"
+  | "Bitmap";
 
 export type GraphicItemDto =
   | RectangleDto
   | EllipseDto
   | LineDto
   | PolygonDto
-  | TextDto;
+  | TextDto
+  | BitmapDto;
 
 export interface RectangleDto extends GraphicProvenance {
   type: "Rectangle";
@@ -143,4 +154,25 @@ export interface TextDto extends GraphicProvenance {
   fontSize?: number;
   origin?: Point;
   textStyle?: string[];
+}
+
+export interface BitmapDto extends GraphicProvenance {
+  type: "Bitmap";
+  extent: Extent;
+  origin?: Point;
+  fileName?: string;
+  imageSource?: string;
+  lineColor?: [number, number, number];
+  fillColor?: [number, number, number];
+  lineThickness?: number;
+  fillPattern?: string;
+  pattern?: string;
+}
+
+export interface BitmapDto extends GraphicProvenance {
+  type: "Bitmap";
+  extent: Extent;
+  origin?: Point;
+  fileName?: string;
+  imageSource?: string;
 }

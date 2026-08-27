@@ -5,6 +5,7 @@ import type {
     LineDto,
     PolygonDto,
     TextDto,
+    BitmapDto,
     GraphicItemDto,
 } from "../../../shared/modelicaGraphics";
 import { recordViewerPerformance } from "../performance";
@@ -145,6 +146,17 @@ function renderText(item: TextDto) {
     </g>;
 }
 
+function renderBitmap(item: BitmapDto) {
+    const x = Math.min(item.extent.p1.x, item.extent.p2.x);
+    const y = Math.min(item.extent.p1.y, item.extent.p2.y);
+    const width = Math.abs(item.extent.p2.x - item.extent.p1.x);
+    const height = Math.abs(item.extent.p2.y - item.extent.p1.y);
+    return <g className="bitmap-placeholder">
+        <rect x={x} y={y} width={width} height={height} fill="rgb(var(--accent-rgb) / 0.06)" stroke="#7b8799" strokeDasharray="5 3" vectorEffect="non-scaling-stroke" />
+        <path d={`M ${x} ${y} L ${x + width} ${y + height} M ${x + width} ${y} L ${x} ${y + height}`} stroke="#7b8799" vectorEffect="non-scaling-stroke" />
+    </g>;
+}
+
 export const GraphicItem = memo(function GraphicItem({ item, styleId = "graphic-style" }: { item: GraphicItemDto; styleId?: string }) {
     recordViewerPerformance("graphicItemRenders");
     const rendered = (() => {
@@ -154,6 +166,7 @@ export const GraphicItem = memo(function GraphicItem({ item, styleId = "graphic-
             case "Line": return renderLine(item);
             case "Polygon": return renderPolygon(item, styleId);
             case "Text": return renderText(item);
+            case "Bitmap": return renderBitmap(item);
         }
     })();
     const content = <>{styleDefinitions(item, styleId)}{rendered}</>;

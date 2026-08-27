@@ -1,4 +1,9 @@
-import type { IconDto, EditableIconDto } from "./modelicaGraphics.js";
+import type {
+  IconDto,
+  EditableIconDto,
+  GraphicToolType,
+  Point,
+} from "./modelicaGraphics.js";
 
 export type ClassKind =
   | "package"
@@ -70,10 +75,22 @@ export type SourceEditReason =
   | "vertex"
   | "property"
   | "delete"
+  | "create"
   | "undo"
   | "redo";
 
 export type ApplySourceEditResult = { ok: true } | { error: string };
+
+export interface CreateGraphicRequest {
+  targetQualifiedName: string;
+  graphicType: GraphicToolType;
+  position: Point;
+  sourceVersion?: number;
+}
+
+export type CreateGraphicResult =
+  | { ok: true; graphicId: string; graphicPath: string; graphicText: string }
+  | { error: string };
 
 export type ReloadClassRangeResult =
   | { sourceRange: SourceRangeDto | null }

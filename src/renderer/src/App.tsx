@@ -2,15 +2,23 @@ import { useEffect, useRef, useState } from "react";
 import type {
   LoadPackageResult,
   PackageNodeDto,
+  CreateGraphicResult,
   SourceEditReason,
 } from "../../shared/modelica";
 import type { LibraryInfo } from "../../shared/api";
-import type { IconDto, EditableIconDto } from "../../shared/modelicaGraphics";
+import type { IconDto, EditableIconDto, GraphicToolType, Point } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
 import { AppearancePopover } from "./components/AppearancePopover";
 
 type ViewMode = "source" | "icon" | "diagram";
+
+const emptyIcon: IconDto = {
+  coordinateSystem: {
+    extent: { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } },
+  },
+  graphics: [],
+};
 
 function App(): JSX.Element {
   const [ipcStatus, setIpcStatus] = useState("checking…");
@@ -160,7 +168,7 @@ function App(): JSX.Element {
           setIconError(iconRes.error);
           setIcon(null);
         } else {
-          setIcon(iconRes.icon);
+          setIcon(iconRes.icon ?? emptyIcon);
           setIconWarning(iconRes.warnings?.join("；") ?? null);
         }
         if ("error" in editableRes) {
@@ -249,6 +257,42 @@ function App(): JSX.Element {
     await window.api.modelica.reveal(path);
   };
 
+  const refreshSelectedIcon = async (): Promise<boolean> => {
+    if (!selected || !window.api) return false;
+    const freshRangeRes = await window.api.modelica.reloadClassRange(
+      selected.node.sourceFile,
+      selected.node.qualifiedName,
+    );
+    const freshRange =
+      !("error" in freshRangeRes) && freshRangeRes.sourceRange
+        ? freshRangeRes.sourceRange
+        : null;
+    if (!freshRange) {
+      setIconError("保存后无法重新定位当前 Modelica 类，已保留原 Icon");
+      return false;
+    }
+    const [srcRes, iconRes, editableRes] = await Promise.all([
+      window.api.modelica.readSource(selected.node.sourceFile),
+      window.api.modelica.getIcon(selected.node.sourceFile, freshRange, selected.node.name),
+      window.api.modelica.getEditableIcon(selected.node.sourceFile, freshRange, selected.node.name),
+    ]);
+    if ("error" in srcRes) {
+      setSourceError(srcRes.error);
+    } else {
+      setDocumentSource(srcRes.content);
+      setSource(srcRes.content.slice(freshRange.start, freshRange.end));
+    }
+    if ("error" in iconRes) {
+      setIconError(iconRes.error);
+      return false;
+    }
+    setIconError(null);
+    setIcon(iconRes.icon ?? emptyIcon);
+    if ("error" in editableRes) setEditableIcon(null);
+    else setEditableIcon(editableRes.editable);
+    return true;
+  };
+
   const handleIconEdit = async (
     edit: {
       start: number;
@@ -281,57 +325,35 @@ function App(): JSX.Element {
         setIconError(res.error);
         return false;
       }
-      // refresh source and icon after write: re-parse current class for fresh range
-      const freshRangeRes = await window.api.modelica.reloadClassRange(
-        selected.node.sourceFile,
-        selected.node.qualifiedName,
-      );
-      const freshRange =
-        !("error" in freshRangeRes) && freshRangeRes.sourceRange
-          ? freshRangeRes.sourceRange
-          : null;
-      if (!freshRange) {
-        setIconError("保存后无法重新定位当前 Modelica 类，已保留原 Icon");
-        return false;
-      }
-      const [srcRes, iconRes, editableRes] = await Promise.all([
-        window.api.modelica.readSource(selected.node.sourceFile),
-        window.api.modelica.getIcon(
-          selected.node.sourceFile,
-          freshRange,
-          selected.node.name,
-        ),
-        window.api.modelica.getEditableIcon(
-          selected.node.sourceFile,
-          freshRange,
-          selected.node.name,
-        ),
-      ]);
-      if ("error" in srcRes) {
-        setSourceError(srcRes.error);
-      } else if (freshRange) {
-        setDocumentSource(srcRes.content);
-        setSource(srcRes.content.slice(freshRange.start, freshRange.end));
-      } else {
-        setDocumentSource(srcRes.content);
-        setSource(srcRes.content);
-      }
-      if ("error" in iconRes || !iconRes.icon) {
-        setIconError(
-          "error" in iconRes
-            ? iconRes.error
-            : "保存后重新解析未找到 Icon，已保留原 Icon",
-        );
-        return false;
-      }
-      setIconError(null);
-      setIcon(iconRes.icon);
-      if ("error" in editableRes) setEditableIcon(null);
-      else setEditableIcon(editableRes.editable);
-      return true;
+      return refreshSelectedIcon();
     } catch (e) {
       setIconError((e as Error).message);
       return false;
+    }
+  };
+
+  const handleCreateGraphic = async (
+    graphicType: GraphicToolType,
+    position: Point,
+  ): Promise<CreateGraphicResult> => {
+    if (!selected || !window.api) return { error: "当前没有可编辑的 Modelica 类" };
+    try {
+      const result = await window.api.modelica.createGraphic(selected.node.sourceFile, {
+        targetQualifiedName: selected.node.qualifiedName,
+        graphicType,
+        position,
+        sourceVersion: editableIcon?.sourceVersion,
+      });
+      if ("error" in result) {
+        setIconError(result.error);
+        return result;
+      }
+      if (!(await refreshSelectedIcon())) return { error: "创建后重新解析 Icon 失败" };
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      setIconError(message);
+      return { error: message };
     }
   };
 
@@ -347,23 +369,24 @@ function App(): JSX.Element {
       <header className="app-header">
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true">∿</div>
-          <div>
-            <p className="eyebrow">MODELICA WORKSPACE</p>
-            <strong className="brand-title">Library Viewer</strong>
-          </div>
+          <strong className="brand-title">Modelica Viewer</strong>
         </div>
         <div className="header-context">
           <span className="connection-pill">
             <span className={`status-dot ${ipcStatus === "pong" ? "is-live" : ""}`} />
             {ipcStatus === "pong" ? "Ready" : ipcStatus}
           </span>
-          {currentPath && (
-            <span className="current-path" title={currentPath}>
-              {currentPath}
+          {(selected?.node.sourceFile ?? currentPath) && (
+            <span className="current-path" title={selected?.node.sourceFile ?? currentPath}>
+              {(selected?.node.sourceFile ?? currentPath).split(/[\\/]/).pop() ?? (selected?.node.sourceFile ?? currentPath)}
             </span>
           )}
+          {selected && <span className="compact-class-context" title={selected.node.qualifiedName}>{selected.node.qualifiedName}</span>}
         </div>
         <div className="header-actions">
+          {selected && (
+            <button className="ghost-btn compact-action" onClick={() => void handleReveal()} title="在文件夹中显示">↗</button>
+          )}
           <button
             className="primary-btn"
             onClick={() => void handleOpenFile()}
@@ -474,18 +497,6 @@ function App(): JSX.Element {
           <section className="detail-pane">
             {selected ? (
               <>
-                <div className="source-toolbar">
-                  <div className="workspace-title">
-                    <span className="section-kicker">OPEN CLASS</span>
-                    <strong>{selected.node.qualifiedName}</strong>
-                    <span className="source-path" title={selected.node.sourceFile}>
-                      {selected.node.sourceFile}
-                    </span>
-                  </div>
-                  <button className="ghost-btn" onClick={() => void handleReveal()}>
-                    ↗ 在文件夹中显示
-                  </button>
-                </div>
                 <div className="viewer-tabs" role="tablist" aria-label="Viewer mode">
                   <button
                     className={viewMode === "source" ? "active" : ""}
@@ -545,6 +556,7 @@ function App(): JSX.Element {
                           resetKey={selected.node.qualifiedName}
                           sourceText={documentSource}
                           onEdit={handleIconEdit}
+                          onCreateGraphic={selected.kind === "package" ? undefined : handleCreateGraphic}
                         />
                       </>
                     )}

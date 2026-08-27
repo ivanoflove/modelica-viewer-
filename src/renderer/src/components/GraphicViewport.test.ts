@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   contentViewBox,
+  clientToModelicaWithViewport,
+  modelToViewportRoot,
   panViewBox,
   viewportGroupTransform,
   wheelZoomFactor,
@@ -52,5 +54,40 @@ describe("GraphicViewport math", () => {
         { x: -40, y: -50, width: 100, height: 100 },
       ),
     ).toBe("matrix(2 0 0 2 -20 0)");
+  });
+
+  it("maps Modelica points through viewport zoom and the flipped Y axis", () => {
+    const viewport = {
+      base: { x: -100, y: -100, width: 200, height: 200 },
+      viewBox: { x: -40, y: -50, width: 100, height: 100 },
+    };
+    expect(modelToViewportRoot({ x: 10, y: 20 }, viewport)).toEqual({
+      x: 0,
+      y: -40,
+    });
+  });
+
+  it("round-trips client coordinates with letterboxed SVG geometry", () => {
+    const svg = {
+      getBoundingClientRect: () => ({
+        left: 100,
+        top: 50,
+        width: 800,
+        height: 400,
+      }),
+    } as SVGSVGElement;
+    const viewport = {
+      base: { x: -100, y: -100, width: 200, height: 200 },
+      viewBox: { x: -100, y: -100, width: 200, height: 200 },
+    };
+    const screen = modelToViewportRoot({ x: 20, y: 30 }, viewport);
+    const client = {
+      x: 100 + 200 + (screen.x - viewport.base.x) * 2,
+      y: 50 + (screen.y - viewport.base.y) * 2,
+    };
+    expect(clientToModelicaWithViewport(svg, client.x, client.y, viewport)).toEqual({
+      x: 20,
+      y: 30,
+    });
   });
 });

@@ -91,21 +91,21 @@ button { -webkit-app-region: no-drag; }
 .app-header {
   position: relative;
   z-index: 5;
-  min-height: 64px;
+  min-height: 52px;
   display: flex;
   align-items: center;
-  gap: 20px;
-  padding: 10px 18px;
+  gap: 14px;
+  padding: 7px 14px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--surface-raised);
   backdrop-filter: var(--blur-panel);
 }
 
 .brand-lockup, .header-context, .header-actions { display: flex; align-items: center; }
-.brand-lockup { flex: 0 0 auto; gap: 10px; min-width: 190px; }
+.brand-lockup { flex: 0 0 auto; gap: 9px; min-width: 174px; }
 .brand-mark {
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   display: grid;
   place-items: center;
   border: 1px solid rgb(var(--accent-rgb) / 0.2);
@@ -115,7 +115,10 @@ button { -webkit-app-region: no-drag; }
   font-size: 24px;
   line-height: 1;
 }
-.brand-title { display: block; font-size: 14px; letter-spacing: -0.01em; }
+.brand-title { display: block; font-size: 13px; letter-spacing: -0.01em; }
+.header-context { min-width: 0; flex: 1 1 auto; gap: 9px; overflow: hidden; }
+.compact-class-context { min-width: 0; overflow: hidden; color: var(--text-primary); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.compact-action { min-width: 30px; padding-inline: 8px; }
 .eyebrow, .section-kicker {
   margin: 0 0 3px;
   color: var(--text-tertiary);
@@ -290,8 +293,15 @@ button { -webkit-app-region: no-drag; }
 [data-theme="dark"] .icon-warning { color: #e8c36a; }
 
 .icon-viewer { flex: 1; display: flex; align-items: stretch; justify-content: center; overflow: hidden; background: var(--surface); overscroll-behavior: none; touch-action: none; user-select: none; }
-.icon-editor-shell { position: relative; width: 100%; min-height: 100%; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); overflow: hidden; background: var(--surface); overscroll-behavior: none; touch-action: none; user-select: none; }
-.graphic-viewport { grid-column: 1; grid-row: 1; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; outline: none; overflow: hidden; overscroll-behavior: none; touch-action: none; user-select: none; }
+.icon-editor-shell { position: relative; width: 100%; min-height: 100%; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; background: var(--surface); overscroll-behavior: none; touch-action: none; user-select: none; }
+.graphic-toolbar { grid-column: 1; grid-row: 1; display: flex; align-items: center; gap: 4px; min-height: 42px; padding: 5px 10px; border-bottom: 1px solid var(--border-subtle); background: var(--surface-soft); overflow-x: auto; }
+.graphic-toolbar-label { margin-right: 4px; color: var(--text-tertiary); font: 9px "SFMono-Regular", Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.graphic-tool { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; min-height: 30px; padding: 5px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-secondary); cursor: grab; font-size: 11px; }
+.graphic-tool:hover { border-color: rgb(var(--accent-rgb) / .16); background: var(--accent-soft); color: var(--text-primary); }
+.graphic-tool:disabled { opacity: .45; cursor: not-allowed; }
+.graphic-tool:active, .graphic-tool.is-dragging { cursor: grabbing; border-color: rgb(var(--accent-rgb) / .28); color: var(--accent); }
+.graphic-tool svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+.graphic-viewport { grid-column: 1; grid-row: 2; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; outline: none; overflow: hidden; overscroll-behavior: none; touch-action: none; user-select: none; }
 .icon-viewer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 13px; color: var(--text-secondary); font-size: 11px; pointer-events: auto; }
 .icon-viewer-toolbar > span { padding: 5px 8px; border: 1px solid var(--border-subtle); border-radius: var(--radius-pill); background: var(--surface-soft); font: 10px "SFMono-Regular", Consolas, monospace; }
 .fit-toggle { display: flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid var(--border-subtle); border-radius: var(--radius-pill); background: var(--surface-soft); }
