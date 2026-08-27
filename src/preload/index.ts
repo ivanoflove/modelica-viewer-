@@ -65,11 +65,16 @@ const api: WindowApi = {
         sourceRange,
         modelName,
       ) as Promise<GetEditableIconResult>,
-    getDiagram: (filePath: string, sourceRange: SourceRangeDto | null) =>
+    getDiagram: (
+      filePath: string,
+      sourceRange: SourceRangeDto | null,
+      qualifiedName: string,
+    ) =>
       ipcRenderer.invoke(
         "modelica:getDiagram",
         filePath,
         sourceRange,
+        qualifiedName,
       ) as Promise<GetDiagramResult>,
     applySourceEdit: (filePath: string, edit: SourceEdit) =>
       ipcRenderer.invoke(

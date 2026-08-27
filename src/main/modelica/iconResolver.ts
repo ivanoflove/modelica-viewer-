@@ -928,6 +928,19 @@ export function findClassByQualifiedName(
   return null;
 }
 
+/** Build a fresh index for a freshly parsed source tree. */
+export function buildClassIndex(classes: ClassNode[]): Map<string, ClassNode> {
+  const index = new Map<string, ClassNode>();
+  const visit = (nodes: ClassNode[]) => {
+    for (const node of nodes) {
+      index.set(node.qualifiedName, node);
+      visit(node.children);
+    }
+  };
+  visit(classes);
+  return index;
+}
+
 /**
  * Resolve a class after reparsing a source file. Normally the qualified name
  * is sufficient; the unique-leaf fallback covers legacy Modelica files that

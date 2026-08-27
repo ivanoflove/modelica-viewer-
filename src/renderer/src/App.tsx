@@ -201,6 +201,7 @@ function App(): JSX.Element {
         const result = await window.api.modelica.getDiagram(
           selected.node.sourceFile,
           selected.node.sourceRange ?? null,
+          selected.node.qualifiedName,
         );
         if (!active) return;
         if ("error" in result) {

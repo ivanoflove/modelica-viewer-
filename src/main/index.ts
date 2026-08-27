@@ -12,6 +12,7 @@ import {
   findIconAnnotationOffset,
   findIconSourceRange,
   findClassByQualifiedNameOrUniqueLeaf,
+  buildClassIndex,
   findClassBySourceRange,
   resolveIconForClass,
   buildGraphicInsertionEdit,
@@ -416,15 +417,22 @@ function registerIpcHandlers(): void {
     async (
       _event,
       filePath: string,
-      sourceRange: { start: number; end: number } | null,
+      _sourceRange: { start: number; end: number } | null,
+      selectedQualifiedName: string,
     ) => {
       try {
         if (!filePath) return { error: "No file path provided" };
         const content = await readFile(filePath, "utf-8");
         const parsed = parseModelicaFile(content, filePath);
         libraryRegistry.registerSource(filePath, content, parsed);
-        const target = findClassBySourceRange(parsed.classes, sourceRange);
-        if (!target) return { error: "DIAGRAM_CLASS_NOT_FOUND: unable to locate selected class" };
+        const classByQualifiedName = buildClassIndex(parsed.classes);
+        const target = classByQualifiedName.get(selectedQualifiedName);
+        if (!target) {
+          const availableClasses = Array.from(classByQualifiedName.keys()).sort();
+          return {
+            error: `DIAGRAM_CLASS_NOT_FOUND: selectedQualifiedName=${JSON.stringify(selectedQualifiedName)}, currentFile=${JSON.stringify(filePath)}, packagePath=${JSON.stringify(parsed.within)}, availableClasses=${JSON.stringify(availableClasses)}`,
+          };
+        }
         const scene = resolveDiagramForClass(
           target,
           content,

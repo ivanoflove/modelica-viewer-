@@ -48,6 +48,7 @@ export interface WindowApi {
     getDiagram: (
       filePath: string,
       sourceRange: SourceRangeDto | null,
+      qualifiedName: string,
     ) => Promise<GetDiagramResult>;
     applySourceEdit: (
       filePath: string,

@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { parseModelicaFile } from "../parser.js";
 import { resolveDiagramForClass } from "../diagramResolver.js";
+import { buildClassIndex } from "../iconResolver.js";
 import { computePlacementTransform, transformPlacementPoint } from "../../../shared/diagram.js";
 
 describe("Diagram M1 resolver", () => {
+  it("indexes every freshly parsed qualified class, including nested classes", () => {
+    const parsed = parseModelicaFile("within Demo; package Sub model Inner end Inner; end Sub;", "demo.mo");
+    const index = buildClassIndex(parsed.classes);
+    expect(Array.from(index.keys())).toEqual(["Demo.Sub", "Demo.Sub.Inner"]);
+  });
+
   it("extracts placed components and resolves each component Icon", () => {
     const source = `
       within Demo;
