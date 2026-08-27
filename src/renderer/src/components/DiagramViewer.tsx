@@ -36,6 +36,13 @@ function viewportIcon(scene: DiagramSceneDto): IconDto {
   };
 }
 
+function connectionPoints(line: NonNullable<DiagramSceneDto["connections"][number]["line"]>): string {
+  const origin = line.origin ?? { x: 0, y: 0 };
+  return line.points
+    .map((point) => `${point.x + origin.x},${point.y + origin.y}`)
+    .join(" ");
+}
+
 function ComponentRenderer({
   component,
   index,
@@ -115,12 +122,14 @@ export function DiagramViewer({ scene }: { scene: DiagramSceneDto }) {
       )}
       <GraphicViewport
         icon={viewportIcon}
-        resetKey={`diagram:${scene.components.map((component) => component.id).join("|")}:${scene.connections.length}:${scene.backgroundGraphics.length}:${scene.contentBounds?.x ?? ""}:${scene.contentBounds?.y ?? ""}:${scene.contentBounds?.width ?? ""}:${scene.contentBounds?.height ?? ""}`}
+        resetKey={`diagram:${scene.classQualifiedName ?? "selected"}`}
         svgRef={svgRef}
         onPointerMove={() => undefined}
         onPointerUp={() => undefined}
         onPointerCancel={() => undefined}
         canvasLabel="Diagram 画布"
+        initialFitMode="coordinateSystem"
+        showFitModes={false}
       >
         <g transform="scale(1,-1)" className="diagram-layer">
           {scene.backgroundGraphics.map((graphic, graphicIndex) => (
@@ -132,11 +141,21 @@ export function DiagramViewer({ scene }: { scene: DiagramSceneDto }) {
           ))}
           {scene.connections.map((connection, connectionIndex) => (
             connection.line ? (
-              <ResolvedGraphicRenderer
-                key={connection.id}
-                item={connection.line}
-                styleId={`diagram-connection-style-${connectionIndex}`}
-              />
+              <g key={connection.id} className="diagram-connection">
+                <ResolvedGraphicRenderer
+                  item={connection.line}
+                  styleId={`diagram-connection-style-${connectionIndex}`}
+                />
+                <polyline
+                  className="connection-hit-target"
+                  points={connectionPoints(connection.line)}
+                  stroke="transparent"
+                  strokeWidth={10}
+                  fill="none"
+                  vectorEffect="non-scaling-stroke"
+                  pointerEvents="stroke"
+                />
+              </g>
             ) : null
           ))}
           {scene.components.map((component, index) => (

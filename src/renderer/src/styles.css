@@ -369,6 +369,7 @@ button { -webkit-app-region: no-drag; }
 .resize-hit-target { fill: transparent; stroke: none; pointer-events: all; cursor: nwse-resize; }
 .hit-layer { pointer-events: auto; }
 .line-hit-target, .polygon-hit-target { cursor: pointer; }
+.connection-hit-target { cursor: pointer; }
 .vertex-handle { fill: var(--surface); stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke; pointer-events: none; }
 .vertex-handle.active { fill: var(--accent); }
 .vertex-hit-target { fill: transparent; stroke: none; pointer-events: all; cursor: crosshair; }

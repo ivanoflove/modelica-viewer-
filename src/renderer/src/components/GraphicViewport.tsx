@@ -98,6 +98,8 @@ interface Props {
   onCanvasDragOver?: (event: React.DragEvent<HTMLDivElement>) => void;
   onCanvasDrop?: (event: React.DragEvent<HTMLDivElement>) => void;
   canvasLabel?: string;
+  initialFitMode?: "content" | "coordinateSystem";
+  showFitModes?: boolean;
   onUndo?: () => void;
   onRedo?: () => void;
   onDelete?: () => boolean;
@@ -228,6 +230,8 @@ export function GraphicViewport({
   onCanvasDragOver,
   onCanvasDrop,
   canvasLabel = "Icon 画布",
+  initialFitMode = "content",
+  showFitModes = true,
   onUndo,
   onRedo,
   onDelete,
@@ -243,9 +247,7 @@ export function GraphicViewport({
   const stateSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onViewportTransformRef = useRef(onViewportTransform);
   onViewportTransformRef.current = onViewportTransform;
-  const [fitMode, setFitMode] = useState<"content" | "coordinateSystem">(
-    "content",
-  );
+  const [fitMode, setFitMode] = useState<"content" | "coordinateSystem">(initialFitMode);
   const [viewBox, setViewBox] = useState<ViewBox>(() => contentViewBox(icon));
   const [isPanning, setIsPanning] = useState(false);
   const viewportRef = useRef<ViewportStateSnapshot>({
@@ -296,16 +298,18 @@ export function GraphicViewport({
 
   useEffect(() => {
     const base = coordinateViewBox(icon);
-    const initial = contentViewBox(icon);
+    const initial = initialFitMode === "coordinateSystem"
+      ? coordinateViewBox(icon)
+      : contentViewBox(icon);
     viewportRef.current = { base, viewBox: initial };
-    setFitMode("content");
+    setFitMode(initialFitMode);
     setViewBox(initial);
     onViewportTransformRef.current?.({
       base: { ...base },
       viewBox: { ...initial },
     });
     scheduleViewportRender();
-  }, [resetKey]);
+  }, [initialFitMode, resetKey]);
 
   useEffect(() => {
     applyViewportTransform();
@@ -473,27 +477,29 @@ export function GraphicViewport({
       <div className="icon-viewer-toolbar">
         <span>{canvasLabel} · {zoomPercent}%</span>
         <div className="fit-toggle">
-          <button
-            className={fitMode === "content" ? "active" : ""}
-            onClick={() => {
-              setFitMode("content");
-              fit("content");
-            }}
-          >
-            Fit Content
-          </button>
-          <button
-            className={fitMode === "coordinateSystem" ? "active" : ""}
-            onClick={() => {
-              setFitMode("coordinateSystem");
-              fit("coordinateSystem");
-            }}
-          >
-            Fit CoordinateSystem
-          </button>
+          {showFitModes && <>
+            <button
+              className={fitMode === "content" ? "active" : ""}
+              onClick={() => {
+                setFitMode("content");
+                fit("content");
+              }}
+            >
+              Fit Content
+            </button>
+            <button
+              className={fitMode === "coordinateSystem" ? "active" : ""}
+              onClick={() => {
+                setFitMode("coordinateSystem");
+                fit("coordinateSystem");
+              }}
+            >
+              Fit CoordinateSystem
+            </button>
+          </>}
           <button onClick={() => zoomBy(0.8)} aria-label="Zoom out">−</button>
           <button onClick={() => zoomBy(1.25)} aria-label="Zoom in">+</button>
-          <button onClick={() => fit()}>Fit</button>
+          <button onClick={() => fit("coordinateSystem")} title="Fit Diagram Coordinate System">Fit</button>
           <button onClick={onUndo} disabled={!canUndo} aria-label="Undo">Undo</button>
           <button onClick={onRedo} disabled={!canRedo} aria-label="Redo">Redo</button>
         </div>

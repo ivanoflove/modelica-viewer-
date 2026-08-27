@@ -100,6 +100,7 @@ export interface DiagramConnectionDto {
 }
 
 export interface DiagramSceneDto {
+  classQualifiedName?: string;
   coordinateSystem: IconDto["coordinateSystem"];
   backgroundGraphics: GraphicItemDto[];
   components: ComponentInstanceDto[];

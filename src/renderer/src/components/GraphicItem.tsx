@@ -102,7 +102,7 @@ function renderRectangle(item: RectangleDto, styleId: string) {
         height={Math.abs(y2 - y1)} rx={item.radius} ry={item.radius}
         stroke={item.pattern === "LinePattern.None" ? "none" : lineColor(item)}
         strokeDasharray={strokeDasharray(item.pattern)} fill={fillPaint(item, styleId)}
-        strokeWidth={item.lineThickness ?? 1} vectorEffect="non-scaling-stroke" />;
+        strokeWidth={item.lineThickness ?? 1} />;
 }
 
 function renderEllipse(item: EllipseDto, styleId: string) {
@@ -114,21 +114,21 @@ function renderEllipse(item: EllipseDto, styleId: string) {
         rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2}
         stroke={item.pattern === "LinePattern.None" ? "none" : lineColor(item)}
         strokeDasharray={strokeDasharray(item.pattern)} fill={fillPaint(item, styleId)}
-        strokeWidth={item.lineThickness ?? 1} vectorEffect="non-scaling-stroke" />;
+        strokeWidth={item.lineThickness ?? 1} />;
 }
 
 function renderLine(item: LineDto) {
     return <polyline points={item.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none"
         stroke={item.pattern === "LinePattern.None" ? "none" : lineColor(item)}
         strokeDasharray={strokeDasharray(item.pattern)} strokeWidth={item.thickness ?? 1}
-        vectorEffect="non-scaling-stroke" />;
+        />;
 }
 
 function renderPolygon(item: PolygonDto, styleId: string) {
     return <polygon points={item.points.map((p) => `${p.x},${p.y}`).join(" ")}
         stroke={item.pattern === "LinePattern.None" ? "none" : lineColor(item)}
         strokeDasharray={strokeDasharray(item.pattern)} fill={fillPaint(item, styleId)}
-        strokeWidth={item.lineThickness ?? 1} vectorEffect="non-scaling-stroke" />;
+        strokeWidth={item.lineThickness ?? 1} />;
 }
 
 function renderText(item: TextDto) {
@@ -163,8 +163,8 @@ function renderBitmap(item: BitmapDto) {
     const width = Math.abs(item.extent.p2.x - item.extent.p1.x);
     const height = Math.abs(item.extent.p2.y - item.extent.p1.y);
     return <g className="bitmap-placeholder">
-        <rect x={x} y={y} width={width} height={height} fill="rgb(var(--accent-rgb) / 0.06)" stroke="#7b8799" strokeDasharray="5 3" vectorEffect="non-scaling-stroke" />
-        <path d={`M ${x} ${y} L ${x + width} ${y + height} M ${x + width} ${y} L ${x} ${y + height}`} stroke="#7b8799" vectorEffect="non-scaling-stroke" />
+        <rect x={x} y={y} width={width} height={height} fill="rgb(var(--accent-rgb) / 0.06)" stroke="#7b8799" strokeDasharray="5 3" />
+        <path d={`M ${x} ${y} L ${x + width} ${y + height} M ${x + width} ${y} L ${x} ${y + height}`} stroke="#7b8799" />
     </g>;
 }
 

@@ -532,6 +532,7 @@ export function resolveDiagramForClass(
   }
 
   return {
+    classQualifiedName: classNode.qualifiedName,
     coordinateSystem: diagram.coordinateSystem,
     backgroundGraphics: diagram.graphics,
     components,
