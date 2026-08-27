@@ -95,7 +95,7 @@ impl Render for ModelicaViewer {
             .flex_col()
             .gap_1()
             .p_2()
-            .overflow_y_scroll();
+            .overflow_scroll();
 
         for (index, row) in self.classes.iter().enumerate() {
             let selected = self.selected == Some(index);
@@ -219,7 +219,7 @@ impl Render for ModelicaViewer {
                             .border_color(rgb(0x27272a))
                             .bg(rgb(0xfafafa))
                             .overflow_hidden()
-                            .child(icon_canvas(scene).size_full()),
+                            .child(icon_canvas(scene)),
                     )
                     .child(
                         div()
@@ -252,6 +252,7 @@ fn icon_canvas(scene: IconScene) -> impl IntoElement {
             paint_icon_scene(&scene, bounds, window);
         },
     )
+    .size_full()
 }
 
 fn paint_icon_scene(scene: &IconScene, bounds: Bounds<Pixels>, window: &mut Window) {
