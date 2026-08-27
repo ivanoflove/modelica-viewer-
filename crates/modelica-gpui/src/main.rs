@@ -7,8 +7,8 @@ use gpui::{
 use gpui_platform::application;
 use icon_view::{SharedIconViewState, new_icon_view_state};
 use modelica_core::{
-    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry,
-    PackageLoader, PackageNode,
+    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry, PackageLoader,
+    PackageNode,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -33,6 +33,13 @@ enum AccentName {
 enum GlassMode {
     On,
     Reduced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetailTab {
+    Source,
+    Icon,
+    Diagram,
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +107,16 @@ impl GlassMode {
     }
 }
 
+impl DetailTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source => "Source",
+            Self::Icon => "Icon",
+            Self::Diagram => "Diagram",
+        }
+    }
+}
+
 fn palette(theme: ThemeMode, accent: AccentName) -> Palette {
     let dark = matches!(theme, ThemeMode::System | ThemeMode::Dark);
     if dark {
@@ -162,9 +179,12 @@ struct ModelicaViewer {
     tree_root: TreeNode,
     expanded: HashSet<String>,
     selected: Option<usize>,
+    selected_source: Vec<String>,
+    source_start_line: usize,
     scene: IconScene,
     registry: LibraryRegistry,
     icon_view: SharedIconViewState,
+    active_tab: DetailTab,
     theme: ThemeMode,
     accent: AccentName,
     glass: GlassMode,
@@ -191,9 +211,12 @@ impl ModelicaViewer {
             tree_root,
             expanded,
             selected: None,
+            selected_source: Vec::new(),
+            source_start_line: 1,
             scene: empty_scene(None),
             registry,
             icon_view: new_icon_view_state(),
+            active_tab: DetailTab::Icon,
             theme: ThemeMode::System,
             accent: AccentName::Violet,
             glass: GlassMode::On,
@@ -215,11 +238,24 @@ impl ModelicaViewer {
                         "SOURCE_READ",
                         format!("{}: {error}", class.source_file.display()),
                     ));
+                self.selected_source = vec![format!("// unable to read source: {error}")];
+                self.source_start_line = 1;
                 self.selected = Some(index);
                 self.request_icon_fit();
                 return;
             }
         };
+
+        self.source_start_line = source[..class.source_range.start.min(source.len())]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let selected_source = source
+            .get(class.source_range.start..class.source_range.end)
+            .unwrap_or("");
+        self.selected_source = selected_source.lines().map(str::to_owned).collect();
+
         let _ = self
             .registry
             .register_source(class.source_file.clone(), source.clone());
@@ -277,92 +313,91 @@ impl Render for ModelicaViewer {
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
 
-        let tree =
-            uniform_list(
-                "class-tree",
-                visible_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|row_index| {
-                            let row = visible_rows.get(row_index)?.clone();
-                            let selected = row
-                                .class_index
-                                .is_some_and(|index| this.selected == Some(index));
-                            let key = row.key.clone();
-                            let class_index = row.class_index;
-                            let has_children = row.has_children;
-                            let toggle = if has_children {
-                                if row.expanded { "▾" } else { "▸" }
-                            } else {
-                                ""
-                            };
-                            let indent = 5.0 + row.depth as f32 * 12.0;
+        let tree = uniform_list(
+            "class-tree",
+            visible_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                range
+                    .filter_map(|row_index| {
+                        let row = visible_rows.get(row_index)?.clone();
+                        let selected = row
+                            .class_index
+                            .is_some_and(|index| this.selected == Some(index));
+                        let key = row.key.clone();
+                        let class_index = row.class_index;
+                        let has_children = row.has_children;
+                        let toggle = if has_children {
+                            if row.expanded { "▾" } else { "▸" }
+                        } else {
+                            ""
+                        };
+                        let indent = 5.0 + row.depth as f32 * 12.0;
 
-                            Some(
-                                div()
-                                    .id(format!("tree-row-{row_index}"))
-                                    .mx_1()
-                                    .w_full()
-                                    .h(px(29.0))
-                                    .pl(px(indent))
-                                    .pr_2()
-                                    .rounded_md()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(if selected {
-                                        palette.selected_text
+                        Some(
+                            div()
+                                .id(format!("tree-row-{row_index}"))
+                                .mx_1()
+                                .w_full()
+                                .h(px(29.0))
+                                .pl(px(indent))
+                                .pr_2()
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(if selected {
+                                    palette.selected_text
+                                } else {
+                                    palette.text
+                                }))
+                                .bg(rgb(if selected {
+                                    palette.accent
+                                } else {
+                                    palette.panel_alt
+                                })
+                                .opacity(if selected { 0.95 } else { 0.18 }))
+                                .hover(move |style| {
+                                    style.bg(rgb(if selected {
+                                        palette.accent_hover
                                     } else {
-                                        palette.text
-                                    }))
-                                    .bg(rgb(if selected {
-                                        palette.accent
-                                    } else {
-                                        palette.panel_alt
+                                        palette.card
                                     })
-                                    .opacity(if selected { 0.95 } else { 0.18 }))
-                                    .hover(move |style| {
-                                        style.bg(rgb(if selected {
-                                            palette.accent_hover
-                                        } else {
-                                            palette.card
-                                        })
-                                        .opacity(0.78))
-                                    })
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(px(14.0))
-                                            .text_color(rgb(palette.subtle))
-                                            .child(toggle),
-                                    )
-                                    .child(tree_icon(row.kind, selected, palette))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .child(row.label),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if has_children && class_index.is_none() {
+                                    .opacity(0.78))
+                                })
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .w(px(14.0))
+                                        .text_color(rgb(palette.subtle))
+                                        .child(toggle),
+                                )
+                                .child(tree_icon(row.kind, selected, palette))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .child(row.label),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if has_children && class_index.is_none() {
+                                        this.toggle_tree(&key);
+                                    } else if let Some(index) = class_index {
+                                        this.select_class(index);
+                                        if has_children {
                                             this.toggle_tree(&key);
-                                        } else if let Some(index) = class_index {
-                                            this.select_class(index);
-                                            if has_children {
-                                                this.toggle_tree(&key);
-                                            }
                                         }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .h_full();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -463,9 +498,111 @@ impl Render for ModelicaViewer {
             .flex()
             .items_end()
             .gap_1()
-            .child(tab_chip("Source", false, palette))
-            .child(tab_chip("Icon", true, palette))
-            .child(tab_chip("Diagram", false, palette));
+            .child(
+                tab_chip(DetailTab::Source, self.active_tab == DetailTab::Source, palette)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.active_tab = DetailTab::Source;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                tab_chip(DetailTab::Icon, self.active_tab == DetailTab::Icon, palette).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.active_tab = DetailTab::Icon;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                tab_chip(
+                    DetailTab::Diagram,
+                    self.active_tab == DetailTab::Diagram,
+                    palette,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.active_tab = DetailTab::Diagram;
+                    cx.notify();
+                })),
+            );
+
+        let source_lines = self.selected_source.clone();
+        let source_start_line = self.source_start_line;
+        let source_line_count = source_lines.len();
+        let source_list = uniform_list(
+            "source-lines",
+            source_line_count,
+            cx.processor(move |_this, range: Range<usize>, _window, _cx| {
+                range
+                    .filter_map(|index| {
+                        let line = source_lines.get(index)?.clone();
+                        Some(
+                            div()
+                                .h(px(22.0))
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .text_xs()
+                                .child(
+                                    div()
+                                        .w(px(54.0))
+                                        .pr_2()
+                                        .text_right()
+                                        .text_color(rgb(palette.subtle))
+                                        .child(format!("{}", source_start_line + index)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_color(rgb(palette.text))
+                                        .child(line),
+                                ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h_full();
+
+        let (detail_status, detail_toolbar, detail_body): (String, gpui::AnyElement, gpui::AnyElement) =
+            match self.active_tab {
+                DetailTab::Source => (
+                    if self.selected.is_some() {
+                        format!("{source_line_count} lines · selected class source")
+                    } else {
+                        "Select a class to view source".to_owned()
+                    },
+                    div().into_any_element(),
+                    div()
+                        .size_full()
+                        .bg(rgb(if matches!(self.theme, ThemeMode::System | ThemeMode::Dark) {
+                            0x1b1d23
+                        } else {
+                            0xffffff
+                        }))
+                        .child(source_list)
+                        .into_any_element(),
+                ),
+                DetailTab::Icon => (
+                    format!("{primitive_count} graphics  ·  {diagnostic_count} diagnostics"),
+                    icon_toolbar.into_any_element(),
+                    icon_view::icon_canvas(scene, self.icon_view.clone()).into_any_element(),
+                ),
+                DetailTab::Diagram => (
+                    "Diagram viewer is the next migration stage".to_owned(),
+                    div().into_any_element(),
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(rgb(palette.subtle))
+                        .child("Diagram resolver / component placement not wired in GPUI yet")
+                        .into_any_element(),
+                ),
+            };
 
         let detail = div()
             .flex_1()
@@ -490,11 +627,9 @@ impl Render for ModelicaViewer {
                         div()
                             .text_xs()
                             .text_color(rgb(palette.subtle))
-                            .child(format!(
-                                "{primitive_count} graphics  ·  {diagnostic_count} diagnostics"
-                            )),
+                            .child(detail_status),
                     )
-                    .child(icon_toolbar),
+                    .child(detail_toolbar),
             )
             .child(
                 div()
@@ -508,7 +643,7 @@ impl Render for ModelicaViewer {
                     .bg(rgb(palette.canvas))
                     .shadow_sm()
                     .overflow_hidden()
-                    .child(icon_view::icon_canvas(scene, self.icon_view.clone())),
+                    .child(detail_body),
             )
             .child(
                 div()
@@ -837,8 +972,9 @@ fn setting_group(label: &str, choices: gpui::Div, palette: Palette) -> gpui::Div
         .child(choices)
 }
 
-fn tab_chip(label: &str, active: bool, palette: Palette) -> gpui::Div {
+fn tab_chip(tab: DetailTab, active: bool, palette: Palette) -> gpui::Stateful<gpui::Div> {
     div()
+        .id(format!("detail-tab-{}", tab.label()))
         .h(px(37.0))
         .px_3()
         .border_b_2()
@@ -851,7 +987,8 @@ fn tab_chip(label: &str, active: bool, palette: Palette) -> gpui::Div {
         .text_color(rgb(if active { palette.text } else { palette.muted }))
         .flex()
         .items_center()
-        .child(label.to_owned())
+        .cursor_pointer()
+        .child(tab.label())
 }
 
 fn build_package_tree(package: &PackageNode, classes: &mut Vec<Class>) -> TreeNode {
