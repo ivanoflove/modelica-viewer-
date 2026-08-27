@@ -169,6 +169,16 @@ pub struct ResolvedGraphic {
     pub editable: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IconDebugStats {
+    pub own_graphics: usize,
+    pub inherited_graphics: usize,
+    pub connector_graphics: usize,
+    pub editable_graphics: usize,
+    pub unresolved_bases: usize,
+    pub unresolved_connectors: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentInstance {
     pub id: String,
@@ -193,6 +203,35 @@ pub struct IconScene {
     pub coordinate_system: CoordinateSystem,
     pub graphics: Vec<ResolvedGraphic>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+impl IconScene {
+    pub fn debug_stats(&self) -> IconDebugStats {
+        let mut stats = IconDebugStats {
+            unresolved_bases: self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "ICON_BASE_NOT_FOUND")
+                .count(),
+            unresolved_connectors: self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "ICON_CONNECTOR_NOT_FOUND")
+                .count(),
+            ..Default::default()
+        };
+        for graphic in &self.graphics {
+            match graphic.owner.kind {
+                GraphicOwnerKind::Own => stats.own_graphics += 1,
+                GraphicOwnerKind::Inherited => stats.inherited_graphics += 1,
+                GraphicOwnerKind::Connector => stats.connector_graphics += 1,
+            }
+            if graphic.editable {
+                stats.editable_graphics += 1;
+            }
+        }
+        stats
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

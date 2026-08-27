@@ -22,6 +22,6 @@ pub use icon::IconResolver;
 pub use library::{Library, LibraryKind, LibraryRegistry, PackageLoader, PackageNode};
 pub use parser::{ParseError, parse, requalify_class_tree};
 pub use scene::{
-    DiagramScene, Graphic, GraphicId, GraphicOwner, GraphicOwnerKind, IconScene, ResolvedGraphic,
-    Transform2D,
+    DiagramScene, Graphic, GraphicId, GraphicOwner, GraphicOwnerKind, IconDebugStats, IconScene,
+    ResolvedGraphic, Transform2D,
 };

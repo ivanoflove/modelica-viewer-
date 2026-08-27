@@ -975,5 +975,15 @@ end Parent;
                 .filter(|graphic| graphic.owner.kind == GraphicOwnerKind::Connector)
                 .all(|graphic| !graphic.editable)
         );
+        assert_eq!(
+            scene.debug_stats(),
+            crate::scene::IconDebugStats {
+                own_graphics: 1,
+                inherited_graphics: 0,
+                connector_graphics: 2,
+                editable_graphics: 1,
+                ..Default::default()
+            }
+        );
     }
 }

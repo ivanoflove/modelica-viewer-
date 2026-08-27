@@ -7,8 +7,8 @@ use gpui::{
 use gpui_platform::application;
 use icon_view::{SharedIconViewState, new_icon_view_state};
 use modelica_core::{
-    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry,
-    PackageLoader, PackageNode,
+    Class, ClassKind, IconDebugStats, IconResolver, IconScene, Library, LibraryKind,
+    LibraryRegistry, PackageLoader, PackageNode,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -189,6 +189,7 @@ struct ModelicaViewer {
     accent: AccentName,
     glass: GlassMode,
     appearance_open: bool,
+    scene_debug_open: bool,
 }
 
 impl ModelicaViewer {
@@ -221,6 +222,7 @@ impl ModelicaViewer {
             accent: AccentName::Violet,
             glass: GlassMode::On,
             appearance_open: false,
+            scene_debug_open: false,
         })
     }
 
@@ -403,6 +405,7 @@ impl Render for ModelicaViewer {
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
         let diagnostic_count = scene.diagnostics.len();
+        let debug_stats = scene.debug_stats();
         let diagnostics = self
             .scene
             .diagnostics
@@ -413,7 +416,14 @@ impl Render for ModelicaViewer {
             .join("  ·  ");
 
         let appearance = appearance_control(self, palette, cx);
-        let icon_toolbar = icon_toolbar(self.icon_zoom_percent(), palette, cx);
+        let icon_toolbar = icon_toolbar(
+            self.icon_zoom_percent(),
+            debug_stats,
+            self.scene_debug_open,
+            diagnostic_count,
+            palette,
+            cx,
+        );
 
         let header = div()
             .h(px(50.0))
@@ -702,9 +712,43 @@ impl Render for ModelicaViewer {
 
 fn icon_toolbar(
     zoom_percent: i32,
+    debug_stats: IconDebugStats,
+    scene_debug_open: bool,
+    diagnostic_count: usize,
     palette: Palette,
     cx: &mut Context<ModelicaViewer>,
 ) -> gpui::Div {
+    let mut scene_button = toolbar_button(
+        "icon-scene-debug",
+        if scene_debug_open {
+            "Scene ▴"
+        } else {
+            "Scene ▾"
+        },
+        palette,
+    )
+    .on_click(cx.listener(|this, _, _, cx| {
+        this.scene_debug_open = !this.scene_debug_open;
+        cx.notify();
+    }));
+
+    if scene_debug_open {
+        let popover = scene_debug_popover(debug_stats, diagnostic_count, palette)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.scene_debug_open = false;
+                cx.notify();
+            }));
+        scene_button = scene_button.child(
+            deferred(
+                anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(10.0))
+                    .child(popover),
+            )
+            .priority(11),
+        );
+    }
+
     div()
         .flex()
         .items_center()
@@ -737,6 +781,80 @@ fn icon_toolbar(
                 cx.notify();
             })),
         )
+        .child(scene_button)
+}
+
+fn scene_debug_popover(
+    stats: IconDebugStats,
+    diagnostic_count: usize,
+    palette: Palette,
+) -> gpui::Div {
+    div()
+        .w(px(220.0))
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(palette.border).opacity(0.78))
+        .bg(rgb(palette.panel).opacity(0.98))
+        .shadow_xl()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(div().text_sm().child("Icon Scene"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette.subtle))
+                        .child("Debug"),
+                ),
+        )
+        .child(scene_debug_row(
+            "Graphics",
+            stats.own_graphics + stats.inherited_graphics + stats.connector_graphics,
+            palette,
+        ))
+        .child(scene_debug_row("Own", stats.own_graphics, palette))
+        .child(scene_debug_row(
+            "Inherited",
+            stats.inherited_graphics,
+            palette,
+        ))
+        .child(scene_debug_row(
+            "Connectors",
+            stats.connector_graphics,
+            palette,
+        ))
+        .child(scene_debug_row(
+            "Editable",
+            stats.editable_graphics,
+            palette,
+        ))
+        .child(scene_debug_row("Diagnostics", diagnostic_count, palette))
+        .child(scene_debug_row(
+            "Unresolved bases",
+            stats.unresolved_bases,
+            palette,
+        ))
+        .child(scene_debug_row(
+            "Unresolved connectors",
+            stats.unresolved_connectors,
+            palette,
+        ))
+}
+
+fn scene_debug_row(label: &str, value: usize, palette: Palette) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_xs()
+        .child(div().text_color(rgb(palette.muted)).child(label.to_owned()))
+        .child(div().text_color(rgb(palette.text)).child(value.to_string()))
 }
 
 fn toolbar_button(id: &'static str, label: &str, palette: Palette) -> gpui::Stateful<gpui::Div> {
