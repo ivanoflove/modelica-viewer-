@@ -99,7 +99,10 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             index += 1;
             tokens.push(token(TokenKind::Punctuation, source, start, index));
         } else {
-            index += 1;
+            // Unknown bytes may be the leading byte of a multi-byte UTF-8
+            // character. Advance by the character width so token ranges stay
+            // valid string boundaries for diagnostics and source highlighting.
+            index += source[index..].chars().next().map_or(1, char::len_utf8);
             tokens.push(token(TokenKind::Unknown, source, start, index));
         }
     }
@@ -159,5 +162,16 @@ mod tests {
                 .iter()
                 .any(|token| token.text == "Fake" && token.kind == TokenKind::Identifier)
         );
+    }
+
+    #[test]
+    fn preserves_utf8_boundaries_for_unknown_characters() {
+        let tokens = tokenize("model A©;");
+        let copyright = tokens
+            .iter()
+            .find(|token| token.text == "©")
+            .expect("unicode character token");
+        assert_eq!(copyright.kind, TokenKind::Unknown);
+        assert_eq!(&"model A©;"[copyright.start..copyright.end], "©");
     }
 }
