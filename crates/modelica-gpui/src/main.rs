@@ -1013,7 +1013,7 @@ fn build_package_tree(package: &PackageNode, classes: &mut Vec<Class>) -> TreeNo
             .iter()
             .map(|class| build_class_tree(class, classes)),
     );
-    children.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    children.sort_by_key(|a| a.label.to_lowercase());
     TreeNode {
         key: format!("package:{}", package.qualified_name),
         label: package.name.clone(),
@@ -1031,7 +1031,7 @@ fn build_class_tree(class: &Class, classes: &mut Vec<Class>) -> TreeNode {
         .iter()
         .map(|child| build_class_tree(child, classes))
         .collect::<Vec<_>>();
-    children.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    children.sort_by_key(|a| a.label.to_lowercase());
     TreeNode {
         key: format!("class:{}", class.qualified_name),
         label: class.name.clone(),

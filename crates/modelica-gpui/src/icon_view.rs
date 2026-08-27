@@ -181,11 +181,11 @@ pub fn icon_canvas(scene: IconScene, state: SharedIconViewState) -> impl IntoEle
             window.refresh();
         })
         .on_mouse_move(move |event, window, _cx| {
-            if let Ok(mut state) = move_state.lock() {
-                if state.pan_active {
-                    state.update_pan(f32::from(event.position.x), f32::from(event.position.y));
-                    window.refresh();
-                }
+            if let Ok(mut state) = move_state.lock()
+                && state.pan_active
+            {
+                state.update_pan(f32::from(event.position.x), f32::from(event.position.y));
+                window.refresh();
             }
         })
         .on_mouse_down(MouseButton::Left, move |event, window, cx| {

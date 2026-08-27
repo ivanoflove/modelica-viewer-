@@ -50,10 +50,9 @@ impl PackageLoader {
             if root
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("package.mo"))
+                && let Some(directory) = root.parent()
             {
-                if let Some(directory) = root.parent() {
-                    return self.load_package_directory(directory, None);
-                }
+                return self.load_package_directory(directory, None);
             }
             return self.load_standalone(root);
         }
@@ -418,12 +417,11 @@ impl LibraryRegistry {
                     library.root.join(&prefix).join("package.mo"),
                 ];
                 for candidate in candidates {
-                    if let Ok(source) = fs::read_to_string(&candidate) {
-                        if self.register_source(candidate, source).is_ok()
-                            && self.classes.contains_key(qualified_name)
-                        {
-                            return;
-                        }
+                    if let Ok(source) = fs::read_to_string(&candidate)
+                        && self.register_source(candidate, source).is_ok()
+                        && self.classes.contains_key(qualified_name)
+                    {
+                        return;
                     }
                 }
             }

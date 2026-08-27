@@ -17,7 +17,7 @@ const WHITE: [u8; 3] = [255, 255, 255];
 
 pub fn resolve_icon_call(icon: &AnnotationCall) -> IconScene {
     let mut diagnostics = Vec::new();
-    let coordinate_system = resolve_coordinate_system(icon, &mut diagnostics);
+    let coordinate_system = resolve_coordinate_system(icon);
     let graphics = match graphics_value(icon) {
         None => Vec::new(),
         Some(value) => match value.as_array() {
@@ -42,10 +42,7 @@ pub fn resolve_icon_call(icon: &AnnotationCall) -> IconScene {
     }
 }
 
-fn resolve_coordinate_system(
-    icon: &AnnotationCall,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> CoordinateSystem {
+fn resolve_coordinate_system(icon: &AnnotationCall) -> CoordinateSystem {
     let coordinate_call = icon
         .named("coordinateSystem")
         .and_then(AnnotationValue::as_call)
@@ -65,12 +62,6 @@ fn resolve_coordinate_system(
         .and_then(parse_extent)
         .or_else(|| icon.named("extent").and_then(parse_extent))
         .unwrap_or(DEFAULT_EXTENT);
-    if coordinate_call.is_none() && icon.named("extent").is_none() && icon.positional(0).is_none() {
-        diagnostics.push(Diagnostic::warning(
-            "ICON_DEFAULT_COORDINATE_SYSTEM",
-            "Icon coordinateSystem is missing; using Modelica default extent",
-        ));
-    }
     let preserve_aspect_ratio = coordinate_call
         .and_then(|call| call.named("preserveAspectRatio"))
         .and_then(parse_bool)
@@ -100,7 +91,7 @@ fn graphics_value(icon: &AnnotationCall) -> Option<&AnnotationValue> {
 
 fn resolve_graphic(value: &AnnotationValue, diagnostics: &mut Vec<Diagnostic>) -> Option<Graphic> {
     let call = value.as_call()?;
-    let graphic = match call.name.as_str() {
+    match call.name.as_str() {
         "Rectangle" => parse_rectangle(call, diagnostics).map(Graphic::Rectangle),
         "Ellipse" => parse_ellipse(call, diagnostics).map(Graphic::Ellipse),
         "Line" => parse_line(call, diagnostics).map(Graphic::Line),
@@ -114,8 +105,7 @@ fn resolve_graphic(value: &AnnotationValue, diagnostics: &mut Vec<Diagnostic>) -
             ));
             None
         }
-    };
-    graphic
+    }
 }
 
 fn parse_rectangle(
@@ -286,6 +276,7 @@ fn parse_text(call: &AnnotationCall, diagnostics: &mut Vec<Diagnostic>) -> Optio
             "fontSize",
             "fontName",
             "textColor",
+            "lineColor",
             "horizontalAlignment",
             "textStyle",
         ],
