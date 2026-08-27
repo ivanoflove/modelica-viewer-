@@ -1,5 +1,5 @@
-use crate::annotation::{AnnotationCall, parse_call};
-use crate::ast::Class;
+use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
+use crate::ast::{Class, ClassKind};
 use crate::diagnostics::Diagnostic;
 use crate::graphics::resolve_icon_call;
 use crate::lexer::{TokenKind, tokenize};
@@ -17,7 +17,7 @@ impl<'a> IconResolver<'a> {
 
     pub fn resolve(&mut self, class: &Class, source: &str) -> IconScene {
         let mut visiting = Vec::new();
-        self.resolve_inner(class, source, &mut visiting)
+        self.resolve_inner(class, source, &mut visiting, &class.name)
     }
 
     fn resolve_inner(
@@ -25,6 +25,7 @@ impl<'a> IconResolver<'a> {
         class: &Class,
         source: &str,
         visiting: &mut Vec<String>,
+        instance_name: &str,
     ) -> IconScene {
         if visiting.iter().any(|name| name == &class.qualified_name) {
             return empty_scene(
@@ -47,7 +48,7 @@ impl<'a> IconResolver<'a> {
                 ));
                 continue;
             };
-            let base = self.resolve_inner(&base_class, &base_source, visiting);
+            let base = self.resolve_inner(&base_class, &base_source, visiting, instance_name);
             inherited = Some(match inherited.take() {
                 None => base,
                 Some(mut current) => {
@@ -57,8 +58,6 @@ impl<'a> IconResolver<'a> {
                 }
             });
         }
-        visiting.pop();
-
         let mut result = match (inherited, own) {
             (None, None) => empty_scene(class, diagnostics),
             (Some(mut base), None) => {
@@ -89,10 +88,68 @@ impl<'a> IconResolver<'a> {
                 merged
             }
         };
+        let connector_graphics =
+            self.resolve_public_connector_graphics(class, source, visiting, instance_name);
+        result.graphics.extend(connector_graphics);
+        expand_text_macros(&mut result, class, instance_name);
+        visiting.pop();
         for diagnostic in &mut result.diagnostics {
             diagnostic.owner = Some(class.qualified_name.clone());
         }
         result
+    }
+
+    fn resolve_public_connector_graphics(
+        &mut self,
+        class: &Class,
+        source: &str,
+        visiting: &mut Vec<String>,
+        _instance_name: &str,
+    ) -> Vec<crate::scene::Graphic> {
+        let mut graphics = Vec::new();
+        for component in find_component_placements(class, source) {
+            if !component.visible || component.icon_visible == Some(false) {
+                continue;
+            }
+            let Some(transformation) = component.icon_transformation.or(component.transformation)
+            else {
+                continue;
+            };
+            let Some((component_class, component_source)) =
+                self.resolve_component(class, &component.type_name)
+            else {
+                continue;
+            };
+            if !matches!(
+                component_class.kind,
+                ClassKind::Connector | ClassKind::ExpandableConnector
+            ) {
+                continue;
+            }
+            let child = self.resolve_inner(
+                &component_class,
+                &component_source,
+                visiting,
+                &component.name,
+            );
+            let coordinate_system = child.coordinate_system;
+            graphics.extend(child.graphics.into_iter().map(|graphic| {
+                transform_graphic_by_placement(graphic, coordinate_system, transformation)
+            }));
+        }
+        graphics
+    }
+
+    fn resolve_component(&mut self, class: &Class, type_name: &str) -> Option<(Class, String)> {
+        let mut candidates = vec![type_name.to_owned()];
+        let parts = class.qualified_name.split('.').collect::<Vec<_>>();
+        for length in (1..parts.len()).rev() {
+            candidates.push(format!("{}.{}", parts[..length].join("."), type_name));
+        }
+        candidates.dedup();
+        candidates
+            .into_iter()
+            .find_map(|candidate| self.registry.resolve_class(&candidate))
     }
 
     fn resolve_base(&mut self, class: &Class, base_name: &str) -> Option<(Class, String)> {
@@ -106,6 +163,450 @@ impl<'a> IconResolver<'a> {
             .into_iter()
             .find_map(|candidate| self.registry.resolve_class(&candidate))
     }
+}
+
+#[derive(Clone, Copy)]
+struct PlacementTransform {
+    origin: crate::scene::Point,
+    extent: crate::scene::Extent,
+    rotation: f32,
+}
+
+struct ComponentPlacement {
+    type_name: String,
+    name: String,
+    visible: bool,
+    icon_visible: Option<bool>,
+    transformation: Option<PlacementTransform>,
+    icon_transformation: Option<PlacementTransform>,
+}
+
+fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacement> {
+    let range = class.source_range;
+    let Some(class_source) = source.get(range.start..range.end) else {
+        return Vec::new();
+    };
+    let owned = mask_child_ranges(class, source, class_source);
+    let tokens = tokenize(&owned);
+    let mut result = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.text != "annotation" || token.kind != TokenKind::Keyword {
+            continue;
+        }
+        let statement_start = tokens[..index]
+            .iter()
+            .rposition(|item| item.text == ";")
+            .map_or(0, |item| item + 1);
+        let statement = &tokens[statement_start..index];
+        if statement.iter().any(|item| item.text == "protected") {
+            continue;
+        }
+        let Some((type_name, name)) = component_declaration(statement) else {
+            continue;
+        };
+        let Some(open_index) = next_significant(&tokens, index + 1) else {
+            continue;
+        };
+        if tokens[open_index].text != "(" {
+            continue;
+        }
+        let Some(close_index) = matching_paren(&tokens, open_index) else {
+            continue;
+        };
+        let Some(call_source) = owned.get(token.start..tokens[close_index].end) else {
+            continue;
+        };
+        let Ok(annotation) = parse_call(call_source) else {
+            continue;
+        };
+        let Some(placement) = find_call_argument(&annotation, "Placement") else {
+            continue;
+        };
+        result.push(ComponentPlacement {
+            type_name,
+            name,
+            visible: placement
+                .named("visible")
+                .and_then(parse_bool_value)
+                .unwrap_or(true),
+            icon_visible: placement.named("iconVisible").and_then(parse_bool_value),
+            transformation: find_call_argument(placement, "transformation")
+                .and_then(parse_placement_transform),
+            icon_transformation: find_call_argument(placement, "iconTransformation")
+                .and_then(parse_placement_transform),
+        });
+    }
+    result
+}
+
+fn component_declaration(tokens: &[crate::lexer::Token]) -> Option<(String, String)> {
+    let significant = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .collect::<Vec<_>>();
+    let ignored = [
+        "algorithm",
+        "block",
+        "class",
+        "connector",
+        "else",
+        "equation",
+        "extends",
+        "function",
+        "if",
+        "input",
+        "output",
+        "model",
+        "package",
+        "record",
+        "flow",
+        "stream",
+        "final",
+        "parameter",
+        "constant",
+        "discrete",
+        "replaceable",
+        "inner",
+        "outer",
+        "each",
+        "redeclare",
+        "constrainedby",
+        "type",
+        "when",
+    ];
+    let mut declaration = None;
+    for start in 0..significant.len() {
+        let first = significant[start];
+        if ignored.contains(&first.text.as_str())
+            || !matches!(first.kind, TokenKind::Identifier | TokenKind::Keyword)
+        {
+            continue;
+        }
+        let mut index = start + 1;
+        let mut type_name = first.text.clone();
+        while significant
+            .get(index)
+            .is_some_and(|token| token.text == ".")
+        {
+            let part = significant.get(index + 1)?;
+            if !matches!(part.kind, TokenKind::Identifier | TokenKind::Keyword) {
+                break;
+            }
+            type_name.push('.');
+            type_name.push_str(&part.text);
+            index += 2;
+        }
+        while significant
+            .get(index)
+            .is_some_and(|token| token.text == "{")
+        {
+            let mut depth = 0;
+            while let Some(token) = significant.get(index) {
+                index += 1;
+                if token.text == "{" {
+                    depth += 1;
+                } else if token.text == "}" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(name) = significant.get(index) else {
+            continue;
+        };
+        if !matches!(name.kind, TokenKind::Identifier | TokenKind::Keyword)
+            || ignored.contains(&name.text.as_str())
+        {
+            continue;
+        }
+        declaration = Some((type_name, name.text.clone()));
+    }
+    declaration
+}
+
+fn find_call_argument<'a>(call: &'a AnnotationCall, name: &str) -> Option<&'a AnnotationCall> {
+    call.named(name)
+        .and_then(AnnotationValue::as_call)
+        .or_else(|| {
+            call.args
+                .iter()
+                .filter(|entry| entry.name.is_none())
+                .find_map(|entry| {
+                    entry
+                        .value
+                        .as_call()
+                        .filter(|candidate| candidate.name == name)
+                })
+        })
+}
+
+fn parse_placement_transform(call: &AnnotationCall) -> Option<PlacementTransform> {
+    Some(PlacementTransform {
+        origin: call
+            .named("origin")
+            .and_then(parse_point)
+            .unwrap_or(crate::scene::Point { x: 0.0, y: 0.0 }),
+        extent: call.named("extent").and_then(parse_extent)?,
+        rotation: call.named("rotation").and_then(parse_number).unwrap_or(0.0),
+    })
+}
+
+fn transform_graphic_by_placement(
+    graphic: crate::scene::Graphic,
+    coordinate_system: crate::scene::CoordinateSystem,
+    transform: PlacementTransform,
+) -> crate::scene::Graphic {
+    use crate::scene::Graphic;
+    let origin = graphic_origin(&graphic);
+    let rotation = graphic_rotation(&graphic);
+    let map = |point: crate::scene::Point| {
+        let source = transform_graphic_point(point, origin, rotation);
+        transform_placement_point(source, coordinate_system, transform)
+    };
+    match graphic {
+        Graphic::Line(mut item) => {
+            item.points = item.points.into_iter().map(map).collect();
+            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
+            item.rotation = 0.0;
+            Graphic::Line(item)
+        }
+        Graphic::Polygon(mut item) => {
+            item.points = item.points.into_iter().map(map).collect();
+            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
+            item.rotation = 0.0;
+            Graphic::Polygon(item)
+        }
+        Graphic::Rectangle(mut item) => {
+            item.extent = transformed_extent(item.extent, &map);
+            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
+            item.rotation = 0.0;
+            Graphic::Rectangle(item)
+        }
+        Graphic::Ellipse(mut item) => {
+            item.extent = transformed_extent(item.extent, &map);
+            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
+            item.rotation = 0.0;
+            Graphic::Ellipse(item)
+        }
+        Graphic::Text(mut item) => {
+            item.extent = transformed_extent(item.extent, &map);
+            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
+            item.rotation = transform.rotation;
+            Graphic::Text(item)
+        }
+        Graphic::Bitmap(mut item) => {
+            item.extent = transformed_extent(item.extent, &map);
+            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
+            item.rotation = 0.0;
+            Graphic::Bitmap(item)
+        }
+    }
+}
+
+fn graphic_origin(graphic: &crate::scene::Graphic) -> crate::scene::Point {
+    match graphic {
+        crate::scene::Graphic::Line(item) => item.origin,
+        crate::scene::Graphic::Polygon(item) => item.origin,
+        crate::scene::Graphic::Rectangle(item) => item.origin,
+        crate::scene::Graphic::Ellipse(item) => item.origin,
+        crate::scene::Graphic::Text(item) => item.origin,
+        crate::scene::Graphic::Bitmap(item) => item.origin,
+    }
+}
+
+fn graphic_rotation(graphic: &crate::scene::Graphic) -> f32 {
+    match graphic {
+        crate::scene::Graphic::Line(item) => item.rotation,
+        crate::scene::Graphic::Polygon(item) => item.rotation,
+        crate::scene::Graphic::Rectangle(item) => item.rotation,
+        crate::scene::Graphic::Ellipse(item) => item.rotation,
+        crate::scene::Graphic::Text(item) => item.rotation,
+        crate::scene::Graphic::Bitmap(item) => item.rotation,
+    }
+}
+
+fn transform_graphic_point(
+    point: crate::scene::Point,
+    origin: crate::scene::Point,
+    rotation: f32,
+) -> crate::scene::Point {
+    let angle = rotation.to_radians();
+    crate::scene::Point {
+        x: origin.x + point.x * angle.cos() - point.y * angle.sin(),
+        y: origin.y + point.x * angle.sin() + point.y * angle.cos(),
+    }
+}
+
+fn transform_placement_point(
+    point: crate::scene::Point,
+    coordinate_system: crate::scene::CoordinateSystem,
+    transform: PlacementTransform,
+) -> crate::scene::Point {
+    let source = coordinate_system.extent;
+    let target = transform.extent;
+    let source_width = target_dimension(source.p2.x - source.p1.x);
+    let source_height = target_dimension(source.p2.y - source.p1.y);
+    let scale_x = (target.p2.x - target.p1.x) / source_width;
+    let scale_y = (target.p2.y - target.p1.y) / source_height;
+    let translated = crate::scene::Point {
+        x: point.x * scale_x + target.p1.x - source.p1.x * scale_x,
+        y: point.y * scale_y + target.p1.y - source.p1.y * scale_y,
+    };
+    let angle = transform.rotation.to_radians();
+    crate::scene::Point {
+        x: transform.origin.x + translated.x * angle.cos() - translated.y * angle.sin(),
+        y: transform.origin.y + translated.x * angle.sin() + translated.y * angle.cos(),
+    }
+}
+
+fn target_dimension(value: f32) -> f32 {
+    if value.abs() <= f32::EPSILON {
+        1.0
+    } else {
+        value
+    }
+}
+
+fn parse_bool_value(value: &AnnotationValue) -> Option<bool> {
+    match value {
+        AnnotationValue::Bool(value) => Some(*value),
+        AnnotationValue::Name(value) => match value.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_number_value(value: &AnnotationValue) -> Option<f32> {
+    match value {
+        AnnotationValue::Number(value) => Some(*value as f32),
+        _ => None,
+    }
+}
+
+fn parse_point(value: &AnnotationValue) -> Option<crate::scene::Point> {
+    let values = value.as_array()?;
+    Some(crate::scene::Point {
+        x: values.first().and_then(parse_number_value)?,
+        y: values.get(1).and_then(parse_number_value)?,
+    })
+}
+
+fn parse_extent(value: &AnnotationValue) -> Option<crate::scene::Extent> {
+    let values = value.as_array()?;
+    Some(crate::scene::Extent {
+        p1: values.first().and_then(parse_point)?,
+        p2: values.get(1).and_then(parse_point)?,
+    })
+}
+
+fn parse_number(value: &AnnotationValue) -> Option<f32> {
+    parse_number_value(value)
+}
+
+fn transformed_extent(
+    extent: crate::scene::Extent,
+    map: &impl Fn(crate::scene::Point) -> crate::scene::Point,
+) -> crate::scene::Extent {
+    let points = [
+        extent.p1,
+        crate::scene::Point {
+            x: extent.p1.x,
+            y: extent.p2.y,
+        },
+        crate::scene::Point {
+            x: extent.p2.x,
+            y: extent.p1.y,
+        },
+        extent.p2,
+    ]
+    .map(map);
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+    for point in points {
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
+    crate::scene::Extent {
+        p1: crate::scene::Point { x: min_x, y: min_y },
+        p2: crate::scene::Point { x: max_x, y: max_y },
+    }
+}
+
+fn expand_text_macros(scene: &mut IconScene, class: &Class, instance_name: &str) {
+    for graphic in &mut scene.graphics {
+        let crate::scene::Graphic::Text(text) = graphic else {
+            continue;
+        };
+        text.text = expand_text(&text.text, class, instance_name);
+    }
+}
+
+fn expand_text(template: &str, class: &Class, instance_name: &str) -> String {
+    let mut output = String::with_capacity(template.len());
+    let chars = template.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '%' {
+            output.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        if chars.get(index + 1) == Some(&'%') {
+            output.push('%');
+            index += 2;
+            continue;
+        }
+        let braced = chars.get(index + 1) == Some(&'{');
+        let (start, mut end) = if braced {
+            let start = index + 2;
+            let end = chars[start..]
+                .iter()
+                .position(|character| *character == '}')
+                .map_or(start, |offset| start + offset);
+            (start, end)
+        } else {
+            let start = index + 1;
+            let mut end = start;
+            while chars
+                .get(end)
+                .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
+            {
+                end += 1;
+            }
+            (start, end)
+        };
+        if end == start {
+            output.push('%');
+            index += 1;
+            continue;
+        }
+        let key = chars[start..end].iter().collect::<String>();
+        if braced && chars.get(end) == Some(&'}') {
+            end += 1;
+        }
+        match key.as_str() {
+            "name" => output.push_str(instance_name),
+            "class" => output.push_str(&class.name),
+            _ => {
+                output.push('%');
+                if braced {
+                    output.push('{');
+                }
+                output.push_str(&key);
+                if braced && end > 0 {
+                    output.push('}');
+                }
+            }
+        }
+        index = end;
+    }
+    output
 }
 
 fn empty_scene(class: &Class, mut diagnostics: Vec<Diagnostic>) -> IconScene {
@@ -308,5 +809,39 @@ end WithDialog;"#;
             "{:?}",
             scene.diagnostics
         );
+    }
+
+    #[test]
+    fn expands_text_macros_and_composes_public_connector_icons() {
+        let source = r#"
+connector Pin
+  annotation(Icon(graphics={
+    Text(extent={{-20,-10},{20,10}}, textString="%name/%class"),
+    Rectangle(extent={{-5,-5},{5,5}})
+  }));
+end Pin;
+
+model Parent
+  Pin leftPin annotation(Placement(transformation(extent={{-100,-10},{-80,10}})));
+  annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%name") }));
+end Parent;
+"#;
+        let file = parse(source, "Icons.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("Icons.mo", source)
+            .expect("index source");
+        let scene = IconResolver::new(&mut registry).resolve(&file.classes[1], source);
+        assert_eq!(scene.graphics.len(), 3);
+        let texts = scene
+            .graphics
+            .iter()
+            .filter_map(|graphic| match graphic {
+                Graphic::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"Parent"));
+        assert!(texts.contains(&"leftPin/Pin"));
     }
 }

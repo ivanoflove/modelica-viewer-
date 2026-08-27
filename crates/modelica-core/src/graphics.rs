@@ -130,6 +130,7 @@ fn parse_rectangle(
             "rotation",
             "lineColor",
             "fillColor",
+            "pattern",
             "linePattern",
             "fillPattern",
             "lineThickness",
@@ -143,7 +144,8 @@ fn parse_rectangle(
         extent: required_extent(call, diagnostics)?,
         line_color: parse_color_arg(call, "lineColor").unwrap_or(BLACK),
         fill_color: parse_color_arg(call, "fillColor").unwrap_or(WHITE),
-        line_pattern: parse_name_arg(call, "linePattern"),
+        line_pattern: parse_name_arg(call, "pattern")
+            .or_else(|| parse_name_arg(call, "linePattern")),
         line_thickness: parse_number_arg(call, "lineThickness"),
         fill_pattern: parse_name_arg(call, "fillPattern"),
         radius: parse_number_arg(call, "radius"),
@@ -162,6 +164,7 @@ fn parse_ellipse(
             "rotation",
             "lineColor",
             "fillColor",
+            "pattern",
             "linePattern",
             "fillPattern",
             "lineThickness",
@@ -176,7 +179,8 @@ fn parse_ellipse(
         extent: required_extent(call, diagnostics)?,
         line_color: parse_color_arg(call, "lineColor").unwrap_or(BLACK),
         fill_color: parse_color_arg(call, "fillColor").unwrap_or(WHITE),
-        line_pattern: parse_name_arg(call, "linePattern"),
+        line_pattern: parse_name_arg(call, "pattern")
+            .or_else(|| parse_name_arg(call, "linePattern")),
         line_thickness: parse_number_arg(call, "lineThickness"),
         fill_pattern: parse_name_arg(call, "fillPattern"),
         start_angle: parse_number_arg(call, "startAngle"),
@@ -241,6 +245,7 @@ fn parse_polygon(
             "rotation",
             "lineColor",
             "fillColor",
+            "pattern",
             "linePattern",
             "fillPattern",
             "lineThickness",
@@ -262,7 +267,8 @@ fn parse_polygon(
         points: points?,
         line_color: parse_color_arg(call, "lineColor").unwrap_or(BLACK),
         fill_color: parse_color_arg(call, "fillColor").unwrap_or(WHITE),
-        line_pattern: parse_name_arg(call, "linePattern"),
+        line_pattern: parse_name_arg(call, "pattern")
+            .or_else(|| parse_name_arg(call, "linePattern")),
         line_thickness: parse_number_arg(call, "lineThickness"),
         fill_pattern: parse_name_arg(call, "fillPattern"),
         smooth: parse_name_arg(call, "smooth"),
@@ -471,5 +477,35 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "ICON_UNKNOWN_PROPERTY")
         );
+    }
+
+    #[test]
+    fn accepts_modelica_pattern_for_closed_graphics() {
+        let annotation = parse_annotation(
+            "annotation(Icon(graphics={Rectangle(extent={{0,0},{1,1}}, pattern=LinePattern.None), Ellipse(extent={{0,0},{1,1}}, pattern=LinePattern.Dash), Polygon(points={{0,0},{1,0},{0,1}}, pattern=LinePattern.Dot)}))",
+        )
+        .expect("annotation");
+        let icon = annotation.entries[0].value.as_call().expect("Icon call");
+        let scene = resolve_icon_call(icon);
+        assert!(
+            !scene
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "ICON_UNKNOWN_PROPERTY" }),
+            "{:?}",
+            scene.diagnostics
+        );
+        assert!(matches!(
+            &scene.graphics[0],
+            Graphic::Rectangle(item) if item.line_pattern.as_deref() == Some("LinePattern.None")
+        ));
+        assert!(matches!(
+            &scene.graphics[1],
+            Graphic::Ellipse(item) if item.line_pattern.as_deref() == Some("LinePattern.Dash")
+        ));
+        assert!(matches!(
+            &scene.graphics[2],
+            Graphic::Polygon(item) if item.line_pattern.as_deref() == Some("LinePattern.Dot")
+        ));
     }
 }
