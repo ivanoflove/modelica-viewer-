@@ -2,9 +2,10 @@ use gpui::{
     Bounds, MouseButton, PathBuilder, Pixels, ScrollDelta, TransformationMatrix, Window, canvas,
     div, fill, point, prelude::*, px, radians, rgb, size,
 };
-use modelica_core::{Graphic, IconScene};
+use modelica_core::{Graphic, IconScene, ResolvedGraphic, Transform2D};
 use modelica_render::{
-    Bounds as RenderBounds, ModelBounds, ModelPoint, ScreenPoint, Vec2, Viewport, hit_test_graphics,
+    Bounds as RenderBounds, ModelBounds, ModelPoint, ScreenPoint, Vec2, Viewport,
+    hit_test_resolved_graphics, transform_point,
 };
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -112,7 +113,7 @@ impl IconViewState {
         let tolerance = self
             .viewport
             .model_tolerance_for_screen_pixels(HIT_TOLERANCE_PX);
-        self.selected_graphic = hit_test_graphics(
+        self.selected_graphic = hit_test_resolved_graphics(
             &scene.graphics,
             modelica_core::scene::Point {
                 x: model.0.x,
@@ -240,11 +241,24 @@ fn paint_icon_scene(
     }
 }
 
-fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mut gpui::App) {
+fn paint_graphic(
+    resolved: &ResolvedGraphic,
+    map: &SceneMap,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let graphic = &resolved.graphic;
+    let transform = resolved.transform;
+    let stroke_scale = transform
+        .scale_x
+        .abs()
+        .min(transform.scale_y.abs())
+        .max(f32::EPSILON);
     match graphic {
         Graphic::Rectangle(graphic) => {
-            let points = extent_points(graphic.extent)
-                .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation));
+            let points = extent_points(graphic.extent).map(|point| {
+                map.graphic_point_with_transform(point, graphic.origin, graphic.rotation, transform)
+            });
             paint_closed_polygon(
                 window,
                 &points,
@@ -252,7 +266,7 @@ fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mu
                 graphic.line_color,
                 graphic.fill_pattern.as_deref(),
                 graphic.line_pattern.as_deref(),
-                graphic.line_thickness.unwrap_or(0.25) * map.viewport.zoom,
+                graphic.line_thickness.unwrap_or(0.25) * map.viewport.zoom * stroke_scale,
             );
         }
         Graphic::Ellipse(graphic) => {
@@ -263,13 +277,14 @@ fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mu
             let mut points = Vec::with_capacity(72);
             for index in 0..72 {
                 let angle = std::f32::consts::TAU * index as f32 / 72.0;
-                points.push(map.graphic_point(
+                points.push(map.graphic_point_with_transform(
                     modelica_core::scene::Point {
                         x: center_x + radius_x * angle.cos(),
                         y: center_y + radius_y * angle.sin(),
                     },
                     graphic.origin,
                     graphic.rotation,
+                    transform,
                 ));
             }
             paint_closed_polygon(
@@ -279,7 +294,7 @@ fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mu
                 graphic.line_color,
                 graphic.fill_pattern.as_deref(),
                 graphic.line_pattern.as_deref(),
-                graphic.line_thickness.unwrap_or(0.25) * map.viewport.zoom,
+                graphic.line_thickness.unwrap_or(0.25) * map.viewport.zoom * stroke_scale,
             );
         }
         Graphic::Line(graphic) => {
@@ -290,13 +305,20 @@ fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mu
                 .points
                 .iter()
                 .copied()
-                .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation))
+                .map(|point| {
+                    map.graphic_point_with_transform(
+                        point,
+                        graphic.origin,
+                        graphic.rotation,
+                        transform,
+                    )
+                })
                 .collect::<Vec<_>>();
             paint_polyline_patterned(
                 window,
                 &points,
                 graphic.color,
-                graphic.thickness.max(0.25) * map.viewport.zoom,
+                graphic.thickness.max(0.25) * map.viewport.zoom * stroke_scale,
                 graphic.pattern.as_deref(),
                 false,
             );
@@ -306,7 +328,14 @@ fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mu
                 .points
                 .iter()
                 .copied()
-                .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation))
+                .map(|point| {
+                    map.graphic_point_with_transform(
+                        point,
+                        graphic.origin,
+                        graphic.rotation,
+                        transform,
+                    )
+                })
                 .collect::<Vec<_>>();
             paint_closed_polygon(
                 window,
@@ -315,15 +344,16 @@ fn paint_graphic(graphic: &Graphic, map: &SceneMap, window: &mut Window, cx: &mu
                 graphic.line_color,
                 graphic.fill_pattern.as_deref(),
                 graphic.line_pattern.as_deref(),
-                graphic.line_thickness.unwrap_or(0.25) * map.viewport.zoom,
+                graphic.line_thickness.unwrap_or(0.25) * map.viewport.zoom * stroke_scale,
             );
         }
         Graphic::Bitmap(graphic) => {
-            let points = extent_points(graphic.extent)
-                .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation));
+            let points = extent_points(graphic.extent).map(|point| {
+                map.graphic_point_with_transform(point, graphic.origin, graphic.rotation, transform)
+            });
             paint_bitmap_placeholder(window, &points);
         }
-        Graphic::Text(graphic) => paint_text(graphic, map, window, cx),
+        Graphic::Text(graphic) => paint_text(graphic, transform, map, window, cx),
     }
 }
 
@@ -333,19 +363,27 @@ struct SceneMap {
 }
 
 impl SceneMap {
-    fn graphic_point(
+    fn graphic_point_with_transform(
         &self,
         local: modelica_core::scene::Point,
         origin: modelica_core::scene::Point,
         rotation: f32,
+        transform: Transform2D,
     ) -> gpui::Point<Pixels> {
         let angle = rotation.to_radians();
         let rotated_x = local.x * angle.cos() - local.y * angle.sin();
         let rotated_y = local.x * angle.sin() + local.y * angle.cos();
-        let screen = self.viewport.model_to_screen(
-            ModelPoint(Vec2 {
+        let model = transform_point(
+            modelica_core::scene::Point {
                 x: origin.x + rotated_x,
                 y: origin.y + rotated_y,
+            },
+            transform,
+        );
+        let screen = self.viewport.model_to_screen(
+            ModelPoint(Vec2 {
+                x: model.x,
+                y: model.y,
             }),
             self.bounds,
         );
@@ -688,6 +726,7 @@ fn paint_simple_segment(
 
 fn paint_text(
     graphic: &modelica_core::scene::TextGraphic,
+    transform: Transform2D,
     map: &SceneMap,
     window: &mut Window,
     cx: &mut gpui::App,
@@ -707,9 +746,10 @@ fn paint_text(
         x: (graphic.extent.p1.x + graphic.extent.p2.x) * 0.5,
         y: (graphic.extent.p1.y + graphic.extent.p2.y) * 0.5,
     };
-    let center = map.graphic_point(center_local, graphic.origin, graphic.rotation);
-    let screen_width = width_model * map.viewport.scale_x;
-    let screen_height = height_model * map.viewport.scale_y;
+    let center =
+        map.graphic_point_with_transform(center_local, graphic.origin, graphic.rotation, transform);
+    let screen_width = width_model * map.viewport.scale_x * transform.scale_x.abs();
+    let screen_height = height_model * map.viewport.scale_y * transform.scale_y.abs();
     let bounds = Bounds::new(
         point(
             px(f32::from(center.x) - screen_width * 0.5),
@@ -764,7 +804,7 @@ fn paint_text(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     svg.hash(&mut hasher);
     let path = format!("__modelica_text_{:x}", hasher.finish());
-    let rotation = graphic.rotation.to_radians();
+    let rotation = (graphic.rotation + transform.rotation).to_radians();
     let _ = window.paint_svg(
         bounds,
         path.into(),
@@ -783,7 +823,7 @@ fn escape_xml(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn paint_selection_overlay(graphic: &Graphic, map: &SceneMap, window: &mut Window) {
+fn paint_selection_overlay(graphic: &ResolvedGraphic, map: &SceneMap, window: &mut Window) {
     let points = graphic_screen_points(graphic, map);
     if points.is_empty() {
         return;
@@ -842,31 +882,33 @@ fn paint_selection_overlay(graphic: &Graphic, map: &SceneMap, window: &mut Windo
     }
 }
 
-fn graphic_screen_points(graphic: &Graphic, map: &SceneMap) -> Vec<gpui::Point<Pixels>> {
+fn graphic_screen_points(resolved: &ResolvedGraphic, map: &SceneMap) -> Vec<gpui::Point<Pixels>> {
+    let graphic = &resolved.graphic;
+    let transform = resolved.transform;
     match graphic {
         Graphic::Line(item) => item
             .points
             .iter()
             .copied()
-            .map(|p| map.graphic_point(p, item.origin, item.rotation))
+            .map(|p| map.graphic_point_with_transform(p, item.origin, item.rotation, transform))
             .collect(),
         Graphic::Polygon(item) => item
             .points
             .iter()
             .copied()
-            .map(|p| map.graphic_point(p, item.origin, item.rotation))
+            .map(|p| map.graphic_point_with_transform(p, item.origin, item.rotation, transform))
             .collect(),
         Graphic::Rectangle(item) => extent_points(item.extent)
-            .map(|p| map.graphic_point(p, item.origin, item.rotation))
+            .map(|p| map.graphic_point_with_transform(p, item.origin, item.rotation, transform))
             .to_vec(),
         Graphic::Ellipse(item) => extent_points(item.extent)
-            .map(|p| map.graphic_point(p, item.origin, item.rotation))
+            .map(|p| map.graphic_point_with_transform(p, item.origin, item.rotation, transform))
             .to_vec(),
         Graphic::Text(item) => extent_points(item.extent)
-            .map(|p| map.graphic_point(p, item.origin, item.rotation))
+            .map(|p| map.graphic_point_with_transform(p, item.origin, item.rotation, transform))
             .to_vec(),
         Graphic::Bitmap(item) => extent_points(item.extent)
-            .map(|p| map.graphic_point(p, item.origin, item.rotation))
+            .map(|p| map.graphic_point_with_transform(p, item.origin, item.rotation, transform))
             .to_vec(),
     }
 }

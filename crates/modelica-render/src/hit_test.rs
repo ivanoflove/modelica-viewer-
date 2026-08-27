@@ -1,4 +1,4 @@
-use modelica_core::scene::{Extent, Graphic, Point};
+use modelica_core::scene::{Extent, Graphic, Point, ResolvedGraphic, Transform2D};
 
 /// Hit test in Modelica model coordinates. `tolerance` is also expressed in
 /// Modelica units; callers should convert a fixed screen-space tolerance using
@@ -37,6 +37,71 @@ pub fn hit_test_graphics(graphics: &[Graphic], point: Point, tolerance: f32) -> 
         .find_map(|(index, graphic)| {
             graphic_contains_point(graphic, point, tolerance).then_some(index)
         })
+}
+
+/// Hit test an ownership-aware scene graph while preserving each graphic's
+/// local geometry and placement transform.
+pub fn resolved_graphic_contains_point(
+    graphic: &ResolvedGraphic,
+    point: Point,
+    tolerance: f32,
+) -> bool {
+    let local = inverse_transform(point, graphic.transform);
+    let scale = graphic
+        .transform
+        .scale_x
+        .abs()
+        .min(graphic.transform.scale_y.abs())
+        .max(f32::EPSILON);
+    graphic_contains_point(&graphic.graphic, local, tolerance / scale)
+}
+
+pub fn hit_test_resolved_graphics(
+    graphics: &[ResolvedGraphic],
+    point: Point,
+    tolerance: f32,
+) -> Option<usize> {
+    graphics
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, graphic)| {
+            resolved_graphic_contains_point(graphic, point, tolerance).then_some(index)
+        })
+}
+
+pub fn transform_point(point: Point, transform: Transform2D) -> Point {
+    let scaled = Point {
+        x: point.x * transform.scale_x,
+        y: point.y * transform.scale_y,
+    };
+    let angle = transform.rotation.to_radians();
+    Point {
+        x: transform.translation.x + scaled.x * angle.cos() - scaled.y * angle.sin(),
+        y: transform.translation.y + scaled.x * angle.sin() + scaled.y * angle.cos(),
+    }
+}
+
+fn inverse_transform(point: Point, transform: Transform2D) -> Point {
+    let translated = Point {
+        x: point.x - transform.translation.x,
+        y: point.y - transform.translation.y,
+    };
+    let angle = (-transform.rotation).to_radians();
+    Point {
+        x: (translated.x * angle.cos() - translated.y * angle.sin())
+            / non_zero_scale(transform.scale_x),
+        y: (translated.x * angle.sin() + translated.y * angle.cos())
+            / non_zero_scale(transform.scale_y),
+    }
+}
+
+fn non_zero_scale(value: f32) -> f32 {
+    if value.abs() <= f32::EPSILON {
+        1.0
+    } else {
+        value
+    }
 }
 
 fn graphic_origin(graphic: &Graphic) -> Point {

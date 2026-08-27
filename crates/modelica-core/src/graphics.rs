@@ -1,8 +1,9 @@
 use crate::annotation::{AnnotationCall, AnnotationValue};
 use crate::diagnostics::Diagnostic;
 use crate::scene::{
-    BitmapGraphic, CoordinateSystem, EllipseGraphic, Extent, Graphic, IconScene, LineGraphic,
-    Point, PolygonGraphic, RectangleGraphic, TextGraphic,
+    BitmapGraphic, CoordinateSystem, EllipseGraphic, Extent, Graphic, GraphicId, GraphicOwner,
+    GraphicOwnerKind, IconScene, LineGraphic, Point, PolygonGraphic, RectangleGraphic,
+    ResolvedGraphic, TextGraphic, Transform2D,
 };
 
 const DEFAULT_EXTENT: Extent = Extent {
@@ -34,6 +35,21 @@ pub fn resolve_icon_call(icon: &AnnotationCall) -> IconScene {
                 .collect(),
         },
     };
+    let graphics = graphics
+        .into_iter()
+        .enumerate()
+        .map(|(index, graphic)| ResolvedGraphic {
+            id: GraphicId(format!("<unresolved>:Icon.graphics:{index}")),
+            graphic,
+            owner: GraphicOwner {
+                qualified_name: "<unresolved>".into(),
+                kind: GraphicOwnerKind::Own,
+                instance_name: None,
+            },
+            transform: Transform2D::identity(),
+            editable: true,
+        })
+        .collect();
     IconScene {
         owner_qualified_name: None,
         coordinate_system,
@@ -447,7 +463,7 @@ mod tests {
         let icon = annotation.entries[0].value.as_call().expect("Icon");
         let scene = resolve_icon_call(icon);
         assert_eq!(scene.graphics.len(), 6);
-        assert!(matches!(scene.graphics[0], Graphic::Rectangle(_)));
+        assert!(matches!(scene.graphics[0].graphic, Graphic::Rectangle(_)));
         assert_eq!(scene.coordinate_system.extent.p1.x, -200.0);
         assert!(!scene.coordinate_system.preserve_aspect_ratio);
         assert!(scene.diagnostics.is_empty());
@@ -487,15 +503,15 @@ mod tests {
             scene.diagnostics
         );
         assert!(matches!(
-            &scene.graphics[0],
+            &scene.graphics[0].graphic,
             Graphic::Rectangle(item) if item.line_pattern.as_deref() == Some("LinePattern.None")
         ));
         assert!(matches!(
-            &scene.graphics[1],
+            &scene.graphics[1].graphic,
             Graphic::Ellipse(item) if item.line_pattern.as_deref() == Some("LinePattern.Dash")
         ));
         assert!(matches!(
-            &scene.graphics[2],
+            &scene.graphics[2].graphic,
             Graphic::Polygon(item) if item.line_pattern.as_deref() == Some("LinePattern.Dot")
         ));
     }

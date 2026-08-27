@@ -4,7 +4,10 @@ use crate::diagnostics::Diagnostic;
 use crate::graphics::resolve_icon_call;
 use crate::lexer::{TokenKind, tokenize};
 use crate::library::LibraryRegistry;
-use crate::scene::{CoordinateSystem, IconScene};
+use crate::scene::{
+    CoordinateSystem, GraphicId, GraphicOwner, GraphicOwnerKind, IconScene, ResolvedGraphic,
+    Transform2D,
+};
 use std::collections::HashMap;
 
 pub struct IconResolver<'a> {
@@ -44,6 +47,8 @@ impl<'a> IconResolver<'a> {
         for base_name in &class.extends {
             let Some((base_class, base_source)) = self.resolve_base(class, base_name) else {
                 if let Some(base) = fallback_base_icon(base_name) {
+                    let mut base = base;
+                    mark_inherited_graphics(&mut base);
                     inherited = Some(match inherited.take() {
                         None => base,
                         Some(mut current) => {
@@ -60,7 +65,8 @@ impl<'a> IconResolver<'a> {
                 ));
                 continue;
             };
-            let base = self.resolve_inner(&base_class, &base_source, visiting, instance_name);
+            let mut base = self.resolve_inner(&base_class, &base_source, visiting, instance_name);
+            mark_inherited_graphics(&mut base);
             inherited = Some(match inherited.take() {
                 None => base,
                 Some(mut current) => {
@@ -78,11 +84,14 @@ impl<'a> IconResolver<'a> {
                 base
             }
             (None, Some((_, _, mut own))) => {
+                stamp_own_graphics(&mut own, class);
                 own.owner_qualified_name = Some(class.qualified_name.clone());
                 own.diagnostics.extend(diagnostics);
                 own
             }
             (Some(base), Some((has_coordinate_system, _, own))) => {
+                let mut own = own;
+                stamp_own_graphics(&mut own, class);
                 let coordinate_system = if has_coordinate_system {
                     own.coordinate_system
                 } else {
@@ -118,7 +127,7 @@ impl<'a> IconResolver<'a> {
         source: &str,
         visiting: &mut Vec<String>,
         _instance_name: &str,
-    ) -> Vec<crate::scene::Graphic> {
+    ) -> Vec<ResolvedGraphic> {
         let mut graphics = Vec::new();
         for component in find_component_placements(class, source) {
             if !component.visible || component.icon_visible == Some(false) {
@@ -146,9 +155,22 @@ impl<'a> IconResolver<'a> {
                 &component.name,
             );
             let coordinate_system = child.coordinate_system;
-            graphics.extend(child.graphics.into_iter().map(|graphic| {
-                transform_graphic_by_placement(graphic, coordinate_system, transformation)
-            }));
+            let placement = placement_transform(coordinate_system, transformation);
+            for mut graphic in child.graphics {
+                let child_id = graphic.id.0;
+                graphic.id = GraphicId(format!(
+                    "{}::{}::{child_id}",
+                    class.qualified_name, component.name
+                ));
+                graphic.owner = GraphicOwner {
+                    qualified_name: graphic.owner.qualified_name,
+                    kind: GraphicOwnerKind::Connector,
+                    instance_name: Some(component.name.clone()),
+                };
+                graphic.transform = compose_transform(placement, graphic.transform);
+                graphic.editable = false;
+                graphics.push(graphic);
+            }
         }
         graphics
     }
@@ -175,6 +197,29 @@ impl<'a> IconResolver<'a> {
         candidates
             .into_iter()
             .find_map(|candidate| self.registry.resolve_class(&candidate))
+    }
+}
+
+fn stamp_own_graphics(scene: &mut IconScene, class: &Class) {
+    for (index, graphic) in scene.graphics.iter_mut().enumerate() {
+        graphic.id = GraphicId(format!("{}:Icon.graphics:{index}", class.qualified_name));
+        graphic.owner = GraphicOwner {
+            qualified_name: class.qualified_name.clone(),
+            kind: GraphicOwnerKind::Own,
+            instance_name: None,
+        };
+        graphic.transform = Transform2D::identity();
+        graphic.editable = true;
+    }
+}
+
+fn mark_inherited_graphics(scene: &mut IconScene) {
+    for graphic in &mut scene.graphics {
+        if graphic.owner.kind == GraphicOwnerKind::Own {
+            graphic.owner.kind = GraphicOwnerKind::Inherited;
+            graphic.owner.instance_name = None;
+            graphic.editable = false;
+        }
     }
 }
 
@@ -366,111 +411,24 @@ fn parse_placement_transform(call: &AnnotationCall) -> Option<PlacementTransform
     })
 }
 
-fn transform_graphic_by_placement(
-    graphic: crate::scene::Graphic,
+fn placement_transform(
     coordinate_system: crate::scene::CoordinateSystem,
     transform: PlacementTransform,
-) -> crate::scene::Graphic {
-    use crate::scene::Graphic;
-    let origin = graphic_origin(&graphic);
-    let rotation = graphic_rotation(&graphic);
-    let map = |point: crate::scene::Point| {
-        let source = transform_graphic_point(point, origin, rotation);
-        transform_placement_point(source, coordinate_system, transform)
-    };
-    match graphic {
-        Graphic::Line(mut item) => {
-            item.points = item.points.into_iter().map(map).collect();
-            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
-            item.rotation = 0.0;
-            Graphic::Line(item)
-        }
-        Graphic::Polygon(mut item) => {
-            item.points = item.points.into_iter().map(map).collect();
-            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
-            item.rotation = 0.0;
-            Graphic::Polygon(item)
-        }
-        Graphic::Rectangle(mut item) => {
-            item.extent = transformed_extent(item.extent, &map);
-            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
-            item.rotation = 0.0;
-            Graphic::Rectangle(item)
-        }
-        Graphic::Ellipse(mut item) => {
-            item.extent = transformed_extent(item.extent, &map);
-            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
-            item.rotation = 0.0;
-            Graphic::Ellipse(item)
-        }
-        Graphic::Text(mut item) => {
-            item.extent = transformed_extent(item.extent, &map);
-            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
-            item.rotation = transform.rotation;
-            Graphic::Text(item)
-        }
-        Graphic::Bitmap(mut item) => {
-            item.extent = transformed_extent(item.extent, &map);
-            item.origin = crate::scene::Point { x: 0.0, y: 0.0 };
-            item.rotation = 0.0;
-            Graphic::Bitmap(item)
-        }
-    }
-}
-
-fn graphic_origin(graphic: &crate::scene::Graphic) -> crate::scene::Point {
-    match graphic {
-        crate::scene::Graphic::Line(item) => item.origin,
-        crate::scene::Graphic::Polygon(item) => item.origin,
-        crate::scene::Graphic::Rectangle(item) => item.origin,
-        crate::scene::Graphic::Ellipse(item) => item.origin,
-        crate::scene::Graphic::Text(item) => item.origin,
-        crate::scene::Graphic::Bitmap(item) => item.origin,
-    }
-}
-
-fn graphic_rotation(graphic: &crate::scene::Graphic) -> f32 {
-    match graphic {
-        crate::scene::Graphic::Line(item) => item.rotation,
-        crate::scene::Graphic::Polygon(item) => item.rotation,
-        crate::scene::Graphic::Rectangle(item) => item.rotation,
-        crate::scene::Graphic::Ellipse(item) => item.rotation,
-        crate::scene::Graphic::Text(item) => item.rotation,
-        crate::scene::Graphic::Bitmap(item) => item.rotation,
-    }
-}
-
-fn transform_graphic_point(
-    point: crate::scene::Point,
-    origin: crate::scene::Point,
-    rotation: f32,
-) -> crate::scene::Point {
-    let angle = rotation.to_radians();
-    crate::scene::Point {
-        x: origin.x + point.x * angle.cos() - point.y * angle.sin(),
-        y: origin.y + point.x * angle.sin() + point.y * angle.cos(),
-    }
-}
-
-fn transform_placement_point(
-    point: crate::scene::Point,
-    coordinate_system: crate::scene::CoordinateSystem,
-    transform: PlacementTransform,
-) -> crate::scene::Point {
+) -> Transform2D {
     let source = coordinate_system.extent;
     let target = transform.extent;
     let source_width = target_dimension(source.p2.x - source.p1.x);
     let source_height = target_dimension(source.p2.y - source.p1.y);
     let scale_x = (target.p2.x - target.p1.x) / source_width;
     let scale_y = (target.p2.y - target.p1.y) / source_height;
-    let translated = crate::scene::Point {
-        x: point.x * scale_x + target.p1.x - source.p1.x * scale_x,
-        y: point.y * scale_y + target.p1.y - source.p1.y * scale_y,
-    };
-    let angle = transform.rotation.to_radians();
-    crate::scene::Point {
-        x: transform.origin.x + translated.x * angle.cos() - translated.y * angle.sin(),
-        y: transform.origin.y + translated.x * angle.sin() + translated.y * angle.cos(),
+    Transform2D {
+        translation: crate::scene::Point {
+            x: transform.origin.x + target.p1.x - source.p1.x * scale_x,
+            y: transform.origin.y + target.p1.y - source.p1.y * scale_y,
+        },
+        rotation: transform.rotation,
+        scale_x,
+        scale_y,
     }
 }
 
@@ -479,6 +437,26 @@ fn target_dimension(value: f32) -> f32 {
         1.0
     } else {
         value
+    }
+}
+
+fn compose_transform(parent: Transform2D, child: Transform2D) -> Transform2D {
+    let angle = parent.rotation.to_radians();
+    let child_translation = crate::scene::Point {
+        x: child.translation.x * parent.scale_x,
+        y: child.translation.y * parent.scale_y,
+    };
+    Transform2D {
+        translation: crate::scene::Point {
+            x: parent.translation.x + child_translation.x * angle.cos()
+                - child_translation.y * angle.sin(),
+            y: parent.translation.y
+                + child_translation.x * angle.sin()
+                + child_translation.y * angle.cos(),
+        },
+        rotation: parent.rotation + child.rotation,
+        scale_x: parent.scale_x * child.scale_x,
+        scale_y: parent.scale_y * child.scale_y,
     }
 }
 
@@ -521,36 +499,6 @@ fn parse_number(value: &AnnotationValue) -> Option<f32> {
     parse_number_value(value)
 }
 
-fn transformed_extent(
-    extent: crate::scene::Extent,
-    map: &impl Fn(crate::scene::Point) -> crate::scene::Point,
-) -> crate::scene::Extent {
-    let points = [
-        extent.p1,
-        crate::scene::Point {
-            x: extent.p1.x,
-            y: extent.p2.y,
-        },
-        crate::scene::Point {
-            x: extent.p2.x,
-            y: extent.p1.y,
-        },
-        extent.p2,
-    ]
-    .map(map);
-    let (mut min_x, mut max_x, mut min_y, mut max_y) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-    for point in points {
-        min_x = min_x.min(point.x);
-        max_x = max_x.max(point.x);
-        min_y = min_y.min(point.y);
-        max_y = max_y.max(point.y);
-    }
-    crate::scene::Extent {
-        p1: crate::scene::Point { x: min_x, y: min_y },
-        p2: crate::scene::Point { x: max_x, y: max_y },
-    }
-}
-
 fn expand_text_macros(
     scene: &mut IconScene,
     class: &Class,
@@ -558,7 +506,7 @@ fn expand_text_macros(
     defaults: &HashMap<String, String>,
 ) {
     for graphic in &mut scene.graphics {
-        let crate::scene::Graphic::Text(text) = graphic else {
+        let crate::scene::Graphic::Text(text) = &mut graphic.graphic else {
             continue;
         };
         text.text = expand_text(&text.text, class, instance_name, defaults);
@@ -737,8 +685,9 @@ fn fallback_base_icon(base_name: &str) -> Option<IconScene> {
     Some(IconScene {
         owner_qualified_name: Some(base_name.to_owned()),
         coordinate_system: CoordinateSystem::default(),
-        graphics: vec![crate::scene::Graphic::Rectangle(
-            crate::scene::RectangleGraphic {
+        graphics: vec![ResolvedGraphic {
+            id: GraphicId(format!("{base_name}:Icon.graphics:0")),
+            graphic: crate::scene::Graphic::Rectangle(crate::scene::RectangleGraphic {
                 origin: crate::scene::Point { x: 0.0, y: 0.0 },
                 rotation: 0.0,
                 extent: crate::scene::Extent {
@@ -751,8 +700,15 @@ fn fallback_base_icon(base_name: &str) -> Option<IconScene> {
                 line_thickness: Some(0.25),
                 fill_pattern: Some("FillPattern.Solid".into()),
                 radius: None,
+            }),
+            owner: GraphicOwner {
+                qualified_name: base_name.to_owned(),
+                kind: GraphicOwnerKind::Own,
+                instance_name: None,
             },
-        )],
+            transform: Transform2D::identity(),
+            editable: true,
+        }],
         diagnostics: Vec::new(),
     })
 }
@@ -864,7 +820,7 @@ mod tests {
     use super::IconResolver;
     use crate::library::LibraryRegistry;
     use crate::parser::parse;
-    use crate::scene::Graphic;
+    use crate::scene::{Graphic, GraphicOwnerKind};
 
     #[test]
     fn resolves_only_selected_class_icon_and_masks_child_icons() {
@@ -878,7 +834,7 @@ mod tests {
             .expect("index source");
         let scene = IconResolver::new(&mut registry).resolve(boundary, source);
         assert_eq!(scene.graphics.len(), 1);
-        assert!(matches!(scene.graphics[0], Graphic::Rectangle(_)));
+        assert!(matches!(scene.graphics[0].graphic, Graphic::Rectangle(_)));
     }
 
     #[test]
@@ -891,6 +847,18 @@ mod tests {
             .expect("index source");
         let scene = IconResolver::new(&mut registry).resolve(&file.classes[1], source);
         assert_eq!(scene.graphics.len(), 2);
+        assert!(
+            scene
+                .graphics
+                .iter()
+                .any(|graphic| graphic.owner.kind == GraphicOwnerKind::Inherited)
+        );
+        assert!(
+            scene
+                .graphics
+                .iter()
+                .any(|graphic| graphic.owner.kind == GraphicOwnerKind::Own)
+        );
     }
 
     #[test]
@@ -985,12 +953,27 @@ end Parent;
         let texts = scene
             .graphics
             .iter()
-            .filter_map(|graphic| match graphic {
+            .filter_map(|graphic| match &graphic.graphic {
                 Graphic::Text(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert!(texts.contains(&"Parent/42"));
         assert!(texts.contains(&"leftPin/Pin"));
+        assert_eq!(
+            scene
+                .graphics
+                .iter()
+                .filter(|graphic| graphic.owner.kind == GraphicOwnerKind::Connector)
+                .count(),
+            2
+        );
+        assert!(
+            scene
+                .graphics
+                .iter()
+                .filter(|graphic| graphic.owner.kind == GraphicOwnerKind::Connector)
+                .all(|graphic| !graphic.editable)
+        );
     }
 }

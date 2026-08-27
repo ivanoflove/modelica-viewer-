@@ -122,6 +122,53 @@ pub enum Graphic {
     Bitmap(BitmapGraphic),
 }
 
+/// Stable identity for a resolved graphic in an Icon scene.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GraphicId(pub String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphicOwnerKind {
+    Own,
+    Inherited,
+    Connector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphicOwner {
+    pub qualified_name: String,
+    pub kind: GraphicOwnerKind,
+    pub instance_name: Option<String>,
+}
+
+/// Transform applied after the graphic's own origin and rotation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform2D {
+    pub translation: Point,
+    pub rotation: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+}
+
+impl Transform2D {
+    pub const fn identity() -> Self {
+        Self {
+            translation: Point { x: 0.0, y: 0.0 },
+            rotation: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedGraphic {
+    pub id: GraphicId,
+    pub graphic: Graphic,
+    pub owner: GraphicOwner,
+    pub transform: Transform2D,
+    pub editable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentInstance {
     pub id: String,
@@ -144,7 +191,7 @@ pub struct DiagramConnection {
 pub struct IconScene {
     pub owner_qualified_name: Option<String>,
     pub coordinate_system: CoordinateSystem,
-    pub graphics: Vec<Graphic>,
+    pub graphics: Vec<ResolvedGraphic>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
