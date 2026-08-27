@@ -75,4 +75,24 @@ describe("FluidUnits icon regressions", () => {
       origin: { x: 1.77636e-15, y: -8.88178e-16 },
     });
   });
+
+  it("preserves Compressor local Polygon coordinates during Icon resolution", () => {
+    const parsed = parseModelicaFile(source, "IEH_CPP.mo");
+    const cls = findClassByQualifiedName(parsed.classes, "IEH_CPP.FluidUnits.Compressor")!;
+    const icon = resolveIconForClass(cls, parsed.classes, source, "Compressor").icon!;
+    const polygon = icon.graphics.find((graphic) => graphic.type === "Polygon");
+    expect(polygon).toMatchObject({
+      points: [
+        { x: -66, y: 54 },
+        { x: -66, y: -54 },
+        { x: 66, y: -30 },
+        { x: 66, y: 30 },
+        { x: -66, y: 54 },
+      ],
+    });
+    expect(icon.coordinateSystem.extent).toEqual({
+      p1: { x: -100, y: -100 },
+      p2: { x: 100, y: 100 },
+    });
+  });
 });

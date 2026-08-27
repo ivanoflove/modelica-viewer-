@@ -55,6 +55,10 @@ import {
   modelToViewportRoot,
   type ViewportStateSnapshot,
 } from "./GraphicViewport";
+import {
+  graphicLocalToSvgRoot,
+  modelToGraphicLocal,
+} from "../../editor/Coordinates";
 import type { CreateGraphicResult, SourceEditReason } from "../../../shared/modelica";
 import type { GraphicToolType } from "../../../shared/modelicaGraphics";
 import { GRAPHIC_DRAG_MIME, GraphicToolbar } from "./GraphicToolbar";
@@ -673,7 +677,7 @@ export function IconViewer({
     const svg = svgRef.current;
     const viewport = viewportStateRef.current;
     if (!svg || !viewport) return;
-    const rootPoint = graphicLocalToRoot(
+    const rootPoint = graphicLocalToSvgRoot(
       session.originalGraphic,
       point,
       transformFor(session.graphicId),
@@ -1534,7 +1538,7 @@ export function IconViewer({
     }
     if (selectedEditable && selectedGraphic && isPointBasedGraphic(selectedGraphic)) {
       selectedGraphic.points.forEach((point, index) => {
-          const rootPoint = graphicLocalToRoot(
+          const rootPoint = graphicLocalToSvgRoot(
             selectedGraphic,
             point,
             transformFor(selectedEditable.id),
@@ -1952,52 +1956,6 @@ function svgRootPixelScale(svg: SVGSVGElement, base: { width: number; height: nu
   );
 }
 
-function graphicLocalToRoot(
-  graphic: EditableGraphic["graphic"],
-  localPoint: Point,
-  transform: GraphicTransform,
-  viewport: ViewportStateSnapshot,
-): Point {
-  const origin = graphic.origin ?? { x: 0, y: 0 };
-  const scaled = {
-    x: localPoint.x * transform.scale.x,
-    y: localPoint.y * transform.scale.y,
-  };
-  const angle = (transform.rotate * Math.PI) / 180;
-  const rotated = {
-    x: scaled.x * Math.cos(angle) - scaled.y * Math.sin(angle),
-    y: scaled.x * Math.sin(angle) + scaled.y * Math.cos(angle),
-  };
-  return modelToViewportRoot(
-    {
-      x: rotated.x + origin.x + transform.translate.x,
-      y: rotated.y + origin.y + transform.translate.y,
-    },
-    viewport,
-  );
-}
-
-function modelToGraphicLocal(
-  modelPoint: Point,
-  graphic: EditableGraphic["graphic"],
-  transform: GraphicTransform,
-): Point {
-  const origin = graphic.origin ?? { x: 0, y: 0 };
-  const translated = {
-    x: modelPoint.x - origin.x - transform.translate.x,
-    y: modelPoint.y - origin.y - transform.translate.y,
-  };
-  const angle = (-transform.rotate * Math.PI) / 180;
-  const unrotated = {
-    x: translated.x * Math.cos(angle) - translated.y * Math.sin(angle),
-    y: translated.x * Math.sin(angle) + translated.y * Math.cos(angle),
-  };
-  return {
-    x: unrotated.x / Math.max(Math.abs(transform.scale.x), 1e-9) * Math.sign(transform.scale.x || 1),
-    y: unrotated.y / Math.max(Math.abs(transform.scale.y), 1e-9) * Math.sign(transform.scale.y || 1),
-  };
-}
-
 function formatModelicaNumber(n: number): string {
   return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
 }
@@ -2197,39 +2155,44 @@ function buildHistoryEdit(
 
 function buildTranslateEdit(
   ed: EditableGraphic,
-  graphic: EditableGraphic["graphic"],
+  beforeGraphic: EditableGraphic["graphic"],
   dx: number,
   dy: number,
 ): Edit | null {
   const source = ed.source;
-  const g = graphic as any;
+  // Derive the replacement from the pre-interaction local geometry exactly
+  // once. This keeps viewport/pointer coordinates out of the source patch and
+  // prevents an already translated optimistic graphic from being translated
+  // a second time.
+  const moved = applyTransform(beforeGraphic, {
+    translate: { x: dx, y: dy },
+    scale: { x: 1, y: 1 },
+    rotate: 0,
+  });
   const format = formatModelicaNumber;
-  if (source.originRange && g.origin) {
+  if (source.originRange && moved.origin) {
     return {
       start: source.originRange.start,
       end: source.originRange.end,
       expectedText: source.originRange.expectedText,
-      replacement: `{${format(g.origin.x + dx)},${format(g.origin.y + dy)}}`,
+      replacement: `{${format(moved.origin.x)},${format(moved.origin.y)}}`,
     };
   }
-  if (source.extentRange && g.extent) {
-    const e = g.extent;
+  if (source.extentRange && "extent" in moved) {
+    const e = moved.extent;
     return {
       start: source.extentRange.start,
       end: source.extentRange.end,
       expectedText: source.extentRange.expectedText,
-      replacement: formatModelicaExtent({
-        p1: { x: e.p1.x + dx, y: e.p1.y + dy },
-        p2: { x: e.p2.x + dx, y: e.p2.y + dy },
-      }),
+      replacement: formatModelicaExtent(e),
     };
   }
-  if (source.pointsRange && g.points) {
+  if (source.pointsRange && "points" in moved) {
     return {
       start: source.pointsRange.start,
       end: source.pointsRange.end,
       expectedText: source.pointsRange.expectedText,
-      replacement: `{${g.points.map((p: { x: number; y: number }) => `{${format(p.x + dx)},${format(p.y + dy)}}`).join(",")}}`,
+      replacement: serializeModelicaPoints(moved.points),
     };
   }
   return null;

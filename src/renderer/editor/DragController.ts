@@ -32,28 +32,6 @@ export function transformWithDragPreview(
   };
 }
 
-/** Convert client/screen coordinates into Modelica SVG coordinates. */
-export function clientToModelica(
-  svg: SVGSVGElement,
-  clientX: number,
-  clientY: number,
-): { x: number; y: number } | null {
-  const ctm = svg.getScreenCTM()?.inverse();
-  if (!ctm) return null;
-  return clientToModelicaWithInverse(clientX, clientY, ctm);
-}
-
-/** Convert a client point using a matrix captured at drag start. */
-export function clientToModelicaWithInverse(
-  clientX: number,
-  clientY: number,
-  inverse: DOMMatrix,
-): { x: number; y: number } {
-  const p = new DOMPoint(clientX, clientY).matrixTransform(inverse);
-  // SVG Y is down; Modelica Y is up
-  return { x: p.x, y: -p.y };
-}
-
 /** Calculate a drag delta from the fixed pointer-down position. */
 export function dragDeltaFromStart(
   start: { x: number; y: number },

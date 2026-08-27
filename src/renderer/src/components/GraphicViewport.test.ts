@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   contentViewBox,
   clientToModelicaWithViewport,
+  modelToScreen,
   modelToViewportRoot,
   panViewBox,
+  screenToModel,
   viewportGroupTransform,
   wheelZoomFactor,
   zoomViewBox,
@@ -89,5 +91,25 @@ describe("GraphicViewport math", () => {
       x: 20,
       y: 30,
     });
+  });
+
+  it("round-trips Modelica points through the single screen mapper after pan and zoom", () => {
+    const svg = {
+      getBoundingClientRect: () => ({
+        left: 40,
+        top: 20,
+        width: 1200,
+        height: 600,
+      }),
+    } as SVGSVGElement;
+    const viewport = {
+      base: { x: -100, y: -100, width: 200, height: 200 },
+      viewBox: { x: -35, y: -60, width: 80, height: 80 },
+    };
+    const original = { x: 17.25, y: -23.5 };
+    const screen = modelToScreen(svg, original, viewport)!;
+    const restored = screenToModel(svg, screen, viewport)!;
+    expect(restored.x).toBeCloseTo(original.x, 10);
+    expect(restored.y).toBeCloseTo(original.y, 10);
   });
 });

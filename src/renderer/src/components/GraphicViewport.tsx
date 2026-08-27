@@ -10,6 +10,13 @@ import {
 import type { IconDto } from "../../../shared/modelicaGraphics";
 import { boundsOf, type Bounds } from "../../editor/Transform";
 import { recordViewerPerformance } from "../performance";
+import {
+  modelToScreen,
+  screenToModel,
+  screenToSvgRoot,
+  type ModelPoint,
+  type SvgPoint,
+} from "../../editor/Coordinates";
 
 export interface ViewBox {
   x: number;
@@ -23,20 +30,8 @@ export interface ViewportStateSnapshot {
   viewBox: ViewBox;
 }
 
-export function modelToViewportRoot(
-  point: { x: number; y: number },
-  viewport: ViewportStateSnapshot,
-): { x: number; y: number } {
-  const scaleX = viewport.base.width / Math.max(viewport.viewBox.width, 1e-9);
-  const scaleY = viewport.base.height / Math.max(viewport.viewBox.height, 1e-9);
-  const translateX = viewport.base.x - viewport.viewBox.x * scaleX;
-  const translateY = viewport.base.y - viewport.viewBox.y * scaleY;
-  // The model layer is wrapped in scale(1,-1) before the viewport group.
-  return {
-    x: point.x * scaleX + translateX,
-    y: -point.y * scaleY + translateY,
-  };
-}
+export type { ModelPoint, ScreenPoint, SvgPoint } from "../../editor/Coordinates";
+export { modelToScreen, modelToSvgRoot as modelToViewportRoot, screenToModel, svgRootToModel } from "../../editor/Coordinates";
 
 /** Convert a client point to root SVG user coordinates without querying CTM. */
 export function clientToViewportRoot(
@@ -44,19 +39,8 @@ export function clientToViewportRoot(
   clientX: number,
   clientY: number,
   base: ViewBox,
-): { x: number; y: number } | null {
-  const rect = svg.getBoundingClientRect();
-  const scale = Math.min(
-    rect.width / Math.max(base.width, 1e-9),
-    rect.height / Math.max(base.height, 1e-9),
-  );
-  if (!Number.isFinite(scale) || scale <= 0) return null;
-  const offsetX = (rect.width - base.width * scale) / 2;
-  const offsetY = (rect.height - base.height * scale) / 2;
-  return {
-    x: base.x + (clientX - rect.left - offsetX) / scale,
-    y: base.y + (clientY - rect.top - offsetY) / scale,
-  };
+): SvgPoint | null {
+  return screenToSvgRoot(svg, { x: clientX, y: clientY }, base);
 }
 
 /** Convert a client point to Modelica coordinates using a captured viewport. */
@@ -65,17 +49,8 @@ export function clientToModelicaWithViewport(
   clientX: number,
   clientY: number,
   viewport: ViewportStateSnapshot,
-): { x: number; y: number } | null {
-  const root = clientToViewportRoot(svg, clientX, clientY, viewport.base);
-  if (!root) return null;
-  const scaleX = viewport.base.width / Math.max(viewport.viewBox.width, 1e-9);
-  const scaleY = viewport.base.height / Math.max(viewport.viewBox.height, 1e-9);
-  const translateX = viewport.base.x - viewport.viewBox.x * scaleX;
-  const translateY = viewport.base.y - viewport.viewBox.y * scaleY;
-  return {
-    x: (root.x - translateX) / scaleX,
-    y: -(root.y - translateY) / scaleY,
-  };
+): ModelPoint | null {
+  return screenToModel(svg, { x: clientX, y: clientY }, viewport);
 }
 
 interface Props {
