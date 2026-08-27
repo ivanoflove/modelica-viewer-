@@ -1,4 +1,5 @@
 mod icon_view;
+mod source_view;
 
 use gpui::{
     Anchor, App, Bounds, Context, Render, Window, WindowBounds, WindowOptions, anchored, deferred,
@@ -10,6 +11,7 @@ use modelica_core::{
     Class, ClassKind, IconDebugStats, IconResolver, IconScene, Library, LibraryKind,
     LibraryRegistry, PackageLoader, PackageNode,
 };
+use source_view::{HighlightKind, highlight_spans};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -114,6 +116,47 @@ impl DetailTab {
             Self::Icon => "Icon",
             Self::Diagram => "Diagram",
         }
+    }
+}
+
+fn highlighted_source_line(line: &str, palette: Palette) -> gpui::Div {
+    let spans = highlight_spans(line);
+    let mut row = div().flex().flex_none().whitespace_nowrap();
+    let mut cursor = 0;
+    for span in spans {
+        if cursor < span.start {
+            row = row.child(
+                div()
+                    .text_color(rgb(palette.text))
+                    .child(line[cursor..span.start].to_owned()),
+            );
+        }
+        row = row.child(
+            div()
+                .text_color(rgb(source_highlight_color(span.kind, palette)))
+                .child(line[span.start..span.end].to_owned()),
+        );
+        cursor = span.end;
+    }
+    if cursor < line.len() {
+        row = row.child(
+            div()
+                .text_color(rgb(palette.text))
+                .child(line[cursor..].to_owned()),
+        );
+    }
+    row
+}
+
+fn source_highlight_color(kind: HighlightKind, palette: Palette) -> u32 {
+    match kind {
+        HighlightKind::Keyword => palette.accent,
+        HighlightKind::Identifier => palette.text,
+        HighlightKind::Number => 0xd98b45,
+        HighlightKind::String => 0x55a879,
+        HighlightKind::Comment => palette.subtle,
+        HighlightKind::Operator => 0x4ca9c4,
+        HighlightKind::Punctuation => palette.muted,
     }
 }
 
@@ -553,7 +596,7 @@ impl Render for ModelicaViewer {
                         Some(
                             div()
                                 .h(px(22.0))
-                                .w_full()
+                                .min_w(px(720.0))
                                 .flex()
                                 .items_center()
                                 .text_xs()
@@ -565,14 +608,7 @@ impl Render for ModelicaViewer {
                                         .text_color(rgb(palette.subtle))
                                         .child(format!("{}", source_start_line + index)),
                                 )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_color(rgb(palette.text))
-                                        .child(line),
-                                ),
+                                .child(highlighted_source_line(&line, palette)),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -601,7 +637,13 @@ impl Render for ModelicaViewer {
                             0xffffff
                         },
                     ))
-                    .child(source_list)
+                    .child(
+                        div()
+                            .id("source-horizontal-scroll")
+                            .size_full()
+                            .overflow_x_scroll()
+                            .child(source_list),
+                    )
                     .into_any_element(),
             ),
             DetailTab::Icon => (

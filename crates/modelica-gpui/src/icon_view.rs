@@ -4,8 +4,9 @@ use gpui::{
 };
 use modelica_core::{Graphic, IconScene, ResolvedGraphic, Transform2D};
 use modelica_render::{
-    Bounds as RenderBounds, ModelBounds, ModelPoint, ScreenPoint, Vec2, Viewport,
-    hit_test_resolved_graphics, transform_point,
+    ArrowKind, Bounds as RenderBounds, LineEnd, ModelBounds, ModelPoint, PathSegment, ScreenPoint,
+    Vec2, Viewport, build_modelica_line_path, hit_test_resolved_graphics, line_arrow_geometry,
+    transform_point,
 };
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -314,14 +315,21 @@ fn paint_graphic(
                     )
                 })
                 .collect::<Vec<_>>();
-            paint_polyline_patterned(
-                window,
-                &points,
-                graphic.color,
-                graphic.thickness.max(0.25) * map.viewport.zoom * stroke_scale,
-                graphic.pattern.as_deref(),
-                false,
-            );
+            let stroke_width = graphic.thickness.max(0.25) * map.viewport.zoom * stroke_scale;
+            if graphic.smooth.as_deref() == Some("Smooth.Bezier") {
+                let path = build_modelica_line_path(&graphic.points, graphic.smooth.as_deref());
+                paint_path_segments(window, &path, map, resolved, graphic.color, stroke_width);
+            } else {
+                paint_polyline_patterned(
+                    window,
+                    &points,
+                    graphic.color,
+                    stroke_width,
+                    graphic.pattern.as_deref(),
+                    false,
+                );
+            }
+            paint_line_arrows(window, graphic, map, transform, stroke_width);
         }
         Graphic::Polygon(graphic) => {
             let points = graphic
@@ -537,6 +545,104 @@ fn paint_polyline_patterned(
             stroke_width,
             dash.expect("checked above"),
         );
+    }
+}
+
+fn paint_path_segments(
+    window: &mut Window,
+    segments: &[PathSegment],
+    map: &SceneMap,
+    resolved: &ResolvedGraphic,
+    color: [u8; 3],
+    stroke_width: f32,
+) {
+    let (origin, rotation) = graphic_pose(&resolved.graphic);
+    let transform = resolved.transform;
+    let mut builder = PathBuilder::stroke(px(stroke_width.max(0.5)));
+    for segment in segments {
+        match *segment {
+            PathSegment::MoveTo(point) => builder
+                .move_to(map.graphic_point_with_transform(point, origin, rotation, transform)),
+            PathSegment::LineTo(point) => builder
+                .line_to(map.graphic_point_with_transform(point, origin, rotation, transform)),
+            PathSegment::CubicTo {
+                control1,
+                control2,
+                end,
+            } => builder.cubic_bezier_to(
+                map.graphic_point_with_transform(control1, origin, rotation, transform),
+                map.graphic_point_with_transform(control2, origin, rotation, transform),
+                map.graphic_point_with_transform(end, origin, rotation, transform),
+            ),
+        }
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(rgb24(color)));
+    }
+}
+
+fn graphic_pose(graphic: &Graphic) -> (modelica_core::scene::Point, f32) {
+    match graphic {
+        Graphic::Line(item) => (item.origin, item.rotation),
+        Graphic::Polygon(item) => (item.origin, item.rotation),
+        Graphic::Rectangle(item) => (item.origin, item.rotation),
+        Graphic::Ellipse(item) => (item.origin, item.rotation),
+        Graphic::Text(item) => (item.origin, item.rotation),
+        Graphic::Bitmap(item) => (item.origin, item.rotation),
+    }
+}
+
+fn paint_line_arrows(
+    window: &mut Window,
+    graphic: &modelica_core::scene::LineGraphic,
+    map: &SceneMap,
+    transform: Transform2D,
+    stroke_width: f32,
+) {
+    let arrow_size = graphic.arrow_size.unwrap_or(10.0);
+    for (index, end) in [(0, LineEnd::Start), (1, LineEnd::End)] {
+        let kind = ArrowKind::parse(graphic.arrow.get(index).map(String::as_str));
+        let Some(arrow) = line_arrow_geometry(&graphic.points, kind, arrow_size, end) else {
+            continue;
+        };
+        let tip = map.graphic_point_with_transform(
+            arrow.tip,
+            graphic.origin,
+            graphic.rotation,
+            transform,
+        );
+        let left = map.graphic_point_with_transform(
+            arrow.left,
+            graphic.origin,
+            graphic.rotation,
+            transform,
+        );
+        let right = map.graphic_point_with_transform(
+            arrow.right,
+            graphic.origin,
+            graphic.rotation,
+            transform,
+        );
+        match kind {
+            ArrowKind::Open => {
+                paint_simple_segment(window, tip, left, graphic.color, stroke_width);
+                paint_simple_segment(window, tip, right, graphic.color, stroke_width);
+            }
+            ArrowKind::Half => {
+                paint_simple_segment(window, tip, left, graphic.color, stroke_width);
+            }
+            ArrowKind::Filled => {
+                let mut builder = PathBuilder::fill();
+                builder.move_to(tip);
+                builder.line_to(left);
+                builder.line_to(right);
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, rgb(rgb24(graphic.color)));
+                }
+            }
+            ArrowKind::None => {}
+        }
     }
 }
 
