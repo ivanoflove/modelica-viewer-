@@ -7,6 +7,8 @@ use modelica_core::{
     Class, ClassKind, Graphic, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry,
     PackageLoader, PackageNode,
 };
+use std::collections::HashSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,8 +97,6 @@ impl GlassMode {
 }
 
 fn palette(theme: ThemeMode, accent: AccentName) -> Palette {
-    // System currently follows the dark chrome used by the native prototype. The setting is kept
-    // separate so native OS appearance tracking can be wired without changing the UI contract.
     let dark = matches!(theme, ThemeMode::System | ThemeMode::Dark);
     if dark {
         Palette {
@@ -131,21 +131,39 @@ fn palette(theme: ThemeMode, accent: AccentName) -> Palette {
     }
 }
 
-struct ClassRow {
-    class: Class,
+#[derive(Clone)]
+struct TreeNode {
+    key: String,
+    label: String,
+    kind: ClassKind,
+    class_index: Option<usize>,
+    children: Vec<TreeNode>,
+}
+
+#[derive(Clone)]
+struct VisibleTreeRow {
+    key: String,
+    label: String,
+    kind: ClassKind,
+    class_index: Option<usize>,
     depth: usize,
+    has_children: bool,
+    expanded: bool,
 }
 
 struct ModelicaViewer {
     package_name: String,
     package_path: PathBuf,
-    classes: Vec<ClassRow>,
+    classes: Vec<Class>,
+    tree_root: TreeNode,
+    expanded: HashSet<String>,
     selected: Option<usize>,
     scene: IconScene,
     registry: LibraryRegistry,
     theme: ThemeMode,
     accent: AccentName,
     glass: GlassMode,
+    appearance_open: bool,
 }
 
 impl ModelicaViewer {
@@ -159,31 +177,30 @@ impl ModelicaViewer {
         register_package_sources(&package, &mut registry);
 
         let mut classes = Vec::new();
-        flatten_package(&package, 0, &mut classes);
+        let tree_root = build_package_tree(&package, &mut classes);
+        let mut expanded = HashSet::new();
+        expanded.insert(tree_root.key.clone());
 
-        let mut viewer = Self {
+        Ok(Self {
             package_name: package.qualified_name.clone(),
             package_path: path.to_owned(),
             classes,
+            tree_root,
+            expanded,
             selected: None,
             scene: empty_scene(None),
             registry,
             theme: ThemeMode::System,
             accent: AccentName::Violet,
             glass: GlassMode::On,
-        };
-
-        if !viewer.classes.is_empty() {
-            viewer.select_class(0);
-        }
-        Ok(viewer)
+            appearance_open: false,
+        })
     }
 
     fn select_class(&mut self, index: usize) {
-        let Some(row) = self.classes.get(index) else {
+        let Some(class) = self.classes.get(index).cloned() else {
             return;
         };
-        let class = row.class.clone();
         let source = match std::fs::read_to_string(&class.source_file) {
             Ok(source) => source,
             Err(error) => {
@@ -208,8 +225,20 @@ impl ModelicaViewer {
     fn selected_name(&self) -> &str {
         self.selected
             .and_then(|index| self.classes.get(index))
-            .map(|row| row.class.qualified_name.as_str())
-            .unwrap_or("No class selected")
+            .map(|class| class.qualified_name.as_str())
+            .unwrap_or("Select a Modelica class")
+    }
+
+    fn toggle_tree(&mut self, key: &str) {
+        if !self.expanded.remove(key) {
+            self.expanded.insert(key.to_owned());
+        }
+    }
+
+    fn visible_tree_rows(&self) -> Vec<VisibleTreeRow> {
+        let mut rows = Vec::new();
+        collect_visible_rows(&self.tree_root, 0, &self.expanded, &mut rows);
+        rows
     }
 }
 
@@ -221,56 +250,88 @@ impl Render for ModelicaViewer {
         } else {
             0.96
         };
-        let row_count = self.classes.len();
 
+        let visible_rows = self.visible_tree_rows();
+        let visible_count = visible_rows.len();
         let tree = uniform_list(
             "class-tree",
-            row_count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+            visible_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
                 range
-                    .filter_map(|index| {
-                        let row = this.classes.get(index)?;
-                        let selected = this.selected == Some(index);
-                        let indent = row.depth as f32 * 14.0;
-                        let label =
-                            format!("{}  {}", class_kind_symbol(row.class.kind), row.class.name);
+                    .filter_map(|row_index| {
+                        let row = visible_rows.get(row_index)?.clone();
+                        let selected = row.class_index == this.selected;
+                        let key = row.key.clone();
+                        let class_index = row.class_index;
+                        let has_children = row.has_children;
+                        let toggle = if row.has_children {
+                            if row.expanded { "▾" } else { "▸" }
+                        } else {
+                            ""
+                        };
+                        let indent = 6.0 + row.depth as f32 * 13.0;
+                        let icon = class_kind_symbol(row.kind);
+
                         Some(
                             div()
-                                .id(format!("class-{index}"))
+                                .id(format!("tree-row-{row_index}"))
                                 .mx_1()
-                                .mb_1()
-                                .pl(px(10.0 + indent))
+                                .h(px(32.0))
+                                .pl(px(indent))
                                 .pr_2()
-                                .py_2()
                                 .rounded_md()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .overflow_hidden()
                                 .text_sm()
                                 .text_color(rgb(if selected {
                                     palette.selected_text
                                 } else {
                                     palette.text
                                 }))
-                                .bg(rgb(if selected {
-                                    palette.accent
-                                } else {
-                                    palette.panel_alt
-                                })
-                                .opacity(if selected {
-                                    0.96
-                                } else {
-                                    0.62
-                                }))
-                                .hover(move |style| {
-                                    style.bg(rgb(if selected {
-                                        palette.accent_hover
+                                .bg(
+                                    rgb(if selected {
+                                        palette.accent
                                     } else {
-                                        palette.card
+                                        palette.panel_alt
                                     })
-                                    .opacity(0.92))
+                                    .opacity(if selected { 0.96 } else { 0.28 }),
+                                )
+                                .hover(move |style| {
+                                    style.bg(
+                                        rgb(if selected {
+                                            palette.accent_hover
+                                        } else {
+                                            palette.card
+                                        })
+                                        .opacity(0.82),
+                                    )
                                 })
                                 .cursor_pointer()
-                                .child(label)
+                                .child(
+                                    div()
+                                        .w(px(16.0))
+                                        .text_color(rgb(palette.subtle))
+                                        .child(toggle),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(20.0))
+                                        .text_color(rgb(if row.kind == ClassKind::Package {
+                                            palette.accent
+                                        } else {
+                                            palette.muted
+                                        }))
+                                        .child(icon),
+                                )
+                                .child(div().flex_1().overflow_hidden().child(row.label))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_class(index);
+                                    if let Some(index) = class_index {
+                                        this.select_class(index);
+                                    } else if has_children {
+                                        this.toggle_tree(&key);
+                                    }
                                     cx.notify();
                                 })),
                         )
@@ -288,103 +349,38 @@ impl Render for ModelicaViewer {
             .scene
             .diagnostics
             .iter()
-            .take(4)
+            .take(3)
             .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
             .collect::<Vec<_>>()
             .join("  ·  ");
 
-        let mut theme_choices = div().flex().gap_1();
-        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
-            let active = self.theme == mode;
-            theme_choices = theme_choices.child(
-                div()
-                    .id(format!("theme-{}", mode.label()))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(rgb(if active {
-                        palette.selected_text
-                    } else {
-                        palette.muted
-                    }))
-                    .bg(rgb(if active {
-                        palette.accent
-                    } else {
-                        palette.panel_alt
-                    })
-                    .opacity(if active { 0.96 } else { 0.68 }))
-                    .child(mode.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.theme = mode;
-                        cx.notify();
-                    })),
-            );
-        }
-
-        let mut accent_choices = div().flex().gap_1();
-        for accent in [
-            AccentName::Violet,
-            AccentName::Blue,
-            AccentName::Cyan,
-            AccentName::Orange,
-        ] {
-            let active = self.accent == accent;
-            accent_choices = accent_choices.child(
-                div()
-                    .id(format!("accent-{}", accent.label()))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(rgb(if active {
-                        accent.color()
-                    } else {
-                        palette.muted
-                    }))
-                    .bg(rgb(palette.panel_alt).opacity(if active { 0.92 } else { 0.58 }))
-                    .child(format!("● {}", accent.label()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.accent = accent;
-                        cx.notify();
-                    })),
-            );
-        }
-
-        let mut glass_choices = div().flex().gap_1();
-        for mode in [GlassMode::On, GlassMode::Reduced] {
-            let active = self.glass == mode;
-            glass_choices = glass_choices.child(
-                div()
-                    .id(format!("glass-{}", mode.label()))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_xs()
-                    .cursor_pointer()
-                    .text_color(rgb(if active {
-                        palette.selected_text
-                    } else {
-                        palette.muted
-                    }))
-                    .bg(rgb(if active {
-                        palette.accent
-                    } else {
-                        palette.panel_alt
-                    })
-                    .opacity(if active { 0.94 } else { 0.58 }))
-                    .child(mode.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.glass = mode;
-                        cx.notify();
-                    })),
-            );
-        }
+        let appearance_button = div()
+            .id("appearance-toggle")
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel_alt).opacity(0.68))
+            .text_xs()
+            .text_color(rgb(if self.appearance_open {
+                palette.accent
+            } else {
+                palette.muted
+            }))
+            .cursor_pointer()
+            .child(if self.appearance_open {
+                "Appearance  ▴"
+            } else {
+                "Appearance  ▾"
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.appearance_open = !this.appearance_open;
+                cx.notify();
+            }));
 
         let header = div()
-            .h(px(54.0))
+            .h(px(52.0))
             .px_4()
             .border_b_1()
             .border_color(rgb(palette.border))
@@ -394,7 +390,7 @@ impl Render for ModelicaViewer {
             .gap_3()
             .child(
                 div()
-                    .w(px(260.0))
+                    .w(px(250.0))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -403,7 +399,7 @@ impl Render for ModelicaViewer {
                             .w(px(30.0))
                             .h(px(30.0))
                             .rounded_lg()
-                            .bg(rgb(palette.accent).opacity(0.16))
+                            .bg(rgb(palette.accent).opacity(0.14))
                             .text_color(rgb(palette.accent))
                             .flex()
                             .items_center()
@@ -426,19 +422,92 @@ impl Render for ModelicaViewer {
             .child(
                 div()
                     .flex_1()
+                    .overflow_hidden()
                     .text_xs()
                     .text_color(rgb(palette.subtle))
                     .child(selected_name.clone()),
             )
-            .child(
+            .child(appearance_button);
+
+        let mut chrome = div().flex().flex_col().child(header);
+        if self.appearance_open {
+            let mut theme_choices = div().flex().gap_1();
+            for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+                let active = self.theme == mode;
+                theme_choices = theme_choices.child(
+                    choice_chip(
+                        format!("theme-{}", mode.label()),
+                        mode.label(),
+                        active,
+                        palette,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.theme = mode;
+                        cx.notify();
+                    })),
+                );
+            }
+
+            let mut accent_choices = div().flex().gap_1();
+            for accent in [
+                AccentName::Violet,
+                AccentName::Blue,
+                AccentName::Cyan,
+                AccentName::Orange,
+            ] {
+                let active = self.accent == accent;
+                accent_choices = accent_choices.child(
+                    choice_chip(
+                        format!("accent-{}", accent.label()),
+                        &format!("● {}", accent.label()),
+                        active,
+                        palette,
+                    )
+                    .text_color(rgb(if active {
+                        accent.color()
+                    } else {
+                        palette.muted
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.accent = accent;
+                        cx.notify();
+                    })),
+                );
+            }
+
+            let mut glass_choices = div().flex().gap_1();
+            for mode in [GlassMode::On, GlassMode::Reduced] {
+                let active = self.glass == mode;
+                glass_choices = glass_choices.child(
+                    choice_chip(
+                        format!("glass-{}", mode.label()),
+                        mode.label(),
+                        active,
+                        palette,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.glass = mode;
+                        cx.notify();
+                    })),
+                );
+            }
+
+            chrome = chrome.child(
                 div()
+                    .h(px(48.0))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel_alt).opacity(glass_alpha))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(theme_choices)
-                    .child(accent_choices)
-                    .child(glass_choices),
+                    .justify_end()
+                    .gap_4()
+                    .child(setting_group("Theme", theme_choices, palette))
+                    .child(setting_group("Accent", accent_choices, palette))
+                    .child(setting_group("Glass", glass_choices, palette)),
             );
+        }
 
         let sidebar = div()
             .w(px(278.0))
@@ -461,7 +530,12 @@ impl Render for ModelicaViewer {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_sm().child(self.package_name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.subtle))
+                                    .child("MODEL LIBRARY"),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -469,6 +543,7 @@ impl Render for ModelicaViewer {
                                     .child(format!("{} classes", self.classes.len())),
                             ),
                     )
+                    .child(div().mt_2().text_sm().child(self.package_name.clone()))
                     .child(
                         div()
                             .mt_1()
@@ -477,7 +552,7 @@ impl Render for ModelicaViewer {
                             .child(self.package_path.display().to_string()),
                     ),
             )
-            .child(div().flex_1().min_h_0().py_2().child(tree));
+            .child(div().flex_1().min_h_0().p_2().child(tree));
 
         let detail = div()
             .flex_1()
@@ -491,7 +566,7 @@ impl Render for ModelicaViewer {
             .flex_col()
             .child(
                 div()
-                    .min_h(px(58.0))
+                    .min_h(px(56.0))
                     .px_4()
                     .border_b_1()
                     .border_color(rgb(palette.border))
@@ -502,7 +577,7 @@ impl Render for ModelicaViewer {
                         div()
                             .flex()
                             .flex_col()
-                            .child(div().text_base().child(selected_name))
+                            .child(div().text_sm().child(selected_name))
                             .child(
                                 div()
                                     .text_xs()
@@ -517,34 +592,9 @@ impl Render for ModelicaViewer {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted))
-                                    .child("Source"),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(palette.accent).opacity(0.13))
-                                    .text_xs()
-                                    .text_color(rgb(palette.accent))
-                                    .child("Icon"),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted))
-                                    .child("Diagram"),
-                            ),
+                            .child(tab_chip("Source", false, palette))
+                            .child(tab_chip("Icon", true, palette))
+                            .child(tab_chip("Diagram", false, palette)),
                     ),
             )
             .child(
@@ -561,7 +611,7 @@ impl Render for ModelicaViewer {
             )
             .child(
                 div()
-                    .min_h(px(34.0))
+                    .min_h(px(32.0))
                     .px_4()
                     .py_2()
                     .border_t_1()
@@ -573,8 +623,7 @@ impl Render for ModelicaViewer {
                         rgb(0xf59e0b)
                     })
                     .child(if diagnostics.is_empty() {
-                        "Ready · GPUI native paint · Electron legacy appearance port"
-                            .to_owned()
+                        "Ready · native GPUI renderer".to_owned()
                     } else {
                         diagnostics
                     }),
@@ -586,7 +635,7 @@ impl Render for ModelicaViewer {
             .text_color(rgb(palette.text))
             .flex()
             .flex_col()
-            .child(header)
+            .child(chrome)
             .child(
                 div()
                     .flex_1()
@@ -597,6 +646,135 @@ impl Render for ModelicaViewer {
                     .child(sidebar)
                     .child(detail),
             )
+    }
+}
+
+fn choice_chip(id: String, label: &str, active: bool, palette: Palette) -> gpui::Div {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if active {
+            palette.accent
+        } else {
+            palette.border
+        }))
+        .bg(
+            rgb(if active {
+                palette.accent
+            } else {
+                palette.panel
+            })
+            .opacity(if active { 0.14 } else { 0.42 }),
+        )
+        .text_xs()
+        .text_color(rgb(if active {
+            palette.accent
+        } else {
+            palette.muted
+        }))
+        .cursor_pointer()
+        .child(label.to_owned())
+}
+
+fn setting_group(label: &str, choices: gpui::Div, palette: Palette) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(palette.subtle))
+                .child(label.to_owned()),
+        )
+        .child(choices)
+}
+
+fn tab_chip(label: &str, active: bool, palette: Palette) -> gpui::Div {
+    div()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(if active {
+            palette.accent
+        } else {
+            palette.muted
+        }))
+        .bg(
+            rgb(if active {
+                palette.accent
+            } else {
+                palette.panel_alt
+            })
+            .opacity(if active { 0.12 } else { 0.20 }),
+        )
+        .child(label.to_owned())
+}
+
+fn build_package_tree(package: &PackageNode, classes: &mut Vec<Class>) -> TreeNode {
+    let mut children = package
+        .children
+        .iter()
+        .map(|child| build_package_tree(child, classes))
+        .collect::<Vec<_>>();
+    children.extend(
+        package
+            .classes
+            .iter()
+            .map(|class| build_class_tree(class, classes)),
+    );
+    children.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    TreeNode {
+        key: format!("package:{}", package.qualified_name),
+        label: package.name.clone(),
+        kind: ClassKind::Package,
+        class_index: None,
+        children,
+    }
+}
+
+fn build_class_tree(class: &Class, classes: &mut Vec<Class>) -> TreeNode {
+    let class_index = classes.len();
+    classes.push(class.clone());
+    let mut children = class
+        .children
+        .iter()
+        .map(|child| build_class_tree(child, classes))
+        .collect::<Vec<_>>();
+    children.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    TreeNode {
+        key: format!("class:{}", class.qualified_name),
+        label: class.name.clone(),
+        kind: class.kind,
+        class_index: Some(class_index),
+        children,
+    }
+}
+
+fn collect_visible_rows(
+    node: &TreeNode,
+    depth: usize,
+    expanded: &HashSet<String>,
+    rows: &mut Vec<VisibleTreeRow>,
+) {
+    let is_expanded = expanded.contains(&node.key);
+    rows.push(VisibleTreeRow {
+        key: node.key.clone(),
+        label: node.label.clone(),
+        kind: node.kind,
+        class_index: node.class_index,
+        depth,
+        has_children: !node.children.is_empty(),
+        expanded: is_expanded,
+    });
+    if is_expanded {
+        for child in &node.children {
+            collect_visible_rows(child, depth + 1, expanded, rows);
+        }
     }
 }
 
@@ -630,7 +808,7 @@ fn paint_icon_scene(scene: &IconScene, bounds: Bounds<Pixels>, window: &mut Wind
                 let center_y = (graphic.extent.p1.y + graphic.extent.p2.y) * 0.5;
                 let radius_x = (graphic.extent.p2.x - graphic.extent.p1.x).abs() * 0.5;
                 let radius_y = (graphic.extent.p2.y - graphic.extent.p1.y).abs() * 0.5;
-                let mut points = Vec::with_capacity(49);
+                let mut points = Vec::with_capacity(48);
                 for index in 0..48 {
                     let angle = std::f32::consts::TAU * index as f32 / 48.0;
                     points.push(map.graphic_point(
@@ -794,25 +972,6 @@ fn paint_polyline(
 
 fn rgb24(color: [u8; 3]) -> u32 {
     (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])
-}
-
-fn flatten_package(package: &PackageNode, depth: usize, rows: &mut Vec<ClassRow>) {
-    for class in &package.classes {
-        flatten_class(class, depth, rows);
-    }
-    for child in &package.children {
-        flatten_package(child, depth + 1, rows);
-    }
-}
-
-fn flatten_class(class: &Class, depth: usize, rows: &mut Vec<ClassRow>) {
-    rows.push(ClassRow {
-        class: class.clone(),
-        depth,
-    });
-    for child in &class.children {
-        flatten_class(child, depth + 1, rows);
-    }
 }
 
 fn register_package_sources(package: &PackageNode, registry: &mut LibraryRegistry) {
