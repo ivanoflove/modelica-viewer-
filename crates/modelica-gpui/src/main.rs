@@ -1,14 +1,14 @@
 mod icon_view;
 
 use gpui::{
-    Anchor, App, Bounds, Context, Pixels, Render, Window, WindowBounds, WindowOptions, anchored,
-    deferred, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, size, uniform_list,
+    Anchor, App, Bounds, Context, Render, Window, WindowBounds, WindowOptions, anchored, deferred,
+    div, linear_color_stop, linear_gradient, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_platform::application;
 use icon_view::{SharedIconViewState, new_icon_view_state};
 use modelica_core::{
-    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry, PackageLoader,
-    PackageNode,
+    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry,
+    PackageLoader, PackageNode,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -277,91 +277,92 @@ impl Render for ModelicaViewer {
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
 
-        let tree = uniform_list(
-            "class-tree",
-            visible_count,
-            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                range
-                    .filter_map(|row_index| {
-                        let row = visible_rows.get(row_index)?.clone();
-                        let selected = row
-                            .class_index
-                            .is_some_and(|index| this.selected == Some(index));
-                        let key = row.key.clone();
-                        let class_index = row.class_index;
-                        let has_children = row.has_children;
-                        let toggle = if has_children {
-                            if row.expanded { "▾" } else { "▸" }
-                        } else {
-                            ""
-                        };
-                        let indent = 5.0 + row.depth as f32 * 12.0;
+        let tree =
+            uniform_list(
+                "class-tree",
+                visible_count,
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|row_index| {
+                            let row = visible_rows.get(row_index)?.clone();
+                            let selected = row
+                                .class_index
+                                .is_some_and(|index| this.selected == Some(index));
+                            let key = row.key.clone();
+                            let class_index = row.class_index;
+                            let has_children = row.has_children;
+                            let toggle = if has_children {
+                                if row.expanded { "▾" } else { "▸" }
+                            } else {
+                                ""
+                            };
+                            let indent = 5.0 + row.depth as f32 * 12.0;
 
-                        Some(
-                            div()
-                                .id(format!("tree-row-{row_index}"))
-                                .mx_1()
-                                .w_full()
-                                .h(px(29.0))
-                                .pl(px(indent))
-                                .pr_2()
-                                .rounded_md()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(rgb(if selected {
-                                    palette.selected_text
-                                } else {
-                                    palette.text
-                                }))
-                                .bg(rgb(if selected {
-                                    palette.accent
-                                } else {
-                                    palette.panel_alt
-                                })
-                                .opacity(if selected { 0.95 } else { 0.18 }))
-                                .hover(move |style| {
-                                    style.bg(rgb(if selected {
-                                        palette.accent_hover
+                            Some(
+                                div()
+                                    .id(format!("tree-row-{row_index}"))
+                                    .mx_1()
+                                    .w_full()
+                                    .h(px(29.0))
+                                    .pl(px(indent))
+                                    .pr_2()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(rgb(if selected {
+                                        palette.selected_text
                                     } else {
-                                        palette.card
+                                        palette.text
+                                    }))
+                                    .bg(rgb(if selected {
+                                        palette.accent
+                                    } else {
+                                        palette.panel_alt
                                     })
-                                    .opacity(0.78))
-                                })
-                                .cursor_pointer()
-                                .child(
-                                    div()
-                                        .w(px(14.0))
-                                        .text_color(rgb(palette.subtle))
-                                        .child(toggle),
-                                )
-                                .child(tree_icon(row.kind, selected, palette))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .child(row.label),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if has_children && class_index.is_none() {
-                                        this.toggle_tree(&key);
-                                    } else if let Some(index) = class_index {
-                                        this.select_class(index);
-                                        if has_children {
+                                    .opacity(if selected { 0.95 } else { 0.18 }))
+                                    .hover(move |style| {
+                                        style.bg(rgb(if selected {
+                                            palette.accent_hover
+                                        } else {
+                                            palette.card
+                                        })
+                                        .opacity(0.78))
+                                    })
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .text_color(rgb(palette.subtle))
+                                            .child(toggle),
+                                    )
+                                    .child(tree_icon(row.kind, selected, palette))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(row.label),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if has_children && class_index.is_none() {
                                             this.toggle_tree(&key);
+                                        } else if let Some(index) = class_index {
+                                            this.select_class(index);
+                                            if has_children {
+                                                this.toggle_tree(&key);
+                                            }
                                         }
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .h_full();
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -580,28 +581,20 @@ fn icon_toolbar(
             ),
         )
         .child(
-            toolbar_button("icon-zoom-in", "+", palette).on_click(cx.listener(
-                |this, _, _, cx| {
-                    this.zoom_icon(1.2);
-                    cx.notify();
-                },
-            )),
+            toolbar_button("icon-zoom-in", "+", palette).on_click(cx.listener(|this, _, _, cx| {
+                this.zoom_icon(1.2);
+                cx.notify();
+            })),
         )
         .child(
-            toolbar_button("icon-fit", "Fit", palette).on_click(cx.listener(
-                |this, _, _, cx| {
-                    this.request_icon_fit();
-                    cx.notify();
-                },
-            )),
+            toolbar_button("icon-fit", "Fit", palette).on_click(cx.listener(|this, _, _, cx| {
+                this.request_icon_fit();
+                cx.notify();
+            })),
         )
 }
 
-fn toolbar_button(
-    id: &'static str,
-    label: &str,
-    palette: Palette,
-) -> gpui::Stateful<gpui::Div> {
+fn toolbar_button(id: &'static str, label: &str, palette: Palette) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .min_w(px(28.0))
@@ -629,7 +622,7 @@ fn appearance_control(
     viewer: &ModelicaViewer,
     palette: Palette,
     cx: &mut Context<ModelicaViewer>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let mut button = div()
         .id("appearance-toggle")
         .px_3()

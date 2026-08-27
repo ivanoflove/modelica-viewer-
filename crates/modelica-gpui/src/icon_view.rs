@@ -1,8 +1,6 @@
 use gpui::{Bounds, PathBuilder, Pixels, Window, canvas, point, prelude::*, px, rgb};
 use modelica_core::{Graphic, IconScene};
-use modelica_render::{
-    Bounds as RenderBounds, ModelBounds, ModelPoint, Vec2, Viewport,
-};
+use modelica_render::{Bounds as RenderBounds, ModelBounds, ModelPoint, Vec2, Viewport};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
