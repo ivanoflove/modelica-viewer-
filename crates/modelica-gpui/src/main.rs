@@ -9,6 +9,86 @@ use modelica_core::{
 };
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThemeMode {
+    Glass,
+    Midnight,
+    Light,
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    root: u32,
+    panel: u32,
+    panel_alt: u32,
+    card: u32,
+    border: u32,
+    text: u32,
+    muted: u32,
+    subtle: u32,
+    accent: u32,
+    accent_hover: u32,
+    selected_text: u32,
+    canvas: u32,
+}
+
+impl ThemeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Glass => "Glass",
+            Self::Midnight => "Midnight",
+            Self::Light => "Light",
+        }
+    }
+
+    fn palette(self) -> Palette {
+        match self {
+            Self::Glass => Palette {
+                root: 0x090b12,
+                panel: 0x121722,
+                panel_alt: 0x181f2d,
+                card: 0x111722,
+                border: 0x2a3446,
+                text: 0xe7edf7,
+                muted: 0x9aa8bc,
+                subtle: 0x68778d,
+                accent: 0x5b8cff,
+                accent_hover: 0x6f9aff,
+                selected_text: 0xffffff,
+                canvas: 0xf8fafc,
+            },
+            Self::Midnight => Palette {
+                root: 0x07090d,
+                panel: 0x0f1117,
+                panel_alt: 0x171a22,
+                card: 0x10131a,
+                border: 0x272b35,
+                text: 0xe5e7eb,
+                muted: 0xa1a1aa,
+                subtle: 0x71717a,
+                accent: 0x2563eb,
+                accent_hover: 0x3b82f6,
+                selected_text: 0xffffff,
+                canvas: 0xfafafa,
+            },
+            Self::Light => Palette {
+                root: 0xeef2f7,
+                panel: 0xf8fafc,
+                panel_alt: 0xffffff,
+                card: 0xffffff,
+                border: 0xd7dee8,
+                text: 0x172033,
+                muted: 0x5f6b7a,
+                subtle: 0x8a96a8,
+                accent: 0x2563eb,
+                accent_hover: 0x1d4ed8,
+                selected_text: 0xffffff,
+                canvas: 0xffffff,
+            },
+        }
+    }
+}
+
 struct ClassRow {
     class: Class,
     depth: usize,
@@ -21,6 +101,7 @@ struct ModelicaViewer {
     selected: Option<usize>,
     scene: IconScene,
     registry: LibraryRegistry,
+    theme: ThemeMode,
 }
 
 impl ModelicaViewer {
@@ -48,6 +129,7 @@ impl ModelicaViewer {
                 diagnostics: Vec::new(),
             },
             registry,
+            theme: ThemeMode::Glass,
         };
 
         if !viewer.classes.is_empty() {
@@ -90,11 +172,15 @@ impl ModelicaViewer {
 
 impl Render for ModelicaViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.theme.palette();
         let mut tree = div()
+            .id("class-tree")
             .flex()
             .flex_col()
             .gap_1()
-            .p_2();
+            .p_2()
+            .flex_1()
+            .overflow_scroll();
 
         for (index, row) in self.classes.iter().enumerate() {
             let selected = self.selected == Some(index);
@@ -108,9 +194,9 @@ impl Render for ModelicaViewer {
                     .py_1()
                     .rounded_md()
                     .text_sm()
-                    .text_color(if selected { rgb(0xffffff) } else { rgb(0xd1d5db) })
-                    .bg(if selected { rgb(0x2563eb) } else { rgb(0x171717) })
-                    .hover(|style| style.bg(rgb(0x262626)))
+                    .text_color(rgb(if selected { palette.selected_text } else { palette.text }))
+                    .bg(rgb(if selected { palette.accent } else { palette.panel_alt }).opacity(if selected { 0.92 } else { 0.72 }))
+                    .hover(move |style| style.bg(rgb(if selected { palette.accent_hover } else { palette.card }).opacity(0.94)))
                     .cursor_pointer()
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -133,29 +219,56 @@ impl Render for ModelicaViewer {
             .collect::<Vec<_>>()
             .join("  ·  ");
 
+        let mut themes = div().flex().gap_1();
+        for mode in [ThemeMode::Glass, ThemeMode::Midnight, ThemeMode::Light] {
+            let active = self.theme == mode;
+            themes = themes.child(
+                div()
+                    .id(format!("theme-{}", mode.label()))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(if active { palette.selected_text } else { palette.muted }))
+                    .bg(rgb(if active { palette.accent } else { palette.panel_alt }).opacity(0.82))
+                    .hover(move |style| style.bg(rgb(if active { palette.accent_hover } else { palette.card }).opacity(0.94)))
+                    .child(mode.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.theme = mode;
+                        cx.notify();
+                    })),
+            );
+        }
+
         div()
             .size_full()
-            .bg(rgb(0x0b0b0c))
-            .text_color(rgb(0xe5e7eb))
+            .bg(rgb(palette.root))
+            .text_color(rgb(palette.text))
             .flex()
+            .p_2()
+            .gap_2()
             .child(
                 div()
-                    .w(px(280.0))
+                    .w(px(300.0))
                     .h_full()
-                    .border_r_1()
-                    .border_color(rgb(0x27272a))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel).opacity(if self.theme == ThemeMode::Glass { 0.86 } else { 1.0 }))
                     .flex()
                     .flex_col()
+                    .overflow_hidden()
                     .child(
                         div()
                             .px_3()
                             .py_3()
                             .border_b_1()
-                            .border_color(rgb(0x27272a))
+                            .border_color(rgb(palette.border))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(rgb(0xa1a1aa))
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
                                     .child("MODEL LIBRARY"),
                             )
                             .child(div().mt_1().text_base().child(self.package_name.clone()))
@@ -163,24 +276,30 @@ impl Render for ModelicaViewer {
                                 div()
                                     .mt_1()
                                     .text_xs()
-                                    .text_color(rgb(0x71717a))
+                                    .text_color(rgb(palette.subtle))
                                     .child(self.package_path.display().to_string()),
                             ),
                     )
-                    .child(tree.flex_1()),
+                    .child(tree),
             )
             .child(
                 div()
                     .flex_1()
                     .h_full()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel).opacity(if self.theme == ThemeMode::Glass { 0.88 } else { 1.0 }))
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .h(px(58.0))
+                            .min_h(px(64.0))
                             .px_4()
+                            .py_2()
                             .border_b_1()
-                            .border_color(rgb(0x27272a))
+                            .border_color(rgb(palette.border))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -192,7 +311,7 @@ impl Render for ModelicaViewer {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0x71717a))
+                                            .text_color(rgb(palette.subtle))
                                             .child(format!(
                                                 "{primitive_count} graphics · {diagnostic_count} diagnostics"
                                             )),
@@ -200,13 +319,20 @@ impl Render for ModelicaViewer {
                             )
                             .child(
                                 div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(0x18181b))
-                                    .text_xs()
-                                    .text_color(rgb(0x93c5fd))
-                                    .child("GPUI native paint"),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(themes)
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(palette.panel_alt).opacity(0.82))
+                                            .text_xs()
+                                            .text_color(rgb(palette.muted))
+                                            .child("GPUI native paint"),
+                                    ),
                             ),
                     )
                     .child(
@@ -215,8 +341,8 @@ impl Render for ModelicaViewer {
                             .m_3()
                             .rounded_lg()
                             .border_1()
-                            .border_color(rgb(0x27272a))
-                            .bg(rgb(0xfafafa))
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.canvas))
                             .overflow_hidden()
                             .child(icon_canvas(scene)),
                     )
@@ -226,15 +352,15 @@ impl Render for ModelicaViewer {
                             .px_4()
                             .py_2()
                             .border_t_1()
-                            .border_color(rgb(0x27272a))
+                            .border_color(rgb(palette.border))
                             .text_xs()
                             .text_color(if diagnostic_count == 0 {
-                                rgb(0x71717a)
+                                rgb(palette.subtle)
                             } else {
-                                rgb(0xfbbf24)
+                                rgb(0xf59e0b)
                             })
                             .child(if diagnostics.is_empty() {
-                                "Ready · Text and Bitmap custom-paint follow in the next renderer step"
+                                "Ready · theme affects UI chrome only; Modelica scene colors stay source-driven"
                                     .to_owned()
                             } else {
                                 diagnostics
@@ -323,10 +449,7 @@ fn paint_icon_scene(scene: &IconScene, bounds: Bounds<Pixels>, window: &mut Wind
                     graphic.line_thickness.unwrap_or(0.25) * map.scale,
                 );
             }
-            Graphic::Text(_) | Graphic::Bitmap(_) => {
-                // Text/Bitmap stay in the semantic scene. Their GPUI paint paths are added next;
-                // silently dropping them from parsing would make the migration impossible to test.
-            }
+            Graphic::Text(_) | Graphic::Bitmap(_) => {}
         }
     }
 }
