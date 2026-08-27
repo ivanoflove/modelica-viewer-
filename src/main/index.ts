@@ -16,6 +16,7 @@ import {
   resolveIconForClass,
   buildGraphicInsertionEdit,
 } from "./modelica/iconResolver.js";
+import { resolveDiagramForClass } from "./modelica/diagramResolver.js";
 import { parseModelicaFile } from "./modelica/parser.js";
 import { tokenize } from "./modelica/lexer.js";
 import { ModelicaLibraryRegistry } from "./modelica/registry.js";
@@ -404,6 +405,32 @@ function registerIpcHandlers(): void {
           };
         }
         return { editable };
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelica:getDiagram",
+    async (
+      _event,
+      filePath: string,
+      sourceRange: { start: number; end: number } | null,
+    ) => {
+      try {
+        if (!filePath) return { error: "No file path provided" };
+        const content = await readFile(filePath, "utf-8");
+        const parsed = parseModelicaFile(content, filePath);
+        libraryRegistry.registerSource(filePath, content, parsed);
+        const target = findClassBySourceRange(parsed.classes, sourceRange);
+        if (!target) return { error: "DIAGRAM_CLASS_NOT_FOUND: unable to locate selected class" };
+        const scene = resolveDiagramForClass(
+          target,
+          content,
+          (owner, baseName) => libraryRegistry.resolveFor(owner, baseName),
+        );
+        return { scene };
       } catch (e) {
         return { error: (e as Error).message };
       }

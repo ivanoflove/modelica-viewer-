@@ -3,6 +3,7 @@ import type {
   CreateGraphicRequest,
   CreateGraphicResult,
   GetEditableIconResult,
+  GetDiagramResult,
   GetIconResult,
   LoadPackageResult,
   ReadSourceResult,
@@ -44,6 +45,10 @@ export interface WindowApi {
       sourceRange: SourceRangeDto | null,
       modelName: string,
     ) => Promise<GetEditableIconResult>;
+    getDiagram: (
+      filePath: string,
+      sourceRange: SourceRangeDto | null,
+    ) => Promise<GetDiagramResult>;
     applySourceEdit: (
       filePath: string,
       edit: SourceEdit,

@@ -4,11 +4,13 @@ import type {
   PackageNodeDto,
   CreateGraphicResult,
   SourceEditReason,
+  DiagramSceneDto,
 } from "../../shared/modelica";
 import type { LibraryInfo } from "../../shared/api";
 import type { IconDto, EditableIconDto, GraphicItemDto, GraphicToolType, Point } from "../../shared/modelicaGraphics";
 import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
+import { DiagramViewer } from "./components/DiagramViewer";
 import { AppearancePopover } from "./components/AppearancePopover";
 
 type ViewMode = "source" | "icon" | "diagram";
@@ -46,6 +48,9 @@ function App(): JSX.Element {
   const [editableIcon, setEditableIcon] = useState<EditableIconDto | null>(
     null,
   );
+  const [diagramScene, setDiagramScene] = useState<DiagramSceneDto | null>(null);
+  const [diagramLoading, setDiagramLoading] = useState(false);
+  const [diagramError, setDiagramError] = useState<string | null>(null);
 
   const applyLoadResult = (result: LoadPackageResult): void => {
     if ("error" in result) {
@@ -112,6 +117,9 @@ function App(): JSX.Element {
       setIcon(null);
       setIconError(null);
       setIconWarning(null);
+      setDiagramScene(null);
+      setDiagramError(null);
+      setDiagramLoading(false);
       return;
     }
     let active = true;
@@ -186,8 +194,33 @@ function App(): JSX.Element {
         if (active) setIconLoading(false);
       }
     };
+    const loadDiagram = async () => {
+      setDiagramLoading(true);
+      setDiagramError(null);
+      try {
+        const result = await window.api.modelica.getDiagram(
+          selected.node.sourceFile,
+          selected.node.sourceRange ?? null,
+        );
+        if (!active) return;
+        if ("error" in result) {
+          setDiagramScene(null);
+          setDiagramError(result.error);
+        } else {
+          setDiagramScene(result.scene);
+        }
+      } catch (e) {
+        if (active) {
+          setDiagramScene(null);
+          setDiagramError((e as Error).message);
+        }
+      } finally {
+        if (active) setDiagramLoading(false);
+      }
+    };
     void loadSource();
     void loadIcon();
+    void loadDiagram();
     return () => {
       active = false;
     };
@@ -565,8 +598,16 @@ function App(): JSX.Element {
                   </div>
                 )}
                 {viewMode === "diagram" && (
-                  <div className="source-editor">
-                    <div className="no-icon">Diagram 暂未实现</div>
+                  <div className="source-editor diagram-tab">
+                    {diagramLoading ? (
+                      <div className="source-status">Diagram 加载中…</div>
+                    ) : diagramError ? (
+                      <div className="source-error">{diagramError}</div>
+                    ) : diagramScene ? (
+                      <DiagramViewer scene={diagramScene} />
+                    ) : (
+                      <div className="diagram-empty">No placed components</div>
+                    )}
                   </div>
                 )}
               </>

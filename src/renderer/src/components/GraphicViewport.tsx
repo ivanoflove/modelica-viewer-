@@ -97,6 +97,7 @@ interface Props {
   canvasCursor?: string;
   onCanvasDragOver?: (event: React.DragEvent<HTMLDivElement>) => void;
   onCanvasDrop?: (event: React.DragEvent<HTMLDivElement>) => void;
+  canvasLabel?: string;
   onUndo?: () => void;
   onRedo?: () => void;
   onDelete?: () => boolean;
@@ -226,6 +227,7 @@ export function GraphicViewport({
   canvasCursor,
   onCanvasDragOver,
   onCanvasDrop,
+  canvasLabel = "Icon 画布",
   onUndo,
   onRedo,
   onDelete,
@@ -469,7 +471,7 @@ export function GraphicViewport({
       }}
     >
       <div className="icon-viewer-toolbar">
-        <span>Icon 画布 · {zoomPercent}%</span>
+        <span>{canvasLabel} · {zoomPercent}%</span>
         <div className="fit-toggle">
           <button
             className={fitMode === "content" ? "active" : ""}

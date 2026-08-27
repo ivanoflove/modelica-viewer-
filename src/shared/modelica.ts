@@ -61,6 +61,36 @@ export type GetEditableIconResult =
   | { editable: EditableIconDto | null }
   | { error: string };
 
+export interface TransformationDto {
+  origin: Point;
+  extent: { p1: Point; p2: Point };
+  rotation: number;
+}
+
+export interface PlacementDto {
+  visible: boolean;
+  transformation?: TransformationDto;
+}
+
+export interface ComponentInstanceDto {
+  id: string;
+  name: string;
+  typeName: string;
+  sourceRange: SourceRangeDto;
+  placement?: PlacementDto;
+  resolvedIcon?: IconDto;
+}
+
+export interface DiagramSceneDto {
+  coordinateSystem: IconDto["coordinateSystem"];
+  components: ComponentInstanceDto[];
+  diagnostics: string[];
+}
+
+export type GetDiagramResult =
+  | { scene: DiagramSceneDto }
+  | { error: string };
+
 export interface SourceEdit {
   start: number;
   end: number;

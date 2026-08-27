@@ -8,6 +8,7 @@ import type {
   CreateGraphicRequest,
   CreateGraphicResult,
   GetEditableIconResult,
+  GetDiagramResult,
   GetIconResult,
   LoadPackageResult,
   ReadSourceResult,
@@ -64,6 +65,12 @@ const api: WindowApi = {
         sourceRange,
         modelName,
       ) as Promise<GetEditableIconResult>,
+    getDiagram: (filePath: string, sourceRange: SourceRangeDto | null) =>
+      ipcRenderer.invoke(
+        "modelica:getDiagram",
+        filePath,
+        sourceRange,
+      ) as Promise<GetDiagramResult>,
     applySourceEdit: (filePath: string, edit: SourceEdit) =>
       ipcRenderer.invoke(
         "modelica:applySourceEdit",
