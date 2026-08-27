@@ -99,6 +99,7 @@ interface Props {
   onCanvasDrop?: (event: React.DragEvent<HTMLDivElement>) => void;
   onUndo?: () => void;
   onRedo?: () => void;
+  onDelete?: () => boolean;
   canUndo?: boolean;
   canRedo?: boolean;
 }
@@ -227,6 +228,7 @@ export function GraphicViewport({
   onCanvasDrop,
   onUndo,
   onRedo,
+  onDelete,
   canUndo = false,
   canRedo = false,
 }: Props) {
@@ -406,9 +408,24 @@ export function GraphicViewport({
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const activeElement = event.currentTarget.ownerDocument.activeElement;
+    const isTextEditing =
+      activeElement instanceof HTMLElement &&
+      (activeElement.tagName === "INPUT" ||
+        activeElement.tagName === "TEXTAREA" ||
+        activeElement.tagName === "SELECT" ||
+        activeElement.isContentEditable);
     if (event.key === " ") {
       spacePressed.current = true;
       event.preventDefault();
+      return;
+    }
+    if ((event.key === "Delete" || event.key === "Backspace") && !isTextEditing) {
+      const handled = event.key === "Delete" ? true : (onDelete?.() ?? false);
+      if (handled) {
+        event.preventDefault();
+        if (event.key === "Delete") onDelete?.();
+      }
       return;
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
@@ -492,6 +509,7 @@ export function GraphicViewport({
           preserveAspectRatio="xMidYMid meet"
           style={{ touchAction: "none", cursor: isPanning ? "grabbing" : canvasCursor ?? "default" }}
           onPointerDownCapture={(event) => {
+            if (event.button === 0) shellRef.current?.focus({ preventScroll: true });
             startPan(event);
             onCanvasPointerDownCapture?.(event);
           }}

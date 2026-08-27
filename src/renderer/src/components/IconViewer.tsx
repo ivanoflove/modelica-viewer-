@@ -221,8 +221,20 @@ export function IconViewer({
     setHiddenGraphicIds(new Set());
     setContextMenu(null);
     setPropertiesGraphicId(null);
-    setFloatingPosition(null);
-  }, [editable]);
+    try {
+      const stored = globalThis.localStorage.getItem(
+        `modelica-viewer:properties-window:${modelName}`,
+      );
+      const parsed = stored ? JSON.parse(stored) as { x?: number; y?: number } : null;
+      setFloatingPosition(
+        parsed && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)
+          ? { x: parsed.x!, y: parsed.y! }
+          : null,
+      );
+    } catch {
+      setFloatingPosition(null);
+    }
+  }, [editable, modelName]);
 
   useEffect(() => {
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
@@ -267,7 +279,12 @@ export function IconViewer({
           return;
         }
         setContextMenu(null);
-        setPropertiesGraphicId(null);
+        if (propertiesGraphicId) {
+          setPropertiesGraphicId(null);
+        } else if (sel.selectedId) {
+          sel.setSelected(null);
+          setVertexSelection(null);
+        }
       }
       if (drawingRef.current && (event.key === "Enter" || event.key === "Backspace")) {
         drawingKeyHandlerRef.current(event);
@@ -280,7 +297,7 @@ export function IconViewer({
       window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [drawingTool]);
+  }, [drawingTool, propertiesGraphicId, sel.selectedId]);
 
   if (!icon) return <div className="no-icon">No Icon annotation</div>;
 
@@ -314,8 +331,13 @@ export function IconViewer({
     const start = session.startPoint;
     const current = session.currentPoint;
     if (session.tool === "Line") {
-      if (!start || !current) return null;
-      return { type: "Line", points: [start, current], color: [0, 0, 0], thickness: 0.25 };
+      const points = session.points.map((point) => ({ ...point }));
+      if (!final && current && (points.length === 0 || points[points.length - 1]!.x !== current.x || points[points.length - 1]!.y !== current.y)) {
+        points.push({ ...current });
+      }
+      return points.length >= 2
+        ? { type: "Line", points, color: [0, 0, 0], thickness: 0.25 }
+        : null;
     }
     if (session.tool === "Polygon") {
       const points = session.points.map((point) => ({ ...point }));
@@ -406,20 +428,16 @@ export function IconViewer({
     setInteractionNotice(null);
     const tool = drawingTool;
     const session = drawingRef.current;
-    if (tool === "Line" && session?.tool === "Line" && session.points.length === 1) {
-      const start = session.points[0]!;
-      if (!drawingIsLargeEnough(start, point)) {
+    if (tool === "Line" && session?.tool === "Line") {
+      const previous = session.points[session.points.length - 1];
+      if (previous && !drawingIsLargeEnough(previous, point)) {
         session.currentPoint = { ...point };
         scheduleDrawingPreview();
         return;
       }
       session.points.push({ ...point });
       session.currentPoint = { ...point };
-      const graphic = drawingGraphic(session, true);
-      drawingRef.current = null;
-      setDrawingPreview(null);
-      setDrawingTool("select");
-      void commitCreatedGraphic("Line", start, graphic ?? undefined);
+      scheduleDrawingPreview();
       return;
     }
     if (tool === "Polygon" && session?.tool === "Polygon") {
@@ -479,10 +497,23 @@ export function IconViewer({
   };
 
   const handleCanvasDoubleClick = (event: MouseEvent<SVGSVGElement>) => {
-    if (drawingRef.current?.tool !== "Polygon") return;
+    if (drawingRef.current?.tool !== "Polygon" && drawingRef.current?.tool !== "Line") return;
     event.preventDefault();
     event.stopPropagation();
-    finishPolygon();
+    if (drawingRef.current.tool === "Polygon") finishPolygon();
+    else finishLine();
+  };
+
+  const finishLine = () => {
+    const session = drawingRef.current;
+    if (!session || session.tool !== "Line" || session.points.length < 2) return;
+    const graphic = drawingGraphic(session, true);
+    if (!graphic) return;
+    const position = session.points[0]!;
+    drawingRef.current = null;
+    setDrawingPreview(null);
+    setDrawingTool("select");
+    void commitCreatedGraphic("Line", position, graphic);
   };
 
   const handleDrawingPointerUp = (event: PointerEvent<SVGSVGElement>) => {
@@ -535,14 +566,7 @@ export function IconViewer({
     if (event.key === "Enter") {
       event.preventDefault();
       if (session.tool === "Polygon") finishPolygon();
-      else if (session.tool === "Line" && session.points.length >= 2) {
-        const graphic = drawingGraphic(session, true);
-        const position = session.points[0]!;
-        drawingRef.current = null;
-        setDrawingPreview(null);
-        setDrawingTool("select");
-        void commitCreatedGraphic("Line", position, graphic ?? undefined);
-      }
+      else if (session.tool === "Line") finishLine();
     }
   };
 
@@ -852,12 +876,18 @@ export function IconViewer({
   const clampFloatingPosition = (x: number, y: number) => {
     const shell = shellRef.current;
     const width = floatingWindowRef.current?.offsetWidth ?? 276;
-    const height = floatingWindowRef.current?.offsetHeight ?? 520;
-    const maxX = Math.max(12, (shell?.clientWidth ?? width + 24) - width - 12);
-    const maxY = Math.max(12, (shell?.clientHeight ?? height + 24) - height - 12);
+    const height = floatingWindowRef.current?.offsetHeight ?? 360;
+    const containerWidth = shell?.clientWidth ?? width + 160;
+    const containerHeight = shell?.clientHeight ?? height + 80;
+    // Keep a usable title-bar strip visible, while allowing the inspector to
+    // move partly outside the workspace like a desktop/CAD palette.
+    const minX = -width + 80;
+    const maxX = Math.max(minX, containerWidth - 80);
+    const minY = 0;
+    const maxY = Math.max(minY, containerHeight - 40);
     return {
-      x: Math.min(Math.max(12, x), maxX),
-      y: Math.min(Math.max(12, y), maxY),
+      x: Math.min(Math.max(minX, x), maxX),
+      y: Math.min(Math.max(minY, y), maxY),
     };
   };
 
@@ -933,7 +963,17 @@ export function IconViewer({
 
   useEffect(() => {
     if (floatingPosition) applyFloatingPosition(floatingPosition);
-  }, [floatingPosition]);
+    try {
+      if (floatingPosition) {
+        globalThis.localStorage.setItem(
+          `modelica-viewer:properties-window:${modelName}`,
+          JSON.stringify(floatingPosition),
+        );
+      }
+    } catch {
+      // Storage is optional in hardened/browser test environments.
+    }
+  }, [floatingPosition, modelName]);
 
   useEffect(() => {
     const clampCurrent = () => {
@@ -945,31 +985,31 @@ export function IconViewer({
     return () => window.removeEventListener("resize", clampCurrent);
   }, []);
 
-  const handleDeleteGraphic = () => {
-    const id = contextMenu?.graphicId;
+  const handleDeleteGraphic = (requestedId?: string): boolean => {
+    const id = requestedId ?? contextMenu?.graphicId ?? sel.selectedId;
     const ed = editables.find((item) => item.id === id);
     if (!id || !ed) {
-      setInteractionNotice("继承图形不能在当前类删除");
+      if (id) setInteractionNotice("继承图形不能在当前类删除");
       closeContextMenu();
-      return;
+      return false;
     }
     if (!onEdit) {
       setInteractionNotice("当前文件不可编辑");
       closeContextMenu();
-      return;
+      return true;
     }
     if (ed.inherited) {
       setInteractionNotice(
         `继承图形不能在当前类删除：${ed.ownerQualifiedName ?? "基类"}`,
       );
       closeContextMenu();
-      return;
+      return true;
     }
     const edit = buildDeleteEdit(ed, sourceText);
     if (!edit) {
       setInteractionNotice("无法安全定位该图元，已取消删除");
       closeContextMenu();
-      return;
+      return true;
     }
     const before = optimisticGraphics.get(ed.id) ?? ed.graphic;
     setHiddenGraphicIds((current) => new Set(current).add(ed.id));
@@ -1001,10 +1041,11 @@ export function IconViewer({
           next.delete(ed.id);
           return next;
         });
-        setInteractionNotice(
+      setInteractionNotice(
           `删除未保存：${error instanceof Error ? error.message : "未知错误"}`,
         );
       });
+    return true;
   };
 
   const openProperties = () => {
@@ -1014,7 +1055,9 @@ export function IconViewer({
       contextMenu.y + 14,
     );
     setPropertiesGraphicId(contextMenu.graphicId);
-    setFloatingPosition((current) => current ?? requested);
+    setFloatingPosition((current) =>
+      current ? clampFloatingPosition(current.x, current.y) : requested,
+    );
     closeContextMenu();
   };
 
@@ -1655,6 +1698,7 @@ export function IconViewer({
         }}
         onUndo={() => void applyHistory("undo")}
         onRedo={() => void applyHistory("redo")}
+        onDelete={() => handleDeleteGraphic()}
         canUndo={canUndo}
         canRedo={canRedo}
       >
@@ -1792,47 +1836,49 @@ export function IconViewer({
           </g>
         </g>
       </GraphicViewport>
-      {contextMenu && (
-        <div
-          className="graphic-context-menu"
-          role="menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onPointerDown={(event) => event.stopPropagation()}
-        >
-          <button
-            role="menuitem"
-            onClick={openProperties}
+      <div className="workspace-overlay">
+        {contextMenu && (
+          <div
+            className="graphic-context-menu"
+            role="menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
           >
-            Properties…
-          </button>
-          <button
-            role="menuitem"
-            disabled={
-              !editables.some(
-                (ed) => ed.id === contextMenu.graphicId && !ed.inherited,
-              )
-            }
-            onClick={handleDeleteGraphic}
-          >
-            Delete
-          </button>
-        </div>
-      )}
-      {inspectorEditable && (
-        <GraphicProperties
-          editable={inspectorEditable ?? null}
-          onPropertyEdit={handlePropertyEdit}
-          onClose={() => setPropertiesGraphicId(null)}
-          onHeaderPointerDown={handleFloatingPointerDown}
-          onHeaderPointerMove={handleFloatingPointerMove}
-          onHeaderPointerUp={endFloatingDrag}
-          onHeaderPointerCancel={endFloatingDrag}
-          floatingWindowRef={floatingWindowRef}
-        />
-      )}
-      {interactionNotice && (
-        <div className="icon-interaction-notice">{interactionNotice}</div>
-      )}
+            <button
+              role="menuitem"
+              onClick={openProperties}
+            >
+              Properties…
+            </button>
+            <button
+              role="menuitem"
+              disabled={
+                !editables.some(
+                  (ed) => ed.id === contextMenu.graphicId && !ed.inherited,
+                )
+              }
+              onClick={() => void handleDeleteGraphic()}
+            >
+              Delete
+            </button>
+          </div>
+        )}
+        {inspectorEditable && (
+          <GraphicProperties
+            editable={inspectorEditable ?? null}
+            onPropertyEdit={handlePropertyEdit}
+            onClose={() => setPropertiesGraphicId(null)}
+            onHeaderPointerDown={handleFloatingPointerDown}
+            onHeaderPointerMove={handleFloatingPointerMove}
+            onHeaderPointerUp={endFloatingDrag}
+            onHeaderPointerCancel={endFloatingDrag}
+            floatingWindowRef={floatingWindowRef}
+          />
+        )}
+        {interactionNotice && (
+          <div className="icon-interaction-notice">{interactionNotice}</div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2411,7 +2457,7 @@ function GraphicProperties({
         onPointerUp={onHeaderPointerUp}
         onPointerCancel={onHeaderPointerCancel}
       >
-        <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><div className="properties-heading-actions"><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span><button className="properties-close" type="button" aria-label="Close properties" onClick={onClose}>×</button></div></div>
+        <div className="properties-heading"><div><span className="properties-kicker">GRAPHIC PROPERTIES</span><h3>{graphic.type}</h3></div><div className="properties-heading-actions"><span className={readOnly ? "property-badge inherited" : "property-badge"}>{readOnly ? "Inherited" : "Own"}</span><button className="properties-close" type="button" aria-label="Close properties" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); }} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onClose(); }}>×</button></div></div>
       </div>
       {readOnly && <p className="property-note">来自 {editable.ownerQualifiedName ?? "基类"}，当前类不可编辑。</p>}
       <PropertySection title="Geometry">
