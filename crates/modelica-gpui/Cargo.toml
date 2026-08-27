@@ -1,0 +1,10 @@
+[package]
+name = "modelica-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modelica-core = { path = "../modelica-core" }
+modelica-render = { path = "../modelica-render" }
+
