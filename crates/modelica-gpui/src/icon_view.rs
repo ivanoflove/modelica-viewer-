@@ -1,6 +1,6 @@
 use gpui::{
     Bounds, MouseButton, PathBuilder, Pixels, ScrollDelta, TextAlign, TextRun, UnderlineStyle,
-    Window, canvas, div, fill, point, prelude::*, px, rgb, size,
+    Window, canvas, div, fill, font, point, prelude::*, px, rgb, size,
 };
 use modelica_core::{Graphic, IconScene};
 use modelica_render::{
@@ -407,17 +407,25 @@ fn paint_closed_polygon(
                 paint_horizontal_hatch(window, points, stroke_color);
                 paint_vertical_hatch(window, points, stroke_color);
             }
-            // GPUI path fill does not expose SVG-style pattern/gradient brushes.
-            // Keep these visible with their base fill rather than dropping the icon.
-            Some("FillPattern.Forward")
-            | Some("FillPattern.Backward")
-            | Some("FillPattern.CrossDiag")
-            | Some("FillPattern.HorizontalCylinder")
-            | Some("FillPattern.VerticalCylinder")
-            | Some("FillPattern.Sphere")
-            | Some("FillPattern.Solid")
-            | None
-            | Some(_) => {}
+            Some("FillPattern.Forward") => paint_diagonal_hatch(window, points, stroke_color, true),
+            Some("FillPattern.Backward") => {
+                paint_diagonal_hatch(window, points, stroke_color, false)
+            }
+            Some("FillPattern.CrossDiag") => {
+                paint_diagonal_hatch(window, points, stroke_color, true);
+                paint_diagonal_hatch(window, points, stroke_color, false);
+            }
+            Some("FillPattern.HorizontalCylinder") => {
+                paint_horizontal_hatch(window, points, blend_color(stroke_color, fill_color, 0.55));
+            }
+            Some("FillPattern.VerticalCylinder") => {
+                paint_vertical_hatch(window, points, blend_color(stroke_color, fill_color, 0.55));
+            }
+            Some("FillPattern.Sphere") => {
+                paint_horizontal_hatch(window, points, blend_color(stroke_color, fill_color, 0.35));
+                paint_vertical_hatch(window, points, blend_color(stroke_color, fill_color, 0.35));
+            }
+            Some("FillPattern.Solid") | None | Some(_) => {}
         }
     }
 
@@ -581,6 +589,62 @@ fn paint_vertical_hatch(window: &mut Window, polygon: &[gpui::Point<Pixels>], co
     }
 }
 
+fn paint_diagonal_hatch(
+    window: &mut Window,
+    polygon: &[gpui::Point<Pixels>],
+    color: [u8; 3],
+    forward: bool,
+) {
+    if polygon.is_empty() {
+        return;
+    }
+    let values = polygon.iter().map(|point| {
+        let x = f32::from(point.x);
+        let y = f32::from(point.y);
+        if forward { x + y } else { x - y }
+    });
+    let (min_value, max_value) = values.fold((f32::MAX, f32::MIN), |(min, max), value| {
+        (min.min(value), max.max(value))
+    });
+    let mut scan = min_value;
+    while scan <= max_value {
+        let mut intersections = Vec::new();
+        for index in 0..polygon.len() {
+            let a = polygon[index];
+            let b = polygon[(index + 1) % polygon.len()];
+            let ax = f32::from(a.x);
+            let ay = f32::from(a.y);
+            let bx = f32::from(b.x);
+            let by = f32::from(b.y);
+            let a_value = if forward { ax + ay } else { ax - ay };
+            let b_value = if forward { bx + by } else { bx - by };
+            if (a_value > scan) == (b_value > scan) || (b_value - a_value).abs() <= f32::EPSILON {
+                continue;
+            }
+            let t = (scan - a_value) / (b_value - a_value);
+            intersections.push((ax + t * (bx - ax), ay + t * (by - ay)));
+        }
+        intersections.sort_by(|left, right| left.0.total_cmp(&right.0));
+        for pair in intersections.chunks_exact(2) {
+            paint_simple_segment(
+                window,
+                point(px(pair[0].0), px(pair[0].1)),
+                point(px(pair[1].0), px(pair[1].1)),
+                color,
+                1.0,
+            );
+        }
+        scan += HATCH_STEP_PX * std::f32::consts::SQRT_2;
+    }
+}
+
+fn blend_color(first: [u8; 3], second: [u8; 3], first_weight: f32) -> [u8; 3] {
+    let weight = first_weight.clamp(0.0, 1.0);
+    std::array::from_fn(|index| {
+        (f32::from(first[index]) * weight + f32::from(second[index]) * (1.0 - weight)) as u8
+    })
+}
+
 fn polygon_scan_intersections(
     polygon: &[gpui::Point<Pixels>],
     scan: f32,
@@ -640,10 +704,28 @@ fn paint_text(
         y: (graphic.extent.p1.y + graphic.extent.p2.y) * 0.5,
     };
     let center = map.graphic_point(center_local, graphic.origin, graphic.rotation);
-    let style = window.text_style();
+    let mut text_font = graphic
+        .font_name
+        .as_deref()
+        .map(font)
+        .unwrap_or_else(|| window.text_style().font());
+    if graphic
+        .text_style
+        .iter()
+        .any(|style| style.ends_with("Bold"))
+    {
+        text_font = text_font.bold();
+    }
+    if graphic
+        .text_style
+        .iter()
+        .any(|style| style.ends_with("Italic"))
+    {
+        text_font = text_font.italic();
+    }
     let run = TextRun {
         len: graphic.text.len(),
-        font: style.font(),
+        font: text_font,
         color: rgb(rgb24(graphic.color)).into(),
         background_color: None,
         underline: graphic
