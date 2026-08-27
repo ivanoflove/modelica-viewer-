@@ -460,7 +460,11 @@ export function resolveIconForClass(
     target.sourceRange.start,
     target.sourceRange.end,
   );
-  const ownRawIcon = extractIconFromSlice(ownSlice, modelName);
+  const ownMatch = findIconAnnotation(ownSlice);
+  const ownRawIcon = ownMatch ? resolveIcon(ownMatch.icon, modelName) : null;
+  const ownDefinesCoordinateSystem = ownMatch
+    ? iconDefinesCoordinateSystem(ownMatch.icon)
+    : false;
   const ownIcon = ownRawIcon
     ? annotateGraphics(ownRawIcon, target, false, [target.qualifiedName])
     : null;
@@ -515,11 +519,25 @@ export function resolveIconForClass(
   if (!inherited) return { icon: ownIcon, warnings };
   return {
     icon: {
-      coordinateSystem: ownIcon.coordinateSystem,
+      coordinateSystem: ownDefinesCoordinateSystem
+        ? ownIcon.coordinateSystem
+        : inherited.coordinateSystem,
       graphics: [...inherited.graphics, ...ownIcon.graphics],
     },
     warnings,
   };
+}
+
+function iconDefinesCoordinateSystem(icon: AnnotationCall): boolean {
+  const named = getArg(icon, "coordinateSystem");
+  if (named?.type === "call" && named.call.name === "coordinateSystem") return true;
+  if (getArg(icon, "extent")) return true;
+  return icon.arguments.some(
+    (argument) =>
+      !argument.name &&
+      argument.value.type === "call" &&
+      argument.value.call.name === "coordinateSystem",
+  );
 }
 
 interface IconAnnotationMatch {

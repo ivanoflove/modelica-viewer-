@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseModelicaFile } from "../parser.js";
 import { resolveDiagramForClass } from "../diagramResolver.js";
-import { buildClassIndex } from "../iconResolver.js";
+import { buildClassIndex, resolveIconForClass } from "../iconResolver.js";
 import { computePlacementTransform, transformPlacementPoint } from "../../../shared/diagram.js";
 
 describe("Diagram M1 resolver", () => {
@@ -56,5 +56,20 @@ describe("Diagram M1 resolver", () => {
     );
     expect(scene.components[0]?.placement).toBeUndefined();
     expect(scene.diagnostics[0]).toContain("no Placement");
+  });
+
+  it("inherits the base Icon coordinateSystem when the derived Icon omits it", () => {
+    const source = `within Demo;
+      model Base annotation(Icon(coordinateSystem(extent={{-200,-100},{200,100}}), graphics={Rectangle(extent={{-200,-100},{200,100}})})); end Base;
+      model Derived extends Base;
+        annotation(Icon(graphics={Ellipse(extent={{-50,-50},{50,50}})}));
+      end Derived;`;
+    const parsed = parseModelicaFile(source, "demo.mo");
+    const derived = parsed.classes.find((item) => item.name === "Derived")!;
+    const resolved = resolveIconForClass(derived, parsed.classes, source, "Derived");
+    expect(resolved.icon?.coordinateSystem.extent).toEqual({
+      p1: { x: -200, y: -100 },
+      p2: { x: 200, y: 100 },
+    });
   });
 });

@@ -2,7 +2,7 @@ import { useMemo, useRef } from "react";
 import type { IconDto, GraphicItemDto } from "../../../shared/modelicaGraphics";
 import type { ComponentInstanceDto, DiagramSceneDto } from "../../../shared/modelica";
 import { computePlacementTransform } from "../../../shared/diagram";
-import { GraphicItem } from "./GraphicItem";
+import { ResolvedGraphicRenderer } from "./GraphicItem";
 import { GraphicViewport } from "./GraphicViewport";
 
 function viewportIcon(scene: DiagramSceneDto): IconDto {
@@ -35,10 +35,10 @@ function ComponentRenderer({
   const labelY = Math.min(transformation.extent.p1.y, transformation.extent.p2.y) - 7;
   return (
     <g className="diagram-component" data-component-id={component.id}>
-      {icon ? (
+      {icon && component.classKind !== "connector" ? (
         <g transform={computePlacementTransform(icon.coordinateSystem, transformation)}>
           {icon.graphics.map((graphic, graphicIndex) => (
-            <GraphicItem
+            <ResolvedGraphicRenderer
               key={`${component.id}:${graphicIndex}`}
               item={graphic}
               styleId={`diagram-style-${index}-${graphicIndex}`}

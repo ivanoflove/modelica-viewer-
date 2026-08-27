@@ -12,9 +12,9 @@ export function computePlacementTransform(
   const iconHeight = icon.p2.y - icon.p1.y || 1;
   const scaleX = (target.p2.x - target.p1.x) / iconWidth;
   const scaleY = (target.p2.y - target.p1.y) / iconHeight;
-  const centerX = (icon.p1.x + icon.p2.x) / 2;
-  const centerY = (icon.p1.y + icon.p2.y) / 2;
-  return `translate(${transformation.origin.x},${transformation.origin.y}) rotate(${transformation.rotation}) scale(${scaleX},${scaleY}) translate(${-centerX},${-centerY})`;
+  const translateX = target.p1.x - icon.p1.x * scaleX;
+  const translateY = target.p1.y - icon.p1.y * scaleY;
+  return `translate(${transformation.origin.x},${transformation.origin.y}) rotate(${transformation.rotation}) translate(${translateX},${translateY}) scale(${scaleX},${scaleY})`;
 }
 
 export function transformPlacementPoint(
@@ -27,13 +27,12 @@ export function transformPlacementPoint(
   const scaleX = (target.p2.x - target.p1.x) / (icon.p2.x - icon.p1.x || 1);
   const scaleY = (target.p2.y - target.p1.y) / (icon.p2.y - icon.p1.y || 1);
   const angle = (transformation.rotation * Math.PI) / 180;
-  const scaled = {
-    x: (point.x - (icon.p1.x + icon.p2.x) / 2) * scaleX,
-    y: (point.y - (icon.p1.y + icon.p2.y) / 2) * scaleY,
+  const translated = {
+    x: point.x * scaleX + target.p1.x - icon.p1.x * scaleX,
+    y: point.y * scaleY + target.p1.y - icon.p1.y * scaleY,
   };
   return {
-    x: transformation.origin.x + scaled.x * Math.cos(angle) - scaled.y * Math.sin(angle),
-    y: transformation.origin.y + scaled.x * Math.sin(angle) + scaled.y * Math.cos(angle),
+    x: transformation.origin.x + translated.x * Math.cos(angle) - translated.y * Math.sin(angle),
+    y: transformation.origin.y + translated.x * Math.sin(angle) + translated.y * Math.cos(angle),
   };
 }
-

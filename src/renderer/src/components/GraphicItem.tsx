@@ -173,3 +173,7 @@ export const GraphicItem = memo(function GraphicItem({ item, styleId = "graphic-
     if (!item.origin) return content;
     return <g transform={`translate(${item.origin.x},${item.origin.y})`}>{content}</g>;
 });
+
+// Diagram and Icon share the same pure graphic renderer. Viewport, selection,
+// hit testing, and editor overlays stay outside this component.
+export const ResolvedGraphicRenderer = GraphicItem;

@@ -180,6 +180,13 @@ function componentFromAnnotation(
       diagnostic: `${declaration.name}: type ${declaration.typeName} could not be resolved`,
     };
   }
+  component.classKind = location.target.kind;
+  if (location.target.kind === "connector") {
+    return {
+      component,
+      diagnostic: `${declaration.name}: connector Diagram layer is not implemented yet`,
+    };
+  }
   const resolved = resolveIconForClass(
     location.target,
     location.allClasses,
@@ -236,6 +243,13 @@ export function resolveDiagramForClass(
         end: classNode.sourceRange.start + tokens[index]!.end,
       },
     };
+    component.classKind = location.target.kind;
+    if (location.target.kind === "connector") {
+      components.push(component);
+      diagnostics.push(`${declaration.name}: connector Diagram layer is not implemented yet`);
+      componentIndex++;
+      continue;
+    }
     const resolved = resolveIconForClass(
       location.target,
       location.allClasses,

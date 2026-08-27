@@ -76,6 +76,7 @@ export interface ComponentInstanceDto {
   id: string;
   name: string;
   typeName: string;
+  classKind?: ClassKind;
   sourceRange: SourceRangeDto;
   placement?: PlacementDto;
   resolvedIcon?: IconDto;
