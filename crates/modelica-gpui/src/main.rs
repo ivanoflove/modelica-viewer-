@@ -1,12 +1,14 @@
+mod icon_view;
+
 use gpui::{
-    Anchor, App, Bounds, Context, PathBuilder, Pixels, Render, Window, WindowBounds, WindowOptions,
-    anchored, canvas, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
-    rgb, size, uniform_list,
+    Anchor, App, Bounds, Context, Pixels, Render, Window, WindowBounds, WindowOptions, anchored,
+    deferred, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_platform::application;
+use icon_view::{SharedIconViewState, new_icon_view_state};
 use modelica_core::{
-    Class, ClassKind, Graphic, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry,
-    PackageLoader, PackageNode,
+    Class, ClassKind, IconResolver, IconScene, Library, LibraryKind, LibraryRegistry, PackageLoader,
+    PackageNode,
 };
 use std::collections::HashSet;
 use std::ops::Range;
@@ -162,6 +164,7 @@ struct ModelicaViewer {
     selected: Option<usize>,
     scene: IconScene,
     registry: LibraryRegistry,
+    icon_view: SharedIconViewState,
     theme: ThemeMode,
     accent: AccentName,
     glass: GlassMode,
@@ -190,6 +193,7 @@ impl ModelicaViewer {
             selected: None,
             scene: empty_scene(None),
             registry,
+            icon_view: new_icon_view_state(),
             theme: ThemeMode::System,
             accent: AccentName::Violet,
             glass: GlassMode::On,
@@ -212,6 +216,7 @@ impl ModelicaViewer {
                         format!("{}: {error}", class.source_file.display()),
                     ));
                 self.selected = Some(index);
+                self.request_icon_fit();
                 return;
             }
         };
@@ -220,6 +225,32 @@ impl ModelicaViewer {
             .register_source(class.source_file.clone(), source.clone());
         self.scene = IconResolver::new(&mut self.registry).resolve(&class, &source);
         self.selected = Some(index);
+        self.request_icon_fit();
+    }
+
+    fn request_icon_fit(&self) {
+        if let Ok(mut state) = self.icon_view.lock() {
+            state.reset_fit();
+        }
+    }
+
+    fn zoom_icon(&self, factor: f32) {
+        if let Ok(mut state) = self.icon_view.lock() {
+            state.zoom_by(factor);
+        }
+    }
+
+    fn reset_icon_100(&self) {
+        if let Ok(mut state) = self.icon_view.lock() {
+            state.reset_100();
+        }
+    }
+
+    fn icon_zoom_percent(&self) -> i32 {
+        self.icon_view
+            .lock()
+            .map(|state| state.zoom_percent())
+            .unwrap_or(100)
     }
 
     fn toggle_tree(&mut self, key: &str) {
@@ -246,92 +277,91 @@ impl Render for ModelicaViewer {
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
 
-        let tree =
-            uniform_list(
-                "class-tree",
-                visible_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|row_index| {
-                            let row = visible_rows.get(row_index)?.clone();
-                            let selected = row
-                                .class_index
-                                .is_some_and(|index| this.selected == Some(index));
-                            let key = row.key.clone();
-                            let class_index = row.class_index;
-                            let has_children = row.has_children;
-                            let toggle = if has_children {
-                                if row.expanded { "▾" } else { "▸" }
-                            } else {
-                                ""
-                            };
-                            let indent = 5.0 + row.depth as f32 * 12.0;
+        let tree = uniform_list(
+            "class-tree",
+            visible_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                range
+                    .filter_map(|row_index| {
+                        let row = visible_rows.get(row_index)?.clone();
+                        let selected = row
+                            .class_index
+                            .is_some_and(|index| this.selected == Some(index));
+                        let key = row.key.clone();
+                        let class_index = row.class_index;
+                        let has_children = row.has_children;
+                        let toggle = if has_children {
+                            if row.expanded { "▾" } else { "▸" }
+                        } else {
+                            ""
+                        };
+                        let indent = 5.0 + row.depth as f32 * 12.0;
 
-                            Some(
-                                div()
-                                    .id(format!("tree-row-{row_index}"))
-                                    .mx_1()
-                                    .w_full()
-                                    .h(px(29.0))
-                                    .pl(px(indent))
-                                    .pr_2()
-                                    .rounded_md()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(if selected {
-                                        palette.selected_text
+                        Some(
+                            div()
+                                .id(format!("tree-row-{row_index}"))
+                                .mx_1()
+                                .w_full()
+                                .h(px(29.0))
+                                .pl(px(indent))
+                                .pr_2()
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(if selected {
+                                    palette.selected_text
+                                } else {
+                                    palette.text
+                                }))
+                                .bg(rgb(if selected {
+                                    palette.accent
+                                } else {
+                                    palette.panel_alt
+                                })
+                                .opacity(if selected { 0.95 } else { 0.18 }))
+                                .hover(move |style| {
+                                    style.bg(rgb(if selected {
+                                        palette.accent_hover
                                     } else {
-                                        palette.text
-                                    }))
-                                    .bg(rgb(if selected {
-                                        palette.accent
-                                    } else {
-                                        palette.panel_alt
+                                        palette.card
                                     })
-                                    .opacity(if selected { 0.95 } else { 0.18 }))
-                                    .hover(move |style| {
-                                        style.bg(rgb(if selected {
-                                            palette.accent_hover
-                                        } else {
-                                            palette.card
-                                        })
-                                        .opacity(0.78))
-                                    })
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(px(14.0))
-                                            .text_color(rgb(palette.subtle))
-                                            .child(toggle),
-                                    )
-                                    .child(tree_icon(row.kind, selected, palette))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .child(row.label),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if has_children && class_index.is_none() {
+                                    .opacity(0.78))
+                                })
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .w(px(14.0))
+                                        .text_color(rgb(palette.subtle))
+                                        .child(toggle),
+                                )
+                                .child(tree_icon(row.kind, selected, palette))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .child(row.label),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if has_children && class_index.is_none() {
+                                        this.toggle_tree(&key);
+                                    } else if let Some(index) = class_index {
+                                        this.select_class(index);
+                                        if has_children {
                                             this.toggle_tree(&key);
-                                        } else if let Some(index) = class_index {
-                                            this.select_class(index);
-                                            if has_children {
-                                                this.toggle_tree(&key);
-                                            }
                                         }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .h_full();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -346,6 +376,7 @@ impl Render for ModelicaViewer {
             .join("  ·  ");
 
         let appearance = appearance_control(self, palette, cx);
+        let icon_toolbar = icon_toolbar(self.icon_zoom_percent(), palette, cx);
 
         let header = div()
             .h(px(50.0))
@@ -449,7 +480,7 @@ impl Render for ModelicaViewer {
             .child(tabs)
             .child(
                 div()
-                    .h(px(32.0))
+                    .h(px(36.0))
                     .px_4()
                     .flex()
                     .items_center()
@@ -462,12 +493,7 @@ impl Render for ModelicaViewer {
                                 "{primitive_count} graphics  ·  {diagnostic_count} diagnostics"
                             )),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(palette.subtle))
-                            .child("GPUI native paint"),
-                    ),
+                    .child(icon_toolbar),
             )
             .child(
                 div()
@@ -481,7 +507,7 @@ impl Render for ModelicaViewer {
                     .bg(rgb(palette.canvas))
                     .shadow_sm()
                     .overflow_hidden()
-                    .child(icon_canvas(scene)),
+                    .child(icon_view::icon_canvas(scene, self.icon_view.clone())),
             )
             .child(
                 div()
@@ -526,6 +552,77 @@ impl Render for ModelicaViewer {
                     .child(detail),
             )
     }
+}
+
+fn icon_toolbar(
+    zoom_percent: i32,
+    palette: Palette,
+    cx: &mut Context<ModelicaViewer>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            toolbar_button("icon-zoom-out", "−", palette).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.zoom_icon(1.0 / 1.2);
+                    cx.notify();
+                },
+            )),
+        )
+        .child(
+            toolbar_button("icon-zoom-100", &format!("{zoom_percent}%"), palette).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.reset_icon_100();
+                    cx.notify();
+                }),
+            ),
+        )
+        .child(
+            toolbar_button("icon-zoom-in", "+", palette).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.zoom_icon(1.2);
+                    cx.notify();
+                },
+            )),
+        )
+        .child(
+            toolbar_button("icon-fit", "Fit", palette).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.request_icon_fit();
+                    cx.notify();
+                },
+            )),
+        )
+}
+
+fn toolbar_button(
+    id: &'static str,
+    label: &str,
+    palette: Palette,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .min_w(px(28.0))
+        .h(px(25.0))
+        .px_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(palette.border).opacity(0.72))
+        .bg(rgb(palette.panel_alt).opacity(0.64))
+        .text_xs()
+        .text_color(rgb(palette.muted))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(move |style| {
+            style
+                .bg(rgb(palette.card).opacity(0.90))
+                .text_color(rgb(palette.text))
+        })
+        .child(label.to_owned())
 }
 
 fn appearance_control(
@@ -825,202 +922,6 @@ fn collect_visible_rows(
             collect_visible_rows(child, depth + 1, expanded, rows);
         }
     }
-}
-
-fn icon_canvas(scene: IconScene) -> impl IntoElement {
-    canvas(
-        move |_, _, _| {},
-        move |bounds, _, window, _| {
-            paint_icon_scene(&scene, bounds, window);
-        },
-    )
-    .size_full()
-}
-
-fn paint_icon_scene(scene: &IconScene, bounds: Bounds<Pixels>, window: &mut Window) {
-    let map = SceneMap::new(scene, bounds);
-    for graphic in &scene.graphics {
-        match graphic {
-            Graphic::Rectangle(graphic) => {
-                let points = extent_points(graphic.extent)
-                    .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation));
-                paint_closed_polygon(
-                    window,
-                    &points,
-                    graphic.fill_color,
-                    graphic.line_color,
-                    graphic.line_thickness.unwrap_or(0.25) * map.scale,
-                );
-            }
-            Graphic::Ellipse(graphic) => {
-                let center_x = (graphic.extent.p1.x + graphic.extent.p2.x) * 0.5;
-                let center_y = (graphic.extent.p1.y + graphic.extent.p2.y) * 0.5;
-                let radius_x = (graphic.extent.p2.x - graphic.extent.p1.x).abs() * 0.5;
-                let radius_y = (graphic.extent.p2.y - graphic.extent.p1.y).abs() * 0.5;
-                let mut points = Vec::with_capacity(48);
-                for index in 0..48 {
-                    let angle = std::f32::consts::TAU * index as f32 / 48.0;
-                    points.push(map.graphic_point(
-                        modelica_core::scene::Point {
-                            x: center_x + radius_x * angle.cos(),
-                            y: center_y + radius_y * angle.sin(),
-                        },
-                        graphic.origin,
-                        graphic.rotation,
-                    ));
-                }
-                paint_closed_polygon(
-                    window,
-                    &points,
-                    graphic.fill_color,
-                    graphic.line_color,
-                    graphic.line_thickness.unwrap_or(0.25) * map.scale,
-                );
-            }
-            Graphic::Line(graphic) => {
-                let points = graphic
-                    .points
-                    .iter()
-                    .copied()
-                    .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation))
-                    .collect::<Vec<_>>();
-                paint_polyline(
-                    window,
-                    &points,
-                    graphic.color,
-                    graphic.thickness.max(0.25) * map.scale,
-                );
-            }
-            Graphic::Polygon(graphic) => {
-                let points = graphic
-                    .points
-                    .iter()
-                    .copied()
-                    .map(|point| map.graphic_point(point, graphic.origin, graphic.rotation))
-                    .collect::<Vec<_>>();
-                paint_closed_polygon(
-                    window,
-                    &points,
-                    graphic.fill_color,
-                    graphic.line_color,
-                    graphic.line_thickness.unwrap_or(0.25) * map.scale,
-                );
-            }
-            Graphic::Text(_) | Graphic::Bitmap(_) => {}
-        }
-    }
-}
-
-struct SceneMap {
-    center_x: f32,
-    center_y: f32,
-    model_center_x: f32,
-    model_center_y: f32,
-    scale: f32,
-}
-
-impl SceneMap {
-    fn new(scene: &IconScene, bounds: Bounds<Pixels>) -> Self {
-        let extent = scene.coordinate_system.extent;
-        let width = (extent.p2.x - extent.p1.x).abs().max(1.0);
-        let height = (extent.p2.y - extent.p1.y).abs().max(1.0);
-        let available_width = f32::from(bounds.size.width).max(1.0) * 0.88;
-        let available_height = f32::from(bounds.size.height).max(1.0) * 0.88;
-        let scale = (available_width / width).min(available_height / height);
-        Self {
-            center_x: f32::from(bounds.origin.x) + f32::from(bounds.size.width) * 0.5,
-            center_y: f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5,
-            model_center_x: (extent.p1.x + extent.p2.x) * 0.5,
-            model_center_y: (extent.p1.y + extent.p2.y) * 0.5,
-            scale,
-        }
-    }
-
-    fn graphic_point(
-        &self,
-        local: modelica_core::scene::Point,
-        origin: modelica_core::scene::Point,
-        rotation: f32,
-    ) -> gpui::Point<Pixels> {
-        let angle = rotation.to_radians();
-        let rotated_x = local.x * angle.cos() - local.y * angle.sin();
-        let rotated_y = local.x * angle.sin() + local.y * angle.cos();
-        let model_x = origin.x + rotated_x;
-        let model_y = origin.y + rotated_y;
-        point(
-            px(self.center_x + (model_x - self.model_center_x) * self.scale),
-            px(self.center_y - (model_y - self.model_center_y) * self.scale),
-        )
-    }
-}
-
-fn extent_points(extent: modelica_core::scene::Extent) -> [modelica_core::scene::Point; 4] {
-    [
-        extent.p1,
-        modelica_core::scene::Point {
-            x: extent.p2.x,
-            y: extent.p1.y,
-        },
-        extent.p2,
-        modelica_core::scene::Point {
-            x: extent.p1.x,
-            y: extent.p2.y,
-        },
-    ]
-}
-
-fn paint_closed_polygon(
-    window: &mut Window,
-    points: &[gpui::Point<Pixels>],
-    fill: [u8; 3],
-    stroke: [u8; 3],
-    stroke_width: f32,
-) {
-    if points.len() < 3 {
-        return;
-    }
-    let mut fill_builder = PathBuilder::fill();
-    fill_builder.move_to(points[0]);
-    for point in &points[1..] {
-        fill_builder.line_to(*point);
-    }
-    fill_builder.close();
-    if let Ok(path) = fill_builder.build() {
-        window.paint_path(path, rgb(rgb24(fill)));
-    }
-
-    let mut stroke_builder = PathBuilder::stroke(px(stroke_width.max(0.5)));
-    stroke_builder.move_to(points[0]);
-    for point in &points[1..] {
-        stroke_builder.line_to(*point);
-    }
-    stroke_builder.line_to(points[0]);
-    if let Ok(path) = stroke_builder.build() {
-        window.paint_path(path, rgb(rgb24(stroke)));
-    }
-}
-
-fn paint_polyline(
-    window: &mut Window,
-    points: &[gpui::Point<Pixels>],
-    color: [u8; 3],
-    stroke_width: f32,
-) {
-    if points.len() < 2 {
-        return;
-    }
-    let mut builder = PathBuilder::stroke(px(stroke_width.max(0.5)));
-    builder.move_to(points[0]);
-    for point in &points[1..] {
-        builder.line_to(*point);
-    }
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, rgb(rgb24(color)));
-    }
-}
-
-fn rgb24(color: [u8; 3]) -> u32 {
-    (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])
 }
 
 fn register_package_sources(package: &PackageNode, registry: &mut LibraryRegistry) {
