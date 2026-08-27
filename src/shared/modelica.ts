@@ -3,6 +3,7 @@ import type {
   EditableIconDto,
   GraphicToolType,
   GraphicItemDto,
+  LineDto,
   Point,
 } from "./modelicaGraphics.js";
 
@@ -82,10 +83,28 @@ export interface ComponentInstanceDto {
   resolvedIcon?: IconDto;
 }
 
+export interface DiagramBoundsDto {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface DiagramConnectionDto {
+  id: string;
+  from: string;
+  to: string;
+  line?: LineDto;
+  sourceRange?: SourceRangeDto;
+}
+
 export interface DiagramSceneDto {
   coordinateSystem: IconDto["coordinateSystem"];
+  backgroundGraphics: GraphicItemDto[];
   components: ComponentInstanceDto[];
+  connections: DiagramConnectionDto[];
   diagnostics: string[];
+  contentBounds?: DiagramBoundsDto;
 }
 
 export type GetDiagramResult =

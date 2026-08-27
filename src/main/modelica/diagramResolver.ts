@@ -1,18 +1,46 @@
-import { parseAnnotationSlice, getArg, getPositionalArg, type AnnotationCall, type AnnotationValue } from "./annotation.js";
+import {
+  parseAnnotationSlice,
+  getArg,
+  getPositionalArg,
+  type AnnotationCall,
+  type AnnotationValue,
+} from "./annotation.js";
 import { tokenize, type Token } from "./lexer.js";
-import { resolveIconForClass, type ExternalClassResolver } from "./iconResolver.js";
+import {
+  resolveGraphicCall,
+  resolveGraphicsFromCall,
+  resolveIconForClass,
+  type ExternalClassResolver,
+} from "./iconResolver.js";
 import type { ClassNode } from "./types.js";
 import type {
   ComponentInstanceDto,
+  DiagramBoundsDto,
+  DiagramConnectionDto,
   DiagramSceneDto,
   PlacementDto,
   TransformationDto,
 } from "../../shared/modelica.js";
-import type { CoordinateSystemDto, Extent, Point } from "../../shared/modelicaGraphics.js";
+import type {
+  CoordinateSystemDto,
+  Extent,
+  GraphicItemDto,
+  LineDto,
+  Point,
+} from "../../shared/modelicaGraphics.js";
+import { transformPlacementPoint } from "../../shared/diagram.js";
 
 const defaultCoordinateSystem: CoordinateSystemDto = {
   extent: { p1: { x: -100, y: -100 }, p2: { x: 100, y: 100 } },
 };
+
+type AnnotationOwner = "class" | "component" | "connection" | "extends" | "other";
+
+interface ScopedAnnotation {
+  annotation: AnnotationCall;
+  tokenIndex: number;
+  owner: AnnotationOwner;
+}
 
 function asNumber(value: AnnotationValue | undefined): number | undefined {
   return value?.type === "number" ? value.value : undefined;
@@ -55,14 +83,12 @@ function findCall(call: AnnotationCall, name: string): AnnotationCall | undefine
 
 function parseTransformation(call: AnnotationCall | undefined): TransformationDto | undefined {
   if (!call) return undefined;
-  const origin = parsePoint(getArg(call, "origin")) ?? { x: 0, y: 0 };
-  const extent = parseExtent(getArg(call, "extent")) ?? {
-    p1: { x: -10, y: -10 },
-    p2: { x: 10, y: 10 },
-  };
   return {
-    origin,
-    extent,
+    origin: parsePoint(getArg(call, "origin")) ?? { x: 0, y: 0 },
+    extent: parseExtent(getArg(call, "extent")) ?? {
+      p1: { x: -10, y: -10 },
+      p2: { x: 10, y: 10 },
+    },
     rotation: asNumber(getArg(call, "rotation")) ?? 0,
   };
 }
@@ -70,36 +96,13 @@ function parseTransformation(call: AnnotationCall | undefined): TransformationDt
 function parsePlacement(annotation: AnnotationCall): PlacementDto | undefined {
   const placement = findCall(annotation, "Placement");
   if (!placement) return undefined;
-  const transformation = parseTransformation(
-    callValue(getArg(placement, "transformation"), "transformation") ??
-      callValue(getPositionalArg(placement, 0), "transformation"),
-  );
   return {
     visible: asBoolean(getArg(placement, "visible")) ?? true,
-    transformation,
+    transformation: parseTransformation(
+      callValue(getArg(placement, "transformation"), "transformation") ??
+        callValue(getPositionalArg(placement, 0), "transformation"),
+    ),
   };
-}
-
-function parseDiagramCoordinateSystem(classSlice: string): CoordinateSystemDto {
-  const tokens = tokenize(classSlice);
-  for (let index = 0; index < tokens.length - 1; index++) {
-    const token = tokens[index]!;
-    if (token.value !== "annotation" || tokens[index + 1]!.type !== "LPAREN") continue;
-    const annotation = parseAnnotationSlice(classSlice.slice(token.start));
-    const diagram = annotation && findCall(annotation, "Diagram");
-    if (!diagram) continue;
-    const coordinateSystem =
-      callValue(getArg(diagram, "coordinateSystem"), "coordinateSystem") ??
-      callValue(getPositionalArg(diagram, 0), "coordinateSystem");
-    if (!coordinateSystem) return defaultCoordinateSystem;
-    return {
-      extent: parseExtent(getArg(coordinateSystem, "extent")) ?? defaultCoordinateSystem.extent,
-      preserveAspectRatio: asBoolean(getArg(coordinateSystem, "preserveAspectRatio")),
-      grid: parsePoint(getArg(coordinateSystem, "grid")),
-      initialScale: asNumber(getArg(coordinateSystem, "initialScale")),
-    };
-  }
-  return defaultCoordinateSystem;
 }
 
 const declarationPrefixes = new Set([
@@ -119,43 +122,90 @@ function qualifiedNameAt(tokens: Token[], start: number): { name: string; end: n
   return { name: parts.join("."), end };
 }
 
+/** Find the declaration prefix, tolerating nested component modifiers. */
 function parseDeclaration(statement: Token[]): { typeName: string; name: string; start: number } | undefined {
-  let nameIndex = -1;
-  for (let index = statement.length - 1; index >= 0; index--) {
-    if (statement[index]!.type === "IDENT") {
-      nameIndex = index;
-      break;
-    }
+  for (let index = 0; index < statement.length; index++) {
+    const type = qualifiedNameAt(statement, index);
+    if (!type) continue;
+    const nameToken = statement[type.end + 1];
+    if (!nameToken || nameToken.type !== "IDENT") continue;
+    // `model System Pump pump` contains a tempting System/Pump pair. A real
+    // declaration is followed by a modifier, annotation, equals, or end of
+    // statement rather than another bare identifier.
+    const afterName = statement[type.end + 2];
+    if (afterName?.type === "IDENT") continue;
+    return { typeName: type.name, name: nameToken.value, start: statement[index]!.start };
   }
-  const nameToken = nameIndex >= 0 ? statement[nameIndex] : undefined;
-  if (!nameToken || nameIndex <= 0) return undefined;
-  let typeEnd = nameIndex - 1;
-  while (typeEnd >= 2 && statement[typeEnd - 1]?.type === "DOT" && statement[typeEnd]?.type === "IDENT") {
-    typeEnd -= 2;
+  return undefined;
+}
+
+function statementStartIndex(tokens: Token[], annotationIndex: number): number {
+  for (let index = annotationIndex - 1; index >= 0; index--) {
+    if (tokens[index]!.type === "SEMICOLON") return index + 1;
   }
-  const type = qualifiedNameAt(statement, typeEnd);
-  if (!type || type.end !== nameIndex - 1 || declarationPrefixes.has(type.name)) return undefined;
-  return { typeName: type.name, name: nameToken.value, start: statement[typeEnd]!.start };
+  return 0;
+}
+
+function classifyAnnotation(tokens: Token[], annotationIndex: number): AnnotationOwner {
+  const statement = tokens.slice(statementStartIndex(tokens, annotationIndex), annotationIndex);
+  if (statement.some((token) => token.value === "connect")) return "connection";
+  if (statement.some((token) => token.value === "extends")) return "extends";
+  if (parseDeclaration(statement)) return "component";
+  if (statement.length === 0 || statement.some((token) => token.value === "annotation")) {
+    return "class";
+  }
+  return "other";
+}
+
+function collectAnnotations(classSlice: string, tokens: Token[]): ScopedAnnotation[] {
+  const result: ScopedAnnotation[] = [];
+  for (let index = 0; index < tokens.length - 1; index++) {
+    const token = tokens[index]!;
+    if (token.value !== "annotation" || tokens[index + 1]!.type !== "LPAREN") continue;
+    const annotation = parseAnnotationSlice(classSlice.slice(token.start));
+    if (!annotation) continue;
+    result.push({ annotation, tokenIndex: index, owner: classifyAnnotation(tokens, index) });
+  }
+  return result;
+}
+
+function parseDiagramAnnotation(
+  annotations: ScopedAnnotation[],
+): { coordinateSystem: CoordinateSystemDto; graphics: GraphicItemDto[] } {
+  for (const record of annotations) {
+    if (record.owner !== "class") continue;
+    const diagram = findCall(record.annotation, "Diagram");
+    if (!diagram) continue;
+    const coordinateSystemCall =
+      callValue(getArg(diagram, "coordinateSystem"), "coordinateSystem") ??
+      callValue(getPositionalArg(diagram, 0), "coordinateSystem");
+    const coordinateSystem = coordinateSystemCall
+      ? {
+          extent: parseExtent(getArg(coordinateSystemCall, "extent")) ?? defaultCoordinateSystem.extent,
+          preserveAspectRatio: asBoolean(getArg(coordinateSystemCall, "preserveAspectRatio")),
+          grid: parsePoint(getArg(coordinateSystemCall, "grid")),
+          initialScale: asNumber(getArg(coordinateSystemCall, "initialScale")),
+        }
+      : defaultCoordinateSystem;
+    return { coordinateSystem, graphics: resolveGraphicsFromCall(diagram, "Diagram") };
+  }
+  return { coordinateSystem: defaultCoordinateSystem, graphics: [] };
 }
 
 function componentFromAnnotation(
   tokens: Token[],
-  annotationIndex: number,
-  annotation: AnnotationCall,
+  annotationRecord: ScopedAnnotation,
   classNode: ClassNode,
   componentIndex: number,
   resolver: ExternalClassResolver,
 ): { component?: ComponentInstanceDto; diagnostic?: string } {
-  let statementStart = 0;
-  for (let index = annotationIndex - 1; index >= 0; index--) {
-    if (tokens[index]!.type === "SEMICOLON") {
-      statementStart = index + 1;
-      break;
-    }
-  }
-  const declaration = parseDeclaration(tokens.slice(statementStart, annotationIndex));
-  const placement = parsePlacement(annotation);
+  const annotationIndex = annotationRecord.tokenIndex;
+  const declaration = parseDeclaration(
+    tokens.slice(statementStartIndex(tokens, annotationIndex), annotationIndex),
+  );
+  const placement = parsePlacement(annotationRecord.annotation);
   if (!declaration || !placement) return {};
+
   let end = tokens[annotationIndex]!.end;
   for (let index = annotationIndex; index < tokens.length; index++) {
     if (tokens[index]!.type === "SEMICOLON") {
@@ -163,7 +213,6 @@ function componentFromAnnotation(
       break;
     }
   }
-  const location = resolver(classNode, declaration.typeName);
   const component: ComponentInstanceDto = {
     id: `${classNode.qualifiedName}:component:${declaration.name}:${componentIndex}`,
     name: declaration.name,
@@ -174,18 +223,13 @@ function componentFromAnnotation(
     },
     placement,
   };
+  const location = resolver(classNode, declaration.typeName);
   if (!location) {
-    return {
-      component,
-      diagnostic: `${declaration.name}: type ${declaration.typeName} could not be resolved`,
-    };
+    return { component, diagnostic: `${declaration.name}: type ${declaration.typeName} could not be resolved` };
   }
   component.classKind = location.target.kind;
   if (location.target.kind === "connector") {
-    return {
-      component,
-      diagnostic: `${declaration.name}: connector Diagram layer is not implemented yet`,
-    };
+    return { component, diagnostic: `${declaration.name}: connector Diagram layer is not implemented yet` };
   }
   const resolved = resolveIconForClass(
     location.target,
@@ -202,6 +246,135 @@ function componentFromAnnotation(
   };
 }
 
+function stripComments(value: string): string {
+  return value.replace(/\/\/[^\n\r]*|\/\*[\s\S]*?\*\//g, "");
+}
+
+function splitTopLevel(value: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let parens = 0;
+  let braces = 0;
+  let brackets = 0;
+  let quoted = false;
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index]!;
+    if (char === '"') {
+      if (quoted && value[index + 1] === '"') index++;
+      else quoted = !quoted;
+      continue;
+    }
+    if (quoted) continue;
+    if (char === "(") parens++;
+    else if (char === ")") parens--;
+    else if (char === "{") braces++;
+    else if (char === "}") braces--;
+    else if (char === "[") brackets++;
+    else if (char === "]") brackets--;
+    else if (char === "," && parens === 0 && braces === 0 && brackets === 0) {
+      parts.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return parts;
+}
+
+function findMatchingCallEnd(tokens: Token[], openIndex: number): number | undefined {
+  let depth = 0;
+  for (let index = openIndex; index < tokens.length; index++) {
+    if (tokens[index]!.type === "LPAREN") depth++;
+    if (tokens[index]!.type === "RPAREN") {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return undefined;
+}
+
+function parseConnection(
+  classSlice: string,
+  tokens: Token[],
+  connectIndex: number,
+): DiagramConnectionDto | undefined {
+  const openIndex = connectIndex + 1;
+  if (tokens[openIndex]?.type !== "LPAREN") return undefined;
+  const closeIndex = findMatchingCallEnd(tokens, openIndex);
+  if (closeIndex === undefined) return undefined;
+  const args = splitTopLevel(
+    classSlice.slice(tokens[openIndex]!.end, tokens[closeIndex]!.start),
+  ).map((part) => stripComments(part).trim());
+  if (args.length !== 2 || !args[0] || !args[1]) return undefined;
+
+  let line: LineDto | undefined;
+  let end = tokens[closeIndex]!.end;
+  for (let index = closeIndex + 1; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token.type === "SEMICOLON") {
+      end = token.end;
+      break;
+    }
+    if (token.value !== "annotation" || tokens[index + 1]?.type !== "LPAREN") continue;
+    const annotation = parseAnnotationSlice(classSlice.slice(token.start));
+    const lineCall = annotation && findCall(annotation, "Line");
+    const resolved = lineCall ? resolveGraphicCall(lineCall, "Diagram") : null;
+    if (resolved?.type === "Line") line = resolved;
+    if (annotation) end = token.start + annotation.sourceRange.end;
+    break;
+  }
+  return {
+    id: `connection:${connectIndex}`,
+    from: args[0],
+    to: args[1],
+    line,
+    sourceRange: { start: tokens[connectIndex]!.start, end },
+  };
+}
+
+interface MutableBounds { minX: number; minY: number; maxX: number; maxY: number }
+
+function includePoint(bounds: MutableBounds, point: Point): void {
+  bounds.minX = Math.min(bounds.minX, point.x);
+  bounds.minY = Math.min(bounds.minY, point.y);
+  bounds.maxX = Math.max(bounds.maxX, point.x);
+  bounds.maxY = Math.max(bounds.maxY, point.y);
+}
+
+function includeGraphic(bounds: MutableBounds, graphic: GraphicItemDto): void {
+  const origin = "origin" in graphic ? graphic.origin ?? { x: 0, y: 0 } : { x: 0, y: 0 };
+  if ("extent" in graphic) {
+    includePoint(bounds, { x: graphic.extent.p1.x + origin.x, y: graphic.extent.p1.y + origin.y });
+    includePoint(bounds, { x: graphic.extent.p2.x + origin.x, y: graphic.extent.p2.y + origin.y });
+  }
+  if ("points" in graphic) {
+    for (const point of graphic.points) includePoint(bounds, { x: point.x + origin.x, y: point.y + origin.y });
+  }
+}
+
+function includeComponent(bounds: MutableBounds, component: ComponentInstanceDto): void {
+  const transformation = component.placement?.transformation;
+  if (!component.placement?.visible || !transformation) return;
+  const sourceExtent = component.resolvedIcon?.coordinateSystem.extent ?? transformation.extent;
+  for (const point of [
+    sourceExtent.p1,
+    { x: sourceExtent.p1.x, y: sourceExtent.p2.y },
+    { x: sourceExtent.p2.x, y: sourceExtent.p1.y },
+    sourceExtent.p2,
+  ]) {
+    includePoint(bounds, transformPlacementPoint(point, { extent: sourceExtent }, transformation));
+  }
+}
+
+function finishBounds(bounds: MutableBounds): DiagramBoundsDto | undefined {
+  if (!Number.isFinite(bounds.minX)) return undefined;
+  return {
+    x: bounds.minX,
+    y: bounds.minY,
+    width: Math.max(bounds.maxX - bounds.minX, 1),
+    height: Math.max(bounds.maxY - bounds.minY, 1),
+  };
+}
+
 export function resolveDiagramForClass(
   classNode: ClassNode,
   source: string,
@@ -209,27 +382,30 @@ export function resolveDiagramForClass(
 ): DiagramSceneDto {
   const classSlice = source.slice(classNode.sourceRange.start, classNode.sourceRange.end);
   const tokens = tokenize(classSlice);
+  const annotations = collectAnnotations(classSlice, tokens);
   const components: ComponentInstanceDto[] = [];
   const diagnostics: string[] = [];
+  const placedNames = new Set<string>();
   let componentIndex = 0;
-  for (let index = 0; index < tokens.length - 1; index++) {
-    const token = tokens[index]!;
-    if (token.value !== "annotation" || tokens[index + 1]!.type !== "LPAREN") continue;
-    const annotation = parseAnnotationSlice(classSlice.slice(token.start));
-    if (!annotation) continue;
-    const parsed = componentFromAnnotation(tokens, index, annotation, classNode, componentIndex, resolver);
+
+  for (const record of annotations) {
+    if (record.owner !== "component") continue;
+    const parsed = componentFromAnnotation(tokens, record, classNode, componentIndex, resolver);
     if (!parsed.component) continue;
     componentIndex++;
+    placedNames.add(parsed.component.name);
     components.push(parsed.component);
     if (parsed.diagnostic) diagnostics.push(parsed.diagnostic);
   }
-  const placedNames = new Set(components.map((component) => component.name));
+
+  // Keep resolvable declarations without Placement in the scene for
+  // diagnostics, but never render them at an invented origin.
   let statementStart = 0;
   for (let index = 0; index < tokens.length; index++) {
     if (tokens[index]!.type !== "SEMICOLON") continue;
     const statement = tokens.slice(statementStart, index);
     statementStart = index + 1;
-    if (statement.some((token) => token.value === "annotation")) continue;
+    if (statement.some((token) => token.value === "annotation" || token.value === "connect")) continue;
     const declaration = parseDeclaration(statement);
     if (!declaration || placedNames.has(declaration.name)) continue;
     const location = resolver(classNode, declaration.typeName);
@@ -243,29 +419,56 @@ export function resolveDiagramForClass(
         end: classNode.sourceRange.start + tokens[index]!.end,
       },
     };
+    componentIndex++;
+    placedNames.add(component.name);
     component.classKind = location.target.kind;
     if (location.target.kind === "connector") {
-      components.push(component);
-      diagnostics.push(`${declaration.name}: connector Diagram layer is not implemented yet`);
-      componentIndex++;
-      continue;
+      diagnostics.push(`${component.name}: connector Diagram layer is not implemented yet`);
+    } else {
+      const resolved = resolveIconForClass(
+        location.target,
+        location.allClasses,
+        location.source,
+        declaration.name,
+        new Set<string>(),
+        resolver,
+      );
+      if (resolved.icon) component.resolvedIcon = resolved.icon;
     }
-    const resolved = resolveIconForClass(
-      location.target,
-      location.allClasses,
-      location.source,
-      declaration.name,
-      new Set<string>(),
-      resolver,
-    );
-    if (resolved.icon) component.resolvedIcon = resolved.icon;
     components.push(component);
-    diagnostics.push(`${declaration.name}: Component has no Placement annotation`);
-    componentIndex++;
+    diagnostics.push(`${component.name}: Component has no Placement annotation`);
   }
+
+  const diagram = parseDiagramAnnotation(annotations);
+  const connections: DiagramConnectionDto[] = [];
+  for (let index = 0; index < tokens.length - 1; index++) {
+    if (tokens[index]!.value !== "connect") continue;
+    const connection = parseConnection(classSlice, tokens, index);
+    if (connection) connections.push(connection);
+  }
+
+  const mutableBounds: MutableBounds = {
+    minX: Number.POSITIVE_INFINITY,
+    minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY,
+    maxY: Number.NEGATIVE_INFINITY,
+  };
+  for (const graphic of diagram.graphics) includeGraphic(mutableBounds, graphic);
+  for (const component of components) includeComponent(mutableBounds, component);
+  for (const connection of connections) {
+    if (!connection.line) continue;
+    const origin = connection.line.origin ?? { x: 0, y: 0 };
+    for (const point of connection.line.points) {
+      includePoint(mutableBounds, { x: origin.x + point.x, y: origin.y + point.y });
+    }
+  }
+
   return {
-    coordinateSystem: parseDiagramCoordinateSystem(classSlice),
+    coordinateSystem: diagram.coordinateSystem,
+    backgroundGraphics: diagram.graphics,
     components,
+    connections,
     diagnostics,
+    contentBounds: finishBounds(mutableBounds),
   };
 }

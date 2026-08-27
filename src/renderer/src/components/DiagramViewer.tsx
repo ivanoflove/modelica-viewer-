@@ -6,6 +6,20 @@ import { ResolvedGraphicRenderer } from "./GraphicItem";
 import { GraphicViewport } from "./GraphicViewport";
 
 function viewportIcon(scene: DiagramSceneDto): IconDto {
+  const content = scene.contentBounds;
+  if (content) {
+    return {
+      coordinateSystem: scene.coordinateSystem,
+      graphics: [{
+        type: "Rectangle",
+        extent: {
+          p1: { x: content.x, y: content.y },
+          p2: { x: content.x + content.width, y: content.y + content.height },
+        },
+        fillPattern: "FillPattern.None",
+      }],
+    };
+  }
   return {
     coordinateSystem: scene.coordinateSystem,
     graphics: scene.components.flatMap((component) => {
@@ -71,29 +85,41 @@ export function DiagramViewer({ scene }: { scene: DiagramSceneDto }) {
           {scene.diagnostics.length} 个 Diagram 提示
         </div>
       )}
-      {visibleComponents.length === 0 ? (
-        <div className="diagram-empty">No placed components</div>
-      ) : (
-        <GraphicViewport
-          icon={viewportIcon}
-          resetKey={`diagram:${scene.components.map((component) => component.id).join("|")}`}
-          svgRef={svgRef}
-          onPointerMove={() => undefined}
-          onPointerUp={() => undefined}
-          onPointerCancel={() => undefined}
-          canvasLabel="Diagram 画布"
-        >
-          <g transform="scale(1,-1)" className="diagram-layer">
-            {scene.components.map((component, index) => (
-              <ComponentRenderer
-                key={component.id}
-                component={component}
-                index={index}
+      <GraphicViewport
+        icon={viewportIcon}
+        resetKey={`diagram:${scene.components.map((component) => component.id).join("|")}:${scene.connections.length}:${scene.backgroundGraphics.length}:${scene.contentBounds?.x ?? ""}:${scene.contentBounds?.y ?? ""}:${scene.contentBounds?.width ?? ""}:${scene.contentBounds?.height ?? ""}`}
+        svgRef={svgRef}
+        onPointerMove={() => undefined}
+        onPointerUp={() => undefined}
+        onPointerCancel={() => undefined}
+        canvasLabel="Diagram 画布"
+      >
+        <g transform="scale(1,-1)" className="diagram-layer">
+          {scene.backgroundGraphics.map((graphic, graphicIndex) => (
+            <ResolvedGraphicRenderer
+              key={`diagram-background:${graphicIndex}`}
+              item={graphic}
+              styleId={`diagram-background-style-${graphicIndex}`}
+            />
+          ))}
+          {scene.connections.map((connection, connectionIndex) => (
+            connection.line ? (
+              <ResolvedGraphicRenderer
+                key={connection.id}
+                item={connection.line}
+                styleId={`diagram-connection-style-${connectionIndex}`}
               />
-            ))}
-          </g>
-        </GraphicViewport>
-      )}
+            ) : null
+          ))}
+          {scene.components.map((component, index) => (
+            <ComponentRenderer
+              key={component.id}
+              component={component}
+              index={index}
+            />
+          ))}
+        </g>
+      </GraphicViewport>
     </div>
   );
 }

@@ -227,6 +227,28 @@ function resolveGraphic(
   }
 }
 
+/** Resolve one graphic call after its ownership has already been established. */
+export function resolveGraphicCall(
+  call: AnnotationCall,
+  modelName: string,
+): GraphicItemDto | null {
+  return resolveGraphic(call, modelName);
+}
+
+/** Resolve graphics from a specific Icon/Diagram call, never from descendants. */
+export function resolveGraphicsFromCall(
+  containerCall: AnnotationCall,
+  modelName: string,
+): GraphicItemDto[] {
+  const graphicsArg = getArg(containerCall, "graphics");
+  if (!graphicsArg || graphicsArg.type !== "array") return [];
+  return graphicsArg.items.flatMap((item) => {
+    if (item.type !== "call") return [];
+    const graphic = resolveGraphic(item.call, modelName);
+    return graphic ? [graphic] : [];
+  });
+}
+
 function parseCoordinateSystem(
   call: AnnotationCall | undefined,
 ): CoordinateSystemDto {
