@@ -677,15 +677,48 @@ fn parameter_defaults(class: &Class, source: &str) -> HashMap<String, String> {
             index = end.saturating_add(1);
             continue;
         };
-        let wrapped = format!("__value({value_source})");
-        if let Ok(call) = parse_call(&wrapped)
-            && let Some(value) = call.positional(0).and_then(scalar_value)
-        {
+        if let Some(value) = scalar_parameter_value(value_source) {
             defaults.insert(name.text.clone(), value);
         }
         index = end.saturating_add(1);
     }
     defaults
+}
+
+fn scalar_parameter_value(source: &str) -> Option<String> {
+    let tokens = tokenize(source)
+        .into_iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .collect::<Vec<_>>();
+    let first = tokens.first()?;
+    if first.kind == TokenKind::String {
+        return parse_call(&format!("__value({})", first.text))
+            .ok()
+            .and_then(|call| call.positional(0).and_then(scalar_value));
+    }
+    if first.text == "-" || first.text == "+" {
+        return tokens
+            .get(1)
+            .filter(|token| token.kind == TokenKind::Number)
+            .map(|number| format!("{}{}", first.text, number.text));
+    }
+    if matches!(
+        first.kind,
+        TokenKind::Number | TokenKind::Identifier | TokenKind::Keyword
+    ) {
+        let mut value = first.text.clone();
+        let mut index = 1;
+        while tokens.get(index).is_some_and(|token| token.text == ".") {
+            let Some(part) = tokens.get(index + 1) else {
+                break;
+            };
+            value.push('.');
+            value.push_str(&part.text);
+            index += 2;
+        }
+        return Some(value);
+    }
+    None
 }
 
 fn scalar_value(value: &AnnotationValue) -> Option<String> {
@@ -937,7 +970,7 @@ connector Pin
 end Pin;
 
 model Parent
-  parameter Real label = 42;
+  parameter Real label = 42 "display label";
   Pin leftPin annotation(Placement(transformation(extent={{-100,-10},{-80,10}})));
   annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%name/%label") }));
 end Parent;
