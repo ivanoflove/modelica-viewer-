@@ -253,93 +253,90 @@ impl Render for ModelicaViewer {
 
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
-        let tree = uniform_list(
-            "class-tree",
-            visible_count,
-            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                range
-                    .filter_map(|row_index| {
-                        let row = visible_rows.get(row_index)?.clone();
-                        let selected = row.class_index == this.selected;
-                        let key = row.key.clone();
-                        let class_index = row.class_index;
-                        let has_children = row.has_children;
-                        let toggle = if row.has_children {
-                            if row.expanded { "▾" } else { "▸" }
-                        } else {
-                            ""
-                        };
-                        let indent = 6.0 + row.depth as f32 * 13.0;
-                        let icon = class_kind_symbol(row.kind);
+        let tree =
+            uniform_list(
+                "class-tree",
+                visible_count,
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|row_index| {
+                            let row = visible_rows.get(row_index)?.clone();
+                            let selected = row.class_index == this.selected;
+                            let key = row.key.clone();
+                            let class_index = row.class_index;
+                            let has_children = row.has_children;
+                            let toggle = if row.has_children {
+                                if row.expanded { "▾" } else { "▸" }
+                            } else {
+                                ""
+                            };
+                            let indent = 6.0 + row.depth as f32 * 13.0;
+                            let icon = class_kind_symbol(row.kind);
 
-                        Some(
-                            div()
-                                .id(format!("tree-row-{row_index}"))
-                                .mx_1()
-                                .h(px(32.0))
-                                .pl(px(indent))
-                                .pr_2()
-                                .rounded_md()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .overflow_hidden()
-                                .text_sm()
-                                .text_color(rgb(if selected {
-                                    palette.selected_text
-                                } else {
-                                    palette.text
-                                }))
-                                .bg(
-                                    rgb(if selected {
+                            Some(
+                                div()
+                                    .id(format!("tree-row-{row_index}"))
+                                    .mx_1()
+                                    .h(px(32.0))
+                                    .pl(px(indent))
+                                    .pr_2()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .text_sm()
+                                    .text_color(rgb(if selected {
+                                        palette.selected_text
+                                    } else {
+                                        palette.text
+                                    }))
+                                    .bg(rgb(if selected {
                                         palette.accent
                                     } else {
                                         palette.panel_alt
                                     })
-                                    .opacity(if selected { 0.96 } else { 0.28 }),
-                                )
-                                .hover(move |style| {
-                                    style.bg(
-                                        rgb(if selected {
+                                    .opacity(if selected { 0.96 } else { 0.28 }))
+                                    .hover(move |style| {
+                                        style.bg(rgb(if selected {
                                             palette.accent_hover
                                         } else {
                                             palette.card
                                         })
-                                        .opacity(0.82),
+                                        .opacity(0.82))
+                                    })
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .w(px(16.0))
+                                            .text_color(rgb(palette.subtle))
+                                            .child(toggle),
                                     )
-                                })
-                                .cursor_pointer()
-                                .child(
-                                    div()
-                                        .w(px(16.0))
-                                        .text_color(rgb(palette.subtle))
-                                        .child(toggle),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(20.0))
-                                        .text_color(rgb(if row.kind == ClassKind::Package {
-                                            palette.accent
-                                        } else {
-                                            palette.muted
-                                        }))
-                                        .child(icon),
-                                )
-                                .child(div().flex_1().overflow_hidden().child(row.label))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(index) = class_index {
-                                        this.select_class(index);
-                                    } else if has_children {
-                                        this.toggle_tree(&key);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .h_full();
+                                    .child(
+                                        div()
+                                            .w(px(20.0))
+                                            .text_color(rgb(if row.kind == ClassKind::Package {
+                                                palette.accent
+                                            } else {
+                                                palette.muted
+                                            }))
+                                            .child(icon),
+                                    )
+                                    .child(div().flex_1().overflow_hidden().child(row.label))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(index) = class_index {
+                                            this.select_class(index);
+                                        } else if has_children {
+                                            this.toggle_tree(&key);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -649,7 +646,12 @@ impl Render for ModelicaViewer {
     }
 }
 
-fn choice_chip(id: String, label: &str, active: bool, palette: Palette) -> gpui::Div {
+fn choice_chip(
+    id: String,
+    label: &str,
+    active: bool,
+    palette: Palette,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_2()
@@ -661,14 +663,12 @@ fn choice_chip(id: String, label: &str, active: bool, palette: Palette) -> gpui:
         } else {
             palette.border
         }))
-        .bg(
-            rgb(if active {
-                palette.accent
-            } else {
-                palette.panel
-            })
-            .opacity(if active { 0.14 } else { 0.42 }),
-        )
+        .bg(rgb(if active {
+            palette.accent
+        } else {
+            palette.panel
+        })
+        .opacity(if active { 0.14 } else { 0.42 }))
         .text_xs()
         .text_color(rgb(if active {
             palette.accent
@@ -704,14 +704,12 @@ fn tab_chip(label: &str, active: bool, palette: Palette) -> gpui::Div {
         } else {
             palette.muted
         }))
-        .bg(
-            rgb(if active {
-                palette.accent
-            } else {
-                palette.panel_alt
-            })
-            .opacity(if active { 0.12 } else { 0.20 }),
-        )
+        .bg(rgb(if active {
+            palette.accent
+        } else {
+            palette.panel_alt
+        })
+        .opacity(if active { 0.12 } else { 0.20 }))
         .child(label.to_owned())
 }
 
