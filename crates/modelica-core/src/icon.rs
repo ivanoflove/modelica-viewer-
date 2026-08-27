@@ -5,6 +5,7 @@ use crate::graphics::resolve_icon_call;
 use crate::lexer::{TokenKind, tokenize};
 use crate::library::LibraryRegistry;
 use crate::scene::{CoordinateSystem, IconScene};
+use std::collections::HashMap;
 
 pub struct IconResolver<'a> {
     registry: &'a mut LibraryRegistry,
@@ -42,6 +43,17 @@ impl<'a> IconResolver<'a> {
         let mut inherited: Option<IconScene> = None;
         for base_name in &class.extends {
             let Some((base_class, base_source)) = self.resolve_base(class, base_name) else {
+                if let Some(base) = fallback_base_icon(base_name) {
+                    inherited = Some(match inherited.take() {
+                        None => base,
+                        Some(mut current) => {
+                            current.graphics.extend(base.graphics);
+                            current.diagnostics.extend(base.diagnostics);
+                            current
+                        }
+                    });
+                    continue;
+                }
                 diagnostics.push(Diagnostic::warning(
                     "ICON_BASE_NOT_FOUND",
                     format!("unable to resolve Icon base `{base_name}`"),
@@ -91,7 +103,8 @@ impl<'a> IconResolver<'a> {
         let connector_graphics =
             self.resolve_public_connector_graphics(class, source, visiting, instance_name);
         result.graphics.extend(connector_graphics);
-        expand_text_macros(&mut result, class, instance_name);
+        let parameter_defaults = parameter_defaults(class, source);
+        expand_text_macros(&mut result, class, instance_name, &parameter_defaults);
         visiting.pop();
         for diagnostic in &mut result.diagnostics {
             diagnostic.owner = Some(class.qualified_name.clone());
@@ -538,16 +551,26 @@ fn transformed_extent(
     }
 }
 
-fn expand_text_macros(scene: &mut IconScene, class: &Class, instance_name: &str) {
+fn expand_text_macros(
+    scene: &mut IconScene,
+    class: &Class,
+    instance_name: &str,
+    defaults: &HashMap<String, String>,
+) {
     for graphic in &mut scene.graphics {
         let crate::scene::Graphic::Text(text) = graphic else {
             continue;
         };
-        text.text = expand_text(&text.text, class, instance_name);
+        text.text = expand_text(&text.text, class, instance_name, defaults);
     }
 }
 
-fn expand_text(template: &str, class: &Class, instance_name: &str) -> String {
+fn expand_text(
+    template: &str,
+    class: &Class,
+    instance_name: &str,
+    defaults: &HashMap<String, String>,
+) -> String {
     let mut output = String::with_capacity(template.len());
     let chars = template.chars().collect::<Vec<_>>();
     let mut index = 0;
@@ -593,20 +616,112 @@ fn expand_text(template: &str, class: &Class, instance_name: &str) -> String {
         match key.as_str() {
             "name" => output.push_str(instance_name),
             "class" => output.push_str(&class.name),
-            _ => {
-                output.push('%');
-                if braced {
-                    output.push('{');
-                }
-                output.push_str(&key);
-                if braced && end > 0 {
-                    output.push('}');
-                }
+            _ if defaults.contains_key(&key) => {
+                output.push_str(defaults.get(&key).expect("checked parameter default key"))
             }
+            _ => append_unresolved_macro(&mut output, &key, braced),
         }
         index = end;
     }
     output
+}
+
+fn append_unresolved_macro(output: &mut String, key: &str, braced: bool) {
+    output.push('%');
+    if braced {
+        output.push('{');
+    }
+    output.push_str(key);
+    if braced {
+        output.push('}');
+    }
+}
+
+fn parameter_defaults(class: &Class, source: &str) -> HashMap<String, String> {
+    let range = class.source_range;
+    let Some(class_source) = source.get(range.start..range.end) else {
+        return HashMap::new();
+    };
+    let owned = mask_child_ranges(class, source, class_source);
+    let tokens = tokenize(&owned);
+    let mut defaults = HashMap::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index].text != "parameter" {
+            index += 1;
+            continue;
+        }
+        let end = tokens[index..]
+            .iter()
+            .position(|token| token.text == ";")
+            .map_or(tokens.len(), |offset| index + offset);
+        let Some(equals) = tokens[index..end]
+            .iter()
+            .position(|token| token.text == "=")
+            .map(|offset| index + offset)
+        else {
+            index = end.saturating_add(1);
+            continue;
+        };
+        let Some(name) = tokens[index..equals]
+            .iter()
+            .rev()
+            .find(|token| matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword))
+        else {
+            index = end.saturating_add(1);
+            continue;
+        };
+        let value_start = tokens[equals].end;
+        let value_end = tokens.get(end).map_or(owned.len(), |token| token.start);
+        let Some(value_source) = owned.get(value_start..value_end) else {
+            index = end.saturating_add(1);
+            continue;
+        };
+        let wrapped = format!("__value({value_source})");
+        if let Ok(call) = parse_call(&wrapped)
+            && let Some(value) = call.positional(0).and_then(scalar_value)
+        {
+            defaults.insert(name.text.clone(), value);
+        }
+        index = end.saturating_add(1);
+    }
+    defaults
+}
+
+fn scalar_value(value: &AnnotationValue) -> Option<String> {
+    match value {
+        AnnotationValue::Number(value) => Some(value.to_string()),
+        AnnotationValue::String(value) | AnnotationValue::Name(value) => Some(value.clone()),
+        AnnotationValue::Bool(value) => Some(value.to_string()),
+        AnnotationValue::Array(_) | AnnotationValue::Call(_) => None,
+    }
+}
+
+fn fallback_base_icon(base_name: &str) -> Option<IconScene> {
+    if !base_name.starts_with("Modelica.Icons.") {
+        return None;
+    }
+    Some(IconScene {
+        owner_qualified_name: Some(base_name.to_owned()),
+        coordinate_system: CoordinateSystem::default(),
+        graphics: vec![crate::scene::Graphic::Rectangle(
+            crate::scene::RectangleGraphic {
+                origin: crate::scene::Point { x: 0.0, y: 0.0 },
+                rotation: 0.0,
+                extent: crate::scene::Extent {
+                    p1: crate::scene::Point { x: -80.0, y: -60.0 },
+                    p2: crate::scene::Point { x: 80.0, y: 60.0 },
+                },
+                line_color: [0, 0, 127],
+                fill_color: [255, 255, 255],
+                line_pattern: None,
+                line_thickness: Some(0.25),
+                fill_pattern: Some("FillPattern.Solid".into()),
+                radius: None,
+            },
+        )],
+        diagnostics: Vec::new(),
+    })
 }
 
 fn empty_scene(class: &Class, mut diagnostics: Vec<Diagnostic>) -> IconScene {
@@ -822,8 +937,9 @@ connector Pin
 end Pin;
 
 model Parent
+  parameter Real label = 42;
   Pin leftPin annotation(Placement(transformation(extent={{-100,-10},{-80,10}})));
-  annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%name") }));
+  annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%name/%label") }));
 end Parent;
 "#;
         let file = parse(source, "Icons.mo").expect("parse");
@@ -841,7 +957,7 @@ end Parent;
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert!(texts.contains(&"Parent"));
+        assert!(texts.contains(&"Parent/42"));
         assert!(texts.contains(&"leftPin/Pin"));
     }
 }
