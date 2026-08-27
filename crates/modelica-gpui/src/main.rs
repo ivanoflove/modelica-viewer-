@@ -246,89 +246,91 @@ impl Render for ModelicaViewer {
         let visible_rows = self.visible_tree_rows();
         let visible_count = visible_rows.len();
 
-        let tree =
-            uniform_list(
-                "class-tree",
-                visible_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|row_index| {
-                            let row = visible_rows.get(row_index)?.clone();
-                            let selected = row.class_index == this.selected;
-                            let key = row.key.clone();
-                            let class_index = row.class_index;
-                            let has_children = row.has_children;
-                            let toggle = if has_children {
-                                if row.expanded { "▾" } else { "▸" }
-                            } else {
-                                ""
-                            };
-                            let indent = 5.0 + row.depth as f32 * 12.0;
+        let tree = uniform_list(
+            "class-tree",
+            visible_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                range
+                    .filter_map(|row_index| {
+                        let row = visible_rows.get(row_index)?.clone();
+                        let selected = row
+                            .class_index
+                            .is_some_and(|index| this.selected == Some(index));
+                        let key = row.key.clone();
+                        let class_index = row.class_index;
+                        let has_children = row.has_children;
+                        let toggle = if has_children {
+                            if row.expanded { "▾" } else { "▸" }
+                        } else {
+                            ""
+                        };
+                        let indent = 5.0 + row.depth as f32 * 12.0;
 
-                            Some(
-                                div()
-                                    .id(format!("tree-row-{row_index}"))
-                                    .mx_1()
-                                    .h(px(29.0))
-                                    .pl(px(indent))
-                                    .pr_2()
-                                    .rounded_md()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(if selected {
-                                        palette.selected_text
+                        Some(
+                            div()
+                                .id(format!("tree-row-{row_index}"))
+                                .mx_1()
+                                .w_full()
+                                .h(px(29.0))
+                                .pl(px(indent))
+                                .pr_2()
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(if selected {
+                                    palette.selected_text
+                                } else {
+                                    palette.text
+                                }))
+                                .bg(rgb(if selected {
+                                    palette.accent
+                                } else {
+                                    palette.panel_alt
+                                })
+                                .opacity(if selected { 0.95 } else { 0.18 }))
+                                .hover(move |style| {
+                                    style.bg(rgb(if selected {
+                                        palette.accent_hover
                                     } else {
-                                        palette.text
-                                    }))
-                                    .bg(rgb(if selected {
-                                        palette.accent
-                                    } else {
-                                        palette.panel_alt
+                                        palette.card
                                     })
-                                    .opacity(if selected { 0.95 } else { 0.18 }))
-                                    .hover(move |style| {
-                                        style.bg(rgb(if selected {
-                                            palette.accent_hover
-                                        } else {
-                                            palette.card
-                                        })
-                                        .opacity(0.78))
-                                    })
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(px(14.0))
-                                            .text_color(rgb(palette.subtle))
-                                            .child(toggle),
-                                    )
-                                    .child(tree_icon(row.kind, selected, palette))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .child(row.label),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if has_children && class_index.is_none() {
+                                    .opacity(0.78))
+                                })
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .w(px(14.0))
+                                        .text_color(rgb(palette.subtle))
+                                        .child(toggle),
+                                )
+                                .child(tree_icon(row.kind, selected, palette))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .child(row.label),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if has_children && class_index.is_none() {
+                                        this.toggle_tree(&key);
+                                    } else if let Some(index) = class_index {
+                                        this.select_class(index);
+                                        if has_children {
                                             this.toggle_tree(&key);
-                                        } else if let Some(index) = class_index {
-                                            this.select_class(index);
-                                            if has_children {
-                                                this.toggle_tree(&key);
-                                            }
                                         }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .h_full();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
