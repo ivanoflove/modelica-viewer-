@@ -188,10 +188,12 @@ impl ModelicaViewer {
             Ok(source) => source,
             Err(error) => {
                 self.scene = empty_scene(Some(class.qualified_name.clone()));
-                self.scene.diagnostics.push(modelica_core::Diagnostic::warning(
-                    "SOURCE_READ",
-                    format!("{}: {error}", class.source_file.display()),
-                ));
+                self.scene
+                    .diagnostics
+                    .push(modelica_core::Diagnostic::warning(
+                        "SOURCE_READ",
+                        format!("{}: {error}", class.source_file.display()),
+                    ));
                 self.selected = Some(index);
                 return;
             }
@@ -214,66 +216,68 @@ impl ModelicaViewer {
 impl Render for ModelicaViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = palette(self.theme, self.accent);
-        let glass_alpha = if self.glass == GlassMode::On { 0.80 } else { 0.96 };
+        let glass_alpha = if self.glass == GlassMode::On {
+            0.80
+        } else {
+            0.96
+        };
         let row_count = self.classes.len();
 
         let tree = uniform_list(
             "class-tree",
             row_count,
-            cx.processor(move |this, range, _window, cx| {
-                range
-                    .filter_map(|index| {
-                        let row = this.classes.get(index)?;
-                        let selected = this.selected == Some(index);
-                        let indent = row.depth as f32 * 14.0;
-                        let label = format!(
-                            "{}  {}",
-                            class_kind_symbol(row.class.kind),
-                            row.class.name
-                        );
-                        Some(
-                            div()
-                                .id(format!("class-{index}"))
-                                .mx_1()
-                                .mb_1()
-                                .pl(px(10.0 + indent))
-                                .pr_2()
-                                .py_2()
-                                .rounded_md()
-                                .text_sm()
-                                .text_color(rgb(if selected {
-                                    palette.selected_text
-                                } else {
-                                    palette.text
-                                }))
-                                .bg(
-                                    rgb(if selected {
+            cx.processor(
+                move |this, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|index| {
+                            let row = this.classes.get(index)?;
+                            let selected = this.selected == Some(index);
+                            let indent = row.depth as f32 * 14.0;
+                            let label = format!(
+                                "{}  {}",
+                                class_kind_symbol(row.class.kind),
+                                row.class.name
+                            );
+                            Some(
+                                div()
+                                    .id(format!("class-{index}"))
+                                    .mx_1()
+                                    .mb_1()
+                                    .pl(px(10.0 + indent))
+                                    .pr_2()
+                                    .py_2()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .text_color(rgb(if selected {
+                                        palette.selected_text
+                                    } else {
+                                        palette.text
+                                    }))
+                                    .bg(rgb(if selected {
                                         palette.accent
                                     } else {
                                         palette.panel_alt
                                     })
-                                    .opacity(if selected { 0.96 } else { 0.62 }),
-                                )
-                                .hover(move |style| {
-                                    style.bg(
-                                        rgb(if selected {
+                                    .opacity(if selected { 0.96 } else { 0.62 }))
+                                    .hover(move |style| {
+                                        style.bg(rgb(if selected {
                                             palette.accent_hover
                                         } else {
                                             palette.card
                                         })
-                                        .opacity(0.92),
-                                    )
-                                })
-                                .cursor_pointer()
-                                .child(label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_class(index);
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }),
+                                        .opacity(0.92))
+                                    })
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_class(index);
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                },
+            ),
         )
         .h_full();
 
@@ -306,14 +310,12 @@ impl Render for ModelicaViewer {
                     } else {
                         palette.muted
                     }))
-                    .bg(
-                        rgb(if active {
-                            palette.accent
-                        } else {
-                            palette.panel_alt
-                        })
-                        .opacity(if active { 0.96 } else { 0.68 }),
-                    )
+                    .bg(rgb(if active {
+                        palette.accent
+                    } else {
+                        palette.panel_alt
+                    })
+                    .opacity(if active { 0.96 } else { 0.68 }))
                     .child(mode.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.theme = mode;
@@ -338,7 +340,11 @@ impl Render for ModelicaViewer {
                     .rounded_md()
                     .text_xs()
                     .cursor_pointer()
-                    .text_color(rgb(if active { accent.color() } else { palette.muted }))
+                    .text_color(rgb(if active {
+                        accent.color()
+                    } else {
+                        palette.muted
+                    }))
                     .bg(rgb(palette.panel_alt).opacity(if active { 0.92 } else { 0.58 }))
                     .child(format!("● {}", accent.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -364,14 +370,12 @@ impl Render for ModelicaViewer {
                     } else {
                         palette.muted
                     }))
-                    .bg(
-                        rgb(if active {
-                            palette.accent
-                        } else {
-                            palette.panel_alt
-                        })
-                        .opacity(if active { 0.94 } else { 0.58 }),
-                    )
+                    .bg(rgb(if active {
+                        palette.accent
+                    } else {
+                        palette.panel_alt
+                    })
+                    .opacity(if active { 0.94 } else { 0.58 }))
                     .child(mode.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.glass = mode;
@@ -411,7 +415,12 @@ impl Render for ModelicaViewer {
                         div()
                             .flex()
                             .flex_col()
-                            .child(div().text_xs().text_color(rgb(palette.accent)).child("MODELICA"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.accent))
+                                    .child("MODELICA"),
+                            )
                             .child(div().text_sm().child("Modelica Viewer")),
                     ),
             )
