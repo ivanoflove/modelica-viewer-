@@ -24,6 +24,7 @@ import type {
   SourceRangeRef,
 } from "../../shared/modelicaGraphics.js";
 import { identityTransform } from "../../shared/modelicaGraphics.js";
+import { resolveModelicaTextString } from "../../shared/modelicaText.js";
 import type { ClassNode } from "./types.js";
 
 function asNumber(v: AnnotationValue | undefined): number | undefined {
@@ -179,15 +180,23 @@ function resolveText(call: AnnotationCall, modelName: string): TextDto | null {
   const extent = parseExtent(getArg(call, "extent"));
   const textStringRaw = asString(getArg(call, "textString"));
   if (!extent || textStringRaw === undefined) return null;
-  const textString = textStringRaw.split("%name").join(modelName);
+  const textString = resolveModelicaTextString(textStringRaw, {
+    className: modelName,
+    instanceName: modelName,
+  });
   return {
     type: "Text",
     extent,
     textString,
+    textTemplate: textStringRaw,
     textColor:
       parseColor(getArg(call, "textColor")) ??
       parseColor(getArg(call, "lineColor")),
     fontSize: asNumber(getArg(call, "fontSize")),
+    rotation: asNumber(getArg(call, "rotation")),
+    horizontalAlignment:
+      asName(getArg(call, "horizontalAlignment")) ??
+      asName(getArg(call, "textAlignment")),
     origin: parseOrigin(call),
     textStyle: asNames(getArg(call, "textStyle")),
   };
@@ -203,6 +212,49 @@ function resolveBitmap(call: AnnotationCall): BitmapDto | null {
     fileName: asString(getArg(call, "fileName")),
     imageSource: asString(getArg(call, "imageSource")),
   };
+}
+
+function scalarValueText(value: AnnotationValue): string | undefined {
+  switch (value.type) {
+    case "string": return value.value;
+    case "number": return String(value.value);
+    case "boolean": return String(value.value);
+    case "identifier":
+    case "qualifiedName": return value.name;
+    default: return undefined;
+  }
+}
+
+/** Read scalar parameter defaults from the owning class for Text macros. */
+function parseParameterDefaults(classSlice: string): Record<string, string> {
+  const tokens = tokenize(classSlice);
+  const defaults: Record<string, string> = {};
+  for (let index = 0; index < tokens.length; index++) {
+    if (tokens[index]!.value !== "parameter") continue;
+    let end = index;
+    while (end < tokens.length && tokens[end]!.type !== "SEMICOLON") end++;
+    const relativeEquals = tokens.slice(index, end).findIndex((token) => token.type === "EQUALS");
+    if (relativeEquals < 0) {
+      index = end;
+      continue;
+    }
+    const equalsIndex = index + relativeEquals;
+    let nameIndex = equalsIndex - 1;
+    while (nameIndex > index && tokens[nameIndex]!.type !== "IDENT") nameIndex--;
+    const name = tokens[nameIndex]?.value;
+    if (!name) {
+      index = end;
+      continue;
+    }
+    const valueStart = tokens[equalsIndex]!.end;
+    const valueEnd = tokens[end]?.start ?? classSlice.length;
+    const valueCall = parseAnnotationSlice(`__value(${classSlice.slice(valueStart, valueEnd)})`);
+    const value = valueCall?.arguments[0]?.value;
+    const text = value ? scalarValueText(value) : undefined;
+    if (text !== undefined) defaults[name] = text;
+    index = end;
+  }
+  return defaults;
 }
 
 function resolveGraphic(
@@ -394,9 +446,11 @@ function annotateGraphics(
   owner: ClassNode,
   inherited: boolean,
   inheritancePath: string[],
+  modelName = owner.name,
 ): IconDto {
   return {
     coordinateSystem: icon.coordinateSystem,
+    parameterDefaults: icon.parameterDefaults,
     graphics: icon.graphics.map((graphic, index) => {
       const provenance: GraphicProvenance = {
         graphicId: `${owner.qualifiedName}:Icon.graphics:${index}`,
@@ -405,7 +459,17 @@ function annotateGraphics(
         inherited,
         inheritancePath,
       };
-      return { ...graphic, ...provenance } as typeof graphic;
+      if (graphic.type !== "Text") return { ...graphic, ...provenance } as typeof graphic;
+      const textString = resolveModelicaTextString(
+        graphic.textTemplate ?? graphic.textString,
+        {
+          classQualifiedName: owner.qualifiedName,
+          className: owner.name,
+          instanceName: modelName,
+          parameterDefaults: icon.parameterDefaults,
+        },
+      );
+      return { ...graphic, ...provenance, textString } as typeof graphic;
     }),
   };
 }
@@ -413,6 +477,7 @@ function annotateGraphics(
 function markInherited(icon: IconDto, through: string): IconDto {
   return {
     coordinateSystem: icon.coordinateSystem,
+    parameterDefaults: icon.parameterDefaults,
     graphics: icon.graphics.map((graphic) => ({
       ...graphic,
       inherited: true,
@@ -483,12 +548,19 @@ export function resolveIconForClass(
     target.sourceRange.end,
   );
   const ownMatch = findIconAnnotation(ownSlice);
-  const ownRawIcon = ownMatch ? resolveIcon(ownMatch.icon, modelName) : null;
+  const ownRawIcon = ownMatch
+    ? (() => {
+        const icon = resolveIcon(ownMatch.icon, modelName);
+        return icon
+          ? { ...icon, parameterDefaults: parseParameterDefaults(ownSlice) }
+          : null;
+      })()
+    : null;
   const ownDefinesCoordinateSystem = ownMatch
     ? iconDefinesCoordinateSystem(ownMatch.icon)
     : false;
   const ownIcon = ownRawIcon
-    ? annotateGraphics(ownRawIcon, target, false, [target.qualifiedName])
+    ? annotateGraphics(ownRawIcon, target, false, [target.qualifiedName], modelName)
     : null;
   let inherited: IconDto | null = null;
   const warnings: string[] = [];
@@ -531,6 +603,10 @@ export function resolveIconForClass(
         inherited = {
           graphics: [...currentInherited.graphics, ...inheritedBase.graphics],
           coordinateSystem: currentInherited.coordinateSystem,
+          parameterDefaults: {
+            ...(currentInherited.parameterDefaults ?? {}),
+            ...(inheritedBase.parameterDefaults ?? {}),
+          },
         };
       }
     }
@@ -545,6 +621,10 @@ export function resolveIconForClass(
         ? ownIcon.coordinateSystem
         : inherited.coordinateSystem,
       graphics: [...inherited.graphics, ...ownIcon.graphics],
+      parameterDefaults: {
+        ...(inherited.parameterDefaults ?? {}),
+        ...(ownIcon.parameterDefaults ?? {}),
+      },
     },
     warnings,
   };

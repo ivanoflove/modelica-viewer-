@@ -18,6 +18,8 @@ export interface CoordinateSystemDto {
 export interface IconDto {
   coordinateSystem: CoordinateSystemDto;
   graphics: GraphicItemDto[];
+  /** Scalar parameter defaults used when expanding instance Text macros. */
+  parameterDefaults?: Record<string, string>;
 }
 
 export interface GraphicTransform {
@@ -150,8 +152,12 @@ export interface TextDto extends GraphicProvenance {
   type: "Text";
   extent: Extent;
   textString: string;
+  /** Original annotation template, retained for per-instance expansion. */
+  textTemplate?: string;
   textColor?: [number, number, number];
   fontSize?: number;
+  rotation?: number;
+  horizontalAlignment?: string;
   origin?: Point;
   textStyle?: string[];
 }

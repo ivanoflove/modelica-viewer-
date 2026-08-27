@@ -5,6 +5,7 @@ import { resolveDiagramForClass } from "../diagramResolver.js";
 import { buildClassIndex, resolveIconForClass } from "../iconResolver.js";
 import { ModelicaLibraryRegistry } from "../registry.js";
 import { computePlacementTransform, transformPlacementPoint } from "../../../shared/diagram.js";
+import { resolveModelicaTextString } from "../../../shared/modelicaText.js";
 
 describe("Diagram M1 resolver", () => {
   it("indexes every freshly parsed qualified class, including nested classes", () => {
@@ -135,6 +136,37 @@ describe("Diagram M1 resolver", () => {
     expect(scene.contentBounds?.x).toBeLessThan(-220);
   });
 
+  it("expands component Text macros from defaults and instance modifiers", () => {
+    const source = `package Demo
+      model Boundary
+        parameter String bound="Source";
+        annotation(Icon(graphics={Text(origin={0,-20}, extent={{-40,10},{40,-10}}, textString="%bound", textStyle={TextStyle.Bold})}));
+      end Boundary;
+      model System
+        Boundary source annotation(Placement(transformation(origin={-40,0}, extent={{-10,-10},{10,10}})));
+        Boundary sink(bound="Sink") annotation(Placement(transformation(origin={40,0}, extent={{10,-10},{-10,10}})));
+      end System;
+    end Demo;`;
+    const parsed = parseModelicaFile(source, "demo.mo");
+    const classIndex = buildClassIndex(parsed.classes);
+    const boundary = classIndex.get("Demo.Boundary")!;
+    const system = classIndex.get("Demo.System")!;
+    const scene = resolveDiagramForClass(system, source, (_owner, typeName) =>
+      typeName === "Boundary" ? { target: boundary, allClasses: parsed.classes, source } : null,
+    );
+    const texts = scene.components.map((component) =>
+      component.resolvedIcon?.graphics.find((graphic) => graphic.type === "Text"),
+    );
+    expect(texts.map((text) => text?.textString)).toEqual(["Source", "Source"]);
+    expect(texts.map((text) => text?.textTemplate)).toEqual(["%bound", "%bound"]);
+    expect(scene.components[1]?.parameterBindings).toEqual({ bound: "Sink" });
+    expect(resolveModelicaTextString(texts[1]?.textTemplate ?? "", {
+      instanceName: scene.components[1]?.name,
+      parameterDefaults: scene.components[1]?.resolvedIcon?.parameterDefaults,
+      parameterBindings: scene.components[1]?.parameterBindings,
+    })).toBe("Sink");
+  });
+
   it.skipIf(!existsSync("/mnt/d/Documents/Dymola/Model/GH/IEH_CPP/IEH_CPP.mo"))(
     "keeps the real IEH_CPP SOECsys annotations separated",
     () => {
@@ -146,6 +178,8 @@ describe("Diagram M1 resolver", () => {
       expect(target).toBeDefined();
       const registry = new ModelicaLibraryRegistry();
       registry.registerSource(file, source, parsed);
+      const boundaryClass = index.get("IEH_CPP.FluidUnits.Boundary");
+      const boundaryIcon = boundaryClass ? resolveIconForClass(boundaryClass, parsed.classes, source, "Boundary") : null;
       const scene = resolveDiagramForClass(target!, source, (owner, typeName) =>
         registry.resolveFor(owner, typeName),
       );
@@ -159,6 +193,18 @@ describe("Diagram M1 resolver", () => {
       expect(scene.backgroundGraphics).toEqual([]);
       expect(scene.contentBounds?.x).toBeLessThan(-280);
       expect(scene.contentBounds?.x ?? 0).toBeLessThan(0);
+      const h2grid = scene.components.find((component) => component.name === "h2grid");
+      const si1 = scene.components.find((component) => component.name === "si1");
+      const h2Text = h2grid?.resolvedIcon?.graphics.find((graphic) => graphic.type === "Text");
+      const si1Text = si1?.resolvedIcon?.graphics.find((graphic) => graphic.type === "Text");
+      expect(h2Text?.textString).toBe("Source");
+      expect(si1Text?.textString).toBe("Source");
+      expect(si1?.parameterBindings).toEqual({ bound: "Sink" });
+      expect(resolveModelicaTextString(si1Text?.textTemplate ?? "", {
+        instanceName: si1?.name,
+        parameterDefaults: si1?.resolvedIcon?.parameterDefaults,
+        parameterBindings: si1?.parameterBindings,
+      })).toBe("Sink");
     },
   );
 });

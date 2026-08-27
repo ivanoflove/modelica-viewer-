@@ -193,6 +193,7 @@ function parseDiagramAnnotation(
 }
 
 function componentFromAnnotation(
+  classSlice: string,
   tokens: Token[],
   annotationRecord: ScopedAnnotation,
   classNode: ClassNode,
@@ -205,6 +206,7 @@ function componentFromAnnotation(
   );
   const placement = parsePlacement(annotationRecord.annotation);
   if (!declaration || !placement) return {};
+  const statementStart = statementStartIndex(tokens, annotationIndex);
 
   let end = tokens[annotationIndex]!.end;
   for (let index = annotationIndex; index < tokens.length; index++) {
@@ -222,6 +224,13 @@ function componentFromAnnotation(
       end: classNode.sourceRange.start + end,
     },
     placement,
+    parameterBindings: parseModifierBindings(
+      classSlice,
+      tokens,
+      statementStart,
+      annotationIndex,
+      declaration.name,
+    ),
   };
   const location = resolver(classNode, declaration.typeName);
   if (!location) {
@@ -278,6 +287,65 @@ function splitTopLevel(value: string): string[] {
   }
   parts.push(value.slice(start));
   return parts;
+}
+
+function modifierValueText(value: AnnotationValue): string | undefined {
+  switch (value.type) {
+    case "string": return value.value;
+    case "number": return String(value.value);
+    case "boolean": return String(value.value);
+    case "identifier":
+    case "qualifiedName": return value.name;
+    default: return undefined;
+  }
+}
+
+function findClosingParen(value: string, openIndex: number): number | undefined {
+  let depth = 0;
+  let quoted = false;
+  for (let index = openIndex; index < value.length; index++) {
+    const char = value[index]!;
+    if (char === '"') {
+      if (quoted && value[index + 1] === '"') index++;
+      else quoted = !quoted;
+      continue;
+    }
+    if (quoted) continue;
+    if (char === "(") depth++;
+    if (char === ")") {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return undefined;
+}
+
+function parseModifierBindings(
+  classSlice: string,
+  tokens: Token[],
+  statementStart: number,
+  annotationIndex: number,
+  instanceName: string,
+): Record<string, string> | undefined {
+  const startToken = tokens[statementStart];
+  const annotationToken = tokens[annotationIndex];
+  if (!startToken || !annotationToken) return undefined;
+  const statement = classSlice.slice(startToken.start, annotationToken.start);
+  const nameOffset = statement.indexOf(instanceName);
+  if (nameOffset < 0) return undefined;
+  const openIndex = statement.indexOf("(", nameOffset + instanceName.length);
+  if (openIndex < 0) return undefined;
+  const closeIndex = findClosingParen(statement, openIndex);
+  if (closeIndex === undefined) return undefined;
+  const modifier = parseAnnotationSlice(`__modifier(${statement.slice(openIndex + 1, closeIndex)})`);
+  if (!modifier) return undefined;
+  const bindings: Record<string, string> = {};
+  for (const argument of modifier.arguments) {
+    if (!argument.name) continue;
+    const value = modifierValueText(argument.value);
+    if (value !== undefined) bindings[argument.name] = value;
+  }
+  return Object.keys(bindings).length > 0 ? bindings : undefined;
 }
 
 function findMatchingCallEnd(tokens: Token[], openIndex: number): number | undefined {
@@ -390,7 +458,7 @@ export function resolveDiagramForClass(
 
   for (const record of annotations) {
     if (record.owner !== "component") continue;
-    const parsed = componentFromAnnotation(tokens, record, classNode, componentIndex, resolver);
+    const parsed = componentFromAnnotation(classSlice, tokens, record, classNode, componentIndex, resolver);
     if (!parsed.component) continue;
     componentIndex++;
     placedNames.add(parsed.component.name);

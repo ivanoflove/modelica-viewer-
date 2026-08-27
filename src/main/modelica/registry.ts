@@ -116,12 +116,18 @@ export class ModelicaLibraryRegistry {
 
   resolveFor(target: ClassNode, baseName: string): ClassLocation | null {
     const namespace = target.qualifiedName.split(".").slice(0, -1);
-    const candidates = baseName.includes(".")
-      ? [baseName]
-      : [...Array(namespace.length + 1)].map((_, index) => {
-          const prefix = namespace.slice(0, namespace.length - index).join(".");
-          return prefix ? `${prefix}.${baseName}` : baseName;
-        });
+    // A qualified name may still be relative to the current package. Try an
+    // exact library key first, then progressively enclosing namespaces:
+    // `FluidUnits.Boundary` inside `IEH_CPP.Converter.Cases` must resolve to
+    // `IEH_CPP.FluidUnits.Boundary`, while `Modelica.Blocks.X` resolves by
+    // its exact key.
+    const candidates = [
+      baseName,
+      ...[...Array(namespace.length + 1)].map((_, index) => {
+        const prefix = namespace.slice(0, namespace.length - index).join(".");
+        return prefix ? `${prefix}.${baseName}` : baseName;
+      }),
+    ];
     for (const candidate of candidates) {
       const location = this.resolve(candidate);
       if (location) return location;

@@ -136,11 +136,22 @@ function renderText(item: TextDto) {
     const y1 = item.extent.p1.y;
     const x2 = item.extent.p2.x;
     const y2 = item.extent.p2.y;
-    return <g transform={`translate(${(x1 + x2) / 2},${(y1 + y2) / 2}) scale(1,-1)`}>
-        <text x={0} y={0} textAnchor="middle" dominantBaseline="middle"
-            fontSize={item.fontSize ?? 12}
+    const width = Math.abs(x2 - x1);
+    const height = Math.abs(y2 - y1);
+    const characterCount = Math.max([...item.textString].length, 1);
+    const autoFontSize = Math.max(0.1, Math.min(height * 0.82, width / (characterCount * 0.62)));
+    const fontSize = item.fontSize && item.fontSize > 0 ? item.fontSize : autoFontSize;
+    const textAnchor = item.horizontalAlignment === "TextAlignment.Left" ? "start" :
+        item.horizontalAlignment === "TextAlignment.Right" ? "end" : "middle";
+    const anchorX = textAnchor === "start" ? -width / 2 : textAnchor === "end" ? width / 2 : 0;
+    const fontWeight = item.textStyle?.includes("TextStyle.Bold") ? 700 : 400;
+    const fontStyle = item.textStyle?.includes("TextStyle.Italic") ? "italic" : "normal";
+    const textDecoration = item.textStyle?.includes("TextStyle.UnderLine") ? "underline" : undefined;
+    return <g transform={`translate(${(x1 + x2) / 2},${(y1 + y2) / 2}) rotate(${item.rotation ?? 0}) scale(1,-1)`}>
+        <text x={anchorX} y={0} textAnchor={textAnchor} dominantBaseline="middle"
+            fontSize={fontSize}
             fill={toCssColor(item.textColor) === "none" ? "#000" : toCssColor(item.textColor)}
-            style={{ fontFamily: "Inter, sans-serif", fontWeight: item.textStyle?.includes("TextStyle.Bold") ? 700 : 400 }}>
+            style={{ fontFamily: "sans-serif", fontWeight, fontStyle, textDecoration }}>
             {item.textString}
         </text>
     </g>;

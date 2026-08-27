@@ -81,6 +81,7 @@ export interface ComponentInstanceDto {
   sourceRange: SourceRangeDto;
   placement?: PlacementDto;
   resolvedIcon?: IconDto;
+  parameterBindings?: Record<string, string>;
 }
 
 export interface DiagramBoundsDto {
