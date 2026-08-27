@@ -97,6 +97,8 @@ pub struct TextGraphic {
     pub extent: Extent,
     pub text: String,
     pub color: [u8; 3],
+    pub fill_color: Option<[u8; 3]>,
+    pub fill_pattern: Option<String>,
     pub font_size: Option<f32>,
     pub font_name: Option<String>,
     pub horizontal_alignment: Option<String>,

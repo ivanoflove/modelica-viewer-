@@ -293,6 +293,8 @@ fn parse_text(call: &AnnotationCall, diagnostics: &mut Vec<Diagnostic>) -> Optio
             "fontName",
             "textColor",
             "lineColor",
+            "fillColor",
+            "fillPattern",
             "horizontalAlignment",
             "textStyle",
         ],
@@ -311,6 +313,8 @@ fn parse_text(call: &AnnotationCall, diagnostics: &mut Vec<Diagnostic>) -> Optio
         color: parse_color_arg(call, "textColor")
             .or_else(|| parse_color_arg(call, "lineColor"))
             .unwrap_or(BLACK),
+        fill_color: parse_color_arg(call, "fillColor"),
+        fill_pattern: parse_name_arg(call, "fillPattern"),
         font_size: parse_number_arg(call, "fontSize"),
         font_name: call.named("fontName").and_then(parse_string),
         horizontal_alignment: parse_name_arg(call, "horizontalAlignment")
@@ -514,5 +518,22 @@ mod tests {
             &scene.graphics[2].graphic,
             Graphic::Polygon(item) if item.line_pattern.as_deref() == Some("LinePattern.Dot")
         ));
+    }
+
+    #[test]
+    fn resolves_text_visual_properties_without_diagnostics() {
+        let annotation = parse_annotation(
+            "annotation(Icon(graphics={Text(extent={{-20,-10},{20,10}}, textString=\"ABC\", textColor={0,0,0}, lineColor={1,2,3}, fillColor={255,255,255}, fillPattern=FillPattern.Solid, fontSize=12, horizontalAlignment=TextAlignment.Center, textStyle={TextStyle.Bold})}))",
+        )
+        .expect("annotation");
+        let icon = annotation.entries[0].value.as_call().expect("Icon call");
+        let scene = resolve_icon_call(icon);
+        assert!(scene.diagnostics.is_empty(), "{:?}", scene.diagnostics);
+        let Graphic::Text(text) = &scene.graphics[0].graphic else {
+            panic!("expected Text graphic");
+        };
+        assert_eq!(text.fill_color, Some([255, 255, 255]));
+        assert_eq!(text.fill_pattern.as_deref(), Some("FillPattern.Solid"));
+        assert_eq!(text.color, [0, 0, 0]);
     }
 }
