@@ -226,58 +226,57 @@ impl Render for ModelicaViewer {
         let tree = uniform_list(
             "class-tree",
             row_count,
-            cx.processor(
-                move |this, range: std::ops::Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|index| {
-                            let row = this.classes.get(index)?;
-                            let selected = this.selected == Some(index);
-                            let indent = row.depth as f32 * 14.0;
-                            let label = format!(
-                                "{}  {}",
-                                class_kind_symbol(row.class.kind),
-                                row.class.name
-                            );
-                            Some(
-                                div()
-                                    .id(format!("class-{index}"))
-                                    .mx_1()
-                                    .mb_1()
-                                    .pl(px(10.0 + indent))
-                                    .pr_2()
-                                    .py_2()
-                                    .rounded_md()
-                                    .text_sm()
-                                    .text_color(rgb(if selected {
-                                        palette.selected_text
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                range
+                    .filter_map(|index| {
+                        let row = this.classes.get(index)?;
+                        let selected = this.selected == Some(index);
+                        let indent = row.depth as f32 * 14.0;
+                        let label =
+                            format!("{}  {}", class_kind_symbol(row.class.kind), row.class.name);
+                        Some(
+                            div()
+                                .id(format!("class-{index}"))
+                                .mx_1()
+                                .mb_1()
+                                .pl(px(10.0 + indent))
+                                .pr_2()
+                                .py_2()
+                                .rounded_md()
+                                .text_sm()
+                                .text_color(rgb(if selected {
+                                    palette.selected_text
+                                } else {
+                                    palette.text
+                                }))
+                                .bg(rgb(if selected {
+                                    palette.accent
+                                } else {
+                                    palette.panel_alt
+                                })
+                                .opacity(if selected {
+                                    0.96
+                                } else {
+                                    0.62
+                                }))
+                                .hover(move |style| {
+                                    style.bg(rgb(if selected {
+                                        palette.accent_hover
                                     } else {
-                                        palette.text
-                                    }))
-                                    .bg(rgb(if selected {
-                                        palette.accent
-                                    } else {
-                                        palette.panel_alt
+                                        palette.card
                                     })
-                                    .opacity(if selected { 0.96 } else { 0.62 }))
-                                    .hover(move |style| {
-                                        style.bg(rgb(if selected {
-                                            palette.accent_hover
-                                        } else {
-                                            palette.card
-                                        })
-                                        .opacity(0.92))
-                                    })
-                                    .cursor_pointer()
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_class(index);
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                },
-            ),
+                                    .opacity(0.92))
+                                })
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_class(index);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
         )
         .h_full();
 
