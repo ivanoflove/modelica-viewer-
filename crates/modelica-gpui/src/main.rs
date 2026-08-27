@@ -1,6 +1,6 @@
 use gpui::{
     App, Bounds, Context, PathBuilder, Pixels, Render, Window, WindowBounds, WindowOptions, canvas,
-    div, point, prelude::*, px, rgb, size,
+    div, point, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_platform::application;
 use modelica_core::{
@@ -11,9 +11,23 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThemeMode {
-    Glass,
-    Midnight,
+    System,
     Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccentName {
+    Violet,
+    Blue,
+    Cyan,
+    Orange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlassMode {
+    On,
+    Reduced,
 }
 
 #[derive(Clone, Copy)]
@@ -35,56 +49,84 @@ struct Palette {
 impl ThemeMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Glass => "Glass",
-            Self::Midnight => "Midnight",
+            Self::System => "System",
             Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+}
+
+impl AccentName {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Violet => "Violet",
+            Self::Blue => "Blue",
+            Self::Cyan => "Cyan",
+            Self::Orange => "Orange",
         }
     }
 
-    fn palette(self) -> Palette {
+    fn color(self) -> u32 {
         match self {
-            Self::Glass => Palette {
-                root: 0x090b12,
-                panel: 0x121722,
-                panel_alt: 0x181f2d,
-                card: 0x111722,
-                border: 0x2a3446,
-                text: 0xe7edf7,
-                muted: 0x9aa8bc,
-                subtle: 0x68778d,
-                accent: 0x5b8cff,
-                accent_hover: 0x6f9aff,
-                selected_text: 0xffffff,
-                canvas: 0xf8fafc,
-            },
-            Self::Midnight => Palette {
-                root: 0x07090d,
-                panel: 0x0f1117,
-                panel_alt: 0x171a22,
-                card: 0x10131a,
-                border: 0x272b35,
-                text: 0xe5e7eb,
-                muted: 0xa1a1aa,
-                subtle: 0x71717a,
-                accent: 0x2563eb,
-                accent_hover: 0x3b82f6,
-                selected_text: 0xffffff,
-                canvas: 0xfafafa,
-            },
-            Self::Light => Palette {
-                root: 0xeef2f7,
-                panel: 0xf8fafc,
-                panel_alt: 0xffffff,
-                card: 0xffffff,
-                border: 0xd7dee8,
-                text: 0x172033,
-                muted: 0x5f6b7a,
-                subtle: 0x8a96a8,
-                accent: 0x2563eb,
-                accent_hover: 0x1d4ed8,
-                selected_text: 0xffffff,
-                canvas: 0xffffff,
-            },
+            Self::Violet => 0x6c5ce7,
+            Self::Blue => 0x4c8dff,
+            Self::Cyan => 0x27aeba,
+            Self::Orange => 0xdd7b39,
+        }
+    }
+
+    fn hover(self) -> u32 {
+        match self {
+            Self::Violet => 0x5b4bd6,
+            Self::Blue => 0x3478ee,
+            Self::Cyan => 0x168d99,
+            Self::Orange => 0xc46629,
+        }
+    }
+}
+
+impl GlassMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::On => "On",
+            Self::Reduced => "Reduced",
+        }
+    }
+}
+
+fn palette(theme: ThemeMode, accent: AccentName) -> Palette {
+    // System currently follows the dark chrome used by the native prototype. The setting is kept
+    // separate so native OS appearance tracking can be wired without changing the UI contract.
+    let dark = matches!(theme, ThemeMode::System | ThemeMode::Dark);
+    if dark {
+        Palette {
+            root: 0x17181d,
+            panel: 0x25272f,
+            panel_alt: 0x1f2128,
+            card: 0x2b2d36,
+            border: 0x3a3d47,
+            text: 0xf1f1f4,
+            muted: 0xa9abb6,
+            subtle: 0x7e808c,
+            accent: accent.color(),
+            accent_hover: accent.hover(),
+            selected_text: 0xffffff,
+            canvas: 0xf8f9fc,
+        }
+    } else {
+        Palette {
+            root: 0xf3f4f8,
+            panel: 0xffffff,
+            panel_alt: 0xf8f9fc,
+            card: 0xeef0f5,
+            border: 0xdfe1e8,
+            text: 0x202128,
+            muted: 0x70727d,
+            subtle: 0x9799a4,
+            accent: accent.color(),
+            accent_hover: accent.hover(),
+            selected_text: 0xffffff,
+            canvas: 0xffffff,
         }
     }
 }
@@ -102,6 +144,8 @@ struct ModelicaViewer {
     scene: IconScene,
     registry: LibraryRegistry,
     theme: ThemeMode,
+    accent: AccentName,
+    glass: GlassMode,
 }
 
 impl ModelicaViewer {
@@ -122,14 +166,11 @@ impl ModelicaViewer {
             package_path: path.to_owned(),
             classes,
             selected: None,
-            scene: IconScene {
-                owner_qualified_name: None,
-                coordinate_system: Default::default(),
-                graphics: Vec::new(),
-                diagnostics: Vec::new(),
-            },
+            scene: empty_scene(None),
             registry,
-            theme: ThemeMode::Glass,
+            theme: ThemeMode::System,
+            accent: AccentName::Violet,
+            glass: GlassMode::On,
         };
 
         if !viewer.classes.is_empty() {
@@ -172,39 +213,69 @@ impl ModelicaViewer {
 
 impl Render for ModelicaViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = self.theme.palette();
-        let mut tree = div()
-            .id("class-tree")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .flex_1()
-            .overflow_scroll();
+        let palette = palette(self.theme, self.accent);
+        let glass_alpha = if self.glass == GlassMode::On { 0.80 } else { 0.96 };
+        let row_count = self.classes.len();
 
-        for (index, row) in self.classes.iter().enumerate() {
-            let selected = self.selected == Some(index);
-            let indent = row.depth as f32 * 14.0;
-            let label = format!("{}  {}", class_kind_symbol(row.class.kind), row.class.name);
-            tree = tree.child(
-                div()
-                    .id(format!("class-{index}"))
-                    .pl(px(8.0 + indent))
-                    .pr_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .text_color(rgb(if selected { palette.selected_text } else { palette.text }))
-                    .bg(rgb(if selected { palette.accent } else { palette.panel_alt }).opacity(if selected { 0.92 } else { 0.72 }))
-                    .hover(move |style| style.bg(rgb(if selected { palette.accent_hover } else { palette.card }).opacity(0.94)))
-                    .cursor_pointer()
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_class(index);
-                        cx.notify();
-                    })),
-            );
-        }
+        let tree = uniform_list(
+            "class-tree",
+            row_count,
+            cx.processor(move |this, range, _window, cx| {
+                range
+                    .filter_map(|index| {
+                        let row = this.classes.get(index)?;
+                        let selected = this.selected == Some(index);
+                        let indent = row.depth as f32 * 14.0;
+                        let label = format!(
+                            "{}  {}",
+                            class_kind_symbol(row.class.kind),
+                            row.class.name
+                        );
+                        Some(
+                            div()
+                                .id(format!("class-{index}"))
+                                .mx_1()
+                                .mb_1()
+                                .pl(px(10.0 + indent))
+                                .pr_2()
+                                .py_2()
+                                .rounded_md()
+                                .text_sm()
+                                .text_color(rgb(if selected {
+                                    palette.selected_text
+                                } else {
+                                    palette.text
+                                }))
+                                .bg(
+                                    rgb(if selected {
+                                        palette.accent
+                                    } else {
+                                        palette.panel_alt
+                                    })
+                                    .opacity(if selected { 0.96 } else { 0.62 }),
+                                )
+                                .hover(move |style| {
+                                    style.bg(
+                                        rgb(if selected {
+                                            palette.accent_hover
+                                        } else {
+                                            palette.card
+                                        })
+                                        .opacity(0.92),
+                                    )
+                                })
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_class(index);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h_full();
 
         let scene = self.scene.clone();
         let primitive_count = scene.graphics.len();
@@ -219,10 +290,10 @@ impl Render for ModelicaViewer {
             .collect::<Vec<_>>()
             .join("  ·  ");
 
-        let mut themes = div().flex().gap_1();
-        for mode in [ThemeMode::Glass, ThemeMode::Midnight, ThemeMode::Light] {
+        let mut theme_choices = div().flex().gap_1();
+        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
             let active = self.theme == mode;
-            themes = themes.child(
+            theme_choices = theme_choices.child(
                 div()
                     .id(format!("theme-{}", mode.label()))
                     .px_2()
@@ -230,9 +301,19 @@ impl Render for ModelicaViewer {
                     .rounded_md()
                     .text_xs()
                     .cursor_pointer()
-                    .text_color(rgb(if active { palette.selected_text } else { palette.muted }))
-                    .bg(rgb(if active { palette.accent } else { palette.panel_alt }).opacity(0.82))
-                    .hover(move |style| style.bg(rgb(if active { palette.accent_hover } else { palette.card }).opacity(0.94)))
+                    .text_color(rgb(if active {
+                        palette.selected_text
+                    } else {
+                        palette.muted
+                    }))
+                    .bg(
+                        rgb(if active {
+                            palette.accent
+                        } else {
+                            palette.panel_alt
+                        })
+                        .opacity(if active { 0.96 } else { 0.68 }),
+                    )
                     .child(mode.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.theme = mode;
@@ -241,131 +322,272 @@ impl Render for ModelicaViewer {
             );
         }
 
+        let mut accent_choices = div().flex().gap_1();
+        for accent in [
+            AccentName::Violet,
+            AccentName::Blue,
+            AccentName::Cyan,
+            AccentName::Orange,
+        ] {
+            let active = self.accent == accent;
+            accent_choices = accent_choices.child(
+                div()
+                    .id(format!("accent-{}", accent.label()))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(if active { accent.color() } else { palette.muted }))
+                    .bg(rgb(palette.panel_alt).opacity(if active { 0.92 } else { 0.58 }))
+                    .child(format!("● {}", accent.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.accent = accent;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut glass_choices = div().flex().gap_1();
+        for mode in [GlassMode::On, GlassMode::Reduced] {
+            let active = self.glass == mode;
+            glass_choices = glass_choices.child(
+                div()
+                    .id(format!("glass-{}", mode.label()))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(if active {
+                        palette.selected_text
+                    } else {
+                        palette.muted
+                    }))
+                    .bg(
+                        rgb(if active {
+                            palette.accent
+                        } else {
+                            palette.panel_alt
+                        })
+                        .opacity(if active { 0.94 } else { 0.58 }),
+                    )
+                    .child(mode.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.glass = mode;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let header = div()
+            .h(px(54.0))
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel).opacity(glass_alpha))
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(260.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(30.0))
+                            .h(px(30.0))
+                            .rounded_lg()
+                            .bg(rgb(palette.accent).opacity(0.16))
+                            .text_color(rgb(palette.accent))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("◇"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_xs().text_color(rgb(palette.accent)).child("MODELICA"))
+                            .child(div().text_sm().child("Modelica Viewer")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(rgb(palette.subtle))
+                    .child(selected_name.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(theme_choices)
+                    .child(accent_choices)
+                    .child(glass_choices),
+            );
+
+        let sidebar = div()
+            .w(px(278.0))
+            .h_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel).opacity(glass_alpha))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(self.package_name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.subtle))
+                                    .child(format!("{} classes", self.classes.len())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(palette.subtle))
+                            .child(self.package_path.display().to_string()),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().py_2().child(tree));
+
+        let detail = div()
+            .flex_1()
+            .h_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.panel).opacity(glass_alpha))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .min_h(px(58.0))
+                    .px_4()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_base().child(selected_name))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.subtle))
+                                    .child(format!(
+                                        "{primitive_count} graphics · {diagnostic_count} diagnostics"
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
+                                    .child("Source"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(rgb(palette.accent).opacity(0.13))
+                                    .text_xs()
+                                    .text_color(rgb(palette.accent))
+                                    .child("Icon"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
+                                    .child("Diagram"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .m_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.canvas))
+                    .overflow_hidden()
+                    .child(icon_canvas(scene)),
+            )
+            .child(
+                div()
+                    .min_h(px(34.0))
+                    .px_4()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(palette.border))
+                    .text_xs()
+                    .text_color(if diagnostic_count == 0 {
+                        rgb(palette.subtle)
+                    } else {
+                        rgb(0xf59e0b)
+                    })
+                    .child(if diagnostics.is_empty() {
+                        "Ready · GPUI native paint · Electron legacy appearance port"
+                            .to_owned()
+                    } else {
+                        diagnostics
+                    }),
+            );
+
         div()
             .size_full()
             .bg(rgb(palette.root))
             .text_color(rgb(palette.text))
             .flex()
-            .p_2()
-            .gap_2()
-            .child(
-                div()
-                    .w(px(300.0))
-                    .h_full()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel).opacity(if self.theme == ThemeMode::Glass { 0.86 } else { 1.0 }))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .px_3()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(rgb(palette.border))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted))
-                                    .child("MODEL LIBRARY"),
-                            )
-                            .child(div().mt_1().text_base().child(self.package_name.clone()))
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(rgb(palette.subtle))
-                                    .child(self.package_path.display().to_string()),
-                            ),
-                    )
-                    .child(tree),
-            )
+            .flex_col()
+            .child(header)
             .child(
                 div()
                     .flex_1()
-                    .h_full()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel).opacity(if self.theme == ThemeMode::Glass { 0.88 } else { 1.0 }))
-                    .overflow_hidden()
+                    .min_h_0()
+                    .p_3()
+                    .gap_3()
                     .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .min_h(px(64.0))
-                            .px_4()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(rgb(palette.border))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(div().text_base().child(selected_name))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(palette.subtle))
-                                            .child(format!(
-                                                "{primitive_count} graphics · {diagnostic_count} diagnostics"
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(themes)
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
-                                            .bg(rgb(palette.panel_alt).opacity(0.82))
-                                            .text_xs()
-                                            .text_color(rgb(palette.muted))
-                                            .child("GPUI native paint"),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .m_3()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(rgb(palette.border))
-                            .bg(rgb(palette.canvas))
-                            .overflow_hidden()
-                            .child(icon_canvas(scene)),
-                    )
-                    .child(
-                        div()
-                            .min_h(px(34.0))
-                            .px_4()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(rgb(palette.border))
-                            .text_xs()
-                            .text_color(if diagnostic_count == 0 {
-                                rgb(palette.subtle)
-                            } else {
-                                rgb(0xf59e0b)
-                            })
-                            .child(if diagnostics.is_empty() {
-                                "Ready · theme affects UI chrome only; Modelica scene colors stay source-driven"
-                                    .to_owned()
-                            } else {
-                                diagnostics
-                            }),
-                    ),
+                    .child(sidebar)
+                    .child(detail),
             )
     }
 }
