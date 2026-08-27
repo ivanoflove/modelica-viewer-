@@ -58,7 +58,12 @@ impl IconViewState {
     fn set_bounds_and_fit_if_needed(&mut self, scene: &IconScene, bounds: RenderBounds) {
         self.canvas_bounds = Some(bounds);
         if self.fit_requested {
-            self.viewport = Viewport::fit(scene_bounds(scene), bounds, 0.12);
+            self.viewport = Viewport::fit_with_aspect(
+                scene_bounds(scene),
+                bounds,
+                0.12,
+                scene.coordinate_system.preserve_aspect_ratio,
+            );
             self.fit_requested = false;
         }
     }

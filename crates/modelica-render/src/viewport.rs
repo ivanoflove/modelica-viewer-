@@ -30,8 +30,12 @@ impl ModelBounds {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
-    /// Screen pixels per Modelica unit.
+    /// Reference screen pixels per Modelica unit, used for the zoom display.
     pub zoom: f32,
+    /// Horizontal screen pixels per Modelica unit.
+    pub scale_x: f32,
+    /// Vertical screen pixels per Modelica unit.
+    pub scale_y: f32,
     /// Model-space translation applied before scaling. Keeping pan in model
     /// space makes viewport state independent from window size and DPI.
     pub pan: Vec2,
@@ -41,6 +45,8 @@ impl Default for Viewport {
     fn default() -> Self {
         Self {
             zoom: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
             pan: Vec2::default(),
         }
     }
@@ -49,15 +55,15 @@ impl Default for Viewport {
 impl Viewport {
     pub fn model_to_screen(self, point: ModelPoint, bounds: Bounds) -> ScreenPoint {
         ScreenPoint(Vec2 {
-            x: bounds.x + bounds.width / 2.0 + (point.0.x + self.pan.x) * self.zoom,
-            y: bounds.y + bounds.height / 2.0 - (point.0.y + self.pan.y) * self.zoom,
+            x: bounds.x + bounds.width / 2.0 + (point.0.x + self.pan.x) * self.scale_x,
+            y: bounds.y + bounds.height / 2.0 - (point.0.y + self.pan.y) * self.scale_y,
         })
     }
 
     pub fn screen_to_model(self, point: ScreenPoint, bounds: Bounds) -> ModelPoint {
         ModelPoint(Vec2 {
-            x: (point.0.x - bounds.x - bounds.width / 2.0) / self.zoom - self.pan.x,
-            y: -((point.0.y - bounds.y - bounds.height / 2.0) / self.zoom) - self.pan.y,
+            x: (point.0.x - bounds.x - bounds.width / 2.0) / self.scale_x - self.pan.x,
+            y: -((point.0.y - bounds.y - bounds.height / 2.0) / self.scale_y) - self.pan.y,
         })
     }
 
@@ -65,15 +71,35 @@ impl Viewport {
     /// ratio. `padding_fraction` is the fraction of each viewport dimension
     /// reserved around the fitted content (0.12 means 12% total padding).
     pub fn fit(model: ModelBounds, bounds: Bounds, padding_fraction: f32) -> Self {
+        Self::fit_with_aspect(model, bounds, padding_fraction, true)
+    }
+
+    /// Fit a Modelica rectangle, optionally allowing independent X/Y scales.
+    pub fn fit_with_aspect(
+        model: ModelBounds,
+        bounds: Bounds,
+        padding_fraction: f32,
+        preserve_aspect_ratio: bool,
+    ) -> Self {
         let padding = padding_fraction.clamp(0.0, 0.9);
         let available_width = (bounds.width * (1.0 - padding)).max(1.0);
         let available_height = (bounds.height * (1.0 - padding)).max(1.0);
-        let zoom = (available_width / model.width())
-            .min(available_height / model.height())
-            .clamp(MIN_ZOOM, MAX_ZOOM);
+        let width_scale = (available_width / model.width()).clamp(MIN_ZOOM, MAX_ZOOM);
+        let height_scale = (available_height / model.height()).clamp(MIN_ZOOM, MAX_ZOOM);
+        let zoom = width_scale.min(height_scale);
         let center = model.center();
         Self {
             zoom,
+            scale_x: if preserve_aspect_ratio {
+                zoom
+            } else {
+                width_scale
+            },
+            scale_y: if preserve_aspect_ratio {
+                zoom
+            } else {
+                height_scale
+            },
             pan: Vec2 {
                 x: -center.x,
                 y: -center.y,
@@ -83,6 +109,8 @@ impl Viewport {
 
     pub fn zoom_by(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.scale_x = (self.scale_x * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.scale_y = (self.scale_y * factor).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 
     /// Zoom around a screen-space anchor. The Modelica point underneath the
@@ -101,15 +129,15 @@ impl Viewport {
     /// Pan by a mouse drag measured in screen pixels. Positive dx moves the
     /// drawing right; positive dy moves it down, while Modelica remains Y-up.
     pub fn pan_screen_delta(&mut self, dx: f32, dy: f32) {
-        if self.zoom <= 0.0 {
+        if self.scale_x <= 0.0 || self.scale_y <= 0.0 {
             return;
         }
-        self.pan.x += dx / self.zoom;
-        self.pan.y -= dy / self.zoom;
+        self.pan.x += dx / self.scale_x;
+        self.pan.y -= dy / self.scale_y;
     }
 
     pub fn model_tolerance_for_screen_pixels(self, pixels: f32) -> f32 {
-        pixels.max(0.0) / self.zoom.max(MIN_ZOOM)
+        pixels.max(0.0) / self.scale_x.min(self.scale_y).max(MIN_ZOOM)
     }
 }
 
@@ -125,6 +153,8 @@ mod tests {
     fn model_and_screen_coordinates_round_trip() {
         let viewport = Viewport {
             zoom: 2.0,
+            scale_x: 2.0,
+            scale_y: 2.0,
             pan: Vec2 { x: 4.0, y: -3.0 },
         };
         let bounds = Bounds {
@@ -161,6 +191,28 @@ mod tests {
     }
 
     #[test]
+    fn fit_can_stretch_when_coordinate_system_disables_aspect_ratio() {
+        let viewport = Viewport::fit_with_aspect(
+            ModelBounds {
+                min_x: -100.0,
+                min_y: -50.0,
+                max_x: 100.0,
+                max_y: 50.0,
+            },
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 600.0,
+            },
+            0.12,
+            false,
+        );
+        close(viewport.scale_x, 4.4);
+        close(viewport.scale_y, 5.28);
+    }
+
+    #[test]
     fn zoom_at_keeps_anchor_model_point_stationary() {
         let bounds = Bounds {
             x: 0.0,
@@ -171,6 +223,8 @@ mod tests {
         let anchor = ScreenPoint(Vec2 { x: 612.0, y: 183.0 });
         let mut viewport = Viewport {
             zoom: 2.0,
+            scale_x: 2.0,
+            scale_y: 2.0,
             pan: Vec2 { x: 5.0, y: -7.0 },
         };
         let before = viewport.screen_to_model(anchor, bounds);
@@ -191,6 +245,8 @@ mod tests {
         let model = ModelPoint(Vec2 { x: 0.0, y: 0.0 });
         let mut viewport = Viewport {
             zoom: 4.0,
+            scale_x: 4.0,
+            scale_y: 4.0,
             pan: Vec2::default(),
         };
         let before = viewport.model_to_screen(model, bounds);
