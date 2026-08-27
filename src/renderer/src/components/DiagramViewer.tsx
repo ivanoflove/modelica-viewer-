@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { IconDto, GraphicItemDto } from "../../../shared/modelicaGraphics";
 import type { ComponentInstanceDto, DiagramSceneDto } from "../../../shared/modelica";
 import { resolveModelicaTextString } from "../../../shared/modelicaText";
@@ -41,6 +41,39 @@ function connectionPoints(line: NonNullable<DiagramSceneDto["connections"][numbe
   return line.points
     .map((point) => `${point.x + origin.x},${point.y + origin.y}`)
     .join(" ");
+}
+
+function DiagramDiagnostics({ diagnostics }: { diagnostics: string[] }) {
+  const [open, setOpen] = useState(false);
+  const items = useMemo(
+    () => Array.from(new Set(diagnostics.filter((diagnostic) => diagnostic.trim()))),
+    [diagnostics],
+  );
+  if (items.length === 0) return null;
+
+  return (
+    <div className="diagram-diagnostics">
+      <button
+        type="button"
+        className="diagram-diagnostics-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        ⚠ {items.length} 个 Diagram 警告
+      </button>
+      {open && (
+        <div className="diagram-diagnostics-popover" role="dialog" aria-label="Diagram diagnostics">
+          <div className="diagram-diagnostics-title">
+            <span>Diagram diagnostics</span>
+            <button type="button" onClick={() => setOpen(false)} aria-label="关闭诊断">×</button>
+          </div>
+          <ul>
+            {items.map((diagnostic) => <li key={diagnostic}>{diagnostic}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ComponentRenderer({
@@ -117,11 +150,7 @@ export function DiagramViewer({ scene }: { scene: DiagramSceneDto }) {
   const viewportIcon = useMemo(() => viewportIconForScene(scene), [scene]);
   return (
     <div className="diagram-viewer">
-      {scene.diagnostics.length > 0 && (
-        <div className="diagram-warning" title={scene.diagnostics.join("\n")}>
-          {scene.diagnostics.length} 个 Diagram 提示
-        </div>
-      )}
+      <DiagramDiagnostics diagnostics={scene.diagnostics} />
       <GraphicViewport
         icon={viewportIcon}
         resetKey={`diagram:${scene.classQualifiedName ?? "selected"}`}

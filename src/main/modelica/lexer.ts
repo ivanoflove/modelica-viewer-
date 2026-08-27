@@ -11,6 +11,11 @@ export type TokenType =
   | "RBRACE"
   | "COMMA"
   | "EQUALS"
+  | "LBRACKET"
+  | "RBRACKET"
+  | "OPERATOR"
+  | "WHITESPACE"
+  | "COMMENT"
   | "EOF";
 
 export interface Token {
@@ -23,6 +28,9 @@ export interface Token {
 }
 
 const KEYWORDS = new Set([
+  "algorithm",
+  "and",
+  "annotation",
   "within",
   "package",
   "model",
@@ -32,6 +40,38 @@ const KEYWORDS = new Set([
   "function",
   "class",
   "type",
+  "break",
+  "connect",
+  "constant",
+  "constrainedby",
+  "der",
+  "discrete",
+  "each",
+  "else",
+  "elseif",
+  "elsewhen",
+  "enumeration",
+  "false",
+  "final",
+  "flow",
+  "initial",
+  "impure",
+  "in",
+  "inner",
+  "input",
+  "not",
+  "operator",
+  "or",
+  "outer",
+  "output",
+  "parameter",
+  "pure",
+  "redeclare",
+  "replaceable",
+  "return",
+  "stream",
+  "then",
+  "true",
   "partial",
   "end",
   "encapsulated",
@@ -46,11 +86,18 @@ const KEYWORDS = new Set([
   "algorithm",
   "protected",
   "public",
-  "annotation",
+  "external",
+  "expandable",
 ]);
 
-export function tokenize(input: string): Token[] {
+export interface TokenizeOptions {
+  /** Keep whitespace/comments and otherwise skipped characters for highlighting. */
+  preserveTrivia?: boolean;
+}
+
+export function tokenize(input: string, options: TokenizeOptions = {}): Token[] {
   const tokens: Token[] = [];
+  const preserveTrivia = options.preserveTrivia === true;
   let i = 0;
   let line = 1;
   let col = 1;
@@ -74,19 +121,49 @@ export function tokenize(input: string): Token[] {
 
     // whitespace
     if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+      const start = i;
+      const startLine = line;
+      const startCol = col;
       advance();
+      while (i < input.length && " \t\r\n".includes(input[i]!)) advance();
+      if (preserveTrivia) {
+        tokens.push({
+          type: "WHITESPACE",
+          value: input.slice(start, i),
+          line: startLine,
+          col: startCol,
+          start,
+          end: i,
+        });
+      }
       continue;
     }
 
     // line comment //
     if (ch === "/" && peek(1) === "/") {
+      const start = i;
+      const startLine = line;
+      const startCol = col;
       advance(2);
       while (i < input.length && input[i] !== "\n") advance();
+      if (preserveTrivia) {
+        tokens.push({
+          type: "COMMENT",
+          value: input.slice(start, i),
+          line: startLine,
+          col: startCol,
+          start,
+          end: i,
+        });
+      }
       continue;
     }
 
     // block comment /* */
     if (ch === "/" && peek(1) === "*") {
+      const start = i;
+      const startLine = line;
+      const startCol = col;
       advance(2);
       while (i < input.length) {
         if (input[i] === "*" && peek(1) === "/") {
@@ -94,6 +171,16 @@ export function tokenize(input: string): Token[] {
           break;
         }
         advance();
+      }
+      if (preserveTrivia) {
+        tokens.push({
+          type: "COMMENT",
+          value: input.slice(start, i),
+          line: startLine,
+          col: startCol,
+          start,
+          end: i,
+        });
       }
       continue;
     }
@@ -252,6 +339,22 @@ export function tokenize(input: string): Token[] {
       });
       continue;
     }
+    if (ch === "[") {
+      const start = i;
+      const sL = line;
+      const sC = col;
+      advance();
+      tokens.push({ type: "LBRACKET", value: "[", line: sL, col: sC, start, end: i });
+      continue;
+    }
+    if (ch === "]") {
+      const start = i;
+      const sL = line;
+      const sC = col;
+      advance();
+      tokens.push({ type: "RBRACKET", value: "]", line: sL, col: sC, start, end: i });
+      continue;
+    }
 
     // number: optional sign, digits, optional dot, optional exponent
     if (
@@ -348,10 +451,30 @@ export function tokenize(input: string): Token[] {
       continue;
     }
 
-    // any other char: skip
+    // Keep operators in highlighting mode. The parser intentionally only
+    // needs the punctuation above, but the source viewer must preserve the
+    // exact source coverage.
+    const start = i;
+    const startLine = line;
+    const startCol = col;
     advance();
+    if (preserveTrivia) {
+      tokens.push({
+        type: "OPERATOR",
+        value: input.slice(start, i),
+        line: startLine,
+        col: startCol,
+        start,
+        end: i,
+      });
+    }
   }
 
   tokens.push({ type: "EOF", value: "", line, col, start: i, end: i });
   return tokens;
+}
+
+/** Lexer mode for the read-only Modelica source viewer. */
+export function tokenizeForHighlighting(input: string): Token[] {
+  return tokenize(input, { preserveTrivia: true });
 }

@@ -95,6 +95,28 @@ describe("parser", () => {
     expect(functions.name).toBe("Functions");
   });
 
+  it("should parse short connector definitions and retain annotations", () => {
+    const src = `within Modelica.Blocks.Interfaces;
+      connector RealInput = input Real "'input Real' as connector"
+        annotation(
+          Icon(graphics={Polygon(points={{-100,-100},{100,0},{-100,100},{-100,-100}})}),
+          Diagram(graphics={Text(extent={{-80,-20},{80,20}}, textString="%name")}));
+      connector RealOutput = output Real annotation(Icon(graphics={Polygon(points={{100,0},{-100,-100},{-100,100},{100,0}})}));`;
+    const file = parseModelicaFile(src, "Interfaces.mo");
+    const input = file.classes[0]!;
+    const output = file.classes[1]!;
+
+    expect(input.kind).toBe("connector");
+    expect(input.qualifiedName).toBe("Modelica.Blocks.Interfaces.RealInput");
+    expect(input.isShort).toBe(true);
+    expect(input.baseTypeName).toBe("Real");
+    expect(input.basePrefixes).toEqual({ input: true });
+    expect(src.slice(input.sourceRange.start, input.sourceRange.end)).toContain("Diagram(");
+    expect(output.isShort).toBe(true);
+    expect(output.baseTypeName).toBe("Real");
+    expect(output.basePrefixes).toEqual({ output: true });
+  });
+
   it("should collect extends clauses without treating their arguments as classes", () => {
     const src = `package P
       extends Modelica.Icons.Package;

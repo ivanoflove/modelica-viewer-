@@ -12,6 +12,7 @@ import { PackageTree, type Selection } from "./components/PackageTree";
 import { IconViewer } from "./components/IconViewer";
 import { DiagramViewer } from "./components/DiagramViewer";
 import { AppearancePopover } from "./components/AppearancePopover";
+import { SourceViewer } from "./components/SourceViewer";
 
 type ViewMode = "source" | "icon" | "diagram";
 
@@ -566,9 +567,7 @@ function App(): JSX.Element {
                     ) : sourceError ? (
                       <div className="source-error">{sourceError}</div>
                     ) : (
-                      <pre>
-                        <code>{source}</code>
-                      </pre>
+                      <SourceViewer source={source} />
                     )}
                   </div>
                 )}

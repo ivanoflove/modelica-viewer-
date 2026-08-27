@@ -42,11 +42,10 @@ describe("Diagram M1 resolver", () => {
     const source = `within IEH_CPP;
       package Interfaces
         package FluidInterfaces
-          connector FluidPortIN
+          connector FluidPortIN = input Real "short connector"
             annotation(
               Icon(coordinateSystem(extent={{-100,-100},{100,100}}), graphics={Ellipse(extent={{-100,-100},{100,100}}, fillColor={0,0,255})}),
               Diagram(coordinateSystem(extent={{-100,-100},{100,100}}), graphics={Rectangle(extent={{-100,-100},{100,100}})}));
-          end FluidPortIN;
         end FluidInterfaces;
       end Interfaces;
       package FluidUnits

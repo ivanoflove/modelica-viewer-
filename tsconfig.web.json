@@ -28,6 +28,7 @@
     "src/renderer/src/**/*.ts",
     "src/renderer/src/**/*.tsx",
     "src/renderer/editor/**/*.ts",
-    "src/shared/**/*.ts"
+    "src/shared/**/*.ts",
+    "src/main/modelica/lexer.ts"
   ]
 }

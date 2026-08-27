@@ -169,12 +169,17 @@ class Parser {
       children: [],
     };
 
-    // Short type definitions use `type Name = BaseType(...);` and do not
-    // have an `end Name;` terminator. Track annotation/array delimiters so
-    // semicolons inside nested expressions do not end the declaration.
-    if (kind === "type") {
+    // Short class definitions (`connector X = input Real ...;`, as used by
+    // Modelica.Blocks.Interfaces.RealInput) do not have an `end X;`
+    // terminator. Keep the complete declaration range so annotations after
+    // the base type remain available to Icon/Diagram resolvers.
+    if (this.peek().type === "EQUALS") {
+      this.advance();
       let parenDepth = 0;
       let braceDepth = 0;
+      let bracketDepth = 0;
+      const basePrefixes: NonNullable<ClassNode["basePrefixes"]> = {};
+      let baseTypeName: string | undefined;
       while (true) {
         const tok = this.peek();
         if (tok.type === "EOF") break;
@@ -182,13 +187,33 @@ class Parser {
         if (tok.type === "RPAREN") parenDepth = Math.max(0, parenDepth - 1);
         if (tok.type === "LBRACE") braceDepth++;
         if (tok.type === "RBRACE") braceDepth = Math.max(0, braceDepth - 1);
+        if (tok.value === "[") bracketDepth++;
+        if (tok.value === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+        if (!baseTypeName && tok.type === "IDENT") {
+          baseTypeName = tok.value;
+        }
+        if (tok.value === "input") basePrefixes.input = true;
+        if (tok.value === "output") basePrefixes.output = true;
+        if (tok.value === "flow") basePrefixes.flow = true;
+        if (tok.value === "stream") basePrefixes.stream = true;
+        if (
+          baseTypeName &&
+          this.tokens[this.pos - 1]?.type === "DOT" &&
+          tok.type === "IDENT"
+        ) {
+          baseTypeName += `.${tok.value}`;
+        }
         const endTok = this.advance();
         if (
           endTok.type === "SEMICOLON" &&
           parenDepth === 0 &&
-          braceDepth === 0
+          braceDepth === 0 &&
+          bracketDepth === 0
         ) {
           node.sourceRange.end = endTok.end;
+          node.isShort = true;
+          node.baseTypeName = baseTypeName;
+          node.basePrefixes = basePrefixes;
           break;
         }
       }

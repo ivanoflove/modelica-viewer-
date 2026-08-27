@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { tokenize } from "../lexer.js";
+import { tokenize, tokenizeForHighlighting } from "../lexer.js";
 
 describe("lexer", () => {
   it("should skip line and block comments", () => {
@@ -79,5 +79,17 @@ describe("lexer", () => {
       .filter((token) => token.type === "NUMBER")
       .map((token) => Number(token.value));
     expect(numbers).toEqual([1.77636e-15, -8.88178e-16, 2000, 0.5]);
+  });
+
+  it("should preserve trivia and source coverage for highlighting", () => {
+    const src = `model Demo // 中文 comment
+  parameter Real gain = 3e-5;
+  /* multiline\n     comment */
+end Demo;`;
+    const tokens = tokenizeForHighlighting(src);
+    expect(tokens.filter((token) => token.type === "COMMENT")).toHaveLength(2);
+    expect(tokens.find((token) => token.value === "3e-5")?.type).toBe("NUMBER");
+    expect(tokens.map((token) => src.slice(token.start, token.end)).join(""))
+      .toBe(src);
   });
 });

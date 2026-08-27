@@ -287,12 +287,27 @@ button { -webkit-app-region: no-drag; }
 .source-editor { flex: 1; min-width: 0; min-height: 0; overflow: auto; background: var(--surface); }
 .source-editor.icon-tab { position: relative; display: flex; align-items: stretch; justify-content: stretch; overflow: hidden; overscroll-behavior: none; }
 .source-editor pre { margin: 0; padding: 20px 22px; color: var(--text-primary); font: 12px/1.65 "SFMono-Regular", "Cascadia Code", Consolas, monospace; white-space: pre; tab-size: 2; }
+.modelica-source .source-token-keyword { color: #9b59d0; font-weight: 650; }
+.modelica-source .source-token-annotation { color: #b06b2c; }
+.modelica-source .source-token-type { color: #2878b8; }
+.modelica-source .source-token-builtin { color: #2f8f72; }
+.modelica-source .source-token-number { color: #9a641d; }
+.modelica-source .source-token-string { color: #4c8b45; }
+.modelica-source .source-token-comment { color: var(--text-tertiary); font-style: italic; }
+.modelica-source .source-token-operator, .modelica-source .source-token-punctuation { color: var(--text-secondary); }
 .source-status, .source-error { padding: 20px; font-size: 12px; }
 .source-error { color: var(--danger); background: var(--danger-soft); }
 .diagram-tab { position: relative; }
 .diagram-viewer { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .diagram-viewer .graphic-viewport { width: 100%; }
-.diagram-warning { position: absolute; top: 10px; left: 12px; z-index: 2; padding: 5px 9px; border: 1px solid rgb(226 169 55 / .25); border-radius: 8px; background: rgb(226 169 55 / .12); color: #9a741f; font-size: 10px; pointer-events: none; }
+.diagram-diagnostics { position: absolute; top: 8px; left: 12px; z-index: 5; }
+.diagram-diagnostics-toggle { padding: 5px 9px; border: 1px solid rgb(226 169 55 / .25); border-radius: 8px; background: rgb(226 169 55 / .12); color: #9a741f; cursor: pointer; font-size: 10px; }
+.diagram-diagnostics-toggle:hover { background: rgb(226 169 55 / .2); }
+.diagram-diagnostics-popover { width: min(520px, calc(100vw - 42px)); max-height: 260px; margin-top: 6px; overflow: auto; padding: 9px 11px; border: 1px solid rgb(226 169 55 / .3); border-radius: 9px; background: var(--surface); box-shadow: 0 10px 30px rgb(0 0 0 / .16); color: var(--text-secondary); font-size: 10px; }
+.diagram-diagnostics-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-primary); font-weight: 650; }
+.diagram-diagnostics-title button { border: 0; background: transparent; color: var(--text-tertiary); cursor: pointer; font-size: 16px; line-height: 1; }
+.diagram-diagnostics-popover ul { margin: 8px 0 0; padding-left: 16px; }
+.diagram-diagnostics-popover li { margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
 .diagram-empty { display: grid; flex: 1; place-items: center; color: var(--text-tertiary); font-size: 12px; }
 .diagram-layer { pointer-events: none; }
 .diagram-component { pointer-events: none; }

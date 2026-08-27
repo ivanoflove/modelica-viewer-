@@ -34,6 +34,15 @@ export interface ClassNode {
   isEncapsulated: boolean;
   extendsClauses: string[];
   children: ClassNode[];
+  /** Short class definitions terminate with `;`, not `end <name>;`. */
+  isShort?: boolean;
+  baseTypeName?: string;
+  basePrefixes?: {
+    input?: boolean;
+    output?: boolean;
+    flow?: boolean;
+    stream?: boolean;
+  };
 }
 
 export interface ModelicaFile {
