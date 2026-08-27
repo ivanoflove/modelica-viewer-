@@ -1,11 +1,12 @@
 use gpui::{
-    Bounds, MouseButton, PathBuilder, Pixels, ScrollDelta, TextAlign, TextRun, UnderlineStyle,
-    Window, canvas, div, fill, font, point, prelude::*, px, rgb, size,
+    Bounds, MouseButton, PathBuilder, Pixels, ScrollDelta, TransformationMatrix, Window, canvas,
+    div, fill, point, prelude::*, px, radians, rgb, size,
 };
 use modelica_core::{Graphic, IconScene};
 use modelica_render::{
     Bounds as RenderBounds, ModelBounds, ModelPoint, ScreenPoint, Vec2, Viewport, hit_test_graphics,
 };
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 const HIT_TOLERANCE_PX: f32 = 6.0;
@@ -702,65 +703,84 @@ fn paint_text(
         .font_size
         .filter(|size| *size > 0.0)
         .unwrap_or(auto_font);
-    let font_px = px((font_model * map.viewport.zoom).max(1.0));
-
     let center_local = modelica_core::scene::Point {
         x: (graphic.extent.p1.x + graphic.extent.p2.x) * 0.5,
         y: (graphic.extent.p1.y + graphic.extent.p2.y) * 0.5,
     };
     let center = map.graphic_point(center_local, graphic.origin, graphic.rotation);
-    let mut text_font = graphic
-        .font_name
-        .as_deref()
-        .map(font)
-        .unwrap_or_else(|| window.text_style().font());
-    if graphic
+    let screen_width = width_model * map.viewport.scale_x;
+    let screen_height = height_model * map.viewport.scale_y;
+    let bounds = Bounds::new(
+        point(
+            px(f32::from(center.x) - screen_width * 0.5),
+            px(f32::from(center.y) - screen_height * 0.5),
+        ),
+        size(px(screen_width.max(1.0)), px(screen_height.max(1.0))),
+    );
+    let text_anchor = match graphic.horizontal_alignment.as_deref() {
+        Some("TextAlignment.Left") => "start",
+        Some("TextAlignment.Right") => "end",
+        _ => "middle",
+    };
+    let anchor_x = match text_anchor {
+        "start" => 0.0,
+        "end" => width_model,
+        _ => width_model * 0.5,
+    };
+    let font_weight = if graphic
         .text_style
         .iter()
         .any(|style| style.ends_with("Bold"))
     {
-        text_font = text_font.bold();
-    }
-    if graphic
+        "700"
+    } else {
+        "400"
+    };
+    let font_style = if graphic
         .text_style
         .iter()
         .any(|style| style.ends_with("Italic"))
     {
-        text_font = text_font.italic();
-    }
-    let run = TextRun {
-        len: graphic.text.len(),
-        font: text_font,
-        color: rgb(rgb24(graphic.color)).into(),
-        background_color: None,
-        underline: graphic
-            .text_style
-            .iter()
-            .any(|style| style.ends_with("UnderLine"))
-            .then_some(UnderlineStyle {
-                color: Some(rgb(rgb24(graphic.color)).into()),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-        strikethrough: None,
+        "italic"
+    } else {
+        "normal"
     };
-    let line = window
-        .text_system()
-        .shape_line(graphic.text.clone().into(), font_px, &[run], None);
-    let align = match graphic.horizontal_alignment.as_deref() {
-        Some("TextAlignment.Left") => TextAlign::Left,
-        Some("TextAlignment.Right") => TextAlign::Right,
-        _ => TextAlign::Center,
+    let decoration = if graphic
+        .text_style
+        .iter()
+        .any(|style| style.ends_with("UnderLine"))
+    {
+        "underline"
+    } else {
+        "none"
     };
-    let origin = point(center.x, center.y - px(f32::from(font_px) * 0.55));
-    let _ = line.paint(
-        origin,
-        px(f32::from(font_px) * 1.2),
-        align,
-        None,
-        window,
+    let family = graphic.font_name.as_deref().unwrap_or("sans-serif");
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width_model}" height="{height_model}" viewBox="0 0 {width_model} {height_model}"><text x="{anchor_x}" y="{y}" text-anchor="{text_anchor}" dominant-baseline="middle" font-family="{}" font-size="{font_model}" font-weight="{font_weight}" font-style="{font_style}" text-decoration="{decoration}">{}</text></svg>"#,
+        escape_xml(family),
+        escape_xml(&graphic.text),
+        y = height_model * 0.5,
+    );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    svg.hash(&mut hasher);
+    let path = format!("__modelica_text_{:x}", hasher.finish());
+    let rotation = graphic.rotation.to_radians();
+    let _ = window.paint_svg(
+        bounds,
+        path.into(),
+        Some(svg.as_bytes()),
+        TransformationMatrix::unit().rotate(radians(rotation)),
+        rgb(rgb24(graphic.color)).into(),
         cx,
     );
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn paint_selection_overlay(graphic: &Graphic, map: &SceneMap, window: &mut Window) {
