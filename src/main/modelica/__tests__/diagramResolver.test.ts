@@ -161,6 +161,48 @@ describe("Diagram M1 resolver", () => {
     expect(icon.icon?.graphics.map((graphic) => graphic.type)).toEqual(["Rectangle"]);
   });
 
+  it("keeps Diagram resolution inside the selected class scope", () => {
+    const source = `within Demo;
+      package P
+        model B annotation(Icon(graphics={Rectangle(extent={{-5,-5},{5,5}})})); end B;
+        model D annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})})); end D;
+        model A
+          B b annotation(Placement(transformation(origin={-20,0}, extent={{-5,-5},{5,5}})));
+        equation
+          connect(b.port_a, b.port_b) annotation(Line(points={{-25,0},{-15,0}}));
+        end A;
+        model C
+          D d annotation(Placement(transformation(origin={20,0}, extent={{-5,-5},{5,5}})));
+        equation
+          connect(d.port_a, d.port_b) annotation(Line(points={{15,0},{25,0}}));
+        end C;
+      end P;`;
+    const parsed = parseModelicaFile(source, "demo.mo");
+    const index = buildClassIndex(parsed.classes);
+    const resolver = (owner: import("../types.js").ClassNode, typeName: string) => {
+      const prefix = owner.qualifiedName.split(".").slice(0, -1).join(".");
+      const target = index.get(`${prefix}.${typeName}`);
+      return target ? { target, allClasses: parsed.classes, source } : null;
+    };
+    const packageNode = index.get("Demo.P")!;
+    const classA = index.get("Demo.P.A")!;
+    const classC = index.get("Demo.P.C")!;
+
+    const packageScene = resolveDiagramForClass(packageNode, source, resolver);
+    expect(packageScene.classKind).toBe("package");
+    expect(packageScene.components).toEqual([]);
+    expect(packageScene.connections).toEqual([]);
+    expect(packageScene.backgroundGraphics).toEqual([]);
+
+    const sceneA = resolveDiagramForClass(classA, source, resolver);
+    expect(sceneA.components.map((component) => component.name)).toEqual(["b"]);
+    expect(sceneA.connections).toHaveLength(1);
+
+    const sceneC = resolveDiagramForClass(classC, source, resolver);
+    expect(sceneC.components.map((component) => component.name)).toEqual(["d"]);
+    expect(sceneC.connections).toHaveLength(1);
+  });
+
   it("returns an empty Diagram scene when Diagram annotation is absent", () => {
     const source = `model A annotation(Icon(graphics={Ellipse(extent={{-10,-10},{10,10}})})); end A;
       model System

@@ -11,6 +11,7 @@ import {
   resolveGraphicsFromCall,
   resolveIconForClass,
   resolveDiagramLayerForClass,
+  classOwnedSlice,
   type ExternalClassResolver,
 } from "./iconResolver.js";
 import { typeNameCandidates } from "./registry.js";
@@ -482,7 +483,11 @@ export function resolveDiagramForClass(
   source: string,
   resolver: ExternalClassResolver,
 ): DiagramSceneDto {
-  const classSlice = source.slice(classNode.sourceRange.start, classNode.sourceRange.end);
+  // A class source range includes all nested class declarations. Mask their
+  // bodies before collecting annotations/equations so a package (or any class
+  // containing nested classes) cannot inherit their Diagram contents merely
+  // through a text search over its range.
+  const classSlice = classOwnedSlice(classNode, source);
   const tokens = tokenize(classSlice);
   const annotations = collectAnnotations(classSlice, tokens);
   const components: ComponentInstanceDto[] = [];
@@ -524,6 +529,7 @@ export function resolveDiagramForClass(
 
   return {
     classQualifiedName: classNode.qualifiedName,
+    classKind: classNode.kind,
     coordinateSystem: diagram.coordinateSystem,
     backgroundGraphics: diagram.graphics,
     components,

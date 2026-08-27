@@ -110,6 +110,7 @@ export interface DiagramConnectionDto {
 
 export interface DiagramSceneDto {
   classQualifiedName?: string;
+  classKind?: ClassKind;
   coordinateSystem: IconDto["coordinateSystem"];
   backgroundGraphics: GraphicItemDto[];
   components: ComponentInstanceDto[];

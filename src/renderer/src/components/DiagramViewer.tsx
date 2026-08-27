@@ -148,6 +148,13 @@ function ComponentRenderer({
 export function DiagramViewer({ scene }: { scene: DiagramSceneDto }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const viewportIcon = useMemo(() => viewportIconForScene(scene), [scene]);
+  const isEmptyPackage = scene.classKind === "package"
+    && scene.backgroundGraphics.length === 0
+    && scene.components.length === 0
+    && scene.connections.length === 0;
+  if (isEmptyPackage) {
+    return <div className="diagram-viewer"><div className="diagram-empty">No Diagram</div></div>;
+  }
   return (
     <div className="diagram-viewer">
       <DiagramDiagnostics diagnostics={scene.diagnostics} />
