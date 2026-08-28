@@ -40,7 +40,7 @@ use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
@@ -170,6 +170,14 @@ enum MainView {
     Source,
     Icon,
     Diagram,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PointerInteraction {
+    None,
+    Pan {
+        last_position: PhysicalPosition<f64>,
+    },
 }
 
 impl MainView {
@@ -716,7 +724,9 @@ struct App {
     zoom: f32,
     pan: [f32; 2],
     cursor: PhysicalPosition<f64>,
-    dragging: bool,
+    modifiers: ModifiersState,
+    canvas_rect: Option<egui::Rect>,
+    pointer_interaction: PointerInteraction,
     stats: FrameStats,
 }
 
@@ -1000,9 +1010,30 @@ impl App {
             zoom: INITIAL_ZOOM,
             pan: [0.0, 0.0],
             cursor: PhysicalPosition::new(0.0, 0.0),
-            dragging: false,
+            modifiers: ModifiersState::default(),
+            canvas_rect: None,
+            pointer_interaction: PointerInteraction::None,
             stats: FrameStats::new(),
         }
+    }
+
+    fn canvas_navigation_enabled(&self) -> bool {
+        canvas_navigation_enabled_for(self.main_view)
+    }
+
+    fn pointer_over_canvas(&self) -> bool {
+        let Some(rect) = self.canvas_rect else {
+            return false;
+        };
+        let scale_factor = self.window.scale_factor() as f32;
+        rect.contains(Pos2::new(
+            self.cursor.x as f32 / scale_factor,
+            self.cursor.y as f32 / scale_factor,
+        ))
+    }
+
+    fn canvas_event_allowed(&self, egui_consumed: bool) -> bool {
+        canvas_event_allowed_for(self.main_view, self.pointer_over_canvas(), egui_consumed)
     }
 
     fn update_title(&self, fps: Option<(f32, f32)>) {
@@ -1046,6 +1077,9 @@ impl App {
     }
 
     fn fit_scene(&mut self) {
+        if !self.canvas_navigation_enabled() {
+            return;
+        }
         let active_scene = if self.main_view == MainView::Diagram {
             &self.diagram_scene
         } else {
@@ -1071,6 +1105,9 @@ impl App {
     }
 
     fn zoom_at_cursor(&mut self, wheel_delta: f32) {
+        if !self.canvas_navigation_enabled() {
+            return;
+        }
         let old_zoom = self.zoom;
         self.zoom = (self.zoom * (1.0 + wheel_delta * 0.1)).clamp(MIN_ZOOM, MAX_ZOOM);
         if (self.zoom - old_zoom).abs() < f32::EPSILON {
@@ -1142,7 +1179,12 @@ impl App {
             );
             self.window.request_redraw();
         }
+        let previous_main_view = self.main_view;
         self.main_view = main_view;
+        self.canvas_rect = icon_clip_rect;
+        if previous_main_view != self.main_view && self.main_view == MainView::Source {
+            self.pointer_interaction = PointerInteraction::None;
+        }
         if expand_all_requested {
             if let Some(document) = &self.document {
                 expanded_nodes.clear();
@@ -1189,6 +1231,8 @@ impl App {
                         self.document = Some(document);
                         self.selected_class = None;
                         self.expanded_nodes.clear();
+                        self.canvas_rect = None;
+                        self.pointer_interaction = PointerInteraction::None;
                         self.load_error = None;
                         self.update_title(None);
                     }
@@ -1227,6 +1271,8 @@ impl App {
             );
             self.selected_class = Some(class_name);
             self.main_view = MainView::Source;
+            self.canvas_rect = None;
+            self.pointer_interaction = PointerInteraction::None;
             self.fit_scene();
             self.update_title(None);
             self.window.request_redraw();
@@ -2181,7 +2227,7 @@ fn icon_preview(
     painter.text(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
-        "Drag to pan   ·   Wheel to zoom   ·   120 FPS target",
+        "Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
         ui_font(11.0),
         theme_text_tertiary(),
     );
@@ -2246,7 +2292,7 @@ fn diagram_preview(
     painter.text(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
-        "Drag to pan   ·   Wheel to zoom   ·   120 FPS target",
+        "Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
         ui_font(11.0),
         theme_text_tertiary(),
     );
@@ -2879,6 +2925,31 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+fn canvas_navigation_enabled_for(main_view: MainView) -> bool {
+    matches!(main_view, MainView::Icon | MainView::Diagram)
+}
+
+fn canvas_event_allowed_for(
+    main_view: MainView,
+    pointer_over_canvas: bool,
+    egui_consumed: bool,
+) -> bool {
+    canvas_navigation_enabled_for(main_view) && pointer_over_canvas && !egui_consumed
+}
+
+fn should_zoom_canvas(
+    main_view: MainView,
+    pointer_over_canvas: bool,
+    egui_consumed: bool,
+    control_pressed: bool,
+) -> bool {
+    canvas_event_allowed_for(main_view, pointer_over_canvas, egui_consumed) && control_pressed
+}
+
+fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
+    button == MouseButton::Middle || (button == MouseButton::Left && control_pressed)
+}
+
 #[allow(deprecated)]
 fn main() {
     let input = env::args_os().nth(1).map(PathBuf::from);
@@ -2920,7 +2991,8 @@ fn main() {
             event_loop.set_control_flow(ControlFlow::Poll);
             match event {
                 Event::WindowEvent { window_id, event } if window_id == app.window.id() => {
-                    let _egui_response = app.egui_state.on_window_event(&app.window, &event);
+                    let egui_response = app.egui_state.on_window_event(&app.window, &event);
+                    let egui_consumed = egui_response.consumed;
                     match event {
                         WindowEvent::CloseRequested => event_loop.exit(),
                         WindowEvent::Resized(size) => app.resize(size),
@@ -2935,37 +3007,74 @@ fn main() {
                             }
                             app.window.request_redraw();
                         }
+                        WindowEvent::ModifiersChanged(modifiers) => {
+                            app.modifiers = modifiers.state();
+                        }
                         WindowEvent::KeyboardInput { event, .. }
                             if event.state == ElementState::Pressed && !event.repeat =>
                         {
-                            match event.physical_key {
-                                PhysicalKey::Code(KeyCode::KeyR) => {
-                                    app.fit_scene();
+                            if !egui_consumed {
+                                match event.physical_key {
+                                    PhysicalKey::Code(KeyCode::KeyR) => {
+                                        app.fit_scene();
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                             app.window.request_redraw();
                         }
                         WindowEvent::CursorMoved { position, .. } => {
-                            if app.dragging {
-                                app.pan[0] += (position.x - app.cursor.x) as f32;
-                                app.pan[1] += (position.y - app.cursor.y) as f32;
-                                app.update_view_uniform();
-                            }
                             app.cursor = position;
+                            let canvas_event_allowed = app.canvas_event_allowed(egui_consumed);
+                            let pan_delta = match &mut app.pointer_interaction {
+                                PointerInteraction::Pan { last_position } => {
+                                    let delta = (
+                                        position.x - last_position.x,
+                                        position.y - last_position.y,
+                                    );
+                                    *last_position = position;
+                                    Some(delta)
+                                }
+                                PointerInteraction::None => None,
+                            };
+                            if canvas_event_allowed {
+                                if let Some((delta_x, delta_y)) = pan_delta {
+                                    app.pan[0] += delta_x as f32;
+                                    app.pan[1] += delta_y as f32;
+                                    app.update_view_uniform();
+                                }
+                            }
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
-                            if button == MouseButton::Left || button == MouseButton::Middle {
-                                app.dragging = state == ElementState::Pressed;
+                            if state == ElementState::Released {
+                                if matches!(app.pointer_interaction, PointerInteraction::Pan { .. })
+                                {
+                                    app.pointer_interaction = PointerInteraction::None;
+                                }
+                            } else if app.canvas_event_allowed(egui_consumed)
+                                && wants_pan(button, app.modifiers.control_key())
+                            {
+                                app.pointer_interaction = PointerInteraction::Pan {
+                                    last_position: app.cursor,
+                                };
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
-                            let amount = match delta {
-                                MouseScrollDelta::LineDelta(_, y) => y,
-                                MouseScrollDelta::PixelDelta(position) => position.y as f32 / 80.0,
-                            };
-                            app.zoom_at_cursor(amount);
-                            app.window.request_redraw();
+                            if should_zoom_canvas(
+                                app.main_view,
+                                app.pointer_over_canvas(),
+                                egui_consumed,
+                                app.modifiers.control_key(),
+                            ) {
+                                let amount = match delta {
+                                    MouseScrollDelta::LineDelta(_, y) => y,
+                                    MouseScrollDelta::PixelDelta(position) => {
+                                        position.y as f32 / 80.0
+                                    }
+                                };
+                                app.zoom_at_cursor(amount);
+                                app.window.request_redraw();
+                            }
                         }
                         _ => {}
                     }
@@ -2980,6 +3089,59 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_navigation_is_limited_to_unconsumed_icon_and_diagram_canvas_events() {
+        assert!(!canvas_navigation_enabled_for(MainView::Source));
+        assert!(canvas_navigation_enabled_for(MainView::Icon));
+        assert!(canvas_navigation_enabled_for(MainView::Diagram));
+
+        assert!(!canvas_event_allowed_for(MainView::Source, true, false));
+        assert!(!canvas_event_allowed_for(MainView::Icon, false, false));
+        assert!(!canvas_event_allowed_for(MainView::Icon, true, true));
+        assert!(canvas_event_allowed_for(MainView::Icon, true, false));
+        assert!(canvas_event_allowed_for(MainView::Diagram, true, false));
+    }
+
+    #[test]
+    fn canvas_zoom_requires_ctrl_and_never_uses_plain_wheel() {
+        assert!(!should_zoom_canvas(MainView::Icon, true, false, false));
+        assert!(should_zoom_canvas(MainView::Icon, true, false, true));
+        assert!(!should_zoom_canvas(MainView::Icon, true, true, true));
+        assert!(!should_zoom_canvas(MainView::Source, true, false, true));
+    }
+
+    #[test]
+    fn pan_buttons_match_canvas_navigation_contract() {
+        assert!(wants_pan(MouseButton::Middle, false));
+        assert!(wants_pan(MouseButton::Middle, true));
+        assert!(wants_pan(MouseButton::Left, true));
+        assert!(!wants_pan(MouseButton::Left, false));
+        assert!(!wants_pan(MouseButton::Right, true));
+    }
+
+    #[test]
+    fn source_wheel_and_drag_keep_view_state_unchanged() {
+        let initial_zoom = INITIAL_ZOOM;
+        let initial_pan = [37.0_f32, -19.0_f32];
+        let mut zoom = initial_zoom;
+        let mut pan = initial_pan;
+
+        for _ in 0..100 {
+            if should_zoom_canvas(MainView::Source, true, false, true) {
+                zoom *= 1.1;
+            }
+            if canvas_event_allowed_for(MainView::Source, true, false)
+                && wants_pan(MouseButton::Middle, false)
+            {
+                pan[0] += 4.0;
+                pan[1] += 2.0;
+            }
+        }
+
+        assert_eq!(zoom, initial_zoom);
+        assert_eq!(pan, initial_pan);
+    }
 
     #[test]
     fn zoom_limits_are_safe_for_repeated_wheel_input() {
