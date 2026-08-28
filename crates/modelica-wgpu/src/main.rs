@@ -176,6 +176,36 @@ enum MainView {
     Diagram,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum DiagramSelection {
+    #[default]
+    None,
+    Component(String),
+    Connection(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionSegmentOrientation {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Debug)]
+enum ConnectionHitTarget {
+    Point(usize),
+    Segment {
+        index: usize,
+        orientation: ConnectionSegmentOrientation,
+    },
+    Line,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionHit {
+    connection_id: String,
+    target: ConnectionHitTarget,
+}
+
 #[derive(Clone, Debug)]
 enum PointerInteraction {
     None,
@@ -200,6 +230,25 @@ enum PointerInteraction {
         original_origin: CorePoint,
         preview_delta: CorePoint,
         connected_connections: Vec<ConnectionDragSnapshot>,
+        source_before: String,
+    },
+    MoveDiagramConnectionPoint {
+        button: MouseButton,
+        connection_id: String,
+        point_index: usize,
+        start_pointer_model: CorePoint,
+        original_points: Vec<CorePoint>,
+        preview_points: Vec<CorePoint>,
+        source_before: String,
+    },
+    MoveDiagramConnectionSegment {
+        button: MouseButton,
+        connection_id: String,
+        segment_index: usize,
+        orientation: ConnectionSegmentOrientation,
+        start_pointer_model: CorePoint,
+        original_points: Vec<CorePoint>,
+        preview_points: Vec<CorePoint>,
         source_before: String,
     },
 }
@@ -246,6 +295,14 @@ enum EditCommand {
         before_source: String,
         after_source: String,
         connection_edits: Vec<ConnectionLineEdit>,
+    },
+    MoveDiagramConnection {
+        class_name: String,
+        connection_id: String,
+        before_points: Vec<CorePoint>,
+        after_points: Vec<CorePoint>,
+        before_source: String,
+        after_source: String,
     },
 }
 
@@ -829,6 +886,38 @@ impl GpuIconScene {
             );
         }
     }
+
+    fn preview_connection_points(
+        &self,
+        queue: &wgpu::Queue,
+        connection_id: &str,
+        points: &[CorePoint],
+    ) {
+        for geometry in &self.geometries {
+            if geometry.edit_key.as_deref() != Some(connection_id) {
+                continue;
+            }
+            let Some(connection) = &geometry.connection else {
+                continue;
+            };
+            let mut line = connection.line.clone();
+            line.points = points.to_vec();
+            let Some(preview) = line_geometry(&line, connection.transform)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            if preview.vertices.len() != geometry.base_vertices.len() {
+                continue;
+            }
+            queue.write_buffer(
+                &geometry.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&preview.vertices),
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -949,6 +1038,7 @@ struct App {
     cursor: PhysicalPosition<f64>,
     modifiers: ModifiersState,
     canvas_rect: Option<egui::Rect>,
+    diagram_selection: DiagramSelection,
     pointer_interaction: PointerInteraction,
     history: Vec<EditCommand>,
     redo_history: Vec<EditCommand>,
@@ -1237,6 +1327,7 @@ impl App {
             cursor: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
             canvas_rect: None,
+            diagram_selection: DiagramSelection::None,
             pointer_interaction: PointerInteraction::None,
             history: Vec::new(),
             redo_history: Vec::new(),
@@ -1279,6 +1370,121 @@ impl App {
 
     fn selected_class_name(&self) -> Option<&str> {
         self.selected_class.as_deref()
+    }
+
+    fn selected_connection_id(&self) -> Option<&str> {
+        match &self.diagram_selection {
+            DiagramSelection::Connection(connection_id) => Some(connection_id),
+            _ => None,
+        }
+    }
+
+    fn hit_test_diagram_connection(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<ConnectionHit> {
+        let class_name = self.selected_class_name()?;
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        hit_test_connection(
+            &scene.connections,
+            pointer_model,
+            tolerance,
+            self.selected_connection_id(),
+        )
+    }
+
+    fn hit_test_selected_connection_point(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<ConnectionHit> {
+        let class_name = self.selected_class_name()?;
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let connection_id = self.selected_connection_id()?;
+        hit_test_connection_points(&scene.connections, connection_id, pointer_model, tolerance)
+    }
+
+    fn begin_connection_edit(&mut self, hit: ConnectionHit, pointer_model: CorePoint) {
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Some(connection) = document.diagram(&class_name).and_then(|scene| {
+            scene
+                .connections
+                .iter()
+                .find(|connection| connection.id == hit.connection_id)
+        }) else {
+            return;
+        };
+        let Some(line) = connection.line.as_ref() else {
+            return;
+        };
+        let Some(source_before) = document.class_text(&class_name) else {
+            return;
+        };
+        let original_points = line.points.clone();
+        self.diagram_selection = DiagramSelection::Connection(hit.connection_id.clone());
+        match hit.target {
+            ConnectionHitTarget::Point(point_index)
+                if point_index > 0 && point_index + 1 < original_points.len() =>
+            {
+                self.pointer_interaction = PointerInteraction::MoveDiagramConnectionPoint {
+                    button: MouseButton::Left,
+                    connection_id: hit.connection_id,
+                    point_index,
+                    start_pointer_model: pointer_model,
+                    original_points: original_points.clone(),
+                    preview_points: original_points,
+                    source_before,
+                };
+            }
+            ConnectionHitTarget::Segment { index, orientation }
+                if index > 0 && index + 1 < original_points.len() =>
+            {
+                self.pointer_interaction = PointerInteraction::MoveDiagramConnectionSegment {
+                    button: MouseButton::Left,
+                    connection_id: hit.connection_id,
+                    segment_index: index,
+                    orientation,
+                    start_pointer_model: pointer_model,
+                    original_points: original_points.clone(),
+                    preview_points: original_points,
+                    source_before,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn selected_connection_overlay_points(&self) -> Option<Vec<CorePoint>> {
+        let connection_id = self.selected_connection_id()?;
+        let class_name = self.selected_class_name()?;
+        let connection = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .connections
+            .iter()
+            .find(|connection| connection.id == connection_id)?;
+        let line = connection.line.as_ref()?;
+        let points = match &self.pointer_interaction {
+            PointerInteraction::MoveDiagramConnectionPoint {
+                connection_id: active_id,
+                preview_points,
+                ..
+            }
+            | PointerInteraction::MoveDiagramConnectionSegment {
+                connection_id: active_id,
+                preview_points,
+                ..
+            } if active_id == connection_id => preview_points,
+            _ => &line.points,
+        };
+        Some(connection_world_points(line, points))
     }
 
     fn begin_model_drag(&mut self) {
@@ -1327,6 +1533,11 @@ impl App {
                 let Some(document) = self.document.as_ref() else {
                     return;
                 };
+                if let Some(hit) = self.hit_test_selected_connection_point(pointer_model, tolerance)
+                {
+                    self.begin_connection_edit(hit, pointer_model);
+                    return;
+                }
                 let Some((component_id, component_name, original_origin)) =
                     document.diagram(&class_name).and_then(|scene| {
                         scene
@@ -1350,6 +1561,11 @@ impl App {
                             })
                     })
                 else {
+                    if let Some(hit) = self.hit_test_diagram_connection(pointer_model, tolerance) {
+                        self.begin_connection_edit(hit, pointer_model);
+                    } else {
+                        self.diagram_selection = DiagramSelection::None;
+                    }
                     return;
                 };
                 let Some(source_before) = document.class_text(&class_name) else {
@@ -1380,6 +1596,7 @@ impl App {
                         })
                     })
                     .collect();
+                self.diagram_selection = DiagramSelection::Component(component_name.clone());
                 self.pointer_interaction = PointerInteraction::MoveDiagramComponent {
                     button: MouseButton::Left,
                     component_id,
@@ -1460,6 +1677,67 @@ impl App {
                 }
                 self.window.request_redraw();
             }
+            PointerInteraction::MoveDiagramConnectionPoint {
+                connection_id,
+                point_index,
+                start_pointer_model,
+                original_points,
+                ..
+            } => {
+                let current = self.screen_to_model(position);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                let preview_points =
+                    translated_connection_points_free(&original_points, point_index, delta);
+                self.diagram_scene.preview_connection_points(
+                    &self.queue,
+                    &connection_id,
+                    &preview_points,
+                );
+                if let PointerInteraction::MoveDiagramConnectionPoint {
+                    preview_points: active_preview,
+                    ..
+                } = &mut self.pointer_interaction
+                {
+                    *active_preview = preview_points;
+                }
+                self.window.request_redraw();
+            }
+            PointerInteraction::MoveDiagramConnectionSegment {
+                connection_id,
+                segment_index,
+                orientation,
+                start_pointer_model,
+                original_points,
+                ..
+            } => {
+                let current = self.screen_to_model(position);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                let preview_points = translated_connection_segment(
+                    &original_points,
+                    segment_index,
+                    orientation,
+                    delta,
+                );
+                self.diagram_scene.preview_connection_points(
+                    &self.queue,
+                    &connection_id,
+                    &preview_points,
+                );
+                if let PointerInteraction::MoveDiagramConnectionSegment {
+                    preview_points: active_preview,
+                    ..
+                } = &mut self.pointer_interaction
+                {
+                    *active_preview = preview_points;
+                }
+                self.window.request_redraw();
+            }
             PointerInteraction::None => {}
         }
     }
@@ -1490,6 +1768,14 @@ impl App {
                 ..
             }
             | PointerInteraction::MoveDiagramComponent {
+                button: active_button,
+                ..
+            }
+            | PointerInteraction::MoveDiagramConnectionPoint {
+                button: active_button,
+                ..
+            }
+            | PointerInteraction::MoveDiagramConnectionSegment {
                 button: active_button,
                 ..
             } => *active_button == button,
@@ -1537,6 +1823,55 @@ impl App {
                     source_before,
                     delta,
                     connected_connections,
+                );
+            }
+            PointerInteraction::MoveDiagramConnectionPoint {
+                connection_id,
+                point_index,
+                start_pointer_model,
+                original_points,
+                source_before,
+                ..
+            } => {
+                let current = self.screen_to_model(self.cursor);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                let after_points =
+                    translated_connection_points_free(&original_points, point_index, delta);
+                self.commit_diagram_connection_move(
+                    connection_id,
+                    original_points,
+                    after_points,
+                    source_before,
+                );
+            }
+            PointerInteraction::MoveDiagramConnectionSegment {
+                connection_id,
+                segment_index,
+                orientation,
+                start_pointer_model,
+                original_points,
+                source_before,
+                ..
+            } => {
+                let current = self.screen_to_model(self.cursor);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                let after_points = translated_connection_segment(
+                    &original_points,
+                    segment_index,
+                    orientation,
+                    delta,
+                );
+                self.commit_diagram_connection_move(
+                    connection_id,
+                    original_points,
+                    after_points,
+                    source_before,
                 );
             }
             PointerInteraction::None => {}
@@ -1732,6 +2067,109 @@ impl App {
         self.rebuild_selected_scenes();
     }
 
+    fn commit_diagram_connection_move(
+        &mut self,
+        connection_id: String,
+        before_points: Vec<CorePoint>,
+        after_points: Vec<CorePoint>,
+        source_before: String,
+    ) {
+        if before_points == after_points {
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let after_points = normalize_orthogonal_points(&after_points);
+        if before_points == after_points {
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some((version, line_source_range)) = self.document.as_ref().and_then(|document| {
+            let version = document.source_version(&class_name);
+            let range = document
+                .diagram(&class_name)?
+                .connections
+                .iter()
+                .find(|connection| connection.id == connection_id)
+                .and_then(|connection| connection.line_source_range)?;
+            Some((version, range))
+        }) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let edit = match connection_points_edit(&source_before, line_source_range, &after_points) {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.load_error = Some(format!("Connection edit rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        let candidate = match apply_validated_source_edits(&source_before, vec![edit], version) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.load_error = Some(format!("Connection edit rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+            document
+                .resolve_candidate_scenes(&class_name, &candidate)
+                .ok()
+        }) {
+            Some(scenes) => scenes,
+            None => {
+                self.load_error = Some("Connection edit could not resolve candidate source".into());
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        let Some(connection) = resolved_diagram
+            .connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+        else {
+            self.load_error = Some("Connection edit lost its connection identity".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        if connection
+            .line
+            .as_ref()
+            .is_none_or(|line| line.points != after_points)
+        {
+            self.load_error = Some("Connection edit did not update Line.points".into());
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        document.set_class_text(&class_name, candidate.clone());
+        if let Some(scene) = document.icon_mut(&class_name) {
+            *scene = resolved_icon;
+        }
+        if let Some(scene) = document.diagram_mut(&class_name) {
+            *scene = resolved_diagram;
+        }
+        self.history.push(EditCommand::MoveDiagramConnection {
+            class_name,
+            connection_id,
+            before_points,
+            after_points,
+            before_source: source_before,
+            after_source: candidate,
+        });
+        self.redo_history.clear();
+        self.load_error = None;
+        self.rebuild_selected_scenes();
+    }
+
     fn apply_edit_command(&mut self, command: &EditCommand, after: bool) {
         match command {
             EditCommand::MoveIconGraphic {
@@ -1813,6 +2251,48 @@ impl App {
                     if line.origin != edit.line_origin || line.points != *expected_points {
                         return;
                     }
+                }
+                let Some(document) = self.document.as_mut() else {
+                    return;
+                };
+                document.set_class_text(class_name, source.clone());
+                if let Some(scene) = document.icon_mut(class_name) {
+                    *scene = resolved_icon;
+                }
+                if let Some(scene) = document.diagram_mut(class_name) {
+                    *scene = resolved_diagram;
+                }
+            }
+            EditCommand::MoveDiagramConnection {
+                class_name,
+                connection_id,
+                before_points,
+                after_points,
+                before_source,
+                after_source,
+            } => {
+                let source = if after { after_source } else { before_source };
+                let expected_points = if after { after_points } else { before_points };
+                let Some((resolved_icon, resolved_diagram)) =
+                    self.document.as_ref().and_then(|document| {
+                        document.resolve_candidate_scenes(class_name, source).ok()
+                    })
+                else {
+                    return;
+                };
+                let Some(connection) = resolved_diagram
+                    .connections
+                    .iter()
+                    .find(|connection| connection.id == *connection_id)
+                else {
+                    return;
+                };
+                if connection
+                    .line
+                    .as_ref()
+                    .is_none_or(|line| line.points != *expected_points)
+                {
+                    return;
                 }
                 let Some(document) = self.document.as_mut() else {
                     return;
@@ -1961,6 +2441,11 @@ impl App {
         let mut icon_clip_rect = None;
         let mut expand_all_requested = false;
         let mut collapse_all_requested = false;
+        let selected_connection_points = self.selected_connection_overlay_points();
+        let zoom = self.zoom;
+        let pan = self.pan;
+        let viewport = [self.config.width, self.config.height];
+        let pixels_per_point = self.window.scale_factor() as f32;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_preview_ui(
                 ctx,
@@ -1979,6 +2464,17 @@ impl App {
                 &mut collapse_all_requested,
                 load_error.as_deref(),
             );
+            if main_view == MainView::Diagram {
+                draw_diagram_selection_overlay(
+                    ctx,
+                    icon_clip_rect,
+                    selected_connection_points.as_deref(),
+                    zoom,
+                    pan,
+                    viewport,
+                    pixels_per_point,
+                );
+            }
         });
         if theme_mode != self.theme_mode || accent_theme != self.accent_theme {
             self.theme_mode = theme_mode;
@@ -1992,8 +2488,9 @@ impl App {
         let previous_main_view = self.main_view;
         self.main_view = main_view;
         self.canvas_rect = icon_clip_rect;
-        if previous_main_view != self.main_view && self.main_view == MainView::Source {
+        if previous_main_view != self.main_view {
             self.pointer_interaction = PointerInteraction::None;
+            self.diagram_selection = DiagramSelection::None;
         }
         if expand_all_requested {
             if let Some(document) = &self.document {
@@ -2043,6 +2540,7 @@ impl App {
                         self.expanded_nodes.clear();
                         self.canvas_rect = None;
                         self.pointer_interaction = PointerInteraction::None;
+                        self.diagram_selection = DiagramSelection::None;
                         self.load_error = None;
                         self.update_title(None);
                     }
@@ -2083,6 +2581,7 @@ impl App {
             self.main_view = MainView::Source;
             self.canvas_rect = None;
             self.pointer_interaction = PointerInteraction::None;
+            self.diagram_selection = DiagramSelection::None;
             self.fit_scene();
             self.update_title(None);
             self.window.request_redraw();
@@ -3102,10 +3601,65 @@ fn diagram_preview(
     painter.text(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
-        "Drag component to move   ·   Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
+        "Click connection to edit   ·   Drag component to move   ·   Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
         ui_font(11.0),
         theme_text_tertiary(),
     );
+}
+
+fn draw_diagram_selection_overlay(
+    ctx: &egui::Context,
+    canvas_rect: Option<egui::Rect>,
+    points: Option<&[CorePoint]>,
+    zoom: f32,
+    pan: [f32; 2],
+    viewport: [u32; 2],
+    pixels_per_point: f32,
+) {
+    let (Some(canvas_rect), Some(points)) = (canvas_rect, points) else {
+        return;
+    };
+    if points.len() < 2 {
+        return;
+    }
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("diagram-selection-overlay"),
+        ))
+        .with_clip_rect(canvas_rect);
+    let to_screen = |point: CorePoint| {
+        Pos2::new(
+            (viewport[0] as f32 * 0.5 + pan[0] + point.x * zoom) / pixels_per_point,
+            (viewport[1] as f32 * 0.5 + pan[1] - point.y * zoom) / pixels_per_point,
+        )
+    };
+    let screen_points = points.iter().copied().map(to_screen).collect::<Vec<_>>();
+    let accent = theme_accent();
+    for pair in screen_points.windows(2) {
+        let [start, end] = pair else {
+            continue;
+        };
+        painter.line_segment([*start, *end], Stroke::new(3.0_f32, theme_accent_soft(170)));
+    }
+    for (index, point) in screen_points.iter().enumerate() {
+        let endpoint = index == 0 || index + 1 == screen_points.len();
+        let radius = if endpoint { 4.5 } else { 5.5 };
+        painter.circle_filled(
+            *point,
+            radius,
+            if endpoint {
+                theme_surface_raised(245)
+            } else {
+                accent
+            },
+        );
+        painter.circle_stroke(
+            *point,
+            radius,
+            Stroke::new(1.5_f32, if endpoint { accent } else { theme_surface() }),
+        );
+    }
 }
 
 fn build_scene(
@@ -3855,6 +4409,118 @@ fn diagram_component_contains_point(
     })
 }
 
+fn connection_world_points(line: &LineGraphic, points: &[CorePoint]) -> Vec<CorePoint> {
+    points
+        .iter()
+        .map(|point| {
+            let transformed = transform_graphic_point(
+                *point,
+                line.origin,
+                line.rotation,
+                Transform2D::identity(),
+            );
+            CorePoint {
+                x: transformed[0],
+                y: transformed[1],
+            }
+        })
+        .collect()
+}
+
+fn hit_test_connection_points(
+    connections: &[modelica_core::scene::DiagramConnection],
+    connection_id: &str,
+    pointer: CorePoint,
+    tolerance: f32,
+) -> Option<ConnectionHit> {
+    let connection = connections
+        .iter()
+        .find(|connection| connection.id == connection_id)?;
+    let line = connection.line.as_ref()?;
+    connection_world_points(line, &line.points)
+        .iter()
+        .enumerate()
+        .find(|(_, point)| distance_between(**point, pointer) <= tolerance)
+        .map(|(point_index, _)| ConnectionHit {
+            connection_id: connection.id.clone(),
+            target: ConnectionHitTarget::Point(point_index),
+        })
+}
+
+fn hit_test_connection(
+    connections: &[modelica_core::scene::DiagramConnection],
+    pointer: CorePoint,
+    tolerance: f32,
+    selected_connection_id: Option<&str>,
+) -> Option<ConnectionHit> {
+    if let Some(connection_id) = selected_connection_id {
+        if let Some(hit) =
+            hit_test_connection_points(connections, connection_id, pointer, tolerance)
+        {
+            return Some(hit);
+        }
+    }
+    for connection in connections.iter().rev() {
+        let Some(line) = connection.line.as_ref() else {
+            continue;
+        };
+        let points = connection_world_points(line, &line.points);
+        for (index, pair) in points.windows(2).enumerate() {
+            let [start, end] = pair else {
+                continue;
+            };
+            if distance_to_segment(pointer, *start, *end) > tolerance {
+                continue;
+            }
+            let target = if index > 0 && index + 1 < points.len() - 1 {
+                match segment_orientation(*start, *end) {
+                    Some(orientation) => ConnectionHitTarget::Segment { index, orientation },
+                    None => ConnectionHitTarget::Line,
+                }
+            } else {
+                ConnectionHitTarget::Line
+            };
+            return Some(ConnectionHit {
+                connection_id: connection.id.clone(),
+                target,
+            });
+        }
+    }
+    None
+}
+
+fn distance_between(first: CorePoint, second: CorePoint) -> f32 {
+    ((first.x - second.x).powi(2) + (first.y - second.y).powi(2)).sqrt()
+}
+
+fn distance_to_segment(point: CorePoint, start: CorePoint, end: CorePoint) -> f32 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= f32::EPSILON {
+        return distance_between(point, start);
+    }
+    let projection =
+        (((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared).clamp(0.0, 1.0);
+    distance_between(
+        point,
+        CorePoint {
+            x: start.x + projection * dx,
+            y: start.y + projection * dy,
+        },
+    )
+}
+
+fn segment_orientation(start: CorePoint, end: CorePoint) -> Option<ConnectionSegmentOrientation> {
+    if (start.y - end.y).abs() <= ORTHOGONAL_EPSILON {
+        Some(ConnectionSegmentOrientation::Horizontal)
+    } else if (start.x - end.x).abs() <= ORTHOGONAL_EPSILON {
+        Some(ConnectionSegmentOrientation::Vertical)
+    } else {
+        None
+    }
+}
+
 fn annotation_calls(source: &str) -> Vec<(usize, AnnotationCall)> {
     let tokens = tokenize(source);
     let mut calls = Vec::new();
@@ -4198,6 +4864,75 @@ fn preserve_orthogonal_neighbor(
     } else if (original_endpoint.x - original_neighbor.x).abs() <= ORTHOGONAL_EPSILON {
         neighbor.x += delta.x;
     }
+}
+
+fn translated_connection_points_free(
+    original_points: &[CorePoint],
+    point_index: usize,
+    delta: CorePoint,
+) -> Vec<CorePoint> {
+    let mut points = original_points.to_vec();
+    if let Some(point) = points.get_mut(point_index) {
+        point.x += delta.x;
+        point.y += delta.y;
+    }
+    points
+}
+
+fn translated_connection_segment(
+    original_points: &[CorePoint],
+    segment_index: usize,
+    orientation: ConnectionSegmentOrientation,
+    delta: CorePoint,
+) -> Vec<CorePoint> {
+    let mut points = original_points.to_vec();
+    let Some((first, second)) = points
+        .get_mut(segment_index..=segment_index.saturating_add(1))
+        .and_then(|points| points.split_first_mut())
+    else {
+        return points;
+    };
+    let second = &mut second[0];
+    match orientation {
+        ConnectionSegmentOrientation::Horizontal => {
+            first.y += delta.y;
+            second.y += delta.y;
+        }
+        ConnectionSegmentOrientation::Vertical => {
+            first.x += delta.x;
+            second.x += delta.x;
+        }
+    }
+    points
+}
+
+fn normalize_orthogonal_points(points: &[CorePoint]) -> Vec<CorePoint> {
+    let mut normalized = Vec::with_capacity(points.len());
+    for point in points {
+        if normalized
+            .last()
+            .is_some_and(|previous| distance_between(*previous, *point) <= ORTHOGONAL_EPSILON)
+        {
+            continue;
+        }
+        normalized.push(*point);
+    }
+    let mut index = 1;
+    while index + 1 < normalized.len() {
+        let previous = normalized[index - 1];
+        let current = normalized[index];
+        let next = normalized[index + 1];
+        let collinear = (previous.y - current.y).abs() <= ORTHOGONAL_EPSILON
+            && (current.y - next.y).abs() <= ORTHOGONAL_EPSILON
+            || (previous.x - current.x).abs() <= ORTHOGONAL_EPSILON
+                && (current.x - next.x).abs() <= ORTHOGONAL_EPSILON;
+        if collinear {
+            normalized.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    normalized
 }
 
 fn format_modelica_points(points: &[CorePoint]) -> String {
@@ -4558,6 +5293,108 @@ mod tests {
         assert!(candidate.contains("origin={5, 6}"));
         assert!(candidate.contains("points={{-30, 5}, {0, 0}, {40, 20}}"));
         assert!(candidate.contains("connect(a.port, b.port)"));
+    }
+
+    #[test]
+    fn connection_segment_translation_moves_only_its_orientation_axis() {
+        let points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 30.0 },
+            CorePoint { x: 100.0, y: 30.0 },
+        ];
+        assert_eq!(
+            translated_connection_segment(
+                &points,
+                1,
+                ConnectionSegmentOrientation::Vertical,
+                CorePoint { x: 20.0, y: 100.0 },
+            ),
+            vec![
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 60.0, y: 0.0 },
+                CorePoint { x: 60.0, y: 30.0 },
+                CorePoint { x: 100.0, y: 30.0 },
+            ]
+        );
+        assert_eq!(
+            translated_connection_segment(
+                &points,
+                0,
+                ConnectionSegmentOrientation::Horizontal,
+                CorePoint { x: 100.0, y: 12.0 },
+            ),
+            vec![
+                CorePoint { x: 0.0, y: 12.0 },
+                CorePoint { x: 40.0, y: 12.0 },
+                points[2],
+                points[3],
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_orthogonal_points_removes_duplicates_and_collinear_points() {
+        let points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 10.0, y: 0.0 },
+            CorePoint { x: 20.0, y: 0.0 },
+            CorePoint { x: 20.0, y: 0.0 },
+            CorePoint { x: 20.0, y: 20.0 },
+        ];
+        assert_eq!(
+            normalize_orthogonal_points(&points),
+            vec![
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 20.0, y: 0.0 },
+                CorePoint { x: 20.0, y: 20.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn connection_hit_test_uses_screen_scaled_tolerance_and_finds_middle_segment() {
+        let connection = modelica_core::scene::DiagramConnection {
+            id: "connection:test".to_owned(),
+            lhs: modelica_core::scene::ConnectorRef {
+                component_name: "a".to_owned(),
+                connector_path: "port".to_owned(),
+            },
+            rhs: modelica_core::scene::ConnectorRef {
+                component_name: "b".to_owned(),
+                connector_path: "port".to_owned(),
+            },
+            from: "a.port".to_owned(),
+            to: "b.port".to_owned(),
+            line: Some(LineGraphic {
+                origin: CorePoint { x: 0.0, y: 0.0 },
+                rotation: 0.0,
+                points: vec![
+                    CorePoint { x: 0.0, y: 0.0 },
+                    CorePoint { x: 40.0, y: 0.0 },
+                    CorePoint { x: 40.0, y: 30.0 },
+                    CorePoint { x: 100.0, y: 30.0 },
+                ],
+                color: [0, 0, 0],
+                pattern: Some("LinePattern.Solid".to_owned()),
+                thickness: 1.0,
+                arrow: Vec::new(),
+                arrow_size: None,
+                smooth: None,
+            }),
+            source_range: None,
+            line_source_range: None,
+        };
+        let hit = hit_test_connection(&[connection], CorePoint { x: 40.0, y: 12.0 }, 1.0, None)
+            .expect("middle segment hit");
+        assert_eq!(hit.connection_id, "connection:test");
+        assert!(matches!(
+            hit.target,
+            ConnectionHitTarget::Segment {
+                index: 1,
+                orientation: ConnectionSegmentOrientation::Vertical,
+            }
+        ));
     }
 
     #[test]
