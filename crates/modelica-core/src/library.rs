@@ -347,11 +347,21 @@ impl LibraryRegistry {
             let _ = self.register_source(package.source_file.clone(), source);
         }
         for class in &package.classes {
-            self.index_class_location(class);
+            self.register_class_source(class);
         }
         for child in &package.children {
             self.register_package(child);
         }
+    }
+
+    fn register_class_source(&mut self, class: &Class) {
+        let source_file = class.source_file.clone();
+        if !self.sources.contains_key(&source_file)
+            && let Ok(source) = fs::read_to_string(&source_file)
+        {
+            let _ = self.register_source(source_file, source);
+        }
+        self.index_class_location(class);
     }
 
     pub fn source(&self, path: &Path) -> Option<&str> {
@@ -531,6 +541,22 @@ mod tests {
                 .resolve("Modelica.Electrical.Analog.Basic.Pin")
                 .is_some()
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn registering_package_caches_sources_for_classes_in_separate_files() {
+        let root = fixture_root();
+        let package = PackageLoader.load(&root).expect("load fixture");
+        let mut registry = LibraryRegistry::default();
+        registry.index_package(&package);
+        registry.register_package(&package);
+
+        let (_, source) = registry
+            .resolve_class("Modelica.Electrical.Analog.Basic.Pin")
+            .expect("resolve class source");
+        assert!(source.contains("connector Pin"));
+
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

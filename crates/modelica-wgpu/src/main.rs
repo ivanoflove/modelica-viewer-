@@ -48,6 +48,9 @@ const MSAA_SAMPLES: u32 = 4;
 const INITIAL_ZOOM: f32 = 3.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
+const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
+const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
+const UI_FONT_SYMBOLS: &str = "modelica-ui-symbols";
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -433,8 +436,24 @@ fn add_bundled_msl(registry: &mut LibraryRegistry) {
     }
 }
 
-fn install_cjk_font(ctx: &egui::Context) {
-    let candidates = [
+fn install_ui_fonts(ctx: &egui::Context) {
+    let medium_candidates = [
+        r"C:\Windows\Fonts\Inter-Medium.ttf",
+        r"C:\Windows\Fonts\NotoSans-Medium.ttf",
+        "/usr/share/fonts/inter/Inter-Medium.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-Medium.ttf",
+        "/usr/share/fonts/opentype/inter/Inter-Medium.otf",
+        "/usr/share/fonts/noto/NotoSans-Medium.ttf",
+    ];
+    let semibold_candidates = [
+        r"C:\Windows\Fonts\Inter-SemiBold.ttf",
+        r"C:\Windows\Fonts\NotoSans-SemiBold.ttf",
+        "/usr/share/fonts/inter/Inter-SemiBold.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-SemiBold.ttf",
+        "/usr/share/fonts/opentype/inter/Inter-SemiBold.otf",
+        "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+    ];
+    let cjk_candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
@@ -442,27 +461,116 @@ fn install_cjk_font(ctx: &egui::Context) {
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
     ];
-    let Some((path, bytes)) = candidates
+    let symbol_candidates = [
+        r"C:\Windows\Fonts\seguisym.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols-Medium.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    ];
+    let medium = medium_candidates
         .iter()
-        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)))
-    else {
-        eprintln!("modelica-wgpu: no CJK font found; Chinese glyphs may be missing");
-        return;
-    };
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let medium_path = medium.as_ref().map(|(path, _)| *path);
+    let semibold = semibold_candidates
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let semibold_path = semibold.as_ref().map(|(path, _)| *path);
+    let cjk = cjk_candidates
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let cjk_path = cjk.as_ref().map(|(path, _)| *path);
+    let symbols = symbol_candidates
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let symbols_path = symbols.as_ref().map(|(path, _)| *path);
 
     let mut fonts = FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("modelica-cjk".to_owned(), FontData::from_owned(bytes));
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+    let default_proportional = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let medium_key = if let Some((_, bytes)) = medium {
         fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("modelica-cjk".to_owned());
+            .font_data
+            .insert(UI_FONT_MEDIUM.to_owned(), FontData::from_owned(bytes));
+        UI_FONT_MEDIUM.to_owned()
+    } else {
+        eprintln!("modelica-wgpu: no medium UI font found; using egui default font");
+        default_proportional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Hack".to_owned())
+    };
+    let semibold_key = if let Some((_, bytes)) = semibold {
+        fonts
+            .font_data
+            .insert(UI_FONT_SEMIBOLD.to_owned(), FontData::from_owned(bytes));
+        UI_FONT_SEMIBOLD.to_owned()
+    } else {
+        UI_FONT_MEDIUM.to_owned()
+    };
+    let cjk_key = cjk.map(|(_, bytes)| {
+        let key = "modelica-cjk".to_owned();
+        fonts
+            .font_data
+            .insert(key.clone(), FontData::from_owned(bytes));
+        key
+    });
+    let symbols_key = symbols.map(|(_, bytes)| {
+        let key = UI_FONT_SYMBOLS.to_owned();
+        fonts
+            .font_data
+            .insert(key.clone(), FontData::from_owned(bytes));
+        key
+    });
+
+    let mut ui_fallback = vec![medium_key.clone()];
+    if let Some(cjk_key) = cjk_key.as_ref() {
+        ui_fallback.push(cjk_key.clone());
     }
+    if let Some(symbols_key) = symbols_key.as_ref() {
+        ui_fallback.push(symbols_key.clone());
+    }
+    ui_fallback.extend(default_proportional.clone());
+    fonts
+        .families
+        .insert(FontFamily::Name(UI_FONT_MEDIUM.into()), ui_fallback.clone());
+    let mut semibold_fallback = vec![semibold_key, medium_key];
+    if let Some(cjk_key) = cjk_key.as_ref() {
+        semibold_fallback.push(cjk_key.clone());
+    }
+    if let Some(symbols_key) = symbols_key.as_ref() {
+        semibold_fallback.push(symbols_key.clone());
+    }
+    semibold_fallback.extend(default_proportional);
+    fonts
+        .families
+        .insert(FontFamily::Name(UI_FONT_SEMIBOLD.into()), semibold_fallback);
+    fonts.families.insert(FontFamily::Proportional, ui_fallback);
     ctx.set_fonts(fonts);
-    eprintln!("modelica-wgpu: installed CJK fallback font from {path}");
+    if let Some(path) = medium_path {
+        eprintln!("modelica-wgpu: installed medium UI font from {path}");
+    }
+    if let Some(path) = semibold_path {
+        eprintln!("modelica-wgpu: installed semibold UI font from {path}");
+    }
+    if let Some(path) = cjk_path {
+        eprintln!("modelica-wgpu: installed CJK fallback font from {path}");
+    } else {
+        eprintln!("modelica-wgpu: no CJK font found; Chinese glyphs may be missing");
+    }
+    if let Some(path) = symbols_path {
+        eprintln!("modelica-wgpu: installed symbols fallback font from {path}");
+    }
+}
+
+fn ui_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(UI_FONT_MEDIUM.into()))
+}
+
+fn ui_semibold_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(UI_FONT_SEMIBOLD.into()))
 }
 
 #[allow(dead_code)]
@@ -851,7 +959,7 @@ impl App {
         let diagram_scene = build_diagram_scene(&device, &style_layout, document.as_ref(), None);
         let msaa_view = create_msaa_view(&device, &config);
         let egui_ctx = egui::Context::default();
-        install_cjk_font(&egui_ctx);
+        install_ui_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -1328,15 +1436,26 @@ fn theme_text_primary() -> Color32 {
     if is_dark_theme() {
         theme_rgb(238, 239, 247)
     } else {
-        theme_rgb(32, 33, 40)
+        theme_rgb(32, 35, 43)
     }
 }
 
+// Light-theme UI text tokens: primary #20232B, secondary #505664,
+// muted #737A89, disabled #A1A6B2. These colors apply to UI chrome only.
 fn theme_text_secondary() -> Color32 {
     if is_dark_theme() {
         theme_rgb(181, 184, 201)
     } else {
-        theme_rgb(91, 93, 107)
+        theme_rgb(80, 86, 100)
+    }
+}
+
+#[allow(dead_code)]
+fn theme_text_disabled() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(104, 108, 124)
+    } else {
+        theme_rgb(161, 166, 178)
     }
 }
 
@@ -1344,7 +1463,7 @@ fn theme_text_tertiary() -> Color32 {
     if is_dark_theme() {
         theme_rgb(143, 147, 169)
     } else {
-        theme_rgb(124, 127, 140)
+        theme_rgb(115, 122, 137)
     }
 }
 
@@ -1480,6 +1599,7 @@ fn draw_preview_ui(
                     egui::Button::new(
                         RichText::new("⌘ K    Search models, classes, commands…")
                             .size(14.0)
+                            .font(ui_font(14.0))
                             .color(theme_text_secondary()),
                     )
                     .fill(theme_surface_soft(235))
@@ -1489,7 +1609,9 @@ fn draw_preview_ui(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(18.0);
                     ui.menu_button(
-                        RichText::new(format!("Appearance · {}  ▾", theme_mode.label())).size(13.0),
+                        RichText::new(format!("Appearance · {}  ▾", theme_mode.label()))
+                            .size(13.0)
+                            .font(ui_font(13.0)),
                         |ui| {
                             ui.set_min_width(180.0);
                             ui.label(RichText::new("Theme").size(10.0).strong());
@@ -1523,6 +1645,7 @@ fn draw_preview_ui(
                     ui.label(
                         RichText::new("Preview mode")
                             .size(12.0)
+                            .font(ui_font(12.0))
                             .color(theme_text_tertiary()),
                     );
                 });
@@ -1545,6 +1668,7 @@ fn draw_preview_ui(
                 ui.label(
                     RichText::new("MODEL LIBRARY")
                         .size(12.0)
+                        .font(ui_semibold_font(12.0))
                         .strong()
                         .color(theme_text_tertiary()),
                 );
@@ -1553,6 +1677,7 @@ fn draw_preview_ui(
                     ui.label(
                         RichText::new(class_count.to_string())
                             .size(12.0)
+                            .font(ui_font(12.0))
                             .color(theme_text_tertiary()),
                     );
                 });
@@ -1563,6 +1688,7 @@ fn draw_preview_ui(
                 egui::Button::new(
                     RichText::new("＋  Open Modelica file")
                         .size(13.0)
+                        .font(ui_semibold_font(13.0))
                         .color(theme_surface()),
                 )
                 .fill(theme_accent())
@@ -1580,9 +1706,13 @@ fn draw_preview_ui(
                     if ui
                         .add_sized(
                             [button_width, 26.0],
-                            egui::Button::new(RichText::new("Expand all").size(11.0))
-                                .fill(theme_surface_soft(235))
-                                .rounding(Rounding::same(7.0)),
+                            egui::Button::new(
+                                RichText::new("Expand all")
+                                    .size(11.0)
+                                    .font(ui_semibold_font(11.0)),
+                            )
+                            .fill(theme_surface_soft(235))
+                            .rounding(Rounding::same(7.0)),
                         )
                         .clicked()
                     {
@@ -1591,9 +1721,13 @@ fn draw_preview_ui(
                     if ui
                         .add_sized(
                             [button_width, 26.0],
-                            egui::Button::new(RichText::new("Collapse all").size(11.0))
-                                .fill(theme_surface_soft(235))
-                                .rounding(Rounding::same(7.0)),
+                            egui::Button::new(
+                                RichText::new("Collapse all")
+                                    .size(11.0)
+                                    .font(ui_semibold_font(11.0)),
+                            )
+                            .fill(theme_surface_soft(235))
+                            .rounding(Rounding::same(7.0)),
                         )
                         .clicked()
                     {
@@ -1630,7 +1764,13 @@ fn draw_preview_ui(
             ui.add_space(18.0);
             ui.horizontal(|ui| {
                 let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
-                ui.label(RichText::new(package_name).size(22.0).strong());
+                ui.label(
+                    RichText::new(package_name)
+                        .size(22.0)
+                        .font(ui_semibold_font(22.0))
+                        .strong()
+                        .color(theme_text_primary()),
+                );
                 ui.label(
                     RichText::new(if let Some(class_name) = selected_class {
                         format!(
@@ -1643,6 +1783,7 @@ fn draw_preview_ui(
                         String::new()
                     })
                     .size(13.0)
+                    .font(ui_font(13.0))
                     .color(theme_text_tertiary()),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1652,6 +1793,7 @@ fn draw_preview_ui(
                             None => "GPU canvas ready".to_owned(),
                         })
                         .size(12.0)
+                        .font(ui_font(12.0))
                         .color(theme_live()),
                     );
                 });
@@ -1662,11 +1804,18 @@ fn draw_preview_ui(
                     for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
                         let selected = *main_view == view;
                         let button = egui::Button::new(
-                            RichText::new(view.label()).size(13.0).color(if selected {
-                                theme_accent()
-                            } else {
-                                theme_text_secondary()
-                            }),
+                            RichText::new(view.label())
+                                .size(13.0)
+                                .font(if selected {
+                                    ui_semibold_font(13.0)
+                                } else {
+                                    ui_font(13.0)
+                                })
+                                .color(if selected {
+                                    theme_accent()
+                                } else {
+                                    theme_text_secondary()
+                                }),
                         )
                         .fill(if selected {
                             theme_accent_soft(235)
@@ -1682,9 +1831,11 @@ fn draw_preview_ui(
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let fit_button = ui.add_sized(
                             [54.0, 28.0],
-                            egui::Button::new(RichText::new("Fit").size(12.0))
-                                .fill(theme_surface_soft(230))
-                                .rounding(Rounding::same(7.0)),
+                            egui::Button::new(
+                                RichText::new("Fit").size(12.0).font(ui_semibold_font(12.0)),
+                            )
+                            .fill(theme_surface_soft(230))
+                            .rounding(Rounding::same(7.0)),
                         );
                         if fit_button.clicked() {
                             *fit_requested = true;
@@ -1692,11 +1843,13 @@ fn draw_preview_ui(
                         ui.label(
                             RichText::new("100%")
                                 .size(12.0)
+                                .font(ui_font(12.0))
                                 .color(theme_text_tertiary()),
                         );
                         ui.label(
                             RichText::new("−  +")
                                 .size(16.0)
+                                .font(ui_font(16.0))
                                 .color(theme_text_secondary()),
                         );
                     });
@@ -1740,7 +1893,11 @@ fn tree_row(
         Pos2::new(rect.left() + indent * 18.0 + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
         format!("{marker}  {label}"),
-        FontId::proportional(13.0),
+        if selected {
+            ui_semibold_font(13.0)
+        } else {
+            ui_font(13.0)
+        },
         if selected {
             theme_accent_strong()
         } else {
@@ -2009,7 +2166,7 @@ fn icon_preview(
                 None => "No file loaded".to_owned(),
             }
         ),
-        FontId::proportional(12.0),
+        ui_font(12.0),
         theme_text_tertiary(),
     );
     if document.is_some_and(|document| document.selected_class.is_none()) {
@@ -2017,7 +2174,7 @@ fn icon_preview(
             rect.center(),
             Align2::CENTER_CENTER,
             "Select a model to preview its Icon",
-            FontId::proportional(14.0),
+            ui_font(14.0),
             theme_text_secondary(),
         );
     }
@@ -2025,7 +2182,7 @@ fn icon_preview(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
         "Drag to pan   ·   Wheel to zoom   ·   120 FPS target",
-        FontId::proportional(11.0),
+        ui_font(11.0),
         theme_text_tertiary(),
     );
 }
@@ -2060,7 +2217,7 @@ fn diagram_preview(
             "DIAGRAM CANVAS  ·  {}",
             counts.unwrap_or_else(|| "No file loaded".to_owned())
         ),
-        FontId::proportional(12.0),
+        ui_font(12.0),
         theme_text_tertiary(),
     );
     let has_selected_class = document.is_some_and(|document| document.selected_class.is_some());
@@ -2074,7 +2231,7 @@ fn diagram_preview(
             rect.center(),
             Align2::CENTER_CENTER,
             "Select a model to preview its Diagram",
-            FontId::proportional(14.0),
+            ui_font(14.0),
             theme_text_secondary(),
         );
     } else if !has_diagram_content {
@@ -2082,7 +2239,7 @@ fn diagram_preview(
             rect.center(),
             Align2::CENTER_CENTER,
             "No Diagram graphics in the selected model",
-            FontId::proportional(14.0),
+            ui_font(14.0),
             theme_text_secondary(),
         );
     }
@@ -2090,7 +2247,7 @@ fn diagram_preview(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
         "Drag to pan   ·   Wheel to zoom   ·   120 FPS target",
-        FontId::proportional(11.0),
+        ui_font(11.0),
         theme_text_tertiary(),
     );
 }
