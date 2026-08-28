@@ -6,8 +6,8 @@ use crate::graphics::{
 use crate::lexer::{Token, TokenKind, tokenize};
 use crate::library::LibraryRegistry;
 use crate::scene::{
-    ComponentInstance, DiagramBounds, DiagramConnection, DiagramScene, Extent, Graphic, IconScene,
-    LineGraphic, Point,
+    ComponentInstance, ConnectorRef, DiagramBounds, DiagramConnection, DiagramScene, Extent,
+    Graphic, IconScene, LineGraphic, Point,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -346,6 +346,7 @@ fn parse_connection(
         return None;
     }
     let mut line = None;
+    let mut line_source_range = None;
     let mut end = tokens[close].end;
     let mut index = close + 1;
     while let Some(token) = tokens.get(index) {
@@ -369,6 +370,10 @@ fn parse_connection(
                 );
                 if let Some(Graphic::Line(value)) = graphic {
                     line = Some(value);
+                    line_source_range = Some(SourceRange::new(
+                        token.start + line_call.source_range.start,
+                        token.start + line_call.source_range.end,
+                    ));
                 }
             }
             end = token.start + annotation.source_range.end;
@@ -378,11 +383,24 @@ fn parse_connection(
     }
     Some(DiagramConnection {
         id: format!("connection:{connect_index}"),
+        lhs: connector_ref(args[0].trim()),
+        rhs: connector_ref(args[1].trim()),
         from: args[0].trim().to_owned(),
         to: args[1].trim().to_owned(),
         line,
         source_range: Some(SourceRange::new(tokens[connect_index].start, end)),
+        line_source_range,
     })
+}
+
+fn connector_ref(value: &str) -> ConnectorRef {
+    let (component_name, connector_path) = value
+        .split_once('.')
+        .map_or((value, ""), |(component, connector)| (component, connector));
+    ConnectorRef {
+        component_name: component_name.trim().to_owned(),
+        connector_path: connector_path.trim().to_owned(),
+    }
 }
 
 fn split_top_level(value: &str) -> Vec<&str> {
@@ -672,6 +690,10 @@ end Top;
         assert_eq!(scene.components.len(), 2);
         assert_eq!(scene.connections.len(), 1);
         assert_eq!(scene.connections[0].from, "left");
+        assert_eq!(scene.connections[0].lhs.component_name, "left");
+        assert_eq!(scene.connections[0].lhs.connector_path, "");
+        assert_eq!(scene.connections[0].rhs.component_name, "right");
+        assert_eq!(scene.connections[0].rhs.connector_path, "");
         assert!(
             scene
                 .components
@@ -695,5 +717,31 @@ end P;"#;
         let parent = &file.classes[0].children[1];
         let scene = resolve_diagram(parent, source, &mut registry);
         assert_eq!(scene.background_graphics.len(), 1);
+    }
+
+    #[test]
+    fn keeps_connection_endpoint_ownership_for_array_connectors() {
+        let source = r#"
+model Top
+  Real mixer[2];
+  Real h2grid;
+equation
+  connect(mixer.ports_a[2], h2grid.port)
+    annotation(Line(points={{-40,0},{0,0},{40,20}}));
+end Top;
+"#;
+        let file = parse(source, "ConnectorRefs.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("ConnectorRefs.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[0], source, &mut registry);
+        let connection = &scene.connections[0];
+        assert_eq!(connection.lhs.component_name, "mixer");
+        assert_eq!(connection.lhs.connector_path, "ports_a[2]");
+        assert_eq!(connection.rhs.component_name, "h2grid");
+        assert_eq!(connection.rhs.connector_path, "port");
+        assert_eq!(connection.line.as_ref().unwrap().points.len(), 3);
+        assert!(connection.line_source_range.is_some());
     }
 }

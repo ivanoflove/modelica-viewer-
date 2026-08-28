@@ -198,8 +198,33 @@ enum PointerInteraction {
         start_pointer_model: CorePoint,
         original_origin: CorePoint,
         preview_delta: CorePoint,
+        connected_connections: Vec<ConnectionDragSnapshot>,
         source_before: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionEndpoint {
+    Lhs,
+    Rhs,
+    Both,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionDragSnapshot {
+    connection_id: String,
+    endpoint: ConnectionEndpoint,
+    original_line_points: Vec<CorePoint>,
+    original_line_origin: CorePoint,
+    line_source_range: SourceRange,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionLineEdit {
+    connection_id: String,
+    before_points: Vec<CorePoint>,
+    after_points: Vec<CorePoint>,
+    line_origin: CorePoint,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +244,7 @@ enum EditCommand {
         after_origin: CorePoint,
         before_source: String,
         after_source: String,
+        connection_edits: Vec<ConnectionLineEdit>,
     },
 }
 
@@ -710,6 +736,13 @@ struct Geometry {
     indices: Vec<u16>,
     style: StyleUniform,
     edit_key: Option<String>,
+    connection: Option<ConnectionGeometry>,
+}
+
+#[derive(Clone)]
+struct ConnectionGeometry {
+    line: LineGraphic,
+    transform: Transform2D,
 }
 
 struct GpuGeometry {
@@ -719,6 +752,7 @@ struct GpuGeometry {
     style_bind_group: wgpu::BindGroup,
     base_vertices: Vec<Vertex>,
     edit_key: Option<String>,
+    connection: Option<ConnectionGeometry>,
 }
 
 struct GpuIconScene {
@@ -744,6 +778,54 @@ impl GpuIconScene {
                 })
                 .collect::<Vec<_>>();
             queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+    }
+
+    fn preview_connection_endpoint(
+        &self,
+        queue: &wgpu::Queue,
+        connection_id: &str,
+        endpoint: ConnectionEndpoint,
+        delta: CorePoint,
+    ) {
+        for geometry in &self.geometries {
+            if geometry.edit_key.as_deref() != Some(connection_id) {
+                continue;
+            }
+            let Some(connection) = &geometry.connection else {
+                continue;
+            };
+            let mut line = connection.line.clone();
+            let point = match endpoint {
+                ConnectionEndpoint::Lhs => line.points.first_mut(),
+                ConnectionEndpoint::Rhs => line.points.last_mut(),
+                ConnectionEndpoint::Both => None,
+            };
+            if let Some(point) = point {
+                point.x += delta.x;
+                point.y += delta.y;
+            } else if endpoint == ConnectionEndpoint::Both {
+                for point in &mut line.points {
+                    point.x += delta.x;
+                    point.y += delta.y;
+                }
+            } else {
+                continue;
+            }
+            let Some(preview) = line_geometry(&line, connection.transform)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            if preview.vertices.len() != geometry.base_vertices.len() {
+                continue;
+            }
+            queue.write_buffer(
+                &geometry.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&preview.vertices),
+            );
         }
     }
 }
@@ -1272,6 +1354,31 @@ impl App {
                 let Some(source_before) = document.class_text(&class_name) else {
                     return;
                 };
+                let connected_connections = document
+                    .diagram(&class_name)
+                    .into_iter()
+                    .flat_map(|scene| scene.connections.iter())
+                    .filter_map(|connection| {
+                        let endpoint = match (
+                            connection.lhs.component_name == component_name,
+                            connection.rhs.component_name == component_name,
+                        ) {
+                            (true, true) => ConnectionEndpoint::Both,
+                            (true, false) => ConnectionEndpoint::Lhs,
+                            (false, true) => ConnectionEndpoint::Rhs,
+                            (false, false) => return None,
+                        };
+                        let line = connection.line.as_ref()?;
+                        let line_source_range = connection.line_source_range?;
+                        Some(ConnectionDragSnapshot {
+                            connection_id: connection.id.clone(),
+                            endpoint,
+                            original_line_points: line.points.clone(),
+                            original_line_origin: line.origin,
+                            line_source_range,
+                        })
+                    })
+                    .collect();
                 self.pointer_interaction = PointerInteraction::MoveDiagramComponent {
                     button: MouseButton::Left,
                     component_id,
@@ -1279,6 +1386,7 @@ impl App {
                     start_pointer_model: pointer_model,
                     original_origin,
                     preview_delta: CorePoint { x: 0.0, y: 0.0 },
+                    connected_connections,
                     source_before,
                 };
             }
@@ -1323,6 +1431,7 @@ impl App {
             PointerInteraction::MoveDiagramComponent {
                 component_id,
                 start_pointer_model,
+                connected_connections,
                 ..
             } => {
                 let current = self.screen_to_model(position);
@@ -1335,6 +1444,14 @@ impl App {
                     &component_id,
                     [delta.x, -delta.y],
                 );
+                for connection in &connected_connections {
+                    self.diagram_scene.preview_connection_endpoint(
+                        &self.queue,
+                        &connection.connection_id,
+                        connection.endpoint,
+                        delta,
+                    );
+                }
                 if let PointerInteraction::MoveDiagramComponent { preview_delta, .. } =
                     &mut self.pointer_interaction
                 {
@@ -1403,6 +1520,7 @@ impl App {
                 component_name,
                 start_pointer_model,
                 original_origin,
+                connected_connections,
                 source_before,
                 ..
             } => {
@@ -1417,6 +1535,7 @@ impl App {
                     original_origin,
                     source_before,
                     delta,
+                    connected_connections,
                 );
             }
             PointerInteraction::None => {}
@@ -1507,6 +1626,7 @@ impl App {
         before_origin: CorePoint,
         source_before: String,
         delta: CorePoint,
+        connected_connections: Vec<ConnectionDragSnapshot>,
     ) {
         if delta_is_zero(delta) {
             self.rebuild_selected_scenes();
@@ -1528,15 +1648,52 @@ impl App {
             x: before_origin.x + delta.x,
             y: before_origin.y + delta.y,
         };
-        let candidate =
-            match patch_component_origin(&source_before, &component_name, after_origin, version) {
-                Ok(candidate) => candidate,
+        let mut source_edits = Vec::with_capacity(connected_connections.len() + 1);
+        let component_edit =
+            match component_origin_edit(&source_before, &component_name, after_origin) {
+                Ok(edit) => edit,
                 Err(error) => {
                     self.load_error = Some(format!("Diagram edit rejected: {error}"));
                     self.rebuild_selected_scenes();
                     return;
                 }
             };
+        source_edits.push(component_edit);
+        let mut connection_edits = Vec::with_capacity(connected_connections.len());
+        for snapshot in &connected_connections {
+            let after_points = translated_connection_points(
+                &snapshot.original_line_points,
+                snapshot.endpoint,
+                delta,
+            );
+            let edit = match connection_points_edit(
+                &source_before,
+                snapshot.line_source_range,
+                &after_points,
+            ) {
+                Ok(edit) => edit,
+                Err(error) => {
+                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                    self.rebuild_selected_scenes();
+                    return;
+                }
+            };
+            source_edits.push(edit);
+            connection_edits.push(ConnectionLineEdit {
+                connection_id: snapshot.connection_id.clone(),
+                before_points: snapshot.original_line_points.clone(),
+                after_points,
+                line_origin: snapshot.original_line_origin,
+            });
+        }
+        let candidate = match apply_validated_source_edits(&source_before, source_edits, version) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
         let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
@@ -1567,6 +1724,7 @@ impl App {
             after_origin,
             before_source: source_before,
             after_source: candidate,
+            connection_edits,
         });
         self.redo_history.clear();
         self.load_error = None;
@@ -1619,6 +1777,7 @@ impl App {
                 after_origin,
                 before_source,
                 after_source,
+                connection_edits,
             } => {
                 let source = if after { after_source } else { before_source };
                 let expected_origin = if after { *after_origin } else { *before_origin };
@@ -1633,6 +1792,26 @@ impl App {
                     component.id == *component_id && component.origin == expected_origin
                 }) {
                     return;
+                }
+                for edit in connection_edits {
+                    let expected_points = if after {
+                        &edit.after_points
+                    } else {
+                        &edit.before_points
+                    };
+                    let Some(connection) = resolved_diagram
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == edit.connection_id)
+                    else {
+                        return;
+                    };
+                    let Some(line) = connection.line.as_ref() else {
+                        return;
+                    };
+                    if line.origin != edit.line_origin || line.points != *expected_points {
+                        return;
+                    }
                 }
                 let Some(document) = self.document.as_mut() else {
                     return;
@@ -2999,6 +3178,7 @@ fn gpu_scene_from_geometries(
                 style_bind_group,
                 base_vertices,
                 edit_key: geometry.edit_key,
+                connection: geometry.connection,
             }
         })
         .collect();
@@ -3033,7 +3213,18 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         .collect::<Vec<_>>();
     for connection in &scene.connections {
         if let Some(line) = &connection.line {
-            geometries.extend(line_geometry(line, diagram_flip));
+            geometries.extend(
+                line_geometry(line, diagram_flip)
+                    .into_iter()
+                    .map(|mut geometry| {
+                        geometry.edit_key = Some(connection.id.clone());
+                        geometry.connection = Some(ConnectionGeometry {
+                            line: line.clone(),
+                            transform: diagram_flip,
+                        });
+                        geometry
+                    }),
+            );
         }
     }
     for component in &scene.components {
@@ -3422,6 +3613,7 @@ where
         indices: buffers.indices,
         style,
         edit_key: None,
+        connection: None,
     }
 }
 
@@ -3457,6 +3649,7 @@ where
             _padding: [0; 7],
         },
         edit_key: None,
+        connection: None,
     }
 }
 
@@ -3896,12 +4089,22 @@ fn patch_icon_graphic_origin(
     ))
 }
 
+#[cfg(test)]
 fn patch_component_origin(
     source: &str,
     component_name: &str,
     origin: CorePoint,
     version: u64,
 ) -> Result<String, String> {
+    let edit = component_origin_edit(source, component_name, origin)?;
+    apply_validated_source_edit(source, edit, version)
+}
+
+fn component_origin_edit(
+    source: &str,
+    component_name: &str,
+    origin: CorePoint,
+) -> Result<SourceEdit, String> {
     let scan_source = mask_nested_class_ranges(source);
     for (annotation_start, annotation) in annotation_calls(&scan_source) {
         let statement_start = source[..annotation_start]
@@ -3922,13 +4125,82 @@ fn patch_component_origin(
         let Some(transformation) = nested_call(placement, "transformation") else {
             continue;
         };
-        let edit = origin_edit_for_call(source, annotation_start, transformation, origin)
-            .ok_or_else(|| "unable to locate component origin".to_owned())?;
-        return apply_validated_source_edit(source, edit, version);
+        return origin_edit_for_call(source, annotation_start, transformation, origin)
+            .ok_or_else(|| "unable to locate component origin".to_owned());
     }
     Err(format!(
         "component `{component_name}` placement was not found in source"
     ))
+}
+
+fn translated_connection_points(
+    original_points: &[CorePoint],
+    endpoint: ConnectionEndpoint,
+    delta: CorePoint,
+) -> Vec<CorePoint> {
+    let mut points = original_points.to_vec();
+    match endpoint {
+        ConnectionEndpoint::Lhs => {
+            if let Some(point) = points.first_mut() {
+                point.x += delta.x;
+                point.y += delta.y;
+            }
+        }
+        ConnectionEndpoint::Rhs => {
+            if let Some(point) = points.last_mut() {
+                point.x += delta.x;
+                point.y += delta.y;
+            }
+        }
+        ConnectionEndpoint::Both => {
+            for point in &mut points {
+                point.x += delta.x;
+                point.y += delta.y;
+            }
+        }
+    }
+    points
+}
+
+fn format_modelica_points(points: &[CorePoint]) -> String {
+    format!(
+        "{{{}}}",
+        points
+            .iter()
+            .map(|point| format_modelica_point(*point))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn connection_points_edit(
+    source: &str,
+    line_source_range: SourceRange,
+    points: &[CorePoint],
+) -> Result<SourceEdit, String> {
+    let line_source = source
+        .get(line_source_range.start..line_source_range.end)
+        .ok_or_else(|| "connection Line source range is stale".to_owned())?;
+    let line = parse_call(line_source)
+        .map_err(|error| format!("connection Line annotation cannot be parsed: {error}"))?;
+    let entry = line
+        .args
+        .iter()
+        .find(|entry| entry.name.as_deref() == Some("points"))
+        .ok_or_else(|| "connection Line has no points argument".to_owned())?;
+    let (start, end) = value_range_for_entry(source, line_source_range.start, entry)
+        .ok_or_else(|| "unable to locate connection points".to_owned())?;
+    Ok(SourceEdit {
+        start,
+        end,
+        expected_text: Some(
+            source
+                .get(start..end)
+                .ok_or_else(|| "connection points range is invalid".to_owned())?
+                .to_owned(),
+        ),
+        replacement: format_modelica_points(points),
+    })
 }
 
 fn apply_validated_source_edit(
@@ -3936,8 +4208,16 @@ fn apply_validated_source_edit(
     edit: SourceEdit,
     version: u64,
 ) -> Result<String, String> {
+    apply_validated_source_edits(source, vec![edit], version)
+}
+
+fn apply_validated_source_edits(
+    source: &str,
+    edits: Vec<SourceEdit>,
+    version: u64,
+) -> Result<String, String> {
     let transaction = SourceTransaction {
-        edits: vec![edit],
+        edits,
         source_version: Some(version),
     };
     let candidate = apply_source_transaction(source, &transaction, Some(version))
@@ -4158,6 +4438,60 @@ mod tests {
         assert!(candidate.contains("origin={40, 50}"));
         assert!(candidate.contains("extent={{-5, -6}, {5, 6}}"));
         assert!(candidate.contains("rotation=12"));
+    }
+
+    #[test]
+    fn connected_endpoint_translation_keeps_other_points_and_origin() {
+        let points = vec![
+            CorePoint { x: -40.0, y: 0.0 },
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 20.0 },
+        ];
+        let moved = translated_connection_points(
+            &points,
+            ConnectionEndpoint::Lhs,
+            CorePoint { x: 10.0, y: 5.0 },
+        );
+        assert_eq!(moved[0], CorePoint { x: -30.0, y: 5.0 });
+        assert_eq!(moved[1], points[1]);
+        assert_eq!(moved[2], points[2]);
+
+        let moved_both = translated_connection_points(
+            &points,
+            ConnectionEndpoint::Both,
+            CorePoint { x: 10.0, y: 5.0 },
+        );
+        assert_eq!(
+            moved_both,
+            vec![
+                CorePoint { x: -30.0, y: 5.0 },
+                CorePoint { x: 10.0, y: 5.0 },
+                CorePoint { x: 50.0, y: 25.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn connection_points_edit_changes_only_line_points() {
+        let source = "model Top\n equation\n  connect(a.port, b.port) annotation(Line(origin={5, 6}, points={{-40, 0}, {0, 0}, {40, 20}}));\nend Top;";
+        let line_start = source.find("Line(").expect("Line annotation");
+        let line_end =
+            matching_delimiter(source, line_start + 4, b'(', b')').expect("Line close") + 1;
+        let edit = connection_points_edit(
+            source,
+            SourceRange::new(line_start, line_end),
+            &[
+                CorePoint { x: -30.0, y: 5.0 },
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 40.0, y: 20.0 },
+            ],
+        )
+        .expect("connection points edit");
+        let candidate =
+            apply_validated_source_edits(source, vec![edit], 0).expect("candidate source");
+        assert!(candidate.contains("origin={5, 6}"));
+        assert!(candidate.contains("points={{-30, 5}, {0, 0}, {40, 20}}"));
+        assert!(candidate.contains("connect(a.port, b.port)"));
     }
 
     #[test]

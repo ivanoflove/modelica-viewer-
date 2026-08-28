@@ -197,12 +197,22 @@ pub struct ComponentInstance {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ConnectorRef {
+    pub component_name: String,
+    pub connector_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiagramConnection {
     pub id: String,
+    pub lhs: ConnectorRef,
+    pub rhs: ConnectorRef,
+    /// Kept for callers that still display the original connect arguments.
     pub from: String,
     pub to: String,
     pub line: Option<LineGraphic>,
     pub source_range: Option<SourceRange>,
+    pub line_source_range: Option<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
