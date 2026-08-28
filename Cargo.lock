@@ -1620,6 +1620,7 @@ dependencies = [
  "egui-winit",
  "lyon",
  "modelica-core",
+ "modelica-render",
  "pollster",
  "rfd",
  "wgpu",

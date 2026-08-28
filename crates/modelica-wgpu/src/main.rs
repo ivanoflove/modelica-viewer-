@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path as FsPath, PathBuf},
     sync::{
@@ -24,16 +24,19 @@ use lyon::{
         StrokeVertex, VertexBuffers,
     },
 };
+use modelica_core::annotation::{parse_call, AnnotationCall, AnnotationValue};
 use modelica_core::scene::{
     ComponentInstance as CoreComponentInstance, DiagramScene as CoreDiagramScene, EllipseGraphic,
     Graphic as CoreGraphic, IconScene as CoreIconScene, LineGraphic, Point as CorePoint,
     PolygonGraphic, RectangleGraphic, ResolvedGraphic, Transform2D,
 };
 use modelica_core::{
+    apply_source_transaction,
     lexer::{tokenize, Token, TokenKind},
-    resolve_diagram, Class, IconResolver, Library, LibraryKind, LibraryRegistry, PackageLoader,
-    PackageNode, SourceRange,
+    parse, resolve_diagram, Class, IconResolver, Library, LibraryKind, LibraryRegistry,
+    PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
+use modelica_render::resolved_graphic_contains_point;
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -172,12 +175,50 @@ enum MainView {
     Diagram,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum PointerInteraction {
     None,
     Pan {
         button: MouseButton,
-        last_position: PhysicalPosition<f64>,
+        start_pointer: PhysicalPosition<f64>,
+        start_pan: [f32; 2],
+    },
+    MoveIconGraphic {
+        button: MouseButton,
+        graphic_id: String,
+        start_pointer_model: CorePoint,
+        original_geometry: CoreGraphic,
+        preview_delta: CorePoint,
+        source_before: String,
+    },
+    MoveDiagramComponent {
+        button: MouseButton,
+        component_id: String,
+        component_name: String,
+        start_pointer_model: CorePoint,
+        original_origin: CorePoint,
+        preview_delta: CorePoint,
+        source_before: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum EditCommand {
+    MoveIconGraphic {
+        class_name: String,
+        graphic_id: String,
+        before_geometry: CoreGraphic,
+        after_geometry: CoreGraphic,
+        before_source: String,
+        after_source: String,
+    },
+    MoveDiagramComponent {
+        class_name: String,
+        component_id: String,
+        before_origin: CorePoint,
+        after_origin: CorePoint,
+        before_source: String,
+        after_source: String,
     },
 }
 
@@ -200,6 +241,8 @@ struct LoadedDocument {
     icons: Vec<(String, CoreIconScene)>,
     diagrams: Vec<(String, CoreDiagramScene)>,
     class_sources: Vec<ClassSource>,
+    source_overrides: HashMap<String, String>,
+    source_versions: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +317,8 @@ impl LoadedDocument {
             icons,
             diagrams,
             class_sources,
+            source_overrides: HashMap::new(),
+            source_versions: HashMap::new(),
         })
     }
 
@@ -291,20 +336,61 @@ impl LoadedDocument {
             .map(|(_, scene)| scene)
     }
 
+    fn icon_mut(&mut self, class_name: &str) -> Option<&mut CoreIconScene> {
+        self.icons
+            .iter_mut()
+            .find(|(candidate, _)| candidate == class_name)
+            .map(|(_, scene)| scene)
+    }
+
+    fn diagram_mut(&mut self, class_name: &str) -> Option<&mut CoreDiagramScene> {
+        self.diagrams
+            .iter_mut()
+            .find(|(candidate, _)| candidate == class_name)
+            .map(|(_, scene)| scene)
+    }
+
     fn class_source(&self, qualified_name: &str) -> Option<(String, String)> {
         let class = self
             .class_sources
             .iter()
             .find(|class| class.qualified_name == qualified_name)?;
-        let source = fs::read_to_string(&class.source_file).ok()?;
-        let text = source.get(class.source_range.start..class.source_range.end)?;
+        let text = if let Some(override_text) = self.source_overrides.get(qualified_name) {
+            override_text.clone()
+        } else {
+            let source = fs::read_to_string(&class.source_file).ok()?;
+            source
+                .get(class.source_range.start..class.source_range.end)?
+                .to_owned()
+        };
         let source_name = class
             .source_file
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Modelica source")
             .to_owned();
-        Some((source_name, text.to_owned()))
+        Some((source_name, text))
+    }
+
+    fn class_text(&self, qualified_name: &str) -> Option<String> {
+        self.class_source(qualified_name).map(|(_, source)| source)
+    }
+
+    fn source_version(&self, qualified_name: &str) -> u64 {
+        self.source_versions
+            .get(qualified_name)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn set_class_text(&mut self, qualified_name: &str, text: String) {
+        self.source_overrides
+            .insert(qualified_name.to_owned(), text);
+        let version = self
+            .source_versions
+            .entry(qualified_name.to_owned())
+            .or_default();
+        *version = version.saturating_add(1);
     }
 
     fn ui_summary(&self, selected_class: Option<&str>) -> UiDocument {
@@ -351,7 +437,7 @@ impl LoadedDocument {
             .map(|(fps, worst_ms)| format!(" | {:.1} FPS | worst {:.1} ms", fps, worst_ms))
             .unwrap_or_default();
         format!(
-            "modelica-wgpu | {} | {} | {} classes | drag pan · wheel zoom",
+            "modelica-wgpu | {} | {} | {} classes | drag edit · Ctrl+drag pan",
             self.package_name,
             file_name,
             self.class_names.len(),
@@ -595,6 +681,7 @@ struct Geometry {
     vertices: Vec<Vertex>,
     indices: Vec<u16>,
     style: StyleUniform,
+    edit_key: Option<String>,
 }
 
 struct GpuGeometry {
@@ -602,11 +689,35 @@ struct GpuGeometry {
     index_buffer: wgpu::Buffer,
     index_count: u32,
     style_bind_group: wgpu::BindGroup,
+    base_vertices: Vec<Vertex>,
+    edit_key: Option<String>,
 }
 
 struct GpuIconScene {
     geometries: Vec<GpuGeometry>,
     bounds: Option<SceneBounds>,
+}
+
+impl GpuIconScene {
+    fn preview_translation(&self, queue: &wgpu::Queue, edit_key: &str, translation: [f32; 2]) {
+        for geometry in &self.geometries {
+            if geometry.edit_key.as_deref() != Some(edit_key) {
+                continue;
+            }
+            let vertices = geometry
+                .base_vertices
+                .iter()
+                .map(|vertex| Vertex {
+                    position: [
+                        vertex.position[0] + translation[0],
+                        vertex.position[1] + translation[1],
+                    ],
+                    ..*vertex
+                })
+                .collect::<Vec<_>>();
+            queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -728,6 +839,8 @@ struct App {
     modifiers: ModifiersState,
     canvas_rect: Option<egui::Rect>,
     pointer_interaction: PointerInteraction,
+    history: Vec<EditCommand>,
+    redo_history: Vec<EditCommand>,
     stats: FrameStats,
 }
 
@@ -1014,6 +1127,8 @@ impl App {
             modifiers: ModifiersState::default(),
             canvas_rect: None,
             pointer_interaction: PointerInteraction::None,
+            history: Vec::new(),
+            redo_history: Vec::new(),
             stats: FrameStats::new(),
         }
     }
@@ -1035,6 +1150,465 @@ impl App {
 
     fn canvas_event_allowed(&self) -> bool {
         canvas_event_allowed_for(self.main_view, self.pointer_over_canvas())
+    }
+
+    fn screen_to_model(&self, position: PhysicalPosition<f64>) -> CorePoint {
+        let x = (position.x as f32 - self.config.width as f32 * 0.5 - self.pan[0]) / self.zoom;
+        let screen_y =
+            (position.y as f32 - self.config.height as f32 * 0.5 - self.pan[1]) / self.zoom;
+        CorePoint {
+            x,
+            y: if self.main_view == MainView::Diagram {
+                -screen_y
+            } else {
+                screen_y
+            },
+        }
+    }
+
+    fn selected_class_name(&self) -> Option<&str> {
+        self.selected_class.as_deref()
+    }
+
+    fn begin_model_drag(&mut self) {
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            return;
+        };
+        let pointer_model = self.screen_to_model(self.cursor);
+        let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
+        match self.main_view {
+            MainView::Icon => {
+                let Some(document) = self.document.as_ref() else {
+                    return;
+                };
+                let Some((graphic_id, original_geometry)) =
+                    document.icon(&class_name).and_then(|scene| {
+                        scene
+                            .graphics
+                            .iter()
+                            .rev()
+                            .find(|graphic| {
+                                graphic.editable
+                                    && resolved_graphic_contains_point(
+                                        graphic,
+                                        pointer_model,
+                                        tolerance,
+                                    )
+                            })
+                            .map(|graphic| (graphic.id.0.clone(), graphic.graphic.clone()))
+                    })
+                else {
+                    return;
+                };
+                let Some(source_before) = document.class_text(&class_name) else {
+                    return;
+                };
+                self.pointer_interaction = PointerInteraction::MoveIconGraphic {
+                    button: MouseButton::Left,
+                    graphic_id,
+                    start_pointer_model: pointer_model,
+                    original_geometry,
+                    preview_delta: CorePoint { x: 0.0, y: 0.0 },
+                    source_before,
+                };
+            }
+            MainView::Diagram => {
+                let Some(document) = self.document.as_ref() else {
+                    return;
+                };
+                let Some((component_id, component_name, original_origin)) =
+                    document.diagram(&class_name).and_then(|scene| {
+                        scene
+                            .components
+                            .iter()
+                            .rev()
+                            .find(|component| {
+                                component.visible
+                                    && diagram_component_contains_point(
+                                        component,
+                                        pointer_model,
+                                        tolerance,
+                                    )
+                            })
+                            .map(|component| {
+                                (
+                                    component.id.clone(),
+                                    component.name.clone(),
+                                    component.origin,
+                                )
+                            })
+                    })
+                else {
+                    return;
+                };
+                let Some(source_before) = document.class_text(&class_name) else {
+                    return;
+                };
+                self.pointer_interaction = PointerInteraction::MoveDiagramComponent {
+                    button: MouseButton::Left,
+                    component_id,
+                    component_name,
+                    start_pointer_model: pointer_model,
+                    original_origin,
+                    preview_delta: CorePoint { x: 0.0, y: 0.0 },
+                    source_before,
+                };
+            }
+            MainView::Source => {}
+        }
+    }
+
+    fn update_model_drag_preview(&mut self, position: PhysicalPosition<f64>) {
+        let interaction = self.pointer_interaction.clone();
+        match interaction {
+            PointerInteraction::Pan {
+                start_pointer,
+                start_pan,
+                ..
+            } => {
+                self.pan = [
+                    start_pan[0] + (position.x - start_pointer.x) as f32,
+                    start_pan[1] + (position.y - start_pointer.y) as f32,
+                ];
+                self.update_view_uniform();
+                self.window.request_redraw();
+            }
+            PointerInteraction::MoveIconGraphic {
+                graphic_id,
+                start_pointer_model,
+                ..
+            } => {
+                let current = self.screen_to_model(position);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                self.scene
+                    .preview_translation(&self.queue, &graphic_id, [delta.x, delta.y]);
+                if let PointerInteraction::MoveIconGraphic { preview_delta, .. } =
+                    &mut self.pointer_interaction
+                {
+                    *preview_delta = delta;
+                }
+                self.window.request_redraw();
+            }
+            PointerInteraction::MoveDiagramComponent {
+                component_id,
+                start_pointer_model,
+                ..
+            } => {
+                let current = self.screen_to_model(position);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                self.diagram_scene.preview_translation(
+                    &self.queue,
+                    &component_id,
+                    [delta.x, -delta.y],
+                );
+                if let PointerInteraction::MoveDiagramComponent { preview_delta, .. } =
+                    &mut self.pointer_interaction
+                {
+                    *preview_delta = delta;
+                }
+                self.window.request_redraw();
+            }
+            PointerInteraction::None => {}
+        }
+    }
+
+    fn rebuild_selected_scenes(&mut self) {
+        self.scene = build_scene(
+            &self.device,
+            &self.style_layout,
+            self.document.as_ref(),
+            self.selected_class.as_deref(),
+        );
+        self.diagram_scene = build_diagram_scene(
+            &self.device,
+            &self.style_layout,
+            self.document.as_ref(),
+            self.selected_class.as_deref(),
+        );
+    }
+
+    fn finish_model_drag(&mut self, button: MouseButton) {
+        let matches_button = match &self.pointer_interaction {
+            PointerInteraction::Pan {
+                button: active_button,
+                ..
+            }
+            | PointerInteraction::MoveIconGraphic {
+                button: active_button,
+                ..
+            }
+            | PointerInteraction::MoveDiagramComponent {
+                button: active_button,
+                ..
+            } => *active_button == button,
+            PointerInteraction::None => false,
+        };
+        if !matches_button {
+            return;
+        }
+        let interaction =
+            std::mem::replace(&mut self.pointer_interaction, PointerInteraction::None);
+        match interaction {
+            PointerInteraction::Pan { .. } => {}
+            PointerInteraction::MoveIconGraphic {
+                graphic_id,
+                start_pointer_model,
+                original_geometry,
+                source_before,
+                ..
+            } => {
+                let current = self.screen_to_model(self.cursor);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                self.commit_icon_graphic_move(graphic_id, original_geometry, source_before, delta);
+            }
+            PointerInteraction::MoveDiagramComponent {
+                component_id,
+                component_name,
+                start_pointer_model,
+                original_origin,
+                source_before,
+                ..
+            } => {
+                let current = self.screen_to_model(self.cursor);
+                let delta = CorePoint {
+                    x: current.x - start_pointer_model.x,
+                    y: current.y - start_pointer_model.y,
+                };
+                self.commit_diagram_component_move(
+                    component_id,
+                    component_name,
+                    original_origin,
+                    source_before,
+                    delta,
+                );
+            }
+            PointerInteraction::None => {}
+        }
+    }
+
+    fn commit_icon_graphic_move(
+        &mut self,
+        graphic_id: String,
+        before_geometry: CoreGraphic,
+        source_before: String,
+        delta: CorePoint,
+    ) {
+        if delta_is_zero(delta) {
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(index) = icon_graphic_index(&graphic_id) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(version) = self
+            .document
+            .as_ref()
+            .map(|document| document.source_version(&class_name))
+        else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let after_geometry = translated_graphic(&before_geometry, delta);
+        let candidate = match patch_icon_graphic_origin(
+            &source_before,
+            index,
+            graphic_origin(&after_geometry),
+            version,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.load_error = Some(format!("Icon edit rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        let Some(document) = self.document.as_mut() else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        document.set_class_text(&class_name, candidate.clone());
+        let Some(scene) = document.icon_mut(&class_name) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(graphic) = scene
+            .graphics
+            .iter_mut()
+            .find(|graphic| graphic.id.0 == graphic_id)
+        else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        graphic.graphic = after_geometry.clone();
+        self.history.push(EditCommand::MoveIconGraphic {
+            class_name,
+            graphic_id,
+            before_geometry,
+            after_geometry,
+            before_source: source_before,
+            after_source: candidate,
+        });
+        self.redo_history.clear();
+        self.load_error = None;
+        self.rebuild_selected_scenes();
+    }
+
+    fn commit_diagram_component_move(
+        &mut self,
+        component_id: String,
+        component_name: String,
+        before_origin: CorePoint,
+        source_before: String,
+        delta: CorePoint,
+    ) {
+        if delta_is_zero(delta) {
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(version) = self
+            .document
+            .as_ref()
+            .map(|document| document.source_version(&class_name))
+        else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let after_origin = CorePoint {
+            x: before_origin.x + delta.x,
+            y: before_origin.y + delta.y,
+        };
+        let candidate =
+            match patch_component_origin(&source_before, &component_name, after_origin, version) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                    self.rebuild_selected_scenes();
+                    return;
+                }
+            };
+        let Some(document) = self.document.as_mut() else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        document.set_class_text(&class_name, candidate.clone());
+        let Some(scene) = document.diagram_mut(&class_name) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(component) = scene
+            .components
+            .iter_mut()
+            .find(|component| component.id == component_id)
+        else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        component.origin = after_origin;
+        self.history.push(EditCommand::MoveDiagramComponent {
+            class_name,
+            component_id,
+            before_origin,
+            after_origin,
+            before_source: source_before,
+            after_source: candidate,
+        });
+        self.redo_history.clear();
+        self.load_error = None;
+        self.rebuild_selected_scenes();
+    }
+
+    fn apply_edit_command(&mut self, command: &EditCommand, after: bool) {
+        match command {
+            EditCommand::MoveIconGraphic {
+                class_name,
+                graphic_id,
+                before_geometry,
+                after_geometry,
+                before_source,
+                after_source,
+            } => {
+                let source = if after { after_source } else { before_source };
+                let geometry = if after {
+                    after_geometry
+                } else {
+                    before_geometry
+                };
+                let Some(document) = self.document.as_mut() else {
+                    return;
+                };
+                document.set_class_text(class_name, source.clone());
+                if let Some(scene) = document.icon_mut(class_name) {
+                    if let Some(graphic) = scene
+                        .graphics
+                        .iter_mut()
+                        .find(|graphic| graphic.id.0 == *graphic_id)
+                    {
+                        graphic.graphic = geometry.clone();
+                    }
+                }
+            }
+            EditCommand::MoveDiagramComponent {
+                class_name,
+                component_id,
+                before_origin,
+                after_origin,
+                before_source,
+                after_source,
+                ..
+            } => {
+                let source = if after { after_source } else { before_source };
+                let origin = if after { *after_origin } else { *before_origin };
+                let Some(document) = self.document.as_mut() else {
+                    return;
+                };
+                document.set_class_text(class_name, source.clone());
+                if let Some(scene) = document.diagram_mut(class_name) {
+                    if let Some(component) = scene
+                        .components
+                        .iter_mut()
+                        .find(|component| component.id == *component_id)
+                    {
+                        component.origin = origin;
+                    }
+                }
+            }
+        }
+        self.load_error = None;
+        self.rebuild_selected_scenes();
+    }
+
+    fn undo(&mut self) {
+        let Some(command) = self.history.pop() else {
+            return;
+        };
+        self.apply_edit_command(&command, false);
+        self.redo_history.push(command);
+    }
+
+    fn redo(&mut self) {
+        let Some(command) = self.redo_history.pop() else {
+            return;
+        };
+        self.apply_edit_command(&command, true);
+        self.history.push(command);
     }
 
     fn update_title(&self, fps: Option<(f32, f32)>) {
@@ -2228,7 +2802,7 @@ fn icon_preview(
     painter.text(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
-        "Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
+        "Drag graphic to move   ·   Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
         ui_font(11.0),
         theme_text_tertiary(),
     );
@@ -2293,7 +2867,7 @@ fn diagram_preview(
     painter.text(
         Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
         Align2::LEFT_BOTTOM,
-        "Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
+        "Drag component to move   ·   Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
         ui_font(11.0),
         theme_text_tertiary(),
     );
@@ -2342,7 +2916,7 @@ fn gpu_scene_from_geometries(
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("{label} vertices")),
                 contents: bytemuck::cast_slice(&geometry.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("{label} indices")),
@@ -2362,11 +2936,14 @@ fn gpu_scene_from_geometries(
                     resource: style_buffer.as_entire_binding(),
                 }],
             });
+            let base_vertices = geometry.vertices.clone();
             GpuGeometry {
                 vertex_buffer,
                 index_buffer,
                 index_count: geometry.indices.len() as u32,
                 style_bind_group,
+                base_vertices,
+                edit_key: geometry.edit_key,
             }
         })
         .collect();
@@ -2377,7 +2954,15 @@ fn core_icon_geometry(scene: &CoreIconScene) -> Vec<Geometry> {
     scene
         .graphics
         .iter()
-        .flat_map(core_graphic_geometry)
+        .flat_map(|resolved| {
+            let edit_key = resolved.editable.then(|| resolved.id.0.clone());
+            core_graphic_geometry(resolved)
+                .into_iter()
+                .map(move |mut geometry| {
+                    geometry.edit_key = edit_key.clone();
+                    geometry
+                })
+        })
         .collect()
 }
 
@@ -2407,10 +2992,14 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         for resolved in &icon.graphics {
             let component_transform = compose_transform(placement, resolved.transform);
             let transform = compose_transform(diagram_flip, component_transform);
-            geometries.extend(core_graphic_geometry_from_graphic(
-                &resolved.graphic,
-                transform,
-            ));
+            geometries.extend(
+                core_graphic_geometry_from_graphic(&resolved.graphic, transform)
+                    .into_iter()
+                    .map(|mut geometry| {
+                        geometry.edit_key = Some(component.id.clone());
+                        geometry
+                    }),
+            );
         }
     }
     geometries
@@ -2777,6 +3366,7 @@ where
             .collect(),
         indices: buffers.indices,
         style,
+        edit_key: None,
     }
 }
 
@@ -2811,6 +3401,7 @@ where
             mode: FillMode::Solid as u32,
             _padding: [0; 7],
         },
+        edit_key: None,
     }
 }
 
@@ -2942,6 +3533,365 @@ fn should_zoom_canvas(
     canvas_event_allowed_for(main_view, pointer_over_canvas) && control_pressed
 }
 
+fn delta_is_zero(delta: CorePoint) -> bool {
+    delta.x.abs() <= f32::EPSILON && delta.y.abs() <= f32::EPSILON
+}
+
+fn graphic_origin(graphic: &CoreGraphic) -> CorePoint {
+    match graphic {
+        CoreGraphic::Line(value) => value.origin,
+        CoreGraphic::Polygon(value) => value.origin,
+        CoreGraphic::Rectangle(value) => value.origin,
+        CoreGraphic::Ellipse(value) => value.origin,
+        CoreGraphic::Text(value) => value.origin,
+        CoreGraphic::Bitmap(value) => value.origin,
+    }
+}
+
+fn translated_graphic(graphic: &CoreGraphic, delta: CorePoint) -> CoreGraphic {
+    let mut translated = graphic.clone();
+    match &mut translated {
+        CoreGraphic::Line(value) => {
+            value.origin.x += delta.x;
+            value.origin.y += delta.y;
+        }
+        CoreGraphic::Polygon(value) => {
+            value.origin.x += delta.x;
+            value.origin.y += delta.y;
+        }
+        CoreGraphic::Rectangle(value) => {
+            value.origin.x += delta.x;
+            value.origin.y += delta.y;
+        }
+        CoreGraphic::Ellipse(value) => {
+            value.origin.x += delta.x;
+            value.origin.y += delta.y;
+        }
+        CoreGraphic::Text(value) => {
+            value.origin.x += delta.x;
+            value.origin.y += delta.y;
+        }
+        CoreGraphic::Bitmap(value) => {
+            value.origin.x += delta.x;
+            value.origin.y += delta.y;
+        }
+    }
+    translated
+}
+
+fn diagram_component_contains_point(
+    component: &CoreComponentInstance,
+    point: CorePoint,
+    tolerance: f32,
+) -> bool {
+    let Some(icon) = component.resolved_icon.as_deref() else {
+        return false;
+    };
+    let diagram_flip = Transform2D {
+        scale_y: -1.0,
+        ..Transform2D::identity()
+    };
+    let placement = diagram_placement_transform(icon, component);
+    let render_point = CorePoint {
+        x: point.x,
+        y: -point.y,
+    };
+    icon.graphics.iter().any(|resolved| {
+        let mut candidate = resolved.clone();
+        candidate.transform = compose_transform(
+            diagram_flip,
+            compose_transform(placement, resolved.transform),
+        );
+        resolved_graphic_contains_point(&candidate, render_point, tolerance)
+    })
+}
+
+fn annotation_calls(source: &str) -> Vec<(usize, AnnotationCall)> {
+    let tokens = tokenize(source);
+    let mut calls = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.text != "annotation" || token.kind != TokenKind::Keyword {
+            continue;
+        }
+        let Some(open) = next_significant_token(&tokens, index + 1) else {
+            continue;
+        };
+        if tokens[open].text != "(" {
+            continue;
+        }
+        let Some(close) = matching_paren_tokens(&tokens, open) else {
+            continue;
+        };
+        let Some(call_source) = source.get(token.start..tokens[close].end) else {
+            continue;
+        };
+        let Ok(call) = parse_call(call_source) else {
+            continue;
+        };
+        calls.push((token.start, call));
+    }
+    calls
+}
+
+fn next_significant_token(tokens: &[Token], mut index: usize) -> Option<usize> {
+    while index < tokens.len()
+        && matches!(
+            tokens[index].kind,
+            TokenKind::Whitespace | TokenKind::Comment
+        )
+    {
+        index += 1;
+    }
+    (index < tokens.len()).then_some(index)
+}
+
+fn matching_paren_tokens(tokens: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        if token.text == "(" {
+            depth += 1;
+        } else if token.text == ")" {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn nested_call<'a>(call: &'a AnnotationCall, name: &str) -> Option<&'a AnnotationCall> {
+    call.args.iter().find_map(|entry| {
+        entry
+            .value
+            .as_call()
+            .filter(|candidate| candidate.name == name)
+    })
+}
+
+fn is_graphic_call(call: &AnnotationCall) -> bool {
+    matches!(
+        call.name.as_str(),
+        "Line" | "Polygon" | "Rectangle" | "Ellipse" | "Text" | "Bitmap"
+    )
+}
+
+fn matching_delimiter(source: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0;
+    let mut quoted = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start) {
+        if *byte == b'"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn value_range_for_entry(
+    source: &str,
+    annotation_start: usize,
+    entry: &modelica_core::annotation::AnnotationEntry,
+) -> Option<(usize, usize)> {
+    let entry_start = annotation_start + entry.source_range.start;
+    let entry_end = annotation_start + entry.source_range.end;
+    let entry_source = source.get(entry_start..entry_end)?;
+    let equals = entry_source.find('=')?;
+    let mut value_start = entry_start + equals + 1;
+    while source
+        .as_bytes()
+        .get(value_start)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        value_start += 1;
+    }
+    let value_end = match source.as_bytes().get(value_start).copied()? {
+        b'{' => matching_delimiter(source, value_start, b'{', b'}')?.saturating_add(1),
+        b'(' => matching_delimiter(source, value_start, b'(', b')')?.saturating_add(1),
+        _ => entry_end,
+    };
+    Some((value_start, value_end))
+}
+
+fn insertion_after_call_open(source: &str, call_start: usize, call_end: usize) -> Option<usize> {
+    source
+        .get(call_start..call_end)?
+        .find('(')
+        .map(|offset| call_start + offset + 1)
+}
+
+fn origin_edit_for_call(
+    source: &str,
+    annotation_start: usize,
+    call: &AnnotationCall,
+    origin: CorePoint,
+) -> Option<SourceEdit> {
+    let origin_text = format_modelica_point(origin);
+    if let Some(entry) = call
+        .args
+        .iter()
+        .find(|entry| entry.name.as_deref() == Some("origin"))
+    {
+        let (start, end) = value_range_for_entry(source, annotation_start, entry)?;
+        return Some(SourceEdit {
+            start,
+            end,
+            expected_text: Some(source.get(start..end)?.to_owned()),
+            replacement: origin_text,
+        });
+    }
+    let call_start = annotation_start + call.source_range.start;
+    let call_end = annotation_start + call.source_range.end;
+    let insertion = insertion_after_call_open(source, call_start, call_end)?;
+    Some(SourceEdit {
+        start: insertion,
+        end: insertion,
+        expected_text: Some(String::new()),
+        replacement: format!("origin={origin_text}, "),
+    })
+}
+
+fn format_modelica_point(point: CorePoint) -> String {
+    format!(
+        "{{{}, {}}}",
+        format_modelica_number(point.x),
+        format_modelica_number(point.y)
+    )
+}
+
+fn format_modelica_number(value: f32) -> String {
+    let value = if value.abs() < 0.000_001 { 0.0 } else { value };
+    let mut text = format!("{value:.6}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+fn icon_graphic_index(graphic_id: &str) -> Option<usize> {
+    graphic_id
+        .rsplit_once(":Icon.graphics:")
+        .and_then(|(_, index)| index.parse().ok())
+}
+
+fn mask_nested_class_ranges(source: &str) -> String {
+    let Ok(file) = parse(source, "<candidate>") else {
+        return source.to_owned();
+    };
+    let Some(root) = file.classes.first() else {
+        return source.to_owned();
+    };
+    let mut bytes = source.as_bytes().to_vec();
+    for child in &root.children {
+        let start = child.source_range.start.min(bytes.len());
+        let end = child.source_range.end.min(bytes.len());
+        for byte in &mut bytes[start..end] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned())
+}
+
+fn patch_icon_graphic_origin(
+    source: &str,
+    graphic_index: usize,
+    origin: CorePoint,
+    version: u64,
+) -> Result<String, String> {
+    let scan_source = mask_nested_class_ranges(source);
+    let mut valid_graphics = 0;
+    for (annotation_start, annotation) in annotation_calls(&scan_source) {
+        let Some(icon) = nested_call(&annotation, "Icon") else {
+            continue;
+        };
+        let Some(graphics) = icon.named("graphics").and_then(AnnotationValue::as_array) else {
+            continue;
+        };
+        for entry in graphics {
+            let Some(graphic) = entry.as_call().filter(|call| is_graphic_call(call)) else {
+                continue;
+            };
+            if valid_graphics == graphic_index {
+                let edit = origin_edit_for_call(source, annotation_start, graphic, origin)
+                    .ok_or_else(|| "unable to locate graphic origin".to_owned())?;
+                return apply_validated_source_edit(source, edit, version);
+            }
+            valid_graphics += 1;
+        }
+    }
+    Err(format!(
+        "graphic index {graphic_index} was not found in source"
+    ))
+}
+
+fn patch_component_origin(
+    source: &str,
+    component_name: &str,
+    origin: CorePoint,
+    version: u64,
+) -> Result<String, String> {
+    let scan_source = mask_nested_class_ranges(source);
+    for (annotation_start, annotation) in annotation_calls(&scan_source) {
+        let statement_start = source[..annotation_start]
+            .rfind(';')
+            .map_or(0, |index| index + 1);
+        let statement = &source[statement_start..annotation_start];
+        let last_name = tokenize(statement)
+            .into_iter()
+            .filter(|token| matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword))
+            .map(|token| token.text)
+            .next_back();
+        if last_name.as_deref() != Some(component_name) {
+            continue;
+        }
+        let Some(placement) = nested_call(&annotation, "Placement") else {
+            continue;
+        };
+        let Some(transformation) = nested_call(placement, "transformation") else {
+            continue;
+        };
+        let edit = origin_edit_for_call(source, annotation_start, transformation, origin)
+            .ok_or_else(|| "unable to locate component origin".to_owned())?;
+        return apply_validated_source_edit(source, edit, version);
+    }
+    Err(format!(
+        "component `{component_name}` placement was not found in source"
+    ))
+}
+
+fn apply_validated_source_edit(
+    source: &str,
+    edit: SourceEdit,
+    version: u64,
+) -> Result<String, String> {
+    let transaction = SourceTransaction {
+        edits: vec![edit],
+        source_version: Some(version),
+    };
+    let candidate = apply_source_transaction(source, &transaction, Some(version))
+        .map_err(|error| error.to_string())?;
+    parse(&candidate, "<candidate>")
+        .map_err(|error| format!("candidate source does not parse: {error}"))?;
+    Ok(candidate)
+}
+
 fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
     button == MouseButton::Middle || (button == MouseButton::Left && control_pressed)
 }
@@ -3014,6 +3964,20 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::KeyR) => {
                                         app.fit_scene();
                                     }
+                                    PhysicalKey::Code(KeyCode::KeyZ)
+                                        if app.modifiers.control_key() =>
+                                    {
+                                        if app.modifiers.shift_key() {
+                                            app.redo();
+                                        } else {
+                                            app.undo();
+                                        }
+                                    }
+                                    PhysicalKey::Code(KeyCode::KeyY)
+                                        if app.modifiers.control_key() =>
+                                    {
+                                        app.redo();
+                                    }
                                     _ => {}
                                 }
                             }
@@ -3021,43 +3985,23 @@ fn main() {
                         }
                         WindowEvent::CursorMoved { position, .. } => {
                             app.cursor = position;
-                            let pan_delta = match &mut app.pointer_interaction {
-                                PointerInteraction::Pan { last_position, .. } => {
-                                    let delta = (
-                                        position.x - last_position.x,
-                                        position.y - last_position.y,
-                                    );
-                                    *last_position = position;
-                                    Some(delta)
-                                }
-                                PointerInteraction::None => None,
-                            };
-                            if let Some((delta_x, delta_y)) = pan_delta {
-                                app.pan[0] += delta_x as f32;
-                                app.pan[1] += delta_y as f32;
-                                app.update_view_uniform();
-                                app.window.request_redraw();
-                            }
+                            app.update_model_drag_preview(position);
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
                             if state == ElementState::Released {
-                                let ends_pan = matches!(
-                                    app.pointer_interaction,
-                                    PointerInteraction::Pan {
-                                        button: active_button,
-                                        ..
-                                    } if active_button == button
-                                );
-                                if ends_pan {
-                                    app.pointer_interaction = PointerInteraction::None;
+                                app.finish_model_drag(button);
+                            } else if app.canvas_event_allowed() {
+                                if wants_pan(button, app.modifiers.control_key()) {
+                                    app.pointer_interaction = PointerInteraction::Pan {
+                                        button,
+                                        start_pointer: app.cursor,
+                                        start_pan: app.pan,
+                                    };
+                                } else if button == MouseButton::Left
+                                    && !app.modifiers.control_key()
+                                {
+                                    app.begin_model_drag();
                                 }
-                            } else if app.canvas_event_allowed()
-                                && wants_pan(button, app.modifiers.control_key())
-                            {
-                                app.pointer_interaction = PointerInteraction::Pan {
-                                    button,
-                                    last_position: app.cursor,
-                                };
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
@@ -3139,6 +4083,26 @@ mod tests {
 
         assert_eq!(zoom, initial_zoom);
         assert_eq!(pan, initial_pan);
+    }
+
+    #[test]
+    fn icon_edit_patches_only_graphic_origin() {
+        let source = "model Demo annotation(Icon(graphics={Rectangle(origin={1, 2}, extent={{-10, -20}, {10, 20}}, rotation=15)})); end Demo;";
+        let candidate = patch_icon_graphic_origin(source, 0, CorePoint { x: 11.0, y: 7.0 }, 0)
+            .expect("icon source patch");
+        assert!(candidate.contains("origin={11, 7}"));
+        assert!(candidate.contains("extent={{-10, -20}, {10, 20}}"));
+        assert!(candidate.contains("rotation=15"));
+    }
+
+    #[test]
+    fn component_edit_patches_only_placement_origin() {
+        let source = "model Parent\n  Child p annotation(Placement(transformation(origin={20, 30}, extent={{-5, -6}, {5, 6}}, rotation=12)));\nend Parent;";
+        let candidate = patch_component_origin(source, "p", CorePoint { x: 40.0, y: 50.0 }, 0)
+            .expect("component source patch");
+        assert!(candidate.contains("origin={40, 50}"));
+        assert!(candidate.contains("extent={{-5, -6}, {5, 6}}"));
+        assert!(candidate.contains("rotation=12"));
     }
 
     #[test]
