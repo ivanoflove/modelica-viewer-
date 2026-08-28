@@ -27,8 +27,8 @@ use lyon::{
 use modelica_core::annotation::{parse_call, AnnotationCall, AnnotationValue};
 use modelica_core::scene::{
     ComponentInstance as CoreComponentInstance, DiagramScene as CoreDiagramScene, EllipseGraphic,
-    Graphic as CoreGraphic, IconScene as CoreIconScene, LineGraphic, Point as CorePoint,
-    PolygonGraphic, RectangleGraphic, ResolvedGraphic, Transform2D,
+    Graphic as CoreGraphic, GraphicOwnerKind, IconScene as CoreIconScene, LineGraphic,
+    Point as CorePoint, PolygonGraphic, RectangleGraphic, ResolvedGraphic, Transform2D,
 };
 use modelica_core::{
     apply_source_transaction,
@@ -185,6 +185,18 @@ enum DiagramSelection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeHandle {
+    Corner(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ComponentSelectionOverlay {
+    origin: CorePoint,
+    extent: modelica_core::scene::Extent,
+    rotation: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionSegmentOrientation {
     Horizontal,
     Vertical,
@@ -251,6 +263,17 @@ enum PointerInteraction {
         preview_points: Vec<CorePoint>,
         source_before: String,
     },
+    ResizeDiagramComponent {
+        button: MouseButton,
+        component_id: String,
+        component_name: String,
+        handle: ResizeHandle,
+        original_component: CoreComponentInstance,
+        original_extent: modelica_core::scene::Extent,
+        preview_extent: modelica_core::scene::Extent,
+        connected_connections: Vec<ConnectionDragSnapshot>,
+        source_before: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,7 +289,10 @@ struct ConnectionDragSnapshot {
     endpoint: ConnectionEndpoint,
     original_line_points: Vec<CorePoint>,
     original_line_origin: CorePoint,
+    original_line_rotation: f32,
     line_source_range: SourceRange,
+    lhs_connector_path: Option<String>,
+    rhs_connector_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +329,15 @@ enum EditCommand {
         after_points: Vec<CorePoint>,
         before_source: String,
         after_source: String,
+    },
+    ResizeDiagramComponent {
+        class_name: String,
+        component_id: String,
+        before_extent: modelica_core::scene::Extent,
+        after_extent: modelica_core::scene::Extent,
+        before_source: String,
+        after_source: String,
+        connection_edits: Vec<ConnectionLineEdit>,
     },
 }
 
@@ -795,11 +830,17 @@ struct Geometry {
     style: StyleUniform,
     edit_key: Option<String>,
     connection: Option<ConnectionGeometry>,
+    component: Option<ComponentGeometry>,
 }
 
 #[derive(Clone)]
 struct ConnectionGeometry {
     line: LineGraphic,
+    transform: Transform2D,
+}
+
+#[derive(Clone, Copy)]
+struct ComponentGeometry {
     transform: Transform2D,
 }
 
@@ -811,6 +852,7 @@ struct GpuGeometry {
     base_vertices: Vec<Vertex>,
     edit_key: Option<String>,
     connection: Option<ConnectionGeometry>,
+    component: Option<ComponentGeometry>,
 }
 
 struct GpuIconScene {
@@ -833,6 +875,41 @@ impl GpuIconScene {
                         vertex.position[1] + translation[1],
                     ],
                     ..*vertex
+                })
+                .collect::<Vec<_>>();
+            queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+    }
+
+    fn preview_component_resize(
+        &self,
+        queue: &wgpu::Queue,
+        component_id: &str,
+        new_transform: Transform2D,
+    ) {
+        for geometry in &self.geometries {
+            if geometry.edit_key.as_deref() != Some(component_id) {
+                continue;
+            }
+            let Some(component) = geometry.component else {
+                continue;
+            };
+            let vertices = geometry
+                .base_vertices
+                .iter()
+                .map(|vertex| {
+                    let local = inverse_transform_point(
+                        CorePoint {
+                            x: vertex.position[0],
+                            y: vertex.position[1],
+                        },
+                        component.transform,
+                    );
+                    let resized = apply_transform_point(local, new_transform);
+                    Vertex {
+                        position: [resized.x, resized.y],
+                        ..*vertex
+                    }
                 })
                 .collect::<Vec<_>>();
             queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
@@ -1487,6 +1564,84 @@ impl App {
         Some(connection_world_points(line, points))
     }
 
+    fn selected_component_overlay(&self) -> Option<ComponentSelectionOverlay> {
+        let component_name = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => component_name,
+            _ => return None,
+        };
+        let class_name = self.selected_class_name()?;
+        let component = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .components
+            .iter()
+            .find(|component| component.name == *component_name)?;
+        Some(ComponentSelectionOverlay {
+            origin: component.origin,
+            extent: component
+                .placement_extent
+                .unwrap_or(default_component_extent()),
+            rotation: component.rotation,
+        })
+    }
+
+    fn hit_test_selected_component_handle(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<(String, ResizeHandle)> {
+        let component_name = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => component_name,
+            _ => return None,
+        };
+        let overlay = self.selected_component_overlay()?;
+        component_extent_corners(overlay.origin, overlay.extent, overlay.rotation)
+            .iter()
+            .enumerate()
+            .find(|(_, corner)| distance_between(**corner, pointer_model) <= tolerance)
+            .map(|(index, _)| (component_name.clone(), ResizeHandle::Corner(index)))
+    }
+
+    fn begin_component_resize(&mut self, component_name: String, handle: ResizeHandle) {
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Some(component) = document.diagram(&class_name).and_then(|scene| {
+            scene
+                .components
+                .iter()
+                .find(|component| component.name == component_name)
+                .cloned()
+        }) else {
+            return;
+        };
+        let Some(source_before) = document.class_text(&class_name) else {
+            return;
+        };
+        let original_extent = component
+            .placement_extent
+            .unwrap_or(default_component_extent());
+        let connected_connections = document
+            .diagram(&class_name)
+            .map(|scene| connection_drag_snapshots(scene, &component_name))
+            .unwrap_or_default();
+        self.pointer_interaction = PointerInteraction::ResizeDiagramComponent {
+            button: MouseButton::Left,
+            component_id: component.id.clone(),
+            component_name,
+            handle,
+            original_component: component,
+            original_extent,
+            preview_extent: original_extent,
+            connected_connections,
+            source_before,
+        };
+    }
+
     fn begin_model_drag(&mut self) {
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
             return;
@@ -1536,6 +1691,12 @@ impl App {
                 if let Some(hit) = self.hit_test_selected_connection_point(pointer_model, tolerance)
                 {
                     self.begin_connection_edit(hit, pointer_model);
+                    return;
+                }
+                if let Some((component_name, handle)) =
+                    self.hit_test_selected_component_handle(pointer_model, tolerance)
+                {
+                    self.begin_component_resize(component_name, handle);
                     return;
                 }
                 let Some((component_id, component_name, original_origin)) =
@@ -1592,7 +1753,12 @@ impl App {
                             endpoint,
                             original_line_points: line.points.clone(),
                             original_line_origin: line.origin,
+                            original_line_rotation: line.rotation,
                             line_source_range,
+                            lhs_connector_path: (connection.lhs.component_name == component_name)
+                                .then(|| connection.lhs.connector_path.clone()),
+                            rhs_connector_path: (connection.rhs.component_name == component_name)
+                                .then(|| connection.rhs.connector_path.clone()),
                         })
                     })
                     .collect();
@@ -1738,6 +1904,64 @@ impl App {
                 }
                 self.window.request_redraw();
             }
+            PointerInteraction::ResizeDiagramComponent {
+                component_id,
+                original_component,
+                original_extent,
+                handle,
+                connected_connections,
+                ..
+            } => {
+                let current = self.screen_to_model(position);
+                let preview_extent = resized_extent_from_pointer(
+                    original_extent,
+                    original_component.origin,
+                    original_component.rotation,
+                    handle,
+                    current,
+                );
+                let Some(icon) = original_component.resolved_icon.as_deref() else {
+                    return;
+                };
+                let placement = diagram_placement_transform_for_extent(
+                    icon,
+                    original_component.origin,
+                    original_component.rotation,
+                    preview_extent,
+                );
+                self.diagram_scene.preview_component_resize(
+                    &self.queue,
+                    &component_id,
+                    compose_transform(
+                        Transform2D {
+                            scale_y: -1.0,
+                            ..Transform2D::identity()
+                        },
+                        placement,
+                    ),
+                );
+                for connection in &connected_connections {
+                    let preview_points = resized_connection_points(
+                        &original_component,
+                        original_extent,
+                        preview_extent,
+                        connection,
+                    );
+                    self.diagram_scene.preview_connection_points(
+                        &self.queue,
+                        &connection.connection_id,
+                        &preview_points,
+                    );
+                }
+                if let PointerInteraction::ResizeDiagramComponent {
+                    preview_extent: active_preview,
+                    ..
+                } = &mut self.pointer_interaction
+                {
+                    *active_preview = preview_extent;
+                }
+                self.window.request_redraw();
+            }
             PointerInteraction::None => {}
         }
     }
@@ -1776,6 +2000,10 @@ impl App {
                 ..
             }
             | PointerInteraction::MoveDiagramConnectionSegment {
+                button: active_button,
+                ..
+            }
+            | PointerInteraction::ResizeDiagramComponent {
                 button: active_button,
                 ..
             } => *active_button == button,
@@ -1871,6 +2099,33 @@ impl App {
                     connection_id,
                     original_points,
                     after_points,
+                    source_before,
+                );
+            }
+            PointerInteraction::ResizeDiagramComponent {
+                component_id,
+                component_name,
+                handle,
+                original_component,
+                original_extent,
+                connected_connections,
+                source_before,
+                ..
+            } => {
+                let after_extent = resized_extent_from_pointer(
+                    original_extent,
+                    original_component.origin,
+                    original_component.rotation,
+                    handle,
+                    self.screen_to_model(self.cursor),
+                );
+                self.commit_diagram_component_resize(
+                    component_id,
+                    component_name,
+                    original_component,
+                    original_extent,
+                    after_extent,
+                    connected_connections,
                     source_before,
                 );
             }
@@ -2170,6 +2425,142 @@ impl App {
         self.rebuild_selected_scenes();
     }
 
+    fn commit_diagram_component_resize(
+        &mut self,
+        component_id: String,
+        component_name: String,
+        original_component: CoreComponentInstance,
+        before_extent: modelica_core::scene::Extent,
+        after_extent: modelica_core::scene::Extent,
+        connected_connections: Vec<ConnectionDragSnapshot>,
+        source_before: String,
+    ) {
+        if before_extent == after_extent {
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(version) = self
+            .document
+            .as_ref()
+            .map(|document| document.source_version(&class_name))
+        else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let extent_edit = match component_extent_edit(&source_before, &component_name, after_extent)
+        {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.load_error = Some(format!("Component resize rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        let mut source_edits = vec![extent_edit];
+        let mut connection_edits = Vec::with_capacity(connected_connections.len());
+        for snapshot in &connected_connections {
+            let after_points = resized_connection_points(
+                &original_component,
+                before_extent,
+                after_extent,
+                snapshot,
+            );
+            let edit = match connection_points_edit(
+                &source_before,
+                snapshot.line_source_range,
+                &after_points,
+            ) {
+                Ok(edit) => edit,
+                Err(error) => {
+                    self.load_error = Some(format!("Component resize rejected: {error}"));
+                    self.rebuild_selected_scenes();
+                    return;
+                }
+            };
+            source_edits.push(edit);
+            connection_edits.push(ConnectionLineEdit {
+                connection_id: snapshot.connection_id.clone(),
+                before_points: snapshot.original_line_points.clone(),
+                after_points,
+                line_origin: snapshot.original_line_origin,
+            });
+        }
+        let candidate = match apply_validated_source_edits(&source_before, source_edits, version) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.load_error = Some(format!("Component resize rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+            document
+                .resolve_candidate_scenes(&class_name, &candidate)
+                .ok()
+        }) {
+            Some(scenes) => scenes,
+            None => {
+                self.load_error =
+                    Some("Component resize could not resolve candidate source".into());
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
+        if !resolved_diagram.components.iter().any(|component| {
+            component.id == component_id && component.placement_extent == Some(after_extent)
+        }) {
+            self.load_error = Some("Component resize did not update Placement.extent".into());
+            self.rebuild_selected_scenes();
+            return;
+        }
+        for edit in &connection_edits {
+            let Some(connection) = resolved_diagram
+                .connections
+                .iter()
+                .find(|connection| connection.id == edit.connection_id)
+            else {
+                self.load_error = Some("Component resize lost a connection".into());
+                self.rebuild_selected_scenes();
+                return;
+            };
+            if connection.line.as_ref().is_none_or(|line| {
+                line.origin != edit.line_origin || line.points != edit.after_points
+            }) {
+                self.load_error =
+                    Some("Component resize did not update connection geometry".into());
+                self.rebuild_selected_scenes();
+                return;
+            }
+        }
+        let Some(document) = self.document.as_mut() else {
+            self.rebuild_selected_scenes();
+            return;
+        };
+        document.set_class_text(&class_name, candidate.clone());
+        if let Some(scene) = document.icon_mut(&class_name) {
+            *scene = resolved_icon;
+        }
+        if let Some(scene) = document.diagram_mut(&class_name) {
+            *scene = resolved_diagram;
+        }
+        self.history.push(EditCommand::ResizeDiagramComponent {
+            class_name,
+            component_id,
+            before_extent,
+            after_extent,
+            before_source: source_before,
+            after_source: candidate,
+            connection_edits,
+        });
+        self.redo_history.clear();
+        self.load_error = None;
+        self.rebuild_selected_scenes();
+    }
+
     fn apply_edit_command(&mut self, command: &EditCommand, after: bool) {
         match command {
             EditCommand::MoveIconGraphic {
@@ -2293,6 +2684,61 @@ impl App {
                     .is_none_or(|line| line.points != *expected_points)
                 {
                     return;
+                }
+                let Some(document) = self.document.as_mut() else {
+                    return;
+                };
+                document.set_class_text(class_name, source.clone());
+                if let Some(scene) = document.icon_mut(class_name) {
+                    *scene = resolved_icon;
+                }
+                if let Some(scene) = document.diagram_mut(class_name) {
+                    *scene = resolved_diagram;
+                }
+            }
+            EditCommand::ResizeDiagramComponent {
+                class_name,
+                component_id,
+                before_extent,
+                after_extent,
+                before_source,
+                after_source,
+                connection_edits,
+            } => {
+                let source = if after { after_source } else { before_source };
+                let expected_extent = if after { after_extent } else { before_extent };
+                let Some((resolved_icon, resolved_diagram)) =
+                    self.document.as_ref().and_then(|document| {
+                        document.resolve_candidate_scenes(class_name, source).ok()
+                    })
+                else {
+                    return;
+                };
+                if !resolved_diagram.components.iter().any(|component| {
+                    component.id == *component_id
+                        && component.placement_extent == Some(*expected_extent)
+                }) {
+                    return;
+                }
+                for edit in connection_edits {
+                    let expected_points = if after {
+                        &edit.after_points
+                    } else {
+                        &edit.before_points
+                    };
+                    let Some(connection) = resolved_diagram
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == edit.connection_id)
+                    else {
+                        return;
+                    };
+                    let Some(line) = connection.line.as_ref() else {
+                        return;
+                    };
+                    if line.origin != edit.line_origin || line.points != *expected_points {
+                        return;
+                    }
                 }
                 let Some(document) = self.document.as_mut() else {
                     return;
@@ -2442,6 +2888,7 @@ impl App {
         let mut expand_all_requested = false;
         let mut collapse_all_requested = false;
         let selected_connection_points = self.selected_connection_overlay_points();
+        let selected_component_overlay = self.selected_component_overlay();
         let zoom = self.zoom;
         let pan = self.pan;
         let viewport = [self.config.width, self.config.height];
@@ -2469,6 +2916,7 @@ impl App {
                     ctx,
                     icon_clip_rect,
                     selected_connection_points.as_deref(),
+                    selected_component_overlay,
                     zoom,
                     pan,
                     viewport,
@@ -3611,17 +4059,15 @@ fn draw_diagram_selection_overlay(
     ctx: &egui::Context,
     canvas_rect: Option<egui::Rect>,
     points: Option<&[CorePoint]>,
+    component: Option<ComponentSelectionOverlay>,
     zoom: f32,
     pan: [f32; 2],
     viewport: [u32; 2],
     pixels_per_point: f32,
 ) {
-    let (Some(canvas_rect), Some(points)) = (canvas_rect, points) else {
+    let Some(canvas_rect) = canvas_rect else {
         return;
     };
-    if points.len() < 2 {
-        return;
-    }
     let painter = ctx
         .layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -3634,31 +4080,57 @@ fn draw_diagram_selection_overlay(
             (viewport[1] as f32 * 0.5 + pan[1] - point.y * zoom) / pixels_per_point,
         )
     };
-    let screen_points = points.iter().copied().map(to_screen).collect::<Vec<_>>();
     let accent = theme_accent();
-    for pair in screen_points.windows(2) {
-        let [start, end] = pair else {
-            continue;
-        };
-        painter.line_segment([*start, *end], Stroke::new(3.0_f32, theme_accent_soft(170)));
+    if let Some(points) = points.filter(|points| points.len() >= 2) {
+        let screen_points = points.iter().copied().map(to_screen).collect::<Vec<_>>();
+        for pair in screen_points.windows(2) {
+            let [start, end] = pair else {
+                continue;
+            };
+            painter.line_segment([*start, *end], Stroke::new(3.0_f32, theme_accent_soft(170)));
+        }
+        for (index, point) in screen_points.iter().enumerate() {
+            let endpoint = index == 0 || index + 1 == screen_points.len();
+            let radius = if endpoint { 4.5 } else { 5.5 };
+            painter.circle_filled(
+                *point,
+                radius,
+                if endpoint {
+                    theme_surface_raised(245)
+                } else {
+                    accent
+                },
+            );
+            painter.circle_stroke(
+                *point,
+                radius,
+                Stroke::new(1.5_f32, if endpoint { accent } else { theme_surface() }),
+            );
+        }
     }
-    for (index, point) in screen_points.iter().enumerate() {
-        let endpoint = index == 0 || index + 1 == screen_points.len();
-        let radius = if endpoint { 4.5 } else { 5.5 };
-        painter.circle_filled(
-            *point,
-            radius,
-            if endpoint {
-                theme_surface_raised(245)
-            } else {
-                accent
-            },
-        );
-        painter.circle_stroke(
-            *point,
-            radius,
-            Stroke::new(1.5_f32, if endpoint { accent } else { theme_surface() }),
-        );
+    if let Some(component) = component {
+        let corners =
+            component_extent_corners(component.origin, component.extent, component.rotation);
+        let screen_corners = corners.iter().copied().map(to_screen).collect::<Vec<_>>();
+        for index in 0..screen_corners.len() {
+            painter.line_segment(
+                [
+                    screen_corners[index],
+                    screen_corners[(index + 1) % screen_corners.len()],
+                ],
+                Stroke::new(1.5_f32, theme_accent_soft(210)),
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(screen_corners[index], Vec2::splat(10.0)),
+                Rounding::same(2.0),
+                accent,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_center_size(screen_corners[index], Vec2::splat(10.0)),
+                Rounding::same(2.0),
+                Stroke::new(1.0_f32, theme_surface()),
+            );
+        }
     }
 }
 
@@ -3734,6 +4206,7 @@ fn gpu_scene_from_geometries(
                 base_vertices,
                 edit_key: geometry.edit_key,
                 connection: geometry.connection,
+                component: geometry.component,
             }
         })
         .collect();
@@ -3790,14 +4263,18 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
             continue;
         };
         let placement = diagram_placement_transform(icon, component);
+        let parent_component_transform = compose_transform(diagram_flip, placement);
         for resolved in &icon.graphics {
-            let component_transform = compose_transform(placement, resolved.transform);
-            let transform = compose_transform(diagram_flip, component_transform);
+            let graphic_transform = compose_transform(placement, resolved.transform);
+            let transform = compose_transform(diagram_flip, graphic_transform);
             geometries.extend(
                 core_graphic_geometry_from_graphic(&resolved.graphic, transform)
                     .into_iter()
                     .map(|mut geometry| {
                         geometry.edit_key = Some(component.id.clone());
+                        geometry.component = Some(ComponentGeometry {
+                            transform: parent_component_transform,
+                        });
                         geometry
                     }),
             );
@@ -3827,13 +4304,26 @@ fn diagram_placement_transform(
     icon: &CoreIconScene,
     component: &CoreComponentInstance,
 ) -> Transform2D {
+    diagram_placement_transform_for_extent(
+        icon,
+        component.origin,
+        component.rotation,
+        component
+            .placement_extent
+            .unwrap_or(modelica_core::scene::Extent {
+                p1: CorePoint { x: -10.0, y: -10.0 },
+                p2: CorePoint { x: 10.0, y: 10.0 },
+            }),
+    )
+}
+
+fn diagram_placement_transform_for_extent(
+    icon: &CoreIconScene,
+    origin: CorePoint,
+    rotation: f32,
+    target: modelica_core::scene::Extent,
+) -> Transform2D {
     let source = icon.coordinate_system.extent;
-    let target = component
-        .placement_extent
-        .unwrap_or(modelica_core::scene::Extent {
-            p1: CorePoint { x: -10.0, y: -10.0 },
-            p2: CorePoint { x: 10.0, y: 10.0 },
-        });
     let source_width = if (source.p2.x - source.p1.x).abs() <= f32::EPSILON {
         1.0
     } else {
@@ -3848,10 +4338,10 @@ fn diagram_placement_transform(
     let scale_y = (target.p2.y - target.p1.y) / source_height;
     Transform2D {
         translation: CorePoint {
-            x: component.origin.x + target.p1.x - source.p1.x * scale_x,
-            y: component.origin.y + target.p1.y - source.p1.y * scale_y,
+            x: origin.x + target.p1.x - source.p1.x * scale_x,
+            y: origin.y + target.p1.y - source.p1.y * scale_y,
         },
-        rotation: component.rotation,
+        rotation,
         scale_x,
         scale_y,
     }
@@ -3874,6 +4364,144 @@ fn compose_transform(parent: Transform2D, child: Transform2D) -> Transform2D {
         rotation: parent.rotation + child.rotation,
         scale_x: parent.scale_x * child.scale_x,
         scale_y: parent.scale_y * child.scale_y,
+    }
+}
+
+fn apply_transform_point(point: CorePoint, transform: Transform2D) -> CorePoint {
+    let scaled = CorePoint {
+        x: point.x * transform.scale_x,
+        y: point.y * transform.scale_y,
+    };
+    let radians = transform.rotation.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    CorePoint {
+        x: scaled.x * cos - scaled.y * sin + transform.translation.x,
+        y: scaled.x * sin + scaled.y * cos + transform.translation.y,
+    }
+}
+
+fn inverse_transform_point(point: CorePoint, transform: Transform2D) -> CorePoint {
+    let translated = CorePoint {
+        x: point.x - transform.translation.x,
+        y: point.y - transform.translation.y,
+    };
+    let radians = transform.rotation.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let unrotated = CorePoint {
+        x: translated.x * cos + translated.y * sin,
+        y: -translated.x * sin + translated.y * cos,
+    };
+    CorePoint {
+        x: unrotated.x / nonzero_scale(transform.scale_x),
+        y: unrotated.y / nonzero_scale(transform.scale_y),
+    }
+}
+
+fn component_extent_corners(
+    origin: CorePoint,
+    extent: modelica_core::scene::Extent,
+    rotation: f32,
+) -> [CorePoint; 4] {
+    let transform = Transform2D {
+        translation: origin,
+        rotation,
+        scale_x: 1.0,
+        scale_y: 1.0,
+    };
+    [
+        extent.p1,
+        CorePoint {
+            x: extent.p2.x,
+            y: extent.p1.y,
+        },
+        extent.p2,
+        CorePoint {
+            x: extent.p1.x,
+            y: extent.p2.y,
+        },
+    ]
+    .map(|point| apply_transform_point(point, transform))
+}
+
+fn resized_extent_from_pointer(
+    original: modelica_core::scene::Extent,
+    origin: CorePoint,
+    rotation: f32,
+    handle: ResizeHandle,
+    pointer_model: CorePoint,
+) -> modelica_core::scene::Extent {
+    let local = inverse_transform_point(
+        pointer_model,
+        Transform2D {
+            translation: origin,
+            rotation,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        },
+    );
+    let mut extent = original;
+    match handle {
+        ResizeHandle::Corner(0) => {
+            extent.p1 = local;
+        }
+        ResizeHandle::Corner(1) => {
+            extent.p2.x = local.x;
+            extent.p1.y = local.y;
+        }
+        ResizeHandle::Corner(2) => {
+            extent.p2 = local;
+        }
+        ResizeHandle::Corner(3) => {
+            extent.p1.x = local.x;
+            extent.p2.y = local.y;
+        }
+        ResizeHandle::Corner(_) => {}
+    }
+    keep_extent_nonzero(&mut extent, original, handle);
+    extent
+}
+
+fn keep_extent_nonzero(
+    extent: &mut modelica_core::scene::Extent,
+    original: modelica_core::scene::Extent,
+    handle: ResizeHandle,
+) {
+    let minimum = ORTHOGONAL_EPSILON;
+    let x_direction = if original.p2.x < original.p1.x {
+        -1.0
+    } else {
+        1.0
+    };
+    let y_direction = if original.p2.y < original.p1.y {
+        -1.0
+    } else {
+        1.0
+    };
+    if (extent.p2.x - extent.p1.x).abs() < minimum {
+        if matches!(handle, ResizeHandle::Corner(0) | ResizeHandle::Corner(3)) {
+            extent.p1.x = extent.p2.x - x_direction * minimum;
+        } else {
+            extent.p2.x = extent.p1.x + x_direction * minimum;
+        }
+    }
+    if (extent.p2.y - extent.p1.y).abs() < minimum {
+        if matches!(handle, ResizeHandle::Corner(0) | ResizeHandle::Corner(1)) {
+            extent.p1.y = extent.p2.y - y_direction * minimum;
+        } else {
+            extent.p2.y = extent.p1.y + y_direction * minimum;
+        }
+    }
+}
+
+fn nonzero_scale(scale: f32) -> f32 {
+    if scale.abs() <= f32::EPSILON {
+        if scale.is_sign_negative() {
+            -1.0
+        } else {
+            1.0
+        }
+    } else {
+        scale
     }
 }
 
@@ -4169,6 +4797,7 @@ where
         style,
         edit_key: None,
         connection: None,
+        component: None,
     }
 }
 
@@ -4205,6 +4834,7 @@ where
         },
         edit_key: None,
         connection: None,
+        component: None,
     }
 }
 
@@ -4800,6 +5430,227 @@ fn component_origin_edit(
     ))
 }
 
+fn component_extent_edit(
+    source: &str,
+    component_name: &str,
+    extent: modelica_core::scene::Extent,
+) -> Result<SourceEdit, String> {
+    let scan_source = mask_nested_class_ranges(source);
+    for (annotation_start, annotation) in annotation_calls(&scan_source) {
+        let statement_start = source[..annotation_start]
+            .rfind(';')
+            .map_or(0, |index| index + 1);
+        let statement = &source[statement_start..annotation_start];
+        let last_name = tokenize(statement)
+            .into_iter()
+            .filter(|token| matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword))
+            .map(|token| token.text)
+            .next_back();
+        if last_name.as_deref() != Some(component_name) {
+            continue;
+        }
+        let Some(placement) = nested_call(&annotation, "Placement") else {
+            continue;
+        };
+        let Some(transformation) = nested_call(placement, "transformation") else {
+            continue;
+        };
+        return extent_edit_for_call(source, annotation_start, transformation, extent)
+            .ok_or_else(|| "unable to locate component extent".to_owned());
+    }
+    Err(format!(
+        "component `{component_name}` placement was not found in source"
+    ))
+}
+
+fn extent_edit_for_call(
+    source: &str,
+    annotation_start: usize,
+    call: &AnnotationCall,
+    extent: modelica_core::scene::Extent,
+) -> Option<SourceEdit> {
+    let extent_text = format_modelica_extent(extent);
+    if let Some(entry) = call
+        .args
+        .iter()
+        .find(|entry| entry.name.as_deref() == Some("extent"))
+    {
+        let (start, end) = value_range_for_entry(source, annotation_start, entry)?;
+        return Some(SourceEdit {
+            start,
+            end,
+            expected_text: Some(source.get(start..end)?.to_owned()),
+            replacement: extent_text,
+        });
+    }
+    let call_start = annotation_start + call.source_range.start;
+    let call_end = annotation_start + call.source_range.end;
+    let insertion = insertion_after_call_open(source, call_start, call_end)?;
+    Some(SourceEdit {
+        start: insertion,
+        end: insertion,
+        expected_text: Some(String::new()),
+        replacement: format!("extent={extent_text}, "),
+    })
+}
+
+fn format_modelica_extent(extent: modelica_core::scene::Extent) -> String {
+    format!(
+        "{{{}, {}}}",
+        format_modelica_point(extent.p1),
+        format_modelica_point(extent.p2)
+    )
+}
+
+fn default_component_extent() -> modelica_core::scene::Extent {
+    modelica_core::scene::Extent {
+        p1: CorePoint { x: -10.0, y: -10.0 },
+        p2: CorePoint { x: 10.0, y: 10.0 },
+    }
+}
+
+fn connector_owner_name(path: &str) -> &str {
+    path.split('.')
+        .next()
+        .unwrap_or(path)
+        .split('[')
+        .next()
+        .unwrap_or(path)
+}
+
+fn connector_world_position(
+    component: &CoreComponentInstance,
+    extent: modelica_core::scene::Extent,
+    connector_path: &str,
+) -> Option<CorePoint> {
+    let icon = component.resolved_icon.as_deref()?;
+    let owner_name = connector_owner_name(connector_path);
+    let graphic = icon.graphics.iter().find(|graphic| {
+        graphic.owner.kind == GraphicOwnerKind::Connector
+            && graphic.owner.instance_name.as_deref() == Some(owner_name)
+    })?;
+    let placement =
+        diagram_placement_transform_for_extent(icon, component.origin, component.rotation, extent);
+    Some(apply_transform_point(
+        CorePoint { x: 0.0, y: 0.0 },
+        compose_transform(placement, graphic.transform),
+    ))
+}
+
+fn line_local_point_from_world(
+    world: CorePoint,
+    line_origin: CorePoint,
+    line_rotation: f32,
+) -> CorePoint {
+    inverse_transform_point(
+        world,
+        Transform2D {
+            translation: line_origin,
+            rotation: line_rotation,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        },
+    )
+}
+
+fn resized_connection_points(
+    component: &CoreComponentInstance,
+    before_extent: modelica_core::scene::Extent,
+    after_extent: modelica_core::scene::Extent,
+    snapshot: &ConnectionDragSnapshot,
+) -> Vec<CorePoint> {
+    let mut points = snapshot.original_line_points.clone();
+    let endpoints = [
+        (0usize, snapshot.lhs_connector_path.as_deref()),
+        (
+            points.len().saturating_sub(1),
+            snapshot.rhs_connector_path.as_deref(),
+        ),
+    ];
+    for (index, connector_path) in endpoints {
+        let Some(connector_path) = connector_path else {
+            continue;
+        };
+        let Some(before_world) = connector_world_position(component, before_extent, connector_path)
+        else {
+            continue;
+        };
+        let Some(after_world) = connector_world_position(component, after_extent, connector_path)
+        else {
+            continue;
+        };
+        if index >= points.len() {
+            continue;
+        }
+        let before_local = line_local_point_from_world(
+            before_world,
+            snapshot.original_line_origin,
+            snapshot.original_line_rotation,
+        );
+        let after_local = line_local_point_from_world(
+            after_world,
+            snapshot.original_line_origin,
+            snapshot.original_line_rotation,
+        );
+        let delta = CorePoint {
+            x: after_local.x - before_local.x,
+            y: after_local.y - before_local.y,
+        };
+        let original_endpoint = snapshot.original_line_points[index];
+        points[index] = after_local;
+        if index == 0 && points.len() >= 2 {
+            preserve_orthogonal_neighbor(
+                &mut points[1],
+                original_endpoint,
+                snapshot.original_line_points[1],
+                delta,
+            );
+        } else if index + 1 == points.len() && points.len() >= 2 {
+            preserve_orthogonal_neighbor(
+                &mut points[index - 1],
+                original_endpoint,
+                snapshot.original_line_points[index - 1],
+                delta,
+            );
+        }
+    }
+    points
+}
+
+fn connection_drag_snapshots(
+    scene: &CoreDiagramScene,
+    component_name: &str,
+) -> Vec<ConnectionDragSnapshot> {
+    scene
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            let endpoint = match (
+                connection.lhs.component_name == component_name,
+                connection.rhs.component_name == component_name,
+            ) {
+                (true, true) => ConnectionEndpoint::Both,
+                (true, false) => ConnectionEndpoint::Lhs,
+                (false, true) => ConnectionEndpoint::Rhs,
+                (false, false) => return None,
+            };
+            let line = connection.line.as_ref()?;
+            Some(ConnectionDragSnapshot {
+                connection_id: connection.id.clone(),
+                endpoint,
+                original_line_points: line.points.clone(),
+                original_line_origin: line.origin,
+                original_line_rotation: line.rotation,
+                line_source_range: connection.line_source_range?,
+                lhs_connector_path: (connection.lhs.component_name == component_name)
+                    .then(|| connection.lhs.connector_path.clone()),
+                rhs_connector_path: (connection.rhs.component_name == component_name)
+                    .then(|| connection.rhs.connector_path.clone()),
+            })
+        })
+        .collect()
+}
+
 fn translated_connection_points(
     original_points: &[CorePoint],
     endpoint: ConnectionEndpoint,
@@ -5211,6 +6062,40 @@ mod tests {
         assert!(candidate.contains("origin={40, 50}"));
         assert!(candidate.contains("extent={{-5, -6}, {5, 6}}"));
         assert!(candidate.contains("rotation=12"));
+    }
+
+    #[test]
+    fn component_resize_patches_only_placement_extent_and_preserves_mirror_order() {
+        let source = "model Parent\n  Child p annotation(Placement(transformation(origin={20, 30}, extent={{10, 10}, {-10, -10}}, rotation=12)));\nend Parent;";
+        let extent = modelica_core::scene::Extent {
+            p1: CorePoint { x: 20.0, y: 30.0 },
+            p2: CorePoint { x: -10.0, y: -10.0 },
+        };
+        let edit = component_extent_edit(source, "p", extent).expect("extent edit");
+        let candidate =
+            apply_validated_source_edits(source, vec![edit], 0).expect("candidate source");
+        assert!(candidate.contains("origin={20, 30}"));
+        assert!(candidate.contains("extent={{20, 30}, {-10, -10}}"));
+        assert!(candidate.contains("rotation=12"));
+    }
+
+    #[test]
+    fn resize_corner_keeps_extent_orientation_without_sorting_mirrored_values() {
+        let original = modelica_core::scene::Extent {
+            p1: CorePoint { x: 10.0, y: 10.0 },
+            p2: CorePoint { x: -10.0, y: -10.0 },
+        };
+        let resized = resized_extent_from_pointer(
+            original,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            ResizeHandle::Corner(0),
+            CorePoint { x: 20.0, y: 30.0 },
+        );
+        assert_eq!(resized.p1, CorePoint { x: 20.0, y: 30.0 });
+        assert_eq!(resized.p2, original.p2);
+        assert!(resized.p2.x < resized.p1.x);
+        assert!(resized.p2.y < resized.p1.y);
     }
 
     #[test]
