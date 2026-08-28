@@ -51,6 +51,7 @@ const MSAA_SAMPLES: u32 = 4;
 const INITIAL_ZOOM: f32 = 3.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
+const ORTHOGONAL_EPSILON: f32 = 0.001;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
 const UI_FONT_SYMBOLS: &str = "modelica-ui-symbols";
@@ -4141,13 +4142,37 @@ fn translated_connection_points(
     let mut points = original_points.to_vec();
     match endpoint {
         ConnectionEndpoint::Lhs => {
-            if let Some(point) = points.first_mut() {
+            if points.len() >= 2 {
+                let original_endpoint = points[0];
+                let original_neighbor = points[1];
+                points[0].x += delta.x;
+                points[0].y += delta.y;
+                preserve_orthogonal_neighbor(
+                    &mut points[1],
+                    original_endpoint,
+                    original_neighbor,
+                    delta,
+                );
+            } else if let Some(point) = points.first_mut() {
                 point.x += delta.x;
                 point.y += delta.y;
             }
         }
         ConnectionEndpoint::Rhs => {
-            if let Some(point) = points.last_mut() {
+            if points.len() >= 2 {
+                let endpoint_index = points.len() - 1;
+                let neighbor_index = points.len() - 2;
+                let original_endpoint = points[endpoint_index];
+                let original_neighbor = points[neighbor_index];
+                points[endpoint_index].x += delta.x;
+                points[endpoint_index].y += delta.y;
+                preserve_orthogonal_neighbor(
+                    &mut points[neighbor_index],
+                    original_endpoint,
+                    original_neighbor,
+                    delta,
+                );
+            } else if let Some(point) = points.last_mut() {
                 point.x += delta.x;
                 point.y += delta.y;
             }
@@ -4160,6 +4185,19 @@ fn translated_connection_points(
         }
     }
     points
+}
+
+fn preserve_orthogonal_neighbor(
+    neighbor: &mut CorePoint,
+    original_endpoint: CorePoint,
+    original_neighbor: CorePoint,
+    delta: CorePoint,
+) {
+    if (original_endpoint.y - original_neighbor.y).abs() <= ORTHOGONAL_EPSILON {
+        neighbor.y += delta.y;
+    } else if (original_endpoint.x - original_neighbor.x).abs() <= ORTHOGONAL_EPSILON {
+        neighbor.x += delta.x;
+    }
 }
 
 fn format_modelica_points(points: &[CorePoint]) -> String {
@@ -4453,8 +4491,36 @@ mod tests {
             CorePoint { x: 10.0, y: 5.0 },
         );
         assert_eq!(moved[0], CorePoint { x: -30.0, y: 5.0 });
-        assert_eq!(moved[1], points[1]);
+        assert_eq!(moved[1], CorePoint { x: 0.0, y: 5.0 });
         assert_eq!(moved[2], points[2]);
+
+        let vertical = vec![
+            CorePoint { x: 0.0, y: -40.0 },
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 0.0 },
+        ];
+        let moved_vertical = translated_connection_points(
+            &vertical,
+            ConnectionEndpoint::Lhs,
+            CorePoint { x: 10.0, y: 5.0 },
+        );
+        assert_eq!(moved_vertical[0], CorePoint { x: 10.0, y: -35.0 });
+        assert_eq!(moved_vertical[1], CorePoint { x: 10.0, y: 0.0 });
+        assert_eq!(moved_vertical[2], vertical[2]);
+
+        let rhs_horizontal = vec![
+            CorePoint { x: -40.0, y: 0.0 },
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 0.0 },
+        ];
+        let moved_rhs = translated_connection_points(
+            &rhs_horizontal,
+            ConnectionEndpoint::Rhs,
+            CorePoint { x: 10.0, y: 5.0 },
+        );
+        assert_eq!(moved_rhs[0], rhs_horizontal[0]);
+        assert_eq!(moved_rhs[1], CorePoint { x: 0.0, y: 5.0 });
+        assert_eq!(moved_rhs[2], CorePoint { x: 50.0, y: 5.0 });
 
         let moved_both = translated_connection_points(
             &points,
