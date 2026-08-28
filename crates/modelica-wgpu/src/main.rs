@@ -176,6 +176,7 @@ enum MainView {
 enum PointerInteraction {
     None,
     Pan {
+        button: MouseButton,
         last_position: PhysicalPosition<f64>,
     },
 }
@@ -1032,8 +1033,8 @@ impl App {
         ))
     }
 
-    fn canvas_event_allowed(&self, egui_consumed: bool) -> bool {
-        canvas_event_allowed_for(self.main_view, self.pointer_over_canvas(), egui_consumed)
+    fn canvas_event_allowed(&self) -> bool {
+        canvas_event_allowed_for(self.main_view, self.pointer_over_canvas())
     }
 
     fn update_title(&self, fps: Option<(f32, f32)>) {
@@ -2058,7 +2059,7 @@ fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
         }
         ui.add_space(12.0);
         if let Some(document) = document {
-            egui::ScrollArea::both()
+            egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (number, line) in document.source_lines.iter().enumerate() {
@@ -2929,21 +2930,16 @@ fn canvas_navigation_enabled_for(main_view: MainView) -> bool {
     matches!(main_view, MainView::Icon | MainView::Diagram)
 }
 
-fn canvas_event_allowed_for(
-    main_view: MainView,
-    pointer_over_canvas: bool,
-    egui_consumed: bool,
-) -> bool {
-    canvas_navigation_enabled_for(main_view) && pointer_over_canvas && !egui_consumed
+fn canvas_event_allowed_for(main_view: MainView, pointer_over_canvas: bool) -> bool {
+    canvas_navigation_enabled_for(main_view) && pointer_over_canvas
 }
 
 fn should_zoom_canvas(
     main_view: MainView,
     pointer_over_canvas: bool,
-    egui_consumed: bool,
     control_pressed: bool,
 ) -> bool {
-    canvas_event_allowed_for(main_view, pointer_over_canvas, egui_consumed) && control_pressed
+    canvas_event_allowed_for(main_view, pointer_over_canvas) && control_pressed
 }
 
 fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
@@ -3025,9 +3021,8 @@ fn main() {
                         }
                         WindowEvent::CursorMoved { position, .. } => {
                             app.cursor = position;
-                            let canvas_event_allowed = app.canvas_event_allowed(egui_consumed);
                             let pan_delta = match &mut app.pointer_interaction {
-                                PointerInteraction::Pan { last_position } => {
+                                PointerInteraction::Pan { last_position, .. } => {
                                     let delta = (
                                         position.x - last_position.x,
                                         position.y - last_position.y,
@@ -3037,24 +3032,30 @@ fn main() {
                                 }
                                 PointerInteraction::None => None,
                             };
-                            if canvas_event_allowed {
-                                if let Some((delta_x, delta_y)) = pan_delta {
-                                    app.pan[0] += delta_x as f32;
-                                    app.pan[1] += delta_y as f32;
-                                    app.update_view_uniform();
-                                }
+                            if let Some((delta_x, delta_y)) = pan_delta {
+                                app.pan[0] += delta_x as f32;
+                                app.pan[1] += delta_y as f32;
+                                app.update_view_uniform();
+                                app.window.request_redraw();
                             }
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
                             if state == ElementState::Released {
-                                if matches!(app.pointer_interaction, PointerInteraction::Pan { .. })
-                                {
+                                let ends_pan = matches!(
+                                    app.pointer_interaction,
+                                    PointerInteraction::Pan {
+                                        button: active_button,
+                                        ..
+                                    } if active_button == button
+                                );
+                                if ends_pan {
                                     app.pointer_interaction = PointerInteraction::None;
                                 }
-                            } else if app.canvas_event_allowed(egui_consumed)
+                            } else if app.canvas_event_allowed()
                                 && wants_pan(button, app.modifiers.control_key())
                             {
                                 app.pointer_interaction = PointerInteraction::Pan {
+                                    button,
                                     last_position: app.cursor,
                                 };
                             }
@@ -3063,7 +3064,6 @@ fn main() {
                             if should_zoom_canvas(
                                 app.main_view,
                                 app.pointer_over_canvas(),
-                                egui_consumed,
                                 app.modifiers.control_key(),
                             ) {
                                 let amount = match delta {
@@ -3091,24 +3091,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canvas_navigation_is_limited_to_unconsumed_icon_and_diagram_canvas_events() {
+    fn canvas_navigation_is_limited_to_icon_and_diagram_canvas_events() {
         assert!(!canvas_navigation_enabled_for(MainView::Source));
         assert!(canvas_navigation_enabled_for(MainView::Icon));
         assert!(canvas_navigation_enabled_for(MainView::Diagram));
 
-        assert!(!canvas_event_allowed_for(MainView::Source, true, false));
-        assert!(!canvas_event_allowed_for(MainView::Icon, false, false));
-        assert!(!canvas_event_allowed_for(MainView::Icon, true, true));
-        assert!(canvas_event_allowed_for(MainView::Icon, true, false));
-        assert!(canvas_event_allowed_for(MainView::Diagram, true, false));
+        assert!(!canvas_event_allowed_for(MainView::Source, true));
+        assert!(!canvas_event_allowed_for(MainView::Icon, false));
+        assert!(canvas_event_allowed_for(MainView::Icon, true));
+        assert!(canvas_event_allowed_for(MainView::Diagram, true));
     }
 
     #[test]
     fn canvas_zoom_requires_ctrl_and_never_uses_plain_wheel() {
-        assert!(!should_zoom_canvas(MainView::Icon, true, false, false));
-        assert!(should_zoom_canvas(MainView::Icon, true, false, true));
-        assert!(!should_zoom_canvas(MainView::Icon, true, true, true));
-        assert!(!should_zoom_canvas(MainView::Source, true, false, true));
+        assert!(!should_zoom_canvas(MainView::Icon, true, false));
+        assert!(should_zoom_canvas(MainView::Icon, true, true));
+        assert!(!should_zoom_canvas(MainView::Source, true, true));
     }
 
     #[test]
@@ -3128,10 +3126,10 @@ mod tests {
         let mut pan = initial_pan;
 
         for _ in 0..100 {
-            if should_zoom_canvas(MainView::Source, true, false, true) {
+            if should_zoom_canvas(MainView::Source, true, true) {
                 zoom *= 1.1;
             }
-            if canvas_event_allowed_for(MainView::Source, true, false)
+            if canvas_event_allowed_for(MainView::Source, true)
                 && wants_pan(MouseButton::Middle, false)
             {
                 pan[0] += 4.0;
