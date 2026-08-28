@@ -393,6 +393,34 @@ impl LoadedDocument {
         *version = version.saturating_add(1);
     }
 
+    fn resolve_candidate_scenes(
+        &self,
+        qualified_name: &str,
+        source: &str,
+    ) -> Result<(CoreIconScene, CoreDiagramScene), String> {
+        let package = PackageLoader
+            .load(&self.path)
+            .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
+        let mut registry = LibraryRegistry::default();
+        add_bundled_msl(&mut registry);
+        registry.index_package(&package);
+        registry.register_package(&package);
+        let (mut class, _) = registry
+            .resolve_class(qualified_name)
+            .ok_or_else(|| format!("class `{qualified_name}` was not found"))?;
+        let parsed = parse(source, &class.source_file)
+            .map_err(|error| format!("candidate source does not parse: {error}"))?;
+        let parsed_class = parsed
+            .classes
+            .first()
+            .ok_or_else(|| "candidate source contains no class".to_owned())?;
+        class.source_range = SourceRange::new(0, source.len());
+        class.children = parsed_class.children.clone();
+        let icon = IconResolver::new(&mut registry).resolve(&class, source);
+        let diagram = resolve_diagram(&class, source, &mut registry);
+        Ok((icon, diagram))
+    }
+
     fn ui_summary(&self, selected_class: Option<&str>) -> UiDocument {
         let selected_class = selected_class.map(str::to_owned);
         let (source_name, source) = selected_class
@@ -1436,24 +1464,29 @@ impl App {
                 return;
             }
         };
+        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+            document
+                .resolve_candidate_scenes(&class_name, &candidate)
+                .ok()
+        }) {
+            Some(scenes) => scenes,
+            None => {
+                self.load_error = Some("Icon edit could not resolve candidate source".into());
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
         let Some(document) = self.document.as_mut() else {
             self.rebuild_selected_scenes();
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
-        let Some(scene) = document.icon_mut(&class_name) else {
-            self.rebuild_selected_scenes();
-            return;
-        };
-        let Some(graphic) = scene
-            .graphics
-            .iter_mut()
-            .find(|graphic| graphic.id.0 == graphic_id)
-        else {
-            self.rebuild_selected_scenes();
-            return;
-        };
-        graphic.graphic = after_geometry.clone();
+        if let Some(scene) = document.icon_mut(&class_name) {
+            *scene = resolved_icon;
+        }
+        if let Some(scene) = document.diagram_mut(&class_name) {
+            *scene = resolved_diagram;
+        }
         self.history.push(EditCommand::MoveIconGraphic {
             class_name,
             graphic_id,
@@ -1504,24 +1537,29 @@ impl App {
                     return;
                 }
             };
+        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+            document
+                .resolve_candidate_scenes(&class_name, &candidate)
+                .ok()
+        }) {
+            Some(scenes) => scenes,
+            None => {
+                self.load_error = Some("Diagram edit could not resolve candidate source".into());
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
         let Some(document) = self.document.as_mut() else {
             self.rebuild_selected_scenes();
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
-        let Some(scene) = document.diagram_mut(&class_name) else {
-            self.rebuild_selected_scenes();
-            return;
-        };
-        let Some(component) = scene
-            .components
-            .iter_mut()
-            .find(|component| component.id == component_id)
-        else {
-            self.rebuild_selected_scenes();
-            return;
-        };
-        component.origin = after_origin;
+        if let Some(scene) = document.icon_mut(&class_name) {
+            *scene = resolved_icon;
+        }
+        if let Some(scene) = document.diagram_mut(&class_name) {
+            *scene = resolved_diagram;
+        }
         self.history.push(EditCommand::MoveDiagramComponent {
             class_name,
             component_id,
@@ -1546,23 +1584,32 @@ impl App {
                 after_source,
             } => {
                 let source = if after { after_source } else { before_source };
-                let geometry = if after {
+                let expected_geometry = if after {
                     after_geometry
                 } else {
                     before_geometry
                 };
+                let Some((resolved_icon, resolved_diagram)) =
+                    self.document.as_ref().and_then(|document| {
+                        document.resolve_candidate_scenes(class_name, source).ok()
+                    })
+                else {
+                    return;
+                };
+                if !resolved_icon.graphics.iter().any(|graphic| {
+                    graphic.id.0 == *graphic_id && graphic.graphic == *expected_geometry
+                }) {
+                    return;
+                }
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
                 document.set_class_text(class_name, source.clone());
                 if let Some(scene) = document.icon_mut(class_name) {
-                    if let Some(graphic) = scene
-                        .graphics
-                        .iter_mut()
-                        .find(|graphic| graphic.id.0 == *graphic_id)
-                    {
-                        graphic.graphic = geometry.clone();
-                    }
+                    *scene = resolved_icon;
+                }
+                if let Some(scene) = document.diagram_mut(class_name) {
+                    *scene = resolved_diagram;
                 }
             }
             EditCommand::MoveDiagramComponent {
@@ -1572,22 +1619,30 @@ impl App {
                 after_origin,
                 before_source,
                 after_source,
-                ..
             } => {
                 let source = if after { after_source } else { before_source };
-                let origin = if after { *after_origin } else { *before_origin };
+                let expected_origin = if after { *after_origin } else { *before_origin };
+                let Some((resolved_icon, resolved_diagram)) =
+                    self.document.as_ref().and_then(|document| {
+                        document.resolve_candidate_scenes(class_name, source).ok()
+                    })
+                else {
+                    return;
+                };
+                if !resolved_diagram.components.iter().any(|component| {
+                    component.id == *component_id && component.origin == expected_origin
+                }) {
+                    return;
+                }
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
                 document.set_class_text(class_name, source.clone());
+                if let Some(scene) = document.icon_mut(class_name) {
+                    *scene = resolved_icon;
+                }
                 if let Some(scene) = document.diagram_mut(class_name) {
-                    if let Some(component) = scene
-                        .components
-                        .iter_mut()
-                        .find(|component| component.id == *component_id)
-                    {
-                        component.origin = origin;
-                    }
+                    *scene = resolved_diagram;
                 }
             }
         }
