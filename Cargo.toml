@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/modelica-core",
+    "crates/modelica-render",
+    "crates/modelica-wgpu",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
