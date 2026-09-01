@@ -25,8 +25,8 @@ pub use icon::IconResolver;
 pub use library::{Library, LibraryKind, LibraryRegistry, PackageLoader, PackageNode};
 pub use parser::{ParseError, parse, requalify_class_tree};
 pub use scene::{
-    ConnectorRef, DiagramScene, Graphic, GraphicId, GraphicOwner, GraphicOwnerKind, IconDebugStats,
-    IconScene, ResolvedGraphic, Transform2D,
+    ConnectionKey, ConnectorRef, DiagramScene, Graphic, GraphicId, GraphicOwner, GraphicOwnerKind,
+    IconDebugStats, IconScene, ResolvedGraphic, Transform2D,
 };
 pub use source::{
     SourceDocument, SourceEdit, SourceTransaction, SourceTransactionError, apply_source_transaction,

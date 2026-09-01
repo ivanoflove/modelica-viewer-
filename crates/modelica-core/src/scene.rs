@@ -196,14 +196,61 @@ pub struct ComponentInstance {
     pub resolved_icon: Option<Box<IconScene>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectorRef {
     pub component_name: String,
     pub connector_path: String,
 }
 
+/// Stable semantic identity for a `connect(lhs, rhs)` equation within a
+/// class. Source ranges are intentionally excluded: every source edit can
+/// move byte offsets, while the connector references and occurrence remain
+/// meaningful after reparsing.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectionKey {
+    pub owner_class: String,
+    pub lhs: ConnectorRef,
+    pub rhs: ConnectorRef,
+    pub occurrence: usize,
+}
+
+impl ConnectionKey {
+    pub fn new(
+        owner_class: impl Into<String>,
+        lhs: ConnectorRef,
+        rhs: ConnectorRef,
+        occurrence: usize,
+    ) -> Self {
+        Self {
+            owner_class: owner_class.into(),
+            lhs,
+            rhs,
+            occurrence,
+        }
+    }
+
+    pub fn stable_id(&self) -> String {
+        format!(
+            "connection:{}:{}->{}#{}",
+            self.owner_class,
+            connector_ref_id(&self.lhs),
+            connector_ref_id(&self.rhs),
+            self.occurrence
+        )
+    }
+}
+
+fn connector_ref_id(reference: &ConnectorRef) -> String {
+    if reference.connector_path.is_empty() {
+        reference.component_name.clone()
+    } else {
+        format!("{}.{}", reference.component_name, reference.connector_path)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiagramConnection {
+    pub key: ConnectionKey,
     pub id: String,
     pub lhs: ConnectorRef,
     pub rhs: ConnectorRef,

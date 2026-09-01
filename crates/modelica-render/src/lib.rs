@@ -1,11 +1,13 @@
 //! Backend-independent scene geometry, viewport transforms and hit testing.
 
+pub mod connection_edit;
 pub mod fill;
 pub mod geometry;
 pub mod hit_test;
 pub mod line;
 pub mod viewport;
 
+pub use connection_edit::{line_local_to_world, world_to_line_local};
 pub use fill::{FillStyle, HatchPattern};
 pub use geometry::{Bounds, ModelPoint, ScreenPoint, Vec2};
 pub use hit_test::{

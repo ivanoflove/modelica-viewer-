@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
 use crate::ast::{Class, SourceRange};
 use crate::graphics::{
@@ -6,8 +8,8 @@ use crate::graphics::{
 use crate::lexer::{Token, TokenKind, tokenize};
 use crate::library::LibraryRegistry;
 use crate::scene::{
-    ComponentInstance, ConnectorRef, DiagramBounds, DiagramConnection, DiagramScene, Extent,
-    Graphic, IconScene, LineGraphic, Point,
+    ComponentInstance, ConnectionKey, ConnectorRef, DiagramBounds, DiagramConnection, DiagramScene,
+    Extent, Graphic, IconScene, LineGraphic, Point,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,11 +136,28 @@ pub fn resolve_diagram(
     }
 
     let (coordinate_system, background_graphics) = diagram_layer(&annotations, &mut diagnostics);
+    let mut occurrence_by_endpoints = HashMap::<(ConnectorRef, ConnectorRef), usize>::new();
     let connections = tokens
         .iter()
         .enumerate()
         .filter(|(_, token)| token.text == "connect")
-        .filter_map(|(index, _)| parse_connection(&class_slice, &tokens, index, &mut diagnostics))
+        .filter_map(|(index, _)| {
+            let mut connection = parse_connection(&class_slice, &tokens, index, &mut diagnostics)?;
+            let endpoints = (connection.lhs.clone(), connection.rhs.clone());
+            let occurrence = occurrence_by_endpoints
+                .entry(endpoints.clone())
+                .or_default();
+            let key = ConnectionKey::new(
+                class.qualified_name.clone(),
+                endpoints.0,
+                endpoints.1,
+                *occurrence,
+            );
+            *occurrence += 1;
+            connection.id = key.stable_id();
+            connection.key = key;
+            Some(connection)
+        })
         .collect::<Vec<_>>();
 
     let content_bounds = calculate_bounds(&background_graphics, &components, &connections);
@@ -382,6 +401,18 @@ fn parse_connection(
         index += 1;
     }
     Some(DiagramConnection {
+        key: ConnectionKey::new(
+            "",
+            ConnectorRef {
+                component_name: String::new(),
+                connector_path: String::new(),
+            },
+            ConnectorRef {
+                component_name: String::new(),
+                connector_path: String::new(),
+            },
+            0,
+        ),
         id: format!("connection:{connect_index}"),
         lhs: connector_ref(args[0].trim()),
         rhs: connector_ref(args[1].trim()),
@@ -741,7 +772,48 @@ end Top;
         assert_eq!(connection.lhs.connector_path, "ports_a[2]");
         assert_eq!(connection.rhs.component_name, "h2grid");
         assert_eq!(connection.rhs.connector_path, "port");
+        assert_eq!(connection.key.owner_class, "Top");
+        assert_eq!(connection.key.occurrence, 0);
         assert_eq!(connection.line.as_ref().unwrap().points.len(), 3);
         assert!(connection.line_source_range.is_some());
+    }
+
+    #[test]
+    fn connection_keys_are_stable_when_source_offsets_change() {
+        let source = r#"
+model Top
+  Real a;
+  Real b;
+equation
+  connect(a, b) annotation(Line(points={{0,0},{10,0}}));
+  connect(a, b) annotation(Line(points={{0,1},{10,1}}));
+end Top;
+"#;
+        let shifted = source.replace("connect(a, b)", "\n\n  connect(a, b)");
+        let original_file = parse(source, "Stable.mo").expect("parse original");
+        let shifted_file = parse(&shifted, "Stable.mo").expect("parse shifted");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("Stable.mo", source)
+            .expect("index original");
+        let original = resolve_diagram(&original_file.classes[0], source, &mut registry);
+        registry
+            .register_source("Stable.mo", &shifted)
+            .expect("index shifted");
+        let shifted_scene = resolve_diagram(&shifted_file.classes[0], &shifted, &mut registry);
+
+        let original_keys = original
+            .connections
+            .iter()
+            .map(|connection| connection.key.clone())
+            .collect::<Vec<_>>();
+        let shifted_keys = shifted_scene
+            .connections
+            .iter()
+            .map(|connection| connection.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(original_keys, shifted_keys);
+        assert_eq!(original.connections[0].id, "connection:Top:a->b#0");
+        assert_eq!(original.connections[1].id, "connection:Top:a->b#1");
     }
 }

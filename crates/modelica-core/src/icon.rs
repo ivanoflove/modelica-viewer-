@@ -162,10 +162,16 @@ impl<'a> IconResolver<'a> {
                     "{}::{}::{child_id}",
                     class.qualified_name, component.name
                 ));
+                let nested_instance_name = graphic
+                    .owner
+                    .instance_name
+                    .as_deref()
+                    .map(|name| format!("{}.{}", component.name, name))
+                    .unwrap_or_else(|| component.name.clone());
                 graphic.owner = GraphicOwner {
                     qualified_name: graphic.owner.qualified_name,
                     kind: GraphicOwnerKind::Connector,
-                    instance_name: Some(component.name.clone()),
+                    instance_name: Some(nested_instance_name),
                 };
                 graphic.transform = compose_transform(placement, graphic.transform);
                 graphic.editable = false;
@@ -985,5 +991,32 @@ end Parent;
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn preserves_nested_public_connector_paths() {
+        let source = r#"
+connector Signal
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end Signal;
+
+connector Bus
+  Signal signal annotation(Placement(transformation(extent={{-10,-10},{10,10}})));
+end Bus;
+
+model Parent
+  Bus bus annotation(Placement(transformation(extent={{-20,-20},{20,20}})));
+end Parent;
+"#;
+        let file = parse(source, "NestedConnectors.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("NestedConnectors.mo", source)
+            .expect("index source");
+        let scene = IconResolver::new(&mut registry).resolve(&file.classes[2], source);
+        assert!(scene.graphics.iter().any(|graphic| {
+            graphic.owner.kind == GraphicOwnerKind::Connector
+                && graphic.owner.instance_name.as_deref() == Some("bus.signal")
+        }));
     }
 }
