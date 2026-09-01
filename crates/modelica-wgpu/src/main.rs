@@ -1178,6 +1178,12 @@ impl App {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(capabilities.formats[0]);
+        if std::env::var_os("MODELICA_WGPU_DEBUG_DIAGRAM").is_some() {
+            eprintln!(
+                "modelica-wgpu surface: format={format:?}, srgb={} (annotation colors use linear output)",
+                format.is_srgb()
+            );
+        }
         let no_vsync = std::env::var("MODELICA_WGPU_VSYNC")
             .map(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false"))
             .unwrap_or(false);
@@ -4176,11 +4182,74 @@ fn build_diagram_scene(
     document: Option<&LoadedDocument>,
     selected_class: Option<&str>,
 ) -> GpuIconScene {
-    let geometries = document
-        .and_then(|document| selected_class.and_then(|name| document.diagram(name)))
-        .map(core_diagram_geometry)
-        .unwrap_or_default();
+    let diagram =
+        document.and_then(|document| selected_class.and_then(|name| document.diagram(name)));
+    let geometries = diagram.map(core_diagram_geometry).unwrap_or_default();
+    if std::env::var_os("MODELICA_WGPU_DEBUG_DIAGRAM").is_some() {
+        if let Some(scene) = diagram {
+            log_diagram_geometry_diagnostics(scene, &geometries);
+        } else {
+            eprintln!("diagram diagnostic: no selected DiagramScene");
+        }
+    }
     gpu_scene_from_geometries(device, style_layout, geometries, "diagram")
+}
+
+fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geometry]) {
+    eprintln!(
+        "diagram diagnostic: class={} components={} background={} connections={} gpu_geometries={}",
+        scene.class_qualified_name.as_deref().unwrap_or("<unnamed>"),
+        scene.components.len(),
+        scene.background_graphics.len(),
+        scene.connections.len(),
+        geometries.len()
+    );
+    for component in &scene.components {
+        let Some(icon) = component.resolved_icon.as_deref() else {
+            eprintln!(
+                "diagram diagnostic component={} type={:?} owner={} has no resolved icon",
+                component.name, component.resolved_type_qualified_name, component.source_owner
+            );
+            continue;
+        };
+        let placement = diagram_placement_transform(icon, component);
+        let component_geometries = geometries
+            .iter()
+            .filter(|geometry| geometry.edit_key.as_deref() == Some(component.id.as_str()))
+            .collect::<Vec<_>>();
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut vertices = 0;
+        for geometry in &component_geometries {
+            vertices += geometry.vertices.len();
+            for vertex in &geometry.vertices {
+                min[0] = min[0].min(vertex.position[0]);
+                min[1] = min[1].min(vertex.position[1]);
+                max[0] = max[0].max(vertex.position[0]);
+                max[1] = max[1].max(vertex.position[1]);
+            }
+        }
+        let bounds = (vertices > 0).then_some((min, max));
+        eprintln!(
+            "diagram diagnostic component={} type={:?} owner={} origin=({:.2},{:.2}) rotation={:.2} placement={:?} icon_extent={:?} icon_graphics={} transform=translation({:.2},{:.2}) rotation({:.2}) scale({:.4},{:.4}) gpu_geometries={} vertices={} bounds={bounds:?}",
+            component.name,
+            component.resolved_type_qualified_name,
+            component.source_owner,
+            component.origin.x,
+            component.origin.y,
+            component.rotation,
+            component.placement_extent,
+            icon.coordinate_system.extent,
+            icon.graphics.len(),
+            placement.translation.x,
+            placement.translation.y,
+            placement.rotation,
+            placement.scale_x,
+            placement.scale_y,
+            component_geometries.len(),
+            vertices,
+        );
+    }
 }
 
 fn gpu_scene_from_geometries(
@@ -6556,5 +6625,126 @@ mod tests {
         assert!((color[0] - 0.21586).abs() < 0.001);
         assert!((color[1] - 0.05127).abs() < 0.001);
         assert_eq!(color[2], 1.0);
+    }
+
+    #[test]
+    fn msl_partial_two_port_connectors_reach_diagram_geometry() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../resources/modelica/msl-4.1.0/Modelica");
+        let mut registry = LibraryRegistry::default();
+        registry.add(Library {
+            root,
+            name: Some("Modelica Standard Library".into()),
+            version: Some("4.1.0".into()),
+            kind: LibraryKind::Builtin,
+            read_only: true,
+        });
+
+        let (class, source) = registry
+            .resolve_class("Modelica.Fluid.Interfaces.PartialTwoPort")
+            .expect("bundled MSL PartialTwoPort");
+        let scene = resolve_diagram(&class, &source, &mut registry);
+        let geometries = core_diagram_geometry(&scene);
+
+        for (name, expected_extent, expected_scale_x) in [
+            (
+                "port_a",
+                modelica_core::scene::Extent {
+                    p1: CorePoint {
+                        x: -110.0,
+                        y: -10.0,
+                    },
+                    p2: CorePoint { x: -90.0, y: 10.0 },
+                },
+                0.1,
+            ),
+            (
+                "port_b",
+                modelica_core::scene::Extent {
+                    p1: CorePoint { x: 110.0, y: -10.0 },
+                    p2: CorePoint { x: 90.0, y: 10.0 },
+                },
+                -0.1,
+            ),
+        ] {
+            let component = scene
+                .components
+                .iter()
+                .find(|component| component.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let icon = component
+                .resolved_icon
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} has no resolved icon"));
+            let placement = diagram_placement_transform(icon, component);
+            eprintln!(
+                "diagram diagnostic {name}: type={:?} owner={} origin=({:.1},{:.1}) rotation={:.1} placement=({:.1},{:.1})..({:.1},{:.1}) icon_extent=({:.1},{:.1})..({:.1},{:.1}) icon_graphics={} translation=({:.1},{:.1}) scale=({:.3},{:.3})",
+                component.resolved_type_qualified_name,
+                component.source_owner,
+                component.origin.x,
+                component.origin.y,
+                component.rotation,
+                expected_extent.p1.x,
+                expected_extent.p1.y,
+                expected_extent.p2.x,
+                expected_extent.p2.y,
+                icon.coordinate_system.extent.p1.x,
+                icon.coordinate_system.extent.p1.y,
+                icon.coordinate_system.extent.p2.x,
+                icon.coordinate_system.extent.p2.y,
+                icon.graphics.len(),
+                placement.translation.x,
+                placement.translation.y,
+                placement.scale_x,
+                placement.scale_y,
+            );
+            assert!(icon.graphics.len() > 0, "{name} icon has no graphics");
+            assert!((placement.scale_x - expected_scale_x).abs() < 0.001);
+            assert!((placement.scale_y - 0.1).abs() < 0.001);
+            assert!(
+                (placement.translation.x - if name == "port_a" { -100.0 } else { 100.0 }).abs()
+                    < 0.001
+            );
+            assert!(placement.translation.y.abs() < 0.001);
+
+            let component_geometries = geometries
+                .iter()
+                .filter(|geometry| geometry.edit_key.as_deref() == Some(component.id.as_str()))
+                .collect::<Vec<_>>();
+            assert!(
+                !component_geometries.is_empty(),
+                "{name} produced no geometry"
+            );
+            let mut min = [f32::INFINITY; 2];
+            let mut max = [f32::NEG_INFINITY; 2];
+            for geometry in component_geometries {
+                for vertex in &geometry.vertices {
+                    min[0] = min[0].min(vertex.position[0]);
+                    min[1] = min[1].min(vertex.position[1]);
+                    max[0] = max[0].max(vertex.position[0]);
+                    max[1] = max[1].max(vertex.position[1]);
+                }
+            }
+            eprintln!(
+                "diagram diagnostic {name}: produced_geometry={} bounds=({:.1},{:.1})..({:.1},{:.1})",
+                geometries
+                    .iter()
+                    .filter(|geometry| geometry.edit_key.as_deref() == Some(component.id.as_str()))
+                    .count(),
+                min[0],
+                min[1],
+                max[0],
+                max[1]
+            );
+            let expected_min_x = if name == "port_a" { -110.0 } else { 90.0 };
+            let expected_max_x = if name == "port_a" { -90.0 } else { 110.0 };
+            // Stroke tessellation expands the filled extent by roughly half
+            // the transformed line width, so bounds are checked with a small
+            // renderer tolerance rather than against the raw placement box.
+            assert!((min[0] - expected_min_x).abs() < 0.1);
+            assert!((max[0] - expected_max_x).abs() < 0.1);
+            assert!((min[1] + 10.0).abs() < 0.1);
+            assert!((max[1] - 10.0).abs() < 0.1);
+        }
     }
 }
