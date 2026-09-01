@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
 use crate::ast::{Class, SourceRange};
+use crate::diagnostics::Diagnostic;
 use crate::graphics::{
     resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call,
 };
@@ -63,116 +64,245 @@ const DECLARATION_PREFIXES: &[&str] = &[
     "final",
     "each",
     "constrainedby",
+    "redeclare",
+    "protected",
+    "public",
+    "equation",
+    "algorithm",
+    "initial",
+    "when",
 ];
 
-/// Resolve the Diagram layer owned by one class. Nested class ranges are
-/// masked before scanning annotations, preserving the selected-class scope.
+/// Resolve a class Diagram, including the Diagram content inherited from all
+/// base classes. The renderer receives only this resolved scene; it must not
+/// infer missing connector graphics from connection endpoints.
 pub fn resolve_diagram(
     class: &Class,
     source: &str,
     registry: &mut LibraryRegistry,
 ) -> DiagramScene {
-    let class_slice = class_owned_slice(class, source);
-    let tokens = tokenize(&class_slice);
-    let annotations = collect_annotations(&class_slice, &tokens);
-    let mut components = Vec::new();
-    let mut diagnostics = Vec::new();
+    DiagramResolver::new(registry).resolve(class, source)
+}
 
-    for (component_index, record) in annotations
-        .iter()
-        .filter(|record| record.owner == AnnotationOwner::Component)
-        .enumerate()
-    {
-        let Some((type_name, name)) =
-            parse_declaration(&statement_tokens(&tokens, record.token_index))
-        else {
-            continue;
-        };
-        let Some(placement) = find_call(&record.annotation, "Placement").and_then(parse_placement)
-        else {
-            continue;
-        };
-        if !placement.visible {
-            continue;
-        }
-        let transformation = placement.transformation.unwrap_or(PlacementTransform {
-            origin: Point { x: 0.0, y: 0.0 },
-            extent: Extent {
-                p1: Point { x: -10.0, y: -10.0 },
-                p2: Point { x: 10.0, y: 10.0 },
-            },
-            rotation: 0.0,
-        });
-        let mut component = ComponentInstance {
-            id: format!(
-                "{}:component:{}:{component_index}",
-                class.qualified_name, name
-            ),
-            name,
-            type_name: type_name.clone(),
-            resolved_type_qualified_name: None,
-            class_kind: None,
-            origin: transformation.origin,
-            rotation: transformation.rotation,
-            placement_extent: Some(transformation.extent),
-            visible: true,
-            resolved_icon: None,
-        };
+struct DiagramResolver<'a> {
+    registry: &'a mut LibraryRegistry,
+}
 
-        if let Some((component_class, component_source)) =
-            resolve_component(registry, class, &type_name)
-        {
-            component.resolved_type_qualified_name = Some(component_class.qualified_name.clone());
-            component.class_kind = Some(component_class.kind);
-            let icon = IconResolverAdapter::resolve(registry, &component_class, &component_source);
-            component.resolved_icon = Some(Box::new(icon));
-        } else {
-            diagnostics.push(format!(
-                "COMPONENT_TYPE_UNRESOLVED: {}: declaredTypeName={type_name}",
-                component.name
-            ));
-        }
-        components.push(component);
+impl<'a> DiagramResolver<'a> {
+    fn new(registry: &'a mut LibraryRegistry) -> Self {
+        Self { registry }
     }
 
-    let (coordinate_system, background_graphics) = diagram_layer(&annotations, &mut diagnostics);
-    let mut occurrence_by_endpoints = HashMap::<(ConnectorRef, ConnectorRef), usize>::new();
-    let connections = tokens
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| token.text == "connect")
-        .filter_map(|(index, _)| {
-            let mut connection = parse_connection(&class_slice, &tokens, index, &mut diagnostics)?;
-            let endpoints = (connection.lhs.clone(), connection.rhs.clone());
-            let occurrence = occurrence_by_endpoints
-                .entry(endpoints.clone())
-                .or_default();
-            let key = ConnectionKey::new(
-                class.qualified_name.clone(),
-                endpoints.0,
-                endpoints.1,
-                *occurrence,
-            );
-            *occurrence += 1;
-            connection.id = key.stable_id();
-            connection.key = key;
-            Some(connection)
-        })
-        .collect::<Vec<_>>();
+    fn resolve(&mut self, class: &Class, source: &str) -> DiagramScene {
+        self.resolve_inner(class, source, &mut Vec::new())
+    }
 
-    let content_bounds = calculate_bounds(&background_graphics, &components, &connections);
-    DiagramScene {
-        class_qualified_name: Some(class.qualified_name.clone()),
-        class_kind: Some(class.kind),
-        coordinate_system,
-        background_graphics,
-        components,
-        connections,
-        diagnostics: diagnostics
-            .into_iter()
-            .map(|message| crate::Diagnostic::warning("DIAGRAM_RESOLVE", message))
-            .collect(),
-        content_bounds,
+    fn resolve_inner(
+        &mut self,
+        class: &Class,
+        source: &str,
+        visiting: &mut Vec<String>,
+    ) -> DiagramScene {
+        if visiting
+            .iter()
+            .any(|qualified_name| qualified_name == &class.qualified_name)
+        {
+            return DiagramScene {
+                class_qualified_name: Some(class.qualified_name.clone()),
+                class_kind: Some(class.kind),
+                coordinate_system: Default::default(),
+                background_graphics: Vec::new(),
+                components: Vec::new(),
+                connections: Vec::new(),
+                diagnostics: vec![Diagnostic::warning(
+                    "DIAGRAM_INHERITANCE_CYCLE",
+                    format!("Diagram inheritance cycle at {}", class.qualified_name),
+                )],
+                content_bounds: None,
+            };
+        }
+
+        visiting.push(class.qualified_name.clone());
+
+        let mut coordinate_system = None;
+        let mut background_graphics = Vec::new();
+        let mut components = Vec::new();
+        let mut connections = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        // Base order is source order and is intentionally preserved. This
+        // makes multiple inheritance deterministic and keeps inherited
+        // connection identities owned by the class that defined them.
+        for base_name in class.extends.clone() {
+            let Some((base_class, base_source)) = resolve_base(self.registry, class, &base_name)
+            else {
+                diagnostics.push(Diagnostic::warning(
+                    "DIAGRAM_BASE_NOT_FOUND",
+                    format!(
+                        "unable to resolve Diagram base `{base_name}` of {}",
+                        class.qualified_name
+                    ),
+                ));
+                continue;
+            };
+            let base = self.resolve_inner(&base_class, &base_source, visiting);
+            coordinate_system.get_or_insert(base.coordinate_system);
+            background_graphics.extend(base.background_graphics);
+            let mut base_components = base.components;
+            mark_inherited_components(&mut base_components);
+            components.extend(base_components);
+            connections.extend(base.connections);
+            diagnostics.extend(base.diagnostics);
+        }
+
+        let (
+            own_has_coordinate_system,
+            own_coordinate_system,
+            own_graphics,
+            own_components,
+            own_connections,
+            own_diagnostics,
+        ) = self.resolve_owned(class, source);
+        if own_has_coordinate_system {
+            coordinate_system = Some(own_coordinate_system);
+        }
+        background_graphics.extend(own_graphics);
+        components.extend(own_components);
+        connections.extend(own_connections);
+        diagnostics.extend(own_diagnostics);
+
+        visiting.pop();
+        let content_bounds = calculate_bounds(&background_graphics, &components, &connections);
+        DiagramScene {
+            class_qualified_name: Some(class.qualified_name.clone()),
+            class_kind: Some(class.kind),
+            coordinate_system: coordinate_system.unwrap_or_default(),
+            background_graphics,
+            components,
+            connections,
+            diagnostics,
+            content_bounds,
+        }
+    }
+
+    fn resolve_owned(
+        &mut self,
+        class: &Class,
+        source: &str,
+    ) -> (
+        bool,
+        crate::scene::CoordinateSystem,
+        Vec<Graphic>,
+        Vec<ComponentInstance>,
+        Vec<DiagramConnection>,
+        Vec<Diagnostic>,
+    ) {
+        let class_slice = class_owned_slice(class, source);
+        let tokens = tokenize(&class_slice);
+        let annotations = collect_annotations(&class_slice, &tokens);
+        let mut components = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for (component_index, record) in annotations
+            .iter()
+            .filter(|record| record.owner == AnnotationOwner::Component)
+            .enumerate()
+        {
+            let Some((type_name, name)) =
+                parse_declaration(&statement_tokens(&tokens, record.token_index))
+            else {
+                continue;
+            };
+            let Some(placement) =
+                find_call(&record.annotation, "Placement").and_then(parse_placement)
+            else {
+                continue;
+            };
+            if !placement.visible {
+                continue;
+            }
+            let transformation = placement.transformation.unwrap_or(PlacementTransform {
+                origin: Point { x: 0.0, y: 0.0 },
+                extent: Extent {
+                    p1: Point { x: -10.0, y: -10.0 },
+                    p2: Point { x: 10.0, y: 10.0 },
+                },
+                rotation: 0.0,
+            });
+            let mut component = ComponentInstance {
+                id: format!(
+                    "{}:component:{}:{component_index}",
+                    class.qualified_name, name
+                ),
+                name,
+                source_owner: class.qualified_name.clone(),
+                type_name: type_name.clone(),
+                resolved_type_qualified_name: None,
+                class_kind: None,
+                origin: transformation.origin,
+                rotation: transformation.rotation,
+                placement_extent: Some(transformation.extent),
+                visible: true,
+                editable: true,
+                resolved_icon: None,
+            };
+
+            if let Some((component_class, component_source)) =
+                resolve_component(self.registry, class, &type_name)
+            {
+                component.resolved_type_qualified_name =
+                    Some(component_class.qualified_name.clone());
+                component.class_kind = Some(component_class.kind);
+                let icon = IconResolverAdapter::resolve(
+                    self.registry,
+                    &component_class,
+                    &component_source,
+                );
+                component.resolved_icon = Some(Box::new(icon));
+            } else {
+                diagnostics.push(Diagnostic::warning(
+                    "DIAGRAM_COMPONENT_TYPE_UNRESOLVED",
+                    format!("{}: declaredTypeName={type_name}", component.name),
+                ));
+            }
+            components.push(component);
+        }
+
+        let (has_coordinate_system, coordinate_system, background_graphics) =
+            diagram_layer(&annotations, &mut diagnostics);
+        let mut occurrence_by_endpoints = HashMap::<(ConnectorRef, ConnectorRef), usize>::new();
+        let connections = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| token.text == "connect")
+            .filter_map(|(index, _)| {
+                let mut connection =
+                    parse_connection(&class_slice, &tokens, index, &mut diagnostics)?;
+                let endpoints = (connection.lhs.clone(), connection.rhs.clone());
+                let occurrence = occurrence_by_endpoints
+                    .entry(endpoints.clone())
+                    .or_default();
+                let key = ConnectionKey::new(
+                    class.qualified_name.clone(),
+                    endpoints.0,
+                    endpoints.1,
+                    *occurrence,
+                );
+                *occurrence += 1;
+                connection.id = key.stable_id();
+                connection.key = key;
+                Some(connection)
+            })
+            .collect::<Vec<_>>();
+
+        (
+            has_coordinate_system,
+            coordinate_system,
+            background_graphics,
+            components,
+            connections,
+            diagnostics,
+        )
     }
 }
 
@@ -184,10 +314,16 @@ impl IconResolverAdapter {
     }
 }
 
+fn mark_inherited_components(components: &mut [ComponentInstance]) {
+    for component in components {
+        component.editable = false;
+    }
+}
+
 fn diagram_layer(
     annotations: &[ScopedAnnotation],
-    diagnostics: &mut Vec<String>,
-) -> (crate::scene::CoordinateSystem, Vec<Graphic>) {
+    diagnostics: &mut Vec<Diagnostic>,
+) -> (bool, crate::scene::CoordinateSystem, Vec<Graphic>) {
     for record in annotations {
         if record.owner != AnnotationOwner::Class {
             continue;
@@ -199,14 +335,10 @@ fn diagram_layer(
             .map(resolve_coordinate_system)
             .unwrap_or_default();
         let (graphics, graphic_diagnostics) = resolve_graphics_from_call(diagram);
-        diagnostics.extend(
-            graphic_diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.message),
-        );
-        return (coordinate_system, graphics);
+        diagnostics.extend(graphic_diagnostics);
+        return (true, coordinate_system, graphics);
     }
-    (crate::scene::CoordinateSystem::default(), Vec::new())
+    (false, crate::scene::CoordinateSystem::default(), Vec::new())
 }
 
 fn collect_annotations(class_slice: &str, tokens: &[Token]) -> Vec<ScopedAnnotation> {
@@ -276,14 +408,20 @@ fn statement_tokens(tokens: &[Token], annotation_index: usize) -> Vec<Token> {
 }
 
 fn parse_declaration(tokens: &[Token]) -> Option<(String, String)> {
-    if tokens
+    let significant = tokens
         .iter()
-        .any(|token| DECLARATION_PREFIXES.contains(&token.text.as_str()))
-    {
-        return None;
-    }
-    for start in 0..tokens.len() {
-        let first = tokens.get(start)?;
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .collect::<Vec<_>>();
+    for mut start in 0..significant.len() {
+        while significant
+            .get(start)
+            .is_some_and(|token| DECLARATION_PREFIXES.contains(&token.text.as_str()))
+        {
+            start += 1;
+        }
+        let Some(first) = significant.get(start) else {
+            continue;
+        };
         if !matches!(first.kind, TokenKind::Identifier | TokenKind::Keyword)
             || CLASS_KEYWORDS.contains(&first.text.as_str())
         {
@@ -291,8 +429,13 @@ fn parse_declaration(tokens: &[Token]) -> Option<(String, String)> {
         }
         let mut index = start + 1;
         let mut type_name = first.text.clone();
-        while tokens.get(index).is_some_and(|token| token.text == ".") {
-            let part = tokens.get(index + 1)?;
+        while significant
+            .get(index)
+            .is_some_and(|token| token.text == ".")
+        {
+            let Some(part) = significant.get(index + 1) else {
+                break;
+            };
             if !matches!(part.kind, TokenKind::Identifier | TokenKind::Keyword) {
                 break;
             }
@@ -300,11 +443,13 @@ fn parse_declaration(tokens: &[Token]) -> Option<(String, String)> {
             type_name.push_str(&part.text);
             index += 2;
         }
-        let name = tokens.get(index)?;
+        let Some(name) = significant.get(index) else {
+            continue;
+        };
         if !matches!(name.kind, TokenKind::Identifier | TokenKind::Keyword) {
             continue;
         }
-        if tokens
+        if significant
             .get(index + 1)
             .is_some_and(|token| matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword))
         {
@@ -348,11 +493,27 @@ fn resolve_component(
         .find_map(|candidate| registry.resolve_class(&candidate))
 }
 
+fn resolve_base(
+    registry: &mut LibraryRegistry,
+    class: &Class,
+    base_name: &str,
+) -> Option<(Class, String)> {
+    let mut candidates = vec![base_name.to_owned()];
+    let parts = class.qualified_name.split('.').collect::<Vec<_>>();
+    for length in (1..parts.len()).rev() {
+        candidates.push(format!("{}.{}", parts[..length].join("."), base_name));
+    }
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .find_map(|candidate| registry.resolve_class(&candidate))
+}
+
 fn parse_connection(
     source: &str,
     tokens: &[Token],
     connect_index: usize,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<DiagramConnection> {
     let open = next_significant(tokens, connect_index + 1)?;
     if tokens[open].text != "(" {
@@ -361,7 +522,10 @@ fn parse_connection(
     let close = matching_paren(tokens, open)?;
     let args = split_top_level(source.get(tokens[open].end..tokens[close].start)?);
     if args.len() != 2 {
-        diagnostics.push("invalid connect() argument count".into());
+        diagnostics.push(Diagnostic::warning(
+            "DIAGRAM_CONNECTION_INVALID",
+            "invalid connect() argument count",
+        ));
         return None;
     }
     let mut line = None;
@@ -382,11 +546,7 @@ fn parse_connection(
             };
             if let Some(line_call) = find_call(&annotation, "Line") {
                 let (graphic, line_diagnostics) = resolve_graphic_call(line_call);
-                diagnostics.extend(
-                    line_diagnostics
-                        .into_iter()
-                        .map(|diagnostic| diagnostic.message),
-                );
+                diagnostics.extend(line_diagnostics);
                 if let Some(Graphic::Line(value)) = graphic {
                     line = Some(value);
                     line_source_range = Some(SourceRange::new(
@@ -815,5 +975,114 @@ end Top;
         assert_eq!(original_keys, shifted_keys);
         assert_eq!(original.connections[0].id, "connection:Top:a->b#0");
         assert_eq!(original.connections[1].id, "connection:Top:a->b#1");
+    }
+
+    #[test]
+    fn inherits_diagram_ports_graphics_and_connections() {
+        let source = r#"
+connector FluidPort_a
+  annotation(Icon(graphics={Ellipse(extent={{-10,-10},{10,10}}, fillColor={0,128,255})}));
+end FluidPort_a;
+
+connector FluidPort_b
+  annotation(Icon(graphics={Rectangle(extent={{-10,-10},{10,10}}, fillColor={0,128,255})}));
+end FluidPort_b;
+
+partial model PartialTwoPort
+  FluidPort_a port_a annotation(Placement(transformation(extent={{-110,-10},{-90,10}})));
+  FluidPort_b port_b annotation(Placement(transformation(extent={{90,-10},{110,10}})));
+equation
+  connect(port_a, port_b) annotation(Line(points={{-90,0},{90,0}}));
+annotation(
+  Diagram(coordinateSystem(extent={{-120,-100},{120,100}}), graphics={
+    Rectangle(extent={{-115,-95},{115,95}})
+  })
+);
+end PartialTwoPort;
+
+model Child
+  extends PartialTwoPort;
+end Child;
+"#;
+        let file = parse(source, "InheritedDiagram.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("InheritedDiagram.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[3], source, &mut registry);
+
+        assert_eq!(scene.components.len(), 2);
+        assert!(scene.components.iter().any(|component| {
+            component.name == "port_a"
+                && component.class_kind == Some(crate::ast::ClassKind::Connector)
+                && component
+                    .resolved_icon
+                    .as_ref()
+                    .is_some_and(|icon| !icon.graphics.is_empty())
+        }));
+        assert!(scene.components.iter().any(|component| {
+            component.name == "port_b"
+                && component.class_kind == Some(crate::ast::ClassKind::Connector)
+                && component
+                    .resolved_icon
+                    .as_ref()
+                    .is_some_and(|icon| !icon.graphics.is_empty())
+        }));
+        assert_eq!(scene.background_graphics.len(), 1);
+        assert_eq!(scene.connections.len(), 1);
+        assert_eq!(scene.connections[0].key.owner_class, "PartialTwoPort");
+        assert_eq!(scene.coordinate_system.extent.p1.x, -120.0);
+        assert!(scene.components.iter().all(|component| {
+            component.source_owner == "PartialTwoPort" && !component.editable
+        }));
+    }
+
+    #[test]
+    fn resolves_prefixed_inherited_input_and_output_components() {
+        let source = r#"
+connector RealInput
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end RealInput;
+connector RealOutput
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end RealOutput;
+partial model Ports
+  input RealInput u annotation(Placement(transformation(extent={{-110,-10},{-90,10}})));
+  output RealOutput y annotation(Placement(transformation(extent={{90,-10},{110,10}})));
+end Ports;
+model Derived extends Ports;
+end Derived;
+"#;
+        let file = parse(source, "PrefixedPorts.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("PrefixedPorts.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[3], source, &mut registry);
+        assert_eq!(
+            scene
+                .components
+                .iter()
+                .map(|component| component.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u", "y"]
+        );
+    }
+
+    #[test]
+    fn reports_diagram_inheritance_cycles() {
+        let source = "model A extends B; end A; model B extends A; end B;";
+        let file = parse(source, "DiagramCycle.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("DiagramCycle.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[0], source, &mut registry);
+        assert!(
+            scene
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "DIAGRAM_INHERITANCE_CYCLE")
+        );
     }
 }

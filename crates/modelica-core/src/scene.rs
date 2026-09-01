@@ -186,6 +186,8 @@ pub struct IconDebugStats {
 pub struct ComponentInstance {
     pub id: String,
     pub name: String,
+    /// Qualified class that owns the declaration and its Placement.
+    pub source_owner: String,
     pub type_name: String,
     pub resolved_type_qualified_name: Option<String>,
     pub class_kind: Option<ClassKind>,
@@ -193,6 +195,9 @@ pub struct ComponentInstance {
     pub rotation: f32,
     pub placement_extent: Option<Extent>,
     pub visible: bool,
+    /// Inherited components are visible and can be hit-tested, but are not
+    /// directly editable until Modelica modifiers are supported.
+    pub editable: bool,
     pub resolved_icon: Option<Box<IconScene>>,
 }
 

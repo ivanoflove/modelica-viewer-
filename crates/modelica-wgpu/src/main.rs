@@ -1578,6 +1578,9 @@ impl App {
         }) else {
             return;
         };
+        if !component.editable {
+            return;
+        }
         let Some(source_before) = document.class_text(&class_name) else {
             return;
         };
@@ -1660,7 +1663,8 @@ impl App {
                             .iter()
                             .rev()
                             .find(|component| {
-                                component.visible
+                                component.editable
+                                    && component.visible
                                     && diagram_component_contains_point(
                                         component,
                                         pointer_model,
