@@ -380,6 +380,11 @@ struct UiDocument {
     icon_graphics: usize,
     diagram_background: usize,
     diagram_components: usize,
+    diagram_own_components: usize,
+    diagram_inherited_components: usize,
+    diagram_connectors: usize,
+    diagram_unresolved_components: usize,
+    diagram_unresolved_bases: usize,
     diagram_connections: usize,
     source_name: String,
     source_lines: Vec<String>,
@@ -542,13 +547,28 @@ impl LoadedDocument {
             .as_deref()
             .and_then(|class_name| self.icon(class_name))
             .map_or(0, |scene| scene.graphics.len());
-        let (diagram_background, diagram_components, diagram_connections) = selected_class
+        let (
+            diagram_background,
+            diagram_components,
+            diagram_own_components,
+            diagram_inherited_components,
+            diagram_connectors,
+            diagram_unresolved_components,
+            diagram_unresolved_bases,
+            diagram_connections,
+        ) = selected_class
             .as_ref()
             .and_then(|class_name| self.diagram(class_name))
-            .map_or((0, 0, 0), |scene| {
+            .map_or((0, 0, 0, 0, 0, 0, 0, 0), |scene| {
+                let stats = scene.debug_stats();
                 (
                     scene.background_graphics.len(),
                     scene.components.len(),
+                    stats.own_components,
+                    stats.inherited_components,
+                    stats.connector_components,
+                    stats.unresolved_components,
+                    stats.unresolved_bases,
                     scene.connections.len(),
                 )
             });
@@ -560,6 +580,11 @@ impl LoadedDocument {
             icon_graphics,
             diagram_background,
             diagram_components,
+            diagram_own_components,
+            diagram_inherited_components,
+            diagram_connectors,
+            diagram_unresolved_components,
+            diagram_unresolved_bases,
             diagram_connections,
             source_name,
             source_lines: source.lines().map(str::to_owned).collect(),
@@ -4000,8 +4025,15 @@ fn diagram_preview(
     );
     let counts = document.map(|document| {
         format!(
-            "{} background  ·  {} components  ·  {} connections",
-            document.diagram_background, document.diagram_components, document.diagram_connections,
+            "{} background  ·  {} components ({} own / {} inherited)  ·  {} connectors  ·  {} connections  ·  {} unresolved components / {} unresolved bases",
+            document.diagram_background,
+            document.diagram_components,
+            document.diagram_own_components,
+            document.diagram_inherited_components,
+            document.diagram_connectors,
+            document.diagram_connections,
+            document.diagram_unresolved_components,
+            document.diagram_unresolved_bases,
         )
     });
     painter.text(

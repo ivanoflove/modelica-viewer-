@@ -19,14 +19,14 @@ pub mod source;
 
 pub use ast::{Class, ClassKind, ClassLocation, ModelicaFile, SourceRange};
 pub use diagnostics::{Diagnostic, Severity};
-pub use diagram::resolve_diagram;
+pub use diagram::{DiagramResolver, resolve_diagram};
 pub use graphics::{resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call};
 pub use icon::IconResolver;
 pub use library::{Library, LibraryKind, LibraryRegistry, PackageLoader, PackageNode};
 pub use parser::{ParseError, parse, requalify_class_tree};
 pub use scene::{
-    ConnectionKey, ConnectorRef, DiagramScene, Graphic, GraphicId, GraphicOwner, GraphicOwnerKind,
-    IconDebugStats, IconScene, ResolvedGraphic, Transform2D,
+    ConnectionKey, ConnectorRef, DiagramDebugStats, DiagramScene, Graphic, GraphicId, GraphicOwner,
+    GraphicOwnerKind, IconDebugStats, IconScene, ResolvedGraphic, Transform2D,
 };
 pub use source::{
     SourceDocument, SourceEdit, SourceTransaction, SourceTransactionError, apply_source_transaction,

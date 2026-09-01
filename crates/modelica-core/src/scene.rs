@@ -182,6 +182,15 @@ pub struct IconDebugStats {
     pub unresolved_connectors: usize,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiagramDebugStats {
+    pub own_components: usize,
+    pub inherited_components: usize,
+    pub connector_components: usize,
+    pub unresolved_components: usize,
+    pub unresolved_bases: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentInstance {
     pub id: String,
@@ -322,4 +331,36 @@ pub struct DiagramScene {
     pub connections: Vec<DiagramConnection>,
     pub diagnostics: Vec<Diagnostic>,
     pub content_bounds: Option<DiagramBounds>,
+}
+
+impl DiagramScene {
+    pub fn debug_stats(&self) -> DiagramDebugStats {
+        let mut stats = DiagramDebugStats {
+            unresolved_components: self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "DIAGRAM_COMPONENT_TYPE_UNRESOLVED")
+                .count(),
+            unresolved_bases: self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "DIAGRAM_BASE_NOT_FOUND")
+                .count(),
+            ..Default::default()
+        };
+        for component in &self.components {
+            if component.editable {
+                stats.own_components += 1;
+            } else {
+                stats.inherited_components += 1;
+            }
+            if matches!(
+                component.class_kind,
+                Some(ClassKind::Connector | ClassKind::ExpandableConnector)
+            ) {
+                stats.connector_components += 1;
+            }
+        }
+        stats
+    }
 }

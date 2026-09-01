@@ -84,16 +84,16 @@ pub fn resolve_diagram(
     DiagramResolver::new(registry).resolve(class, source)
 }
 
-struct DiagramResolver<'a> {
+pub struct DiagramResolver<'a> {
     registry: &'a mut LibraryRegistry,
 }
 
 impl<'a> DiagramResolver<'a> {
-    fn new(registry: &'a mut LibraryRegistry) -> Self {
+    pub fn new(registry: &'a mut LibraryRegistry) -> Self {
         Self { registry }
     }
 
-    fn resolve(&mut self, class: &Class, source: &str) -> DiagramScene {
+    pub fn resolve(&mut self, class: &Class, source: &str) -> DiagramScene {
         self.resolve_inner(class, source, &mut Vec::new())
     }
 
@@ -360,8 +360,9 @@ fn collect_annotations(class_slice: &str, tokens: &[Token]) -> Vec<ScopedAnnotat
         else {
             continue;
         };
-        let Ok(annotation) = parse_call(annotation_source) else {
-            continue;
+        let annotation = match parse_call(annotation_source) {
+            Ok(annotation) => annotation,
+            Err(_) => continue,
         };
         result.push(ScopedAnnotation {
             annotation,
@@ -704,6 +705,9 @@ fn class_owned_slice(class: &Class, source: &str) -> String {
     };
     let mut bytes = class_source.as_bytes().to_vec();
     for child in &class.children {
+        if !looks_like_nested_class_range(child, source) {
+            continue;
+        }
         let start = child
             .source_range
             .start
@@ -721,6 +725,39 @@ fn class_owned_slice(class: &Class, source: &str) -> String {
         }
     }
     String::from_utf8(bytes).expect("source masking preserves UTF-8")
+}
+
+fn looks_like_nested_class_range(child: &Class, source: &str) -> bool {
+    let preceding = source
+        .get(..child.source_range.start)
+        .map(tokenize)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .find(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment));
+    if preceding.is_some_and(|token| {
+        matches!(
+            token.text.as_str(),
+            "replaceable" | "redeclare" | "constrainedby"
+        )
+    }) {
+        return false;
+    }
+    let Some(prefix) = source.get(child.source_range.start..child.source_range.end) else {
+        return false;
+    };
+    let first_tokens = tokenize(prefix)
+        .into_iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .take(2)
+        .collect::<Vec<_>>();
+    first_tokens.first().is_some_and(|token| {
+        CLASS_KEYWORDS.contains(&token.text.as_str())
+            || (token.text == "partial"
+                && first_tokens
+                    .get(1)
+                    .is_some_and(|next| CLASS_KEYWORDS.contains(&next.text.as_str())))
+    })
 }
 
 fn calculate_bounds(
@@ -850,7 +887,7 @@ fn include_extent(bounds: &mut MutableBounds, extent: Extent, origin: Point) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_diagram;
+    use super::{DiagramResolver, resolve_diagram};
     use crate::library::LibraryRegistry;
     use crate::parser::parse;
 
@@ -1067,6 +1104,70 @@ end Derived;
                 .collect::<Vec<_>>(),
             vec!["u", "y"]
         );
+    }
+
+    #[test]
+    fn resolves_real_msl_partial_two_port_and_derived_child() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../resources/modelica/msl-4.1.0/Modelica");
+        let mut registry = LibraryRegistry::default();
+        registry.add(crate::library::Library {
+            root,
+            name: Some("Modelica Standard Library".into()),
+            version: Some("4.1.0".into()),
+            kind: crate::library::LibraryKind::Builtin,
+            read_only: true,
+        });
+
+        let (partial, partial_source) = registry
+            .resolve_class("Modelica.Fluid.Interfaces.PartialTwoPort")
+            .expect("bundled MSL PartialTwoPort");
+        let partial_scene = DiagramResolver::new(&mut registry).resolve(&partial, &partial_source);
+        for (name, expected_type) in [
+            ("port_a", "Modelica.Fluid.Interfaces.FluidPort_a"),
+            ("port_b", "Modelica.Fluid.Interfaces.FluidPort_b"),
+        ] {
+            let component = partial_scene
+                .components
+                .iter()
+                .find(|component| component.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                component.resolved_type_qualified_name.as_deref(),
+                Some(expected_type)
+            );
+            assert!(matches!(
+                component.class_kind,
+                Some(crate::ast::ClassKind::Connector)
+            ));
+            assert!(
+                component
+                    .resolved_icon
+                    .as_ref()
+                    .is_some_and(|icon| !icon.graphics.is_empty())
+            );
+        }
+        assert_eq!(partial_scene.debug_stats().connector_components, 2);
+
+        let child_source =
+            "model Child\n  extends Modelica.Fluid.Interfaces.PartialTwoPort;\nend Child;";
+        registry
+            .register_source("DerivedDiagram.mo", child_source)
+            .expect("index derived child");
+        let (child, source) = registry.resolve_class("Child").expect("derived child");
+        let child_scene = DiagramResolver::new(&mut registry).resolve(&child, &source);
+        assert!(child_scene.components.iter().any(|component| {
+            component.name == "port_a"
+                && component.source_owner == "Modelica.Fluid.Interfaces.PartialTwoPort"
+                && !component.editable
+        }));
+        assert!(child_scene.components.iter().any(|component| {
+            component.name == "port_b"
+                && component.source_owner == "Modelica.Fluid.Interfaces.PartialTwoPort"
+                && !component.editable
+        }));
+        assert_eq!(child_scene.debug_stats().inherited_components, 2);
+        assert_eq!(child_scene.debug_stats().connector_components, 2);
     }
 
     #[test]
