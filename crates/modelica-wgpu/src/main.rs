@@ -205,7 +205,6 @@ enum ConnectionSegmentOrientation {
 
 #[derive(Clone, Debug)]
 enum ConnectionHitTarget {
-    Point(usize),
     Segment {
         index: usize,
         orientation: ConnectionSegmentOrientation,
@@ -243,18 +242,6 @@ enum PointerInteraction {
         original_origin: CorePoint,
         preview_delta: CorePoint,
         connected_connections: Vec<ConnectionDragSnapshot>,
-        source_before: String,
-    },
-    MoveDiagramConnectionPoint {
-        button: MouseButton,
-        connection_id: String,
-        connection_key: ConnectionKey,
-        point_index: usize,
-        line_origin: CorePoint,
-        line_rotation: f32,
-        start_pointer_model: CorePoint,
-        original_points: Vec<CorePoint>,
-        preview_points: Vec<CorePoint>,
         source_before: String,
     },
     MoveDiagramConnectionSegment {
@@ -1466,23 +1453,7 @@ impl App {
     ) -> Option<ConnectionHit> {
         let class_name = self.selected_class_name()?;
         let scene = self.document.as_ref()?.diagram(class_name)?;
-        hit_test_connection(
-            &scene.connections,
-            pointer_model,
-            tolerance,
-            self.selected_connection_id(),
-        )
-    }
-
-    fn hit_test_selected_connection_point(
-        &self,
-        pointer_model: CorePoint,
-        tolerance: f32,
-    ) -> Option<ConnectionHit> {
-        let class_name = self.selected_class_name()?;
-        let scene = self.document.as_ref()?.diagram(class_name)?;
-        let connection_id = self.selected_connection_id()?;
-        hit_test_connection_points(&scene.connections, connection_id, pointer_model, tolerance)
+        hit_test_connection(&scene.connections, pointer_model, tolerance)
     }
 
     fn begin_connection_edit(&mut self, hit: ConnectionHit, pointer_model: CorePoint) {
@@ -1509,22 +1480,6 @@ impl App {
         let original_points = line.points.clone();
         self.diagram_selection = DiagramSelection::Connection(hit.connection_id.clone());
         match hit.target {
-            ConnectionHitTarget::Point(point_index)
-                if point_index > 0 && point_index + 1 < original_points.len() =>
-            {
-                self.pointer_interaction = PointerInteraction::MoveDiagramConnectionPoint {
-                    button: MouseButton::Left,
-                    connection_id: hit.connection_id,
-                    connection_key: connection.key.clone(),
-                    point_index,
-                    line_origin: line.origin,
-                    line_rotation: line.rotation,
-                    start_pointer_model: pointer_model,
-                    original_points: original_points.clone(),
-                    preview_points: original_points,
-                    source_before,
-                };
-            }
             ConnectionHitTarget::Segment { index, orientation }
                 if index > 0 && index + 1 < original_points.len() =>
             {
@@ -1558,12 +1513,7 @@ impl App {
             .find(|connection| connection.id == connection_id)?;
         let line = connection.line.as_ref()?;
         let points = match &self.pointer_interaction {
-            PointerInteraction::MoveDiagramConnectionPoint {
-                connection_id: active_id,
-                preview_points,
-                ..
-            }
-            | PointerInteraction::MoveDiagramConnectionSegment {
+            PointerInteraction::MoveDiagramConnectionSegment {
                 connection_id: active_id,
                 preview_points,
                 ..
@@ -1697,11 +1647,6 @@ impl App {
                 let Some(document) = self.document.as_ref() else {
                     return;
                 };
-                if let Some(hit) = self.hit_test_selected_connection_point(pointer_model, tolerance)
-                {
-                    self.begin_connection_edit(hit, pointer_model);
-                    return;
-                }
                 if let Some((component_name, handle)) =
                     self.hit_test_selected_component_handle(pointer_model, tolerance)
                 {
@@ -1851,41 +1796,6 @@ impl App {
                 }
                 self.window.request_redraw();
             }
-            PointerInteraction::MoveDiagramConnectionPoint {
-                connection_id,
-                point_index,
-                line_origin,
-                line_rotation,
-                start_pointer_model,
-                original_points,
-                ..
-            } => {
-                let current = self.screen_to_model(position);
-                let delta = CorePoint {
-                    x: current.x - start_pointer_model.x,
-                    y: current.y - start_pointer_model.y,
-                };
-                let preview_points = translated_connection_points_free(
-                    &original_points,
-                    point_index,
-                    line_origin,
-                    line_rotation,
-                    delta,
-                );
-                self.diagram_scene.preview_connection_points(
-                    &self.queue,
-                    &connection_id,
-                    &preview_points,
-                );
-                if let PointerInteraction::MoveDiagramConnectionPoint {
-                    preview_points: active_preview,
-                    ..
-                } = &mut self.pointer_interaction
-                {
-                    *active_preview = preview_points;
-                }
-                self.window.request_redraw();
-            }
             PointerInteraction::MoveDiagramConnectionSegment {
                 connection_id,
                 segment_index,
@@ -2014,10 +1924,6 @@ impl App {
                 button: active_button,
                 ..
             }
-            | PointerInteraction::MoveDiagramConnectionPoint {
-                button: active_button,
-                ..
-            }
             | PointerInteraction::MoveDiagramConnectionSegment {
                 button: active_button,
                 ..
@@ -2070,36 +1976,6 @@ impl App {
                     source_before,
                     delta,
                     connected_connections,
-                );
-            }
-            PointerInteraction::MoveDiagramConnectionPoint {
-                connection_id: _connection_id,
-                point_index,
-                connection_key,
-                line_origin,
-                line_rotation,
-                start_pointer_model,
-                original_points,
-                source_before,
-                ..
-            } => {
-                let current = self.screen_to_model(self.cursor);
-                let delta = CorePoint {
-                    x: current.x - start_pointer_model.x,
-                    y: current.y - start_pointer_model.y,
-                };
-                let after_points = translated_connection_points_free(
-                    &original_points,
-                    point_index,
-                    line_origin,
-                    line_rotation,
-                    delta,
-                );
-                self.commit_diagram_connection_move(
-                    connection_key,
-                    original_points,
-                    after_points,
-                    source_before,
                 );
             }
             PointerInteraction::MoveDiagramConnectionSegment {
@@ -2350,9 +2226,16 @@ impl App {
                 self.rebuild_selected_scenes();
                 return;
             };
-            if connection.line.as_ref().is_none_or(|line| {
-                line.origin != edit.line_origin || line.points != edit.after_points
-            }) || !connection_endpoints_match(&resolved_diagram, connection)
+            if connection
+                .line
+                .as_ref()
+                .is_none_or(|line| line.origin != edit.line_origin)
+                || !connection_points_match_invariants(
+                    &resolved_diagram,
+                    connection,
+                    &edit.after_points,
+                    edit.before_points.len(),
+                )
             {
                 self.load_error = Some("Diagram edit did not preserve connection endpoints".into());
                 self.rebuild_selected_scenes();
@@ -2457,17 +2340,13 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        if connection
-            .line
-            .as_ref()
-            .is_none_or(|line| line.points != after_points)
-        {
+        if !connection_points_match_invariants(
+            &resolved_diagram,
+            connection,
+            &after_points,
+            before_points.len(),
+        ) {
             self.load_error = Some("Connection edit did not update Line.points".into());
-            self.rebuild_selected_scenes();
-            return;
-        }
-        if !connection_endpoints_match(&resolved_diagram, connection) {
-            self.load_error = Some("Connection edit moved a locked endpoint".into());
             self.rebuild_selected_scenes();
             return;
         }
@@ -2604,9 +2483,16 @@ impl App {
                 self.rebuild_selected_scenes();
                 return;
             };
-            if connection.line.as_ref().is_none_or(|line| {
-                line.origin != edit.line_origin || line.points != edit.after_points
-            }) || !connection_endpoints_match(&resolved_diagram, connection)
+            if connection
+                .line
+                .as_ref()
+                .is_none_or(|line| line.origin != edit.line_origin)
+                || !connection_points_match_invariants(
+                    &resolved_diagram,
+                    connection,
+                    &edit.after_points,
+                    edit.before_points.len(),
+                )
             {
                 self.load_error =
                     Some("Component resize did not update connection geometry".into());
@@ -2771,10 +2657,12 @@ impl App {
                 else {
                     return;
                 };
-                if connection.line.as_ref().is_none_or(|line| {
-                    line.points != *expected_points
-                        || !connection_endpoints_match(&resolved_diagram, connection)
-                }) {
+                if !connection_points_match_invariants(
+                    &resolved_diagram,
+                    connection,
+                    expected_points,
+                    before_points.len(),
+                ) {
                     return;
                 }
                 let Some(document) = self.document.as_mut() else {
@@ -2828,7 +2716,14 @@ impl App {
                     let Some(line) = connection.line.as_ref() else {
                         return;
                     };
-                    if line.origin != edit.line_origin || line.points != *expected_points {
+                    if line.origin != edit.line_origin
+                        || !connection_points_match_invariants(
+                            &resolved_diagram,
+                            connection,
+                            expected_points,
+                            edit.before_points.len(),
+                        )
+                    {
                         return;
                     }
                 }
@@ -5138,39 +5033,11 @@ fn connection_world_points(line: &LineGraphic, points: &[CorePoint]) -> Vec<Core
         .collect()
 }
 
-fn hit_test_connection_points(
-    connections: &[modelica_core::scene::DiagramConnection],
-    connection_id: &str,
-    pointer: CorePoint,
-    tolerance: f32,
-) -> Option<ConnectionHit> {
-    let connection = connections
-        .iter()
-        .find(|connection| connection.id == connection_id)?;
-    let line = connection.line.as_ref()?;
-    connection_world_points(line, &line.points)
-        .iter()
-        .enumerate()
-        .find(|(_, point)| distance_between(**point, pointer) <= tolerance)
-        .map(|(point_index, _)| ConnectionHit {
-            connection_id: connection.id.clone(),
-            target: ConnectionHitTarget::Point(point_index),
-        })
-}
-
 fn hit_test_connection(
     connections: &[modelica_core::scene::DiagramConnection],
     pointer: CorePoint,
     tolerance: f32,
-    selected_connection_id: Option<&str>,
 ) -> Option<ConnectionHit> {
-    if let Some(connection_id) = selected_connection_id {
-        if let Some(hit) =
-            hit_test_connection_points(connections, connection_id, pointer, tolerance)
-        {
-            return Some(hit);
-        }
-    }
     for connection in connections.iter().rev() {
         let Some(line) = connection.line.as_ref() else {
             continue;
@@ -5652,6 +5519,31 @@ fn connection_endpoints_match(
     })
 }
 
+fn is_orthogonal_polyline(points: &[CorePoint]) -> bool {
+    points.windows(2).all(|pair| {
+        let [first, second] = pair else {
+            return true;
+        };
+        (first.x - second.x).abs() <= ORTHOGONAL_EPSILON
+            || (first.y - second.y).abs() <= ORTHOGONAL_EPSILON
+    })
+}
+
+fn connection_points_match_invariants(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    expected_points: &[CorePoint],
+    expected_count: usize,
+) -> bool {
+    let Some(line) = connection.line.as_ref() else {
+        return false;
+    };
+    line.points == expected_points
+        && line.points.len() == expected_count
+        && is_orthogonal_polyline(&line.points)
+        && connection_endpoints_match(scene, connection)
+}
+
 fn line_local_point_from_world(
     world: CorePoint,
     line_origin: CorePoint,
@@ -5841,22 +5733,6 @@ fn preserve_orthogonal_neighbor(
     }
 }
 
-fn translated_connection_points_free(
-    original_points: &[CorePoint],
-    point_index: usize,
-    line_origin: CorePoint,
-    line_rotation: f32,
-    delta: CorePoint,
-) -> Vec<CorePoint> {
-    let mut points = original_points.to_vec();
-    let local_delta = world_delta_to_line_local(line_origin, line_rotation, delta);
-    if let Some(point) = points.get_mut(point_index) {
-        point.x += local_delta.x;
-        point.y += local_delta.y;
-    }
-    points
-}
-
 fn translated_connection_segment(
     original_points: &[CorePoint],
     segment_index: usize,
@@ -5866,6 +5742,9 @@ fn translated_connection_segment(
     delta: CorePoint,
 ) -> Vec<CorePoint> {
     let mut points = original_points.to_vec();
+    if segment_index == 0 || segment_index + 1 >= points.len().saturating_sub(1) {
+        return points;
+    }
     let Some((first, second)) = points
         .get_mut(segment_index..=segment_index.saturating_add(1))
         .and_then(|points| points.split_first_mut())
@@ -6432,6 +6311,7 @@ mod tests {
             CorePoint { x: 0.0, y: 0.0 },
             CorePoint { x: 40.0, y: 0.0 },
             CorePoint { x: 40.0, y: 30.0 },
+            CorePoint { x: 80.0, y: 30.0 },
             CorePoint { x: 100.0, y: 30.0 },
         ];
         let moved = translated_connection_segment(
@@ -6446,6 +6326,7 @@ mod tests {
         assert_eq!(moved[1], CorePoint { x: 45.0, y: 0.0 });
         assert_eq!(moved[2], CorePoint { x: 45.0, y: 30.0 });
         assert_eq!(moved[3], points[3]);
+        assert_eq!(moved[4], points[4]);
     }
 
     #[test]
@@ -6454,6 +6335,7 @@ mod tests {
             CorePoint { x: 0.0, y: 0.0 },
             CorePoint { x: 40.0, y: 0.0 },
             CorePoint { x: 40.0, y: 30.0 },
+            CorePoint { x: 80.0, y: 30.0 },
             CorePoint { x: 100.0, y: 30.0 },
         ];
         assert_eq!(
@@ -6469,25 +6351,40 @@ mod tests {
                 CorePoint { x: 0.0, y: 0.0 },
                 CorePoint { x: 60.0, y: 0.0 },
                 CorePoint { x: 60.0, y: 30.0 },
+                CorePoint { x: 80.0, y: 30.0 },
                 CorePoint { x: 100.0, y: 30.0 },
             ]
         );
         assert_eq!(
             translated_connection_segment(
                 &points,
-                0,
+                2,
                 ConnectionSegmentOrientation::Horizontal,
                 CorePoint { x: 0.0, y: 0.0 },
                 0.0,
                 CorePoint { x: 100.0, y: 12.0 },
             ),
             vec![
-                CorePoint { x: 0.0, y: 12.0 },
-                CorePoint { x: 40.0, y: 12.0 },
-                points[2],
-                points[3],
+                points[0],
+                points[1],
+                CorePoint { x: 40.0, y: 42.0 },
+                CorePoint { x: 80.0, y: 42.0 },
+                points[4],
             ]
         );
+    }
+
+    #[test]
+    fn diagonal_connection_points_are_rejected_by_routing_policy() {
+        assert!(!is_orthogonal_polyline(&[
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 20.0, y: 13.0 },
+        ]));
+        assert!(is_orthogonal_polyline(&[
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 20.0, y: 0.0 },
+            CorePoint { x: 20.0, y: 13.0 },
+        ]));
     }
 
     #[test]
@@ -6554,7 +6451,7 @@ mod tests {
             source_range: None,
             line_source_range: None,
         };
-        let hit = hit_test_connection(&[connection], CorePoint { x: 40.0, y: 12.0 }, 1.0, None)
+        let hit = hit_test_connection(&[connection], CorePoint { x: 40.0, y: 12.0 }, 1.0)
             .expect("middle segment hit");
         assert_eq!(hit.connection_id, "connection:test");
         assert!(matches!(
