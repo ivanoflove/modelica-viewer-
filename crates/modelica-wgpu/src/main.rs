@@ -6327,28 +6327,29 @@ fn main() {
     );
     let mut app = pollster::block_on(App::new(window.clone(), document));
     app.update_title(None);
+    window.request_redraw();
 
     event_loop
         .run(move |event, event_loop| {
-            event_loop.set_control_flow(ControlFlow::Poll);
+            event_loop.set_control_flow(ControlFlow::Wait);
             match event {
                 Event::WindowEvent { window_id, event } if window_id == app.window.id() => {
                     let egui_response = app.egui_state.on_window_event(&app.window, &event);
                     let egui_consumed = egui_response.consumed;
                     match event {
                         WindowEvent::CloseRequested => event_loop.exit(),
-                        WindowEvent::Resized(size) => app.resize(size),
-                        WindowEvent::RedrawRequested => {
-                            match app.render() {
-                                Ok(()) => {}
-                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                    app.resize(app.window.inner_size())
-                                }
-                                Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                                Err(wgpu::SurfaceError::Timeout) => {}
-                            }
+                        WindowEvent::Resized(size) => {
+                            app.resize(size);
                             app.window.request_redraw();
                         }
+                        WindowEvent::RedrawRequested => match app.render() {
+                            Ok(()) => {}
+                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                app.resize(app.window.inner_size())
+                            }
+                            Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                            Err(wgpu::SurfaceError::Timeout) => {}
+                        },
                         WindowEvent::ModifiersChanged(modifiers) => {
                             app.modifiers = modifiers.state();
                         }
@@ -6401,6 +6402,7 @@ fn main() {
                                     app.begin_model_drag();
                                 }
                             }
+                            app.window.request_redraw();
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
                             if should_zoom_canvas(
@@ -6421,7 +6423,7 @@ fn main() {
                         _ => {}
                     }
                 }
-                Event::AboutToWait => app.window.request_redraw(),
+                Event::AboutToWait => {}
                 _ => {}
             }
         })
