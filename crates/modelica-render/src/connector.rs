@@ -262,6 +262,39 @@ pub fn strict_connection_points(
     ))
 }
 
+/// Re-anchor a routed polyline while preserving its interior route.
+///
+/// The first and last points are always derived from semantic connector
+/// positions. Their adjacent points are adjusted only on the endpoint
+/// segment's existing axis, so a component move, resize, or middle-segment
+/// edit cannot turn a valid orthogonal route into a free-floating endpoint.
+pub fn reanchor_connection_points(
+    scene: &DiagramScene,
+    connection: &DiagramConnection,
+    points: &[Point],
+) -> Result<Vec<Point>, ConnectorResolutionError> {
+    if points.is_empty() {
+        return Err(ConnectorResolutionError::MissingLine);
+    }
+    let (lhs, rhs) = strict_connection_points(scene, connection)?;
+    let mut result = points.to_vec();
+    let lhs_before = result[0];
+    result[0] = lhs;
+    if result.len() >= 2 {
+        preserve_endpoint_axis(&mut result[1], lhs_before, points[1], lhs);
+        let rhs_index = result.len() - 1;
+        let rhs_before = result[rhs_index];
+        result[rhs_index] = rhs;
+        preserve_endpoint_axis(
+            &mut result[rhs_index - 1],
+            rhs_before,
+            points[rhs_index - 1],
+            rhs,
+        );
+    }
+    Ok(result)
+}
+
 fn is_connector_component(component: &ComponentInstance) -> bool {
     matches!(
         component.class_kind,
@@ -430,6 +463,19 @@ fn union_bounds(left: Option<Bounds>, right: Option<Bounds>) -> Option<Bounds> {
 
 fn distance(left: Point, right: Point) -> f32 {
     (left.x - right.x).hypot(left.y - right.y)
+}
+
+fn preserve_endpoint_axis(
+    neighbor: &mut Point,
+    before_endpoint: Point,
+    before_neighbor: Point,
+    after_endpoint: Point,
+) {
+    if (before_endpoint.y - before_neighbor.y).abs() <= 0.001 {
+        neighbor.y = after_endpoint.y;
+    } else if (before_endpoint.x - before_neighbor.x).abs() <= 0.001 {
+        neighbor.x = after_endpoint.x;
+    }
 }
 
 #[cfg(test)]
@@ -673,5 +719,13 @@ mod tests {
         assert!((points.0.y - 50.0).abs() < 0.001);
         assert!((points.1.x - 0.0).abs() < 0.001);
         assert!((points.1.y + 50.0).abs() < 0.001);
+        let reanchored = reanchor_connection_points(
+            &scene,
+            &scene.connections[0],
+            &[point(4.0, 50.0), point(4.0, -50.0)],
+        )
+        .unwrap();
+        assert!((reanchored[0].x - points.0.x).abs() < 0.001);
+        assert!((reanchored[1].x - points.1.x).abs() < 0.001);
     }
 }

@@ -27,9 +27,8 @@ use lyon::{
 use modelica_core::annotation::{parse_call, AnnotationCall, AnnotationValue};
 use modelica_core::scene::{
     ComponentInstance as CoreComponentInstance, ConnectionKey, DiagramScene as CoreDiagramScene,
-    EllipseGraphic, Graphic as CoreGraphic, GraphicOwnerKind, IconScene as CoreIconScene,
-    LineGraphic, Point as CorePoint, PolygonGraphic, RectangleGraphic, ResolvedGraphic,
-    Transform2D,
+    EllipseGraphic, Graphic as CoreGraphic, IconScene as CoreIconScene, LineGraphic,
+    Point as CorePoint, PolygonGraphic, RectangleGraphic, ResolvedGraphic, Transform2D,
 };
 use modelica_core::{
     apply_source_transaction,
@@ -38,7 +37,7 @@ use modelica_core::{
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
 use modelica_render::{
-    connector_anchors, hit_test_connector_anchor, line_local_to_world,
+    connector_anchors, hit_test_connector_anchor, line_local_to_world, reanchor_connection_points,
     resolve_connection_endpoints, resolved_graphic_contains_point, world_to_line_local,
     ConnectorAnchor, PortKey,
 };
@@ -275,6 +274,7 @@ enum PointerInteraction {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionEndpoint {
     Lhs,
@@ -286,12 +286,8 @@ enum ConnectionEndpoint {
 struct ConnectionDragSnapshot {
     connection_id: String,
     connection_key: ConnectionKey,
-    endpoint: ConnectionEndpoint,
     original_line_points: Vec<CorePoint>,
     original_line_origin: CorePoint,
-    original_line_rotation: f32,
-    lhs_connector_path: Option<String>,
-    rhs_connector_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -959,45 +955,6 @@ impl GpuIconScene {
                 })
                 .collect::<Vec<_>>();
             queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        }
-    }
-
-    fn preview_connection_endpoint(
-        &self,
-        queue: &wgpu::Queue,
-        connection_id: &str,
-        endpoint: ConnectionEndpoint,
-        delta: CorePoint,
-    ) {
-        for geometry in &self.geometries {
-            if geometry.edit_key.as_deref() != Some(connection_id) {
-                continue;
-            }
-            let Some(connection) = &geometry.connection else {
-                continue;
-            };
-            let mut line = connection.line.clone();
-            line.points = translated_connection_points(
-                &line.points,
-                endpoint,
-                line.origin,
-                line.rotation,
-                delta,
-            );
-            let Some(preview) = line_geometry(&line, connection.transform)
-                .into_iter()
-                .next()
-            else {
-                continue;
-            };
-            if preview.vertices.len() != geometry.base_vertices.len() {
-                continue;
-            }
-            queue.write_buffer(
-                &geometry.vertex_buffer,
-                0,
-                bytemuck::cast_slice(&preview.vertices),
-            );
         }
     }
 
@@ -1782,27 +1739,17 @@ impl App {
                     .into_iter()
                     .flat_map(|scene| scene.connections.iter())
                     .filter_map(|connection| {
-                        let endpoint = match (
-                            connection.lhs.component_name == component_name,
-                            connection.rhs.component_name == component_name,
-                        ) {
-                            (true, true) => ConnectionEndpoint::Both,
-                            (true, false) => ConnectionEndpoint::Lhs,
-                            (false, true) => ConnectionEndpoint::Rhs,
-                            (false, false) => return None,
-                        };
+                        if connection.lhs.component_name != component_name
+                            && connection.rhs.component_name != component_name
+                        {
+                            return None;
+                        }
                         let line = connection.line.as_ref()?;
                         Some(ConnectionDragSnapshot {
                             connection_id: connection.id.clone(),
                             connection_key: connection.key.clone(),
-                            endpoint,
                             original_line_points: line.points.clone(),
                             original_line_origin: line.origin,
-                            original_line_rotation: line.rotation,
-                            lhs_connector_path: (connection.lhs.component_name == component_name)
-                                .then(|| connection.lhs.connector_path.clone()),
-                            rhs_connector_path: (connection.rhs.component_name == component_name)
-                                .then(|| connection.rhs.connector_path.clone()),
                         })
                     })
                     .collect();
@@ -1872,13 +1819,41 @@ impl App {
                     &component_id,
                     [delta.x, -delta.y],
                 );
-                for connection in &connected_connections {
-                    self.diagram_scene.preview_connection_endpoint(
-                        &self.queue,
-                        &connection.connection_id,
-                        connection.endpoint,
-                        delta,
-                    );
+                if let Some(document) = self.document.as_ref() {
+                    if let Some(class_name) = self.selected_class_name() {
+                        if let Some(scene) = document.diagram(class_name) {
+                            let mut preview_scene = scene.clone();
+                            if let Some(component) = preview_scene
+                                .components
+                                .iter_mut()
+                                .find(|component| component.id == component_id)
+                            {
+                                component.origin.x += delta.x;
+                                component.origin.y += delta.y;
+                            }
+                            for snapshot in &connected_connections {
+                                let Some(connection) = preview_scene
+                                    .connections
+                                    .iter()
+                                    .find(|connection| connection.key == snapshot.connection_key)
+                                else {
+                                    continue;
+                                };
+                                let Ok(preview_points) = reanchor_connection_points(
+                                    &preview_scene,
+                                    connection,
+                                    &snapshot.original_line_points,
+                                ) else {
+                                    continue;
+                                };
+                                self.diagram_scene.preview_connection_points(
+                                    &self.queue,
+                                    &snapshot.connection_id,
+                                    &preview_points,
+                                );
+                            }
+                        }
+                    }
                 }
                 if let PointerInteraction::MoveDiagramComponent { preview_delta, .. } =
                     &mut self.pointer_interaction
@@ -1889,6 +1864,7 @@ impl App {
             }
             PointerInteraction::MoveDiagramConnectionSegment {
                 connection_id,
+                connection_key,
                 segment_index,
                 orientation,
                 line_origin,
@@ -1910,6 +1886,23 @@ impl App {
                     line_rotation,
                     delta,
                 );
+                let preview_points = self
+                    .document
+                    .as_ref()
+                    .and_then(|document| {
+                        self.selected_class_name()
+                            .and_then(|class_name| document.diagram(class_name))
+                    })
+                    .and_then(|scene| {
+                        scene
+                            .connections
+                            .iter()
+                            .find(|connection| connection.key == connection_key)
+                            .and_then(|connection| {
+                                reanchor_connection_points(scene, connection, &preview_points).ok()
+                            })
+                    })
+                    .unwrap_or(preview_points);
                 self.diagram_scene.preview_connection_points(
                     &self.queue,
                     &connection_id,
@@ -1960,18 +1953,40 @@ impl App {
                         placement,
                     ),
                 );
-                for connection in &connected_connections {
-                    let preview_points = resized_connection_points(
-                        &original_component,
-                        original_extent,
-                        preview_extent,
-                        connection,
-                    );
-                    self.diagram_scene.preview_connection_points(
-                        &self.queue,
-                        &connection.connection_id,
-                        &preview_points,
-                    );
+                if let Some(document) = self.document.as_ref() {
+                    if let Some(class_name) = self.selected_class_name() {
+                        if let Some(scene) = document.diagram(class_name) {
+                            let mut preview_scene = scene.clone();
+                            if let Some(component) = preview_scene
+                                .components
+                                .iter_mut()
+                                .find(|component| component.id == component_id)
+                            {
+                                component.placement_extent = Some(preview_extent);
+                            }
+                            for snapshot in &connected_connections {
+                                let Some(connection) = preview_scene
+                                    .connections
+                                    .iter()
+                                    .find(|connection| connection.key == snapshot.connection_key)
+                                else {
+                                    continue;
+                                };
+                                let Ok(preview_points) = reanchor_connection_points(
+                                    &preview_scene,
+                                    connection,
+                                    &snapshot.original_line_points,
+                                ) else {
+                                    continue;
+                                };
+                                self.diagram_scene.preview_connection_points(
+                                    &self.queue,
+                                    &snapshot.connection_id,
+                                    &preview_points,
+                                );
+                            }
+                        }
+                    }
                 }
                 if let PointerInteraction::ResizeDiagramComponent {
                     preview_extent: active_preview,
@@ -2246,6 +2261,14 @@ impl App {
             x: before_origin.x + delta.x,
             y: before_origin.y + delta.y,
         };
+        let mut reanchored_scene = current_scene.clone();
+        if let Some(component) = reanchored_scene
+            .components
+            .iter_mut()
+            .find(|component| component.id == component_id)
+        {
+            component.origin = after_origin;
+        }
         let mut source_edits = Vec::with_capacity(connected_connections.len() + 1);
         let component_edit =
             match component_origin_edit(&source_before, &component_name, after_origin) {
@@ -2259,13 +2282,29 @@ impl App {
         source_edits.push(component_edit);
         let mut connection_edits = Vec::with_capacity(connected_connections.len());
         for snapshot in &connected_connections {
-            let after_points = translated_connection_points(
+            let Some(connection) = reanchored_scene
+                .connections
+                .iter()
+                .find(|connection| connection.key == snapshot.connection_key)
+            else {
+                self.load_error = Some("Diagram edit lost a connection".into());
+                self.rebuild_selected_scenes();
+                return;
+            };
+            let after_points = match reanchor_connection_points(
+                &reanchored_scene,
+                connection,
                 &snapshot.original_line_points,
-                snapshot.endpoint,
-                snapshot.original_line_origin,
-                snapshot.original_line_rotation,
-                delta,
-            );
+            ) {
+                Ok(points) => points,
+                Err(error) => {
+                    self.load_error = Some(format!(
+                        "Diagram edit could not resolve connector: {error:?}"
+                    ));
+                    self.rebuild_selected_scenes();
+                    return;
+                }
+            };
             let edit = match connection_points_edit_for_key(
                 &source_before,
                 current_scene,
@@ -2467,7 +2506,7 @@ impl App {
         &mut self,
         component_id: String,
         component_name: String,
-        original_component: CoreComponentInstance,
+        _original_component: CoreComponentInstance,
         before_extent: modelica_core::scene::Extent,
         after_extent: modelica_core::scene::Extent,
         connected_connections: Vec<ConnectionDragSnapshot>,
@@ -2497,6 +2536,14 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
+        let mut reanchored_scene = current_scene.clone();
+        if let Some(component) = reanchored_scene
+            .components
+            .iter_mut()
+            .find(|component| component.id == component_id)
+        {
+            component.placement_extent = Some(after_extent);
+        }
         let extent_edit = match component_extent_edit(&source_before, &component_name, after_extent)
         {
             Ok(edit) => edit,
@@ -2509,12 +2556,29 @@ impl App {
         let mut source_edits = vec![extent_edit];
         let mut connection_edits = Vec::with_capacity(connected_connections.len());
         for snapshot in &connected_connections {
-            let after_points = resized_connection_points(
-                &original_component,
-                before_extent,
-                after_extent,
-                snapshot,
-            );
+            let Some(connection) = reanchored_scene
+                .connections
+                .iter()
+                .find(|connection| connection.key == snapshot.connection_key)
+            else {
+                self.load_error = Some("Component resize lost a connection".into());
+                self.rebuild_selected_scenes();
+                return;
+            };
+            let after_points = match reanchor_connection_points(
+                &reanchored_scene,
+                connection,
+                &snapshot.original_line_points,
+            ) {
+                Ok(points) => points,
+                Err(error) => {
+                    self.load_error = Some(format!(
+                        "Component resize could not resolve connector: {error:?}"
+                    ));
+                    self.rebuild_selected_scenes();
+                    return;
+                }
+            };
             let edit = match connection_points_edit_for_key(
                 &source_before,
                 current_scene,
@@ -5728,33 +5792,6 @@ fn default_component_extent() -> modelica_core::scene::Extent {
     }
 }
 
-fn connector_lookup_name(path: &str) -> &str {
-    path.split('[').next().unwrap_or(path)
-}
-
-fn connector_world_position(
-    component: &CoreComponentInstance,
-    extent: modelica_core::scene::Extent,
-    connector_path: &str,
-) -> Option<CorePoint> {
-    let icon = component.diagram_layer()?;
-    let lookup_name = connector_lookup_name(connector_path);
-    let graphic = icon.graphics.iter().find(|graphic| {
-        graphic.owner.kind == GraphicOwnerKind::Connector
-            && graphic
-                .owner
-                .instance_name
-                .as_deref()
-                .is_some_and(|name| name == connector_path || name == lookup_name)
-    })?;
-    let placement =
-        diagram_placement_transform_for_extent(icon, component.origin, component.rotation, extent);
-    Some(apply_transform_point(
-        CorePoint { x: 0.0, y: 0.0 },
-        compose_transform(placement, graphic.transform),
-    ))
-}
-
 fn connection_endpoints_match(
     scene: &CoreDiagramScene,
     connection: &modelica_core::scene::DiagramConnection,
@@ -5790,92 +5827,6 @@ fn connection_points_match_invariants(
         && connection_endpoints_match(scene, connection)
 }
 
-fn line_local_point_from_world(
-    world: CorePoint,
-    line_origin: CorePoint,
-    line_rotation: f32,
-) -> CorePoint {
-    world_to_line_local(&temporary_line(line_origin, line_rotation), world)
-}
-
-fn temporary_line(origin: CorePoint, rotation: f32) -> LineGraphic {
-    LineGraphic {
-        origin,
-        rotation,
-        points: Vec::new(),
-        color: [0, 0, 0],
-        pattern: None,
-        thickness: 0.25,
-        arrow: Vec::new(),
-        arrow_size: None,
-        smooth: None,
-    }
-}
-
-fn resized_connection_points(
-    component: &CoreComponentInstance,
-    before_extent: modelica_core::scene::Extent,
-    after_extent: modelica_core::scene::Extent,
-    snapshot: &ConnectionDragSnapshot,
-) -> Vec<CorePoint> {
-    let mut points = snapshot.original_line_points.clone();
-    let endpoints = [
-        (0usize, snapshot.lhs_connector_path.as_deref()),
-        (
-            points.len().saturating_sub(1),
-            snapshot.rhs_connector_path.as_deref(),
-        ),
-    ];
-    for (index, connector_path) in endpoints {
-        let Some(connector_path) = connector_path else {
-            continue;
-        };
-        let Some(before_world) = connector_world_position(component, before_extent, connector_path)
-        else {
-            continue;
-        };
-        let Some(after_world) = connector_world_position(component, after_extent, connector_path)
-        else {
-            continue;
-        };
-        if index >= points.len() {
-            continue;
-        }
-        let before_local = line_local_point_from_world(
-            before_world,
-            snapshot.original_line_origin,
-            snapshot.original_line_rotation,
-        );
-        let after_local = line_local_point_from_world(
-            after_world,
-            snapshot.original_line_origin,
-            snapshot.original_line_rotation,
-        );
-        let delta = CorePoint {
-            x: after_local.x - before_local.x,
-            y: after_local.y - before_local.y,
-        };
-        let original_endpoint = snapshot.original_line_points[index];
-        points[index] = after_local;
-        if index == 0 && points.len() >= 2 {
-            preserve_orthogonal_neighbor(
-                &mut points[1],
-                original_endpoint,
-                snapshot.original_line_points[1],
-                delta,
-            );
-        } else if index + 1 == points.len() && points.len() >= 2 {
-            preserve_orthogonal_neighbor(
-                &mut points[index - 1],
-                original_endpoint,
-                snapshot.original_line_points[index - 1],
-                delta,
-            );
-        }
-    }
-    points
-}
-
 fn connection_drag_snapshots(
     scene: &CoreDiagramScene,
     component_name: &str,
@@ -5884,32 +5835,23 @@ fn connection_drag_snapshots(
         .connections
         .iter()
         .filter_map(|connection| {
-            let endpoint = match (
-                connection.lhs.component_name == component_name,
-                connection.rhs.component_name == component_name,
-            ) {
-                (true, true) => ConnectionEndpoint::Both,
-                (true, false) => ConnectionEndpoint::Lhs,
-                (false, true) => ConnectionEndpoint::Rhs,
-                (false, false) => return None,
-            };
+            if connection.lhs.component_name != component_name
+                && connection.rhs.component_name != component_name
+            {
+                return None;
+            }
             let line = connection.line.as_ref()?;
             Some(ConnectionDragSnapshot {
                 connection_id: connection.id.clone(),
                 connection_key: connection.key.clone(),
-                endpoint,
                 original_line_points: line.points.clone(),
                 original_line_origin: line.origin,
-                original_line_rotation: line.rotation,
-                lhs_connector_path: (connection.lhs.component_name == component_name)
-                    .then(|| connection.lhs.connector_path.clone()),
-                rhs_connector_path: (connection.rhs.component_name == component_name)
-                    .then(|| connection.rhs.connector_path.clone()),
             })
         })
         .collect()
 }
 
+#[cfg(test)]
 fn translated_connection_points(
     original_points: &[CorePoint],
     endpoint: ConnectionEndpoint,
@@ -5966,6 +5908,7 @@ fn translated_connection_points(
     points
 }
 
+#[cfg(test)]
 fn preserve_orthogonal_neighbor(
     neighbor: &mut CorePoint,
     original_endpoint: CorePoint,
@@ -6010,6 +5953,20 @@ fn translated_connection_segment(
         }
     }
     points
+}
+
+fn temporary_line(origin: CorePoint, rotation: f32) -> LineGraphic {
+    LineGraphic {
+        origin,
+        rotation,
+        points: Vec::new(),
+        color: [0, 0, 0],
+        pattern: None,
+        thickness: 0.25,
+        arrow: Vec::new(),
+        arrow_size: None,
+        smooth: None,
+    }
 }
 
 fn world_delta_to_line_local(
@@ -6286,6 +6243,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use modelica_core::scene::GraphicOwnerKind;
 
     #[test]
     fn canvas_navigation_is_limited_to_icon_and_diagram_canvas_events() {
