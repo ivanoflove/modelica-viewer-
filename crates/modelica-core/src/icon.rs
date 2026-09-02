@@ -1,5 +1,6 @@
 use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
 use crate::ast::{Class, ClassKind};
+use crate::component::parse_component_declaration;
 use crate::diagnostics::Diagnostic;
 use crate::graphics::resolve_icon_call;
 use crate::lexer::{TokenKind, tokenize};
@@ -76,6 +77,13 @@ impl<'a> IconResolver<'a> {
                 }
             });
         }
+        let connector_graphics = self.resolve_public_connector_graphics(
+            class,
+            source,
+            visiting,
+            instance_name,
+            &mut diagnostics,
+        );
         let mut result = match (inherited, own) {
             (None, None) => empty_scene(class, diagnostics),
             (Some(mut base), None) => {
@@ -109,8 +117,6 @@ impl<'a> IconResolver<'a> {
                 merged
             }
         };
-        let connector_graphics =
-            self.resolve_public_connector_graphics(class, source, visiting, instance_name);
         result.graphics.extend(connector_graphics);
         let parameter_defaults = parameter_defaults(class, source);
         expand_text_macros(&mut result, class, instance_name, &parameter_defaults);
@@ -127,6 +133,7 @@ impl<'a> IconResolver<'a> {
         source: &str,
         visiting: &mut Vec<String>,
         _instance_name: &str,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> Vec<ResolvedGraphic> {
         let mut graphics = Vec::new();
         for component in find_component_placements(class, source) {
@@ -137,9 +144,21 @@ impl<'a> IconResolver<'a> {
             else {
                 continue;
             };
-            let Some((component_class, component_source)) =
-                self.resolve_component(class, &component.type_name)
+            let candidates = self.component_candidates(class, &component.type_name);
+            let Some((component_class, component_source)) = candidates
+                .iter()
+                .find_map(|candidate| self.registry.resolve_class(candidate))
             else {
+                diagnostics.push(Diagnostic::warning(
+                    "ICON_CONNECTOR_TYPE_UNRESOLVED",
+                    format!(
+                        "owner={} instance={} declaredType={} candidates={}",
+                        class.qualified_name,
+                        component.name,
+                        component.type_name,
+                        candidates.join(", ")
+                    ),
+                ));
                 continue;
             };
             if !matches!(
@@ -181,7 +200,7 @@ impl<'a> IconResolver<'a> {
         graphics
     }
 
-    fn resolve_component(&mut self, class: &Class, type_name: &str) -> Option<(Class, String)> {
+    fn component_candidates(&self, class: &Class, type_name: &str) -> Vec<String> {
         let mut candidates = vec![type_name.to_owned()];
         let parts = class.qualified_name.split('.').collect::<Vec<_>>();
         for length in (1..parts.len()).rev() {
@@ -189,8 +208,6 @@ impl<'a> IconResolver<'a> {
         }
         candidates.dedup();
         candidates
-            .into_iter()
-            .find_map(|candidate| self.registry.resolve_class(&candidate))
     }
 
     fn resolve_base(&mut self, class: &Class, base_name: &str) -> Option<(Class, String)> {
@@ -265,7 +282,7 @@ fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacem
         if statement.iter().any(|item| item.text == "protected") {
             continue;
         }
-        let Some((type_name, name)) = component_declaration(statement) else {
+        let Some(declaration) = parse_component_declaration(statement) else {
             continue;
         };
         let Some(open_index) = next_significant(&tokens, index + 1) else {
@@ -287,8 +304,8 @@ fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacem
             continue;
         };
         result.push(ComponentPlacement {
-            type_name,
-            name,
+            type_name: declaration.declared_type_name,
+            name: declaration.instance_name,
             visible: placement
                 .named("visible")
                 .and_then(parse_bool_value)
@@ -301,93 +318,6 @@ fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacem
         });
     }
     result
-}
-
-fn component_declaration(tokens: &[crate::lexer::Token]) -> Option<(String, String)> {
-    let significant = tokens
-        .iter()
-        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
-        .collect::<Vec<_>>();
-    let ignored = [
-        "algorithm",
-        "block",
-        "class",
-        "connector",
-        "else",
-        "equation",
-        "extends",
-        "function",
-        "if",
-        "input",
-        "output",
-        "model",
-        "package",
-        "record",
-        "flow",
-        "stream",
-        "final",
-        "parameter",
-        "constant",
-        "discrete",
-        "replaceable",
-        "inner",
-        "outer",
-        "each",
-        "redeclare",
-        "constrainedby",
-        "type",
-        "when",
-    ];
-    let mut declaration = None;
-    for start in 0..significant.len() {
-        let first = significant[start];
-        if ignored.contains(&first.text.as_str())
-            || !matches!(first.kind, TokenKind::Identifier | TokenKind::Keyword)
-        {
-            continue;
-        }
-        let mut index = start + 1;
-        let mut type_name = first.text.clone();
-        while significant
-            .get(index)
-            .is_some_and(|token| token.text == ".")
-        {
-            let part = significant.get(index + 1)?;
-            if !matches!(part.kind, TokenKind::Identifier | TokenKind::Keyword) {
-                break;
-            }
-            type_name.push('.');
-            type_name.push_str(&part.text);
-            index += 2;
-        }
-        while significant
-            .get(index)
-            .is_some_and(|token| token.text == "{")
-        {
-            let mut depth = 0;
-            while let Some(token) = significant.get(index) {
-                index += 1;
-                if token.text == "{" {
-                    depth += 1;
-                } else if token.text == "}" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-        let Some(name) = significant.get(index) else {
-            continue;
-        };
-        if !matches!(name.kind, TokenKind::Identifier | TokenKind::Keyword)
-            || ignored.contains(&name.text.as_str())
-        {
-            continue;
-        }
-        declaration = Some((type_name, name.text.clone()));
-    }
-    declaration
 }
 
 fn find_call_argument<'a>(call: &'a AnnotationCall, name: &str) -> Option<&'a AnnotationCall> {
@@ -1018,5 +948,64 @@ end Parent;
             graphic.owner.kind == GraphicOwnerKind::Connector
                 && graphic.owner.instance_name.as_deref() == Some("bus.signal")
         }));
+    }
+
+    #[test]
+    fn resolves_ieh_cpp_style_sibling_connector_declaration() {
+        let source = r#"
+package IEH_CPP
+  package Interfaces
+    package FluidInterfaces
+      connector FluidPortIN
+        annotation(
+          Icon(
+            coordinateSystem(extent={{-100,-100},{100,100}}),
+            graphics={Ellipse(
+              extent={{-100,-100},{100,100}},
+              fillColor={0,0,255})}),
+          Diagram(
+            coordinateSystem(extent={{-100,-100},{100,100}}),
+            graphics={Rectangle(extent={{-100,-100},{100,100}})})
+        );
+      end FluidPortIN;
+    end FluidInterfaces;
+  end Interfaces;
+
+  package FluidUnits
+    model Boundary
+      Interfaces.FluidInterfaces.FluidPortIN port
+        annotation(Placement(
+          transformation(origin={48,-2}, extent={{-10,-10},{10,10}}),
+          iconTransformation(origin={50,0}, extent={{-10,-10},{10,10}})));
+      annotation(Icon(graphics={Rectangle(extent={{-60,-10},{60,10}})}));
+    end Boundary;
+  end FluidUnits;
+end IEH_CPP;
+"#;
+        let file = parse(source, "IEH_CPP.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("IEH_CPP.mo", source)
+            .expect("index source");
+        let (boundary, boundary_source) = registry
+            .resolve_class("IEH_CPP.FluidUnits.Boundary")
+            .expect("Boundary class");
+        assert_eq!(boundary.qualified_name, "IEH_CPP.FluidUnits.Boundary");
+        assert_eq!(file.classes[0].qualified_name, "IEH_CPP");
+
+        let scene = IconResolver::new(&mut registry).resolve(&boundary, &boundary_source);
+        let connector = scene
+            .graphics
+            .iter()
+            .find(|graphic| {
+                graphic.owner.kind == GraphicOwnerKind::Connector
+                    && graphic.owner.instance_name.as_deref() == Some("port")
+            })
+            .expect("Boundary Icon contains public connector graphics");
+        assert!(matches!(connector.graphic, Graphic::Ellipse(_)));
+        assert!((connector.transform.translation.x - 50.0).abs() < 0.001);
+        assert!(connector.transform.translation.y.abs() < 0.001);
+        assert!((connector.transform.scale_x - 0.1).abs() < 0.001);
+        assert!((connector.transform.scale_y - 0.1).abs() < 0.001);
     }
 }

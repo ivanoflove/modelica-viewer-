@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
 use crate::ast::{Class, ClassKind, SourceRange};
+use crate::component::parse_component_declaration;
 use crate::diagnostics::Diagnostic;
 use crate::graphics::{
     resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call, resolve_icon_call,
@@ -50,29 +51,6 @@ const CLASS_KEYWORDS: &[&str] = &[
     "class",
     "type",
 ];
-const DECLARATION_PREFIXES: &[&str] = &[
-    "input",
-    "output",
-    "parameter",
-    "constant",
-    "discrete",
-    "flow",
-    "stream",
-    "inner",
-    "outer",
-    "replaceable",
-    "final",
-    "each",
-    "constrainedby",
-    "redeclare",
-    "protected",
-    "public",
-    "equation",
-    "algorithm",
-    "initial",
-    "when",
-];
-
 /// Resolve a class Diagram, including the Diagram content inherited from all
 /// base classes. The renderer receives only this resolved scene; it must not
 /// infer missing connector graphics from connection endpoints.
@@ -208,11 +186,13 @@ impl<'a> DiagramResolver<'a> {
             .filter(|record| record.owner == AnnotationOwner::Component)
             .enumerate()
         {
-            let Some((type_name, name)) =
-                parse_declaration(&statement_tokens(&tokens, record.token_index))
+            let Some(declaration) =
+                parse_component_declaration(&statement_tokens(&tokens, record.token_index))
             else {
                 continue;
             };
+            let type_name = declaration.declared_type_name;
+            let name = declaration.instance_name;
             let Some(placement) =
                 find_call(&record.annotation, "Placement").and_then(parse_placement)
             else {
@@ -413,7 +393,7 @@ fn classify_annotation(tokens: &[Token], annotation_index: usize) -> AnnotationO
     if statement.iter().any(|token| token.text == "extends") {
         return AnnotationOwner::Extends;
     }
-    if parse_declaration(&statement).is_some() {
+    if parse_component_declaration(&statement).is_some() {
         return AnnotationOwner::Component;
     }
     if statement
@@ -438,59 +418,6 @@ fn statement_tokens(tokens: &[Token], annotation_index: usize) -> Vec<Token> {
         .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
         .cloned()
         .collect()
-}
-
-fn parse_declaration(tokens: &[Token]) -> Option<(String, String)> {
-    let significant = tokens
-        .iter()
-        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
-        .collect::<Vec<_>>();
-    for mut start in 0..significant.len() {
-        while significant
-            .get(start)
-            .is_some_and(|token| DECLARATION_PREFIXES.contains(&token.text.as_str()))
-        {
-            start += 1;
-        }
-        let Some(first) = significant.get(start) else {
-            continue;
-        };
-        if !matches!(first.kind, TokenKind::Identifier | TokenKind::Keyword)
-            || CLASS_KEYWORDS.contains(&first.text.as_str())
-        {
-            continue;
-        }
-        let mut index = start + 1;
-        let mut type_name = first.text.clone();
-        while significant
-            .get(index)
-            .is_some_and(|token| token.text == ".")
-        {
-            let Some(part) = significant.get(index + 1) else {
-                break;
-            };
-            if !matches!(part.kind, TokenKind::Identifier | TokenKind::Keyword) {
-                break;
-            }
-            type_name.push('.');
-            type_name.push_str(&part.text);
-            index += 2;
-        }
-        let Some(name) = significant.get(index) else {
-            continue;
-        };
-        if !matches!(name.kind, TokenKind::Identifier | TokenKind::Keyword) {
-            continue;
-        }
-        if significant
-            .get(index + 1)
-            .is_some_and(|token| matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword))
-        {
-            continue;
-        }
-        return Some((type_name, name.text.clone()));
-    }
-    None
 }
 
 fn parse_placement(call: &AnnotationCall) -> Option<Placement> {

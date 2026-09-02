@@ -6,6 +6,7 @@
 
 pub mod annotation;
 pub mod ast;
+pub mod component;
 pub mod diagnostics;
 pub mod diagram;
 pub mod graphics;
@@ -18,6 +19,7 @@ pub mod scene;
 pub mod source;
 
 pub use ast::{Class, ClassKind, ClassLocation, ModelicaFile, SourceRange};
+pub use component::{ComponentDeclaration, parse_component_declaration};
 pub use diagnostics::{Diagnostic, Severity};
 pub use diagram::{DiagramResolver, resolve_diagram};
 pub use graphics::{resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call};
