@@ -855,6 +855,14 @@ enum DiagramRenderLayer {
     Overlay,
 }
 
+const DIAGRAM_RENDER_LAYERS: [DiagramRenderLayer; 4] = [
+    DiagramRenderLayer::Background,
+    DiagramRenderLayer::Component,
+    DiagramRenderLayer::Connection,
+    DiagramRenderLayer::Connector,
+];
+const ICON_RENDER_LAYERS: [DiagramRenderLayer; 1] = [DiagramRenderLayer::Component];
+
 struct Geometry {
     vertices: Vec<Vertex>,
     indices: Vec<u16>,
@@ -882,6 +890,7 @@ struct GpuGeometry {
     index_count: u32,
     style_bind_group: wgpu::BindGroup,
     base_vertices: Vec<Vertex>,
+    layer: DiagramRenderLayer,
     edit_key: Option<String>,
     connection: Option<ConnectionGeometry>,
     component: Option<ComponentGeometry>,
@@ -3154,14 +3163,25 @@ impl App {
                     } else {
                         &self.scene
                     };
-                    for geometry in &active_scene.geometries {
-                        pass.set_bind_group(1, &geometry.style_bind_group, &[]);
-                        pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
-                        pass.set_index_buffer(
-                            geometry.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint16,
-                        );
-                        pass.draw_indexed(0..geometry.index_count, 0, 0..1);
+                    let render_layers: &[DiagramRenderLayer] =
+                        if self.main_view == MainView::Diagram {
+                            &DIAGRAM_RENDER_LAYERS
+                        } else {
+                            &ICON_RENDER_LAYERS
+                        };
+                    for layer in render_layers {
+                        for geometry in &active_scene.geometries {
+                            if geometry.layer != *layer {
+                                continue;
+                            }
+                            pass.set_bind_group(1, &geometry.style_bind_group, &[]);
+                            pass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+                            pass.set_index_buffer(
+                                geometry.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint16,
+                            );
+                            pass.draw_indexed(0..geometry.index_count, 0, 0..1);
+                        }
                     }
                 }
             }
@@ -4309,6 +4329,7 @@ fn gpu_scene_from_geometries(
                 index_count: geometry.indices.len() as u32,
                 style_bind_group,
                 base_vertices,
+                layer: geometry.layer,
                 edit_key: geometry.edit_key,
                 connection: geometry.connection,
                 component: geometry.component,
