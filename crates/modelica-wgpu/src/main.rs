@@ -37,8 +37,8 @@ use modelica_core::{
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
 use modelica_render::{
-    connector_anchors, hit_test_connector_anchor, line_local_to_world, reanchor_connection_points,
-    resolve_connection_endpoints, resolved_graphic_contains_point,
+    connector_anchor_hit_distance, connector_anchors, line_local_to_world,
+    reanchor_connection_points, resolve_connection_endpoints, resolved_graphic_contains_point,
     resolved_graphic_contains_point_with_transform, world_to_line_local, ConnectorAnchor, PortKey,
 };
 use rfd::FileDialog;
@@ -56,6 +56,7 @@ const INITIAL_ZOOM: f32 = 3.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
 const ORTHOGONAL_EPSILON: f32 = 0.001;
+const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
 const UI_FONT_SYMBOLS: &str = "modelica-ui-symbols";
@@ -260,24 +261,132 @@ impl HitBounds {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ComponentHitItem {
-    id: String,
-    name: String,
-    bounds: HitBounds,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GridCell {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ConnectionSegmentRef {
+    connection_index: usize,
+    segment_index: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HitBucket {
+    component_indices: Vec<usize>,
+    port_indices: Vec<usize>,
+    connection_segments: Vec<ConnectionSegmentRef>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpatialCandidates {
+    component_indices: Vec<usize>,
+    port_indices: Vec<usize>,
+    connection_segments: Vec<ConnectionSegmentRef>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiagramSpatialIndex {
+    cells: HashMap<GridCell, HitBucket>,
+}
+
+impl DiagramSpatialIndex {
+    fn cell_for(point: CorePoint) -> GridCell {
+        GridCell {
+            x: (point.x / DIAGRAM_HIT_GRID_CELL_SIZE).floor() as i32,
+            y: (point.y / DIAGRAM_HIT_GRID_CELL_SIZE).floor() as i32,
+        }
+    }
+
+    fn cell_range(bounds: HitBounds) -> impl Iterator<Item = GridCell> {
+        let min = Self::cell_for(bounds.min);
+        let max = Self::cell_for(bounds.max);
+        (min.x..=max.x).flat_map(move |x| (min.y..=max.y).map(move |y| GridCell { x, y }))
+    }
+
+    fn insert_component(&mut self, index: usize, bounds: HitBounds) {
+        for cell in Self::cell_range(bounds) {
+            self.cells
+                .entry(cell)
+                .or_default()
+                .component_indices
+                .push(index);
+        }
+    }
+
+    fn insert_port(&mut self, index: usize, bounds: HitBounds) {
+        for cell in Self::cell_range(bounds) {
+            self.cells.entry(cell).or_default().port_indices.push(index);
+        }
+    }
+
+    fn insert_connection_segment(&mut self, segment: ConnectionSegmentRef, bounds: HitBounds) {
+        for cell in Self::cell_range(bounds) {
+            self.cells
+                .entry(cell)
+                .or_default()
+                .connection_segments
+                .push(segment);
+        }
+    }
+
+    fn query(&self, point: CorePoint, tolerance: f32) -> SpatialCandidates {
+        let tolerance = tolerance.max(0.0);
+        let bounds = HitBounds {
+            min: CorePoint {
+                x: point.x - tolerance,
+                y: point.y - tolerance,
+            },
+            max: CorePoint {
+                x: point.x + tolerance,
+                y: point.y + tolerance,
+            },
+        };
+        let mut candidates = SpatialCandidates::default();
+        for cell in Self::cell_range(bounds) {
+            let Some(bucket) = self.cells.get(&cell) else {
+                continue;
+            };
+            candidates
+                .component_indices
+                .extend(bucket.component_indices.iter().copied());
+            candidates
+                .port_indices
+                .extend(bucket.port_indices.iter().copied());
+            candidates
+                .connection_segments
+                .extend(bucket.connection_segments.iter().copied());
+        }
+        candidates.component_indices.sort_unstable();
+        candidates.component_indices.dedup();
+        candidates.port_indices.sort_unstable();
+        candidates.port_indices.dedup();
+        candidates
+            .connection_segments
+            .sort_unstable_by(|left, right| {
+                left.connection_index
+                    .cmp(&right.connection_index)
+                    .reverse()
+                    .then(left.segment_index.cmp(&right.segment_index))
+            });
+        candidates.connection_segments.dedup();
+        candidates
+    }
 }
 
 #[derive(Clone, Debug)]
-struct ConnectionHitItem {
-    id: String,
+struct ComponentHitItem {
+    scene_index: usize,
     bounds: HitBounds,
 }
 
 #[derive(Clone, Debug, Default)]
 struct DiagramHitCache {
     components: Vec<ComponentHitItem>,
-    connections: Vec<ConnectionHitItem>,
     ports: Vec<ConnectorAnchor>,
+    spatial_index: DiagramSpatialIndex,
 }
 
 #[derive(Clone, Debug)]
@@ -1535,31 +1644,36 @@ impl App {
         tolerance: f32,
     ) -> Option<ConnectionHit> {
         let started = Instant::now();
-        let mut broad_candidates = 0;
-        let precise_started = Instant::now();
         let class_name = self.selected_class_name()?;
         let scene = self.document.as_ref()?.diagram(class_name)?;
-        for item in self.diagram_hit_cache.connections.iter().rev() {
-            if !item.bounds.contains(pointer_model, tolerance) {
-                continue;
-            }
-            broad_candidates += 1;
-            let Some(connection) = scene
-                .connections
-                .iter()
-                .find(|connection| connection.id == item.id)
-            else {
-                continue;
-            };
+        let query_started = Instant::now();
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let precise_started = Instant::now();
+        for segment in &candidates.connection_segments {
             if let Some(hit) =
-                hit_test_connection(std::slice::from_ref(connection), pointer_model, tolerance)
+                scene
+                    .connections
+                    .get(segment.connection_index)
+                    .and_then(|connection| {
+                        hit_test_connection_segment(
+                            connection,
+                            segment.segment_index,
+                            pointer_model,
+                            tolerance,
+                        )
+                    })
             {
                 if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
                     eprintln!(
-                        "hit-test connection: broad_candidates={} precise_ms={:.3} total_ms={:.3}",
-                        broad_candidates,
-                        precise_started.elapsed().as_secs_f64() * 1000.0,
-                        started.elapsed().as_secs_f64() * 1000.0
+                        "hit-test connection: spatial_query_us={:.1} connection_segment_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                        spatial_query_us,
+                        candidates.connection_segments.len(),
+                        precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                        started.elapsed().as_secs_f64() * 1_000_000.0
                     );
                 }
                 return Some(hit);
@@ -1567,10 +1681,11 @@ impl App {
         }
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
             eprintln!(
-                "hit-test connection: broad_candidates={} precise_ms={:.3} total_ms={:.3}",
-                broad_candidates,
-                precise_started.elapsed().as_secs_f64() * 1000.0,
-                started.elapsed().as_secs_f64() * 1000.0
+                "hit-test connection: spatial_query_us={:.1} connection_segment_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                spatial_query_us,
+                candidates.connection_segments.len(),
+                precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                started.elapsed().as_secs_f64() * 1_000_000.0
             );
         }
         None
@@ -1585,13 +1700,30 @@ impl App {
     fn hit_test_diagram_port(&self, pointer_model: CorePoint, tolerance: f32) -> Option<PortKey> {
         let started = Instant::now();
         let anchors = self.diagram_connector_anchors()?;
-        let result = hit_test_connector_anchor(anchors, pointer_model, tolerance)
-            .map(|anchor| anchor.key.clone());
+        let query_started = Instant::now();
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let precise_started = Instant::now();
+        let result = candidates
+            .port_indices
+            .iter()
+            .filter_map(|index| anchors.get(*index))
+            .filter_map(|anchor| {
+                connector_anchor_hit_distance(anchor, pointer_model, tolerance)
+                    .map(|distance| (distance, anchor))
+            })
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, anchor)| anchor.key.clone());
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
             eprintln!(
-                "hit-test port: candidates={} total_ms={:.3}",
-                anchors.len(),
-                started.elapsed().as_secs_f64() * 1000.0
+                "hit-test port: spatial_query_us={:.1} port_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                spatial_query_us,
+                candidates.port_indices.len(),
+                precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                started.elapsed().as_secs_f64() * 1_000_000.0
             );
         }
         result
@@ -1603,27 +1735,27 @@ impl App {
         tolerance: f32,
     ) -> Option<(String, String, CorePoint)> {
         let started = Instant::now();
-        let broad_started = Instant::now();
-        let hit_items = &self.diagram_hit_cache.components;
         let class_name = self.selected_class_name()?;
         let scene = self.document.as_ref()?.diagram(class_name)?;
-        let broad_candidates = hit_items
-            .iter()
-            .filter(|item| item.bounds.contains(pointer_model, tolerance))
-            .count();
-        let broad_ms = broad_started.elapsed().as_secs_f64() * 1000.0;
+        let query_started = Instant::now();
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
         let precise_started = Instant::now();
-        let result = hit_items.iter().rev().find_map(|item| {
+        let result = candidates.component_indices.iter().rev().find_map(|index| {
+            let item = self.diagram_hit_cache.components.get(*index)?;
             if !item.bounds.contains(pointer_model, tolerance) {
                 return None;
             }
-            let component = scene.components.iter().find(|component| {
-                component.id == item.id
-                    && component.name == item.name
-                    && component.editable
-                    && component.visible
-                    && diagram_component_contains_point(component, pointer_model, tolerance)
-            })?;
+            let component = scene.components.get(item.scene_index)?;
+            if !component.editable
+                || !component.visible
+                || !diagram_component_contains_point(component, pointer_model, tolerance)
+            {
+                return None;
+            }
             Some((
                 component.id.clone(),
                 component.name.clone(),
@@ -1632,24 +1764,29 @@ impl App {
         });
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
             eprintln!(
-                "hit-test component: broad_candidates={} broad_ms={:.3} precise_ms={:.3} total_ms={:.3}",
-                broad_candidates,
-                broad_ms,
-                precise_started.elapsed().as_secs_f64() * 1000.0,
-                started.elapsed().as_secs_f64() * 1000.0
+                "hit-test component: spatial_query_us={:.1} component_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                spatial_query_us,
+                candidates.component_indices.len(),
+                precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                started.elapsed().as_secs_f64() * 1_000_000.0
             );
         }
         result
     }
 
-    fn update_hovered_diagram_port(&mut self) {
-        if self.main_view != MainView::Diagram || !self.pointer_over_canvas() {
-            self.hovered_port = None;
-            return;
+    fn update_hovered_diagram_port(&mut self) -> bool {
+        let next_hovered = if self.main_view == MainView::Diagram && self.pointer_over_canvas() {
+            let pointer_model = self.screen_to_model(self.cursor);
+            let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
+            self.hit_test_diagram_port(pointer_model, tolerance)
+        } else {
+            None
+        };
+        if self.hovered_port == next_hovered {
+            return false;
         }
-        let pointer_model = self.screen_to_model(self.cursor);
-        let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
-        self.hovered_port = self.hit_test_diagram_port(pointer_model, tolerance);
+        self.hovered_port = next_hovered;
+        true
     }
 
     fn begin_connection_edit(&mut self, hit: ConnectionHit, pointer_model: CorePoint) {
@@ -1853,6 +1990,26 @@ impl App {
                 let Some(document) = self.document.as_ref() else {
                     return;
                 };
+                let spatial_query_started = Instant::now();
+                let spatial_candidates = self
+                    .diagram_hit_cache
+                    .spatial_index
+                    .query(pointer_model, tolerance);
+                if spatial_candidates.component_indices.is_empty()
+                    && spatial_candidates.port_indices.is_empty()
+                    && spatial_candidates.connection_segments.is_empty()
+                {
+                    self.set_diagram_selection(DiagramSelection::None);
+                    self.pointer_interaction = PointerInteraction::None;
+                    if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+                        eprintln!(
+                            "hit-test blank: spatial_query_us={:.1} port_candidates=0 component_candidates=0 connection_segment_candidates=0 precise_test_us=0.0 total_mouse_down_us={:.1}",
+                            spatial_query_started.elapsed().as_secs_f64() * 1_000_000.0,
+                            hit_test_started.elapsed().as_secs_f64() * 1_000_000.0
+                        );
+                    }
+                    return;
+                }
                 if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
                     self.set_diagram_selection(DiagramSelection::Port(port.clone()));
                     self.hovered_port = Some(port);
@@ -1875,8 +2032,8 @@ impl App {
                     }
                     if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
                         eprintln!(
-                            "hit-test mouse-down: total_ms={:.3}",
-                            hit_test_started.elapsed().as_secs_f64() * 1000.0
+                            "hit-test mouse-down: total_mouse_down_us={:.1}",
+                            hit_test_started.elapsed().as_secs_f64() * 1_000_000.0
                         );
                     }
                     return;
@@ -1919,7 +2076,7 @@ impl App {
         }
     }
 
-    fn update_model_drag_preview(&mut self, position: PhysicalPosition<f64>) {
+    fn update_model_drag_preview(&mut self, position: PhysicalPosition<f64>) -> bool {
         let interaction = self.pointer_interaction.clone();
         match interaction {
             PointerInteraction::Pan {
@@ -1932,7 +2089,7 @@ impl App {
                     start_pan[1] + (position.y - start_pointer.y) as f32,
                 ];
                 self.update_view_uniform();
-                self.window.request_redraw();
+                true
             }
             PointerInteraction::MoveIconGraphic {
                 graphic_id,
@@ -1951,7 +2108,7 @@ impl App {
                 {
                     *preview_delta = delta;
                 }
-                self.window.request_redraw();
+                true
             }
             PointerInteraction::MoveDiagramComponent {
                 component_id,
@@ -2010,7 +2167,7 @@ impl App {
                 {
                     *preview_delta = delta;
                 }
-                self.window.request_redraw();
+                true
             }
             PointerInteraction::MoveDiagramConnectionSegment {
                 connection_id,
@@ -2065,7 +2222,7 @@ impl App {
                 {
                     *active_preview = preview_points;
                 }
-                self.window.request_redraw();
+                true
             }
             PointerInteraction::ResizeDiagramComponent {
                 component_id,
@@ -2084,7 +2241,7 @@ impl App {
                     current,
                 );
                 let Some(icon) = original_component.diagram_layer() else {
-                    return;
+                    return false;
                 };
                 let placement = diagram_placement_transform_for_extent(
                     icon,
@@ -2145,9 +2302,9 @@ impl App {
                 {
                     *active_preview = preview_extent;
                 }
-                self.window.request_redraw();
+                true
             }
-            PointerInteraction::None => {}
+            PointerInteraction::None => false,
         }
     }
 
@@ -4561,42 +4718,74 @@ fn build_diagram_hit_cache(
     else {
         return DiagramHitCache::default();
     };
-    let components = scene
-        .components
-        .iter()
-        .filter_map(|component| {
-            let extent = component
-                .placement_extent
-                .unwrap_or_else(default_component_extent);
-            let bounds = HitBounds::from_points(component_extent_corners(
-                component.origin,
-                extent,
-                component.rotation,
-            ))?;
-            Some(ComponentHitItem {
-                id: component.id.clone(),
-                name: component.name.clone(),
+    let mut components = Vec::new();
+    let mut spatial_index = DiagramSpatialIndex::default();
+    for (scene_index, component) in scene.components.iter().enumerate() {
+        let extent = component
+            .placement_extent
+            .unwrap_or_else(default_component_extent);
+        let bounds = HitBounds::from_points(component_extent_corners(
+            component.origin,
+            extent,
+            component.rotation,
+        ));
+        let Some(bounds) = bounds else {
+            continue;
+        };
+        let cache_index = components.len();
+        components.push(ComponentHitItem {
+            scene_index,
+            bounds,
+        });
+        spatial_index.insert_component(cache_index, bounds);
+    }
+    let ports = connector_anchors(scene);
+    for (port_index, anchor) in ports.iter().enumerate() {
+        spatial_index.insert_port(port_index, connector_anchor_bounds(anchor));
+    }
+    for (connection_index, connection) in scene.connections.iter().enumerate() {
+        let Some(line) = connection.line.as_ref() else {
+            continue;
+        };
+        let points = connection_world_points(line, &line.points);
+        for (segment_index, pair) in points.windows(2).enumerate() {
+            let [start, end] = pair else {
+                continue;
+            };
+            let Some(bounds) = HitBounds::from_points([*start, *end]) else {
+                continue;
+            };
+            spatial_index.insert_connection_segment(
+                ConnectionSegmentRef {
+                    connection_index,
+                    segment_index,
+                },
                 bounds,
-            })
-        })
-        .collect();
-    let connections = scene
-        .connections
-        .iter()
-        .filter_map(|connection| {
-            let line = connection.line.as_ref()?;
-            let points = connection_world_points(line, &line.points);
-            Some(ConnectionHitItem {
-                id: connection.id.clone(),
-                bounds: HitBounds::from_points(points)?,
-            })
-        })
-        .collect();
+            );
+        }
+    }
     DiagramHitCache {
         components,
-        connections,
-        ports: connector_anchors(scene),
+        ports,
+        spatial_index,
     }
+}
+
+fn connector_anchor_bounds(anchor: &ConnectorAnchor) -> HitBounds {
+    let mut points = vec![anchor.world_position];
+    if let Some(bounds) = anchor.visual_bounds {
+        points.extend([
+            CorePoint {
+                x: bounds.x,
+                y: bounds.y,
+            },
+            CorePoint {
+                x: bounds.x + bounds.width,
+                y: bounds.y + bounds.height,
+            },
+        ]);
+    }
+    HitBounds::from_points(points).expect("anchor has a world position")
 }
 
 fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geometry]) {
@@ -5569,6 +5758,7 @@ fn connection_world_points(line: &LineGraphic, points: &[CorePoint]) -> Vec<Core
         .collect()
 }
 
+#[cfg(test)]
 fn hit_test_connection(
     connections: &[modelica_core::scene::DiagramConnection],
     pointer: CorePoint,
@@ -5601,6 +5791,41 @@ fn hit_test_connection(
         }
     }
     None
+}
+
+fn hit_test_connection_segment(
+    connection: &modelica_core::scene::DiagramConnection,
+    segment_index: usize,
+    pointer: CorePoint,
+    tolerance: f32,
+) -> Option<ConnectionHit> {
+    let line = connection.line.as_ref()?;
+    let start = line
+        .points
+        .get(segment_index)
+        .map(|point| line_local_to_world(line, *point))?;
+    let end = line
+        .points
+        .get(segment_index + 1)
+        .map(|point| line_local_to_world(line, *point))?;
+    if distance_to_segment(pointer, start, end) > tolerance {
+        return None;
+    }
+    let target = if segment_index > 0 && segment_index + 1 < line.points.len() - 1 {
+        match segment_orientation(start, end) {
+            Some(orientation) => ConnectionHitTarget::Segment {
+                index: segment_index,
+                orientation,
+            },
+            None => ConnectionHitTarget::Line,
+        }
+    } else {
+        ConnectionHitTarget::Line
+    };
+    Some(ConnectionHit {
+        connection_id: connection.id.clone(),
+        target,
+    })
 }
 
 fn distance_between(first: CorePoint, second: CorePoint) -> f32 {
@@ -6395,9 +6620,11 @@ fn main() {
                         }
                         WindowEvent::CursorMoved { position, .. } => {
                             app.cursor = position;
-                            app.update_hovered_diagram_port();
-                            app.update_model_drag_preview(position);
-                            app.window.request_redraw();
+                            let hover_changed = app.update_hovered_diagram_port();
+                            let drag_changed = app.update_model_drag_preview(position);
+                            if egui_consumed || hover_changed || drag_changed {
+                                app.window.request_redraw();
+                            }
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
                             let selection_before = app.diagram_selection.clone();
@@ -6463,6 +6690,72 @@ mod tests {
         assert!(!canvas_event_allowed_for(MainView::Icon, false));
         assert!(canvas_event_allowed_for(MainView::Icon, true));
         assert!(canvas_event_allowed_for(MainView::Diagram, true));
+    }
+
+    #[test]
+    fn diagram_spatial_index_keeps_blank_queries_local() {
+        let mut index = DiagramSpatialIndex::default();
+        for component_index in 0..500 {
+            let x = component_index as f32 * 100.0;
+            index.insert_component(
+                component_index,
+                HitBounds {
+                    min: CorePoint { x, y: -10.0 },
+                    max: CorePoint {
+                        x: x + 20.0,
+                        y: 10.0,
+                    },
+                },
+            );
+        }
+        for port_index in 0..1000 {
+            let x = port_index as f32 * 50.0;
+            index.insert_port(
+                port_index,
+                HitBounds {
+                    min: CorePoint {
+                        x: x - 2.0,
+                        y: -2.0,
+                    },
+                    max: CorePoint { x: x + 2.0, y: 2.0 },
+                },
+            );
+        }
+        for connection_index in 0..500 {
+            let x = connection_index as f32 * 100.0;
+            index.insert_connection_segment(
+                ConnectionSegmentRef {
+                    connection_index,
+                    segment_index: 0,
+                },
+                HitBounds {
+                    min: CorePoint {
+                        x: x + 30.0,
+                        y: -1.0,
+                    },
+                    max: CorePoint {
+                        x: x + 70.0,
+                        y: 1.0,
+                    },
+                },
+            );
+        }
+
+        let blank = index.query(
+            CorePoint {
+                x: -1_000.0,
+                y: 500.0,
+            },
+            8.0,
+        );
+        assert!(blank.component_indices.is_empty());
+        assert!(blank.port_indices.is_empty());
+        assert!(blank.connection_segments.is_empty());
+
+        let nearby = index.query(CorePoint { x: 12.0, y: 0.0 }, 8.0);
+        assert!(nearby.component_indices.len() <= 1);
+        assert!(nearby.port_indices.len() <= 2);
+        assert!(nearby.connection_segments.len() <= 1);
     }
 
     #[test]
