@@ -261,7 +261,7 @@ impl HitBounds {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct GridCell {
     x: i32,
     y: i32,
@@ -290,6 +290,7 @@ struct SpatialCandidates {
 #[derive(Clone, Debug, Default)]
 struct DiagramSpatialIndex {
     cells: HashMap<GridCell, HitBucket>,
+    connection_cells: HashMap<usize, Vec<GridCell>>,
 }
 
 impl DiagramSpatialIndex {
@@ -329,6 +330,49 @@ impl DiagramSpatialIndex {
                 .or_default()
                 .connection_segments
                 .push(segment);
+            self.connection_cells
+                .entry(segment.connection_index)
+                .or_default()
+                .push(cell);
+        }
+    }
+
+    fn remove_connection(&mut self, connection_index: usize) {
+        let Some(mut cells) = self.connection_cells.remove(&connection_index) else {
+            return;
+        };
+        cells.sort_unstable();
+        cells.dedup();
+        for cell in cells {
+            let mut remove_cell = false;
+            if let Some(bucket) = self.cells.get_mut(&cell) {
+                bucket
+                    .connection_segments
+                    .retain(|segment| segment.connection_index != connection_index);
+                remove_cell = bucket.component_indices.is_empty()
+                    && bucket.port_indices.is_empty()
+                    && bucket.connection_segments.is_empty();
+            }
+            if remove_cell {
+                self.cells.remove(&cell);
+            }
+        }
+    }
+
+    fn update_connection(
+        &mut self,
+        connection_index: usize,
+        segments: impl IntoIterator<Item = (usize, HitBounds)>,
+    ) {
+        self.remove_connection(connection_index);
+        for (segment_index, bounds) in segments {
+            self.insert_connection_segment(
+                ConnectionSegmentRef {
+                    connection_index,
+                    segment_index,
+                },
+                bounds,
+            );
         }
     }
 
@@ -387,6 +431,23 @@ struct DiagramHitCache {
     components: Vec<ComponentHitItem>,
     ports: Vec<ConnectorAnchor>,
     spatial_index: DiagramSpatialIndex,
+}
+
+impl DiagramHitCache {
+    fn update_connection(&mut self, connection_index: usize, line: &LineGraphic) {
+        let points = connection_world_points(line, &line.points);
+        let segments = points
+            .windows(2)
+            .enumerate()
+            .filter_map(|(segment_index, pair)| {
+                let [start, end] = pair else {
+                    return None;
+                };
+                HitBounds::from_points([*start, *end]).map(|bounds| (segment_index, bounds))
+            });
+        self.spatial_index
+            .update_connection(connection_index, segments);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1156,6 +1217,42 @@ impl GpuIconScene {
             );
         }
     }
+
+    fn commit_connection_points(
+        &mut self,
+        queue: &wgpu::Queue,
+        connection_id: &str,
+        points: &[CorePoint],
+    ) {
+        for geometry in &mut self.geometries {
+            if geometry.edit_key.as_deref() != Some(connection_id) {
+                continue;
+            }
+            let Some(connection) = &geometry.connection else {
+                continue;
+            };
+            let mut line = connection.line.clone();
+            line.points = points.to_vec();
+            let Some(canonical) = line_geometry(&line, connection.transform)
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            if canonical.vertices.len() != geometry.base_vertices.len() {
+                continue;
+            }
+            geometry.base_vertices = canonical.vertices.clone();
+            if let Some(connection) = &mut geometry.connection {
+                connection.line.points = points.to_vec();
+            }
+            queue.write_buffer(
+                &geometry.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&canonical.vertices),
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1242,6 +1339,54 @@ impl FrameStats {
         self.last_report = now;
         self.frames_since_report = 0;
         Some((fps, worst_ms))
+    }
+}
+
+struct EditCommitProfile {
+    enabled: bool,
+    started: Instant,
+    source_patch: Duration,
+    resolve_candidate: Duration,
+    semantic_validation: Duration,
+    document_update: Duration,
+    gpu_update: Duration,
+    hit_index_update: Duration,
+}
+
+impl EditCommitProfile {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("MODELICA_WGPU_PROFILE_EDIT").is_some(),
+            started: Instant::now(),
+            source_patch: Duration::ZERO,
+            resolve_candidate: Duration::ZERO,
+            semantic_validation: Duration::ZERO,
+            document_update: Duration::ZERO,
+            gpu_update: Duration::ZERO,
+            hit_index_update: Duration::ZERO,
+        }
+    }
+
+    fn micros(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1_000_000.0
+    }
+}
+
+impl Drop for EditCommitProfile {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "connection-commit: patch_us={:.1} resolve_us={:.1} validate_us={:.1} document_us={:.1} gpu_us={:.1} hit_index_us={:.1} total_us={:.1}",
+            Self::micros(self.source_patch),
+            Self::micros(self.resolve_candidate),
+            Self::micros(self.semantic_validation),
+            Self::micros(self.document_update),
+            Self::micros(self.gpu_update),
+            Self::micros(self.hit_index_update),
+            Self::micros(self.started.elapsed()),
+        );
     }
 }
 
@@ -2714,9 +2859,9 @@ impl App {
         source_before: String,
     ) {
         if before_points == after_points {
-            self.rebuild_selected_scenes();
             return;
         }
+        let mut profile = EditCommitProfile::new();
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
             self.rebuild_selected_scenes();
             return;
@@ -2737,6 +2882,16 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
+        let Some(cache_connection_index) = current_scene
+            .connections
+            .iter()
+            .position(|connection| connection.key == connection_key)
+        else {
+            self.load_error = Some("Connection edit lost its connection identity".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let patch_started = Instant::now();
         let edit = match connection_points_edit_for_key(
             &source_before,
             current_scene,
@@ -2758,6 +2913,10 @@ impl App {
                 return;
             }
         };
+        if profile.enabled {
+            profile.source_patch = patch_started.elapsed();
+        }
+        let resolve_started = Instant::now();
         let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
@@ -2770,11 +2929,20 @@ impl App {
                 return;
             }
         };
-        let Some(connection) = resolved_diagram
+        if profile.enabled {
+            profile.resolve_candidate = resolve_started.elapsed();
+        }
+        let validation_started = Instant::now();
+        let Some(resolved_connection_index) = resolved_diagram
             .connections
             .iter()
-            .find(|connection| connection.key == connection_key)
+            .position(|connection| connection.key == connection_key)
         else {
+            self.load_error = Some("Connection edit lost its connection identity".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let Some(connection) = resolved_diagram.connections.get(resolved_connection_index) else {
             self.load_error = Some("Connection edit lost its connection identity".into());
             self.rebuild_selected_scenes();
             return;
@@ -2789,6 +2957,16 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         }
+        let Some(canonical_line) = connection.line.clone() else {
+            self.load_error = Some("Connection edit lost its Line annotation".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let connection_id = connection.id.clone();
+        if profile.enabled {
+            profile.semantic_validation = validation_started.elapsed();
+        }
+        let document_started = Instant::now();
         let Some(document) = self.document.as_mut() else {
             self.rebuild_selected_scenes();
             return;
@@ -2800,6 +2978,21 @@ impl App {
         if let Some(scene) = document.diagram_mut(&class_name) {
             *scene = resolved_diagram;
         }
+        if profile.enabled {
+            profile.document_update = document_started.elapsed();
+        }
+        let gpu_started = Instant::now();
+        self.diagram_scene
+            .commit_connection_points(&self.queue, &connection_id, &after_points);
+        if profile.enabled {
+            profile.gpu_update = gpu_started.elapsed();
+        }
+        let hit_index_started = Instant::now();
+        self.diagram_hit_cache
+            .update_connection(cache_connection_index, &canonical_line);
+        if profile.enabled {
+            profile.hit_index_update = hit_index_started.elapsed();
+        }
         self.history.push(EditCommand::MoveDiagramConnection {
             class_name,
             connection_key,
@@ -2808,7 +3001,6 @@ impl App {
         });
         self.redo_history.clear();
         self.load_error = None;
-        self.rebuild_selected_scenes();
     }
 
     fn commit_diagram_component_resize(
@@ -6756,6 +6948,65 @@ mod tests {
         assert!(nearby.component_indices.len() <= 1);
         assert!(nearby.port_indices.len() <= 2);
         assert!(nearby.connection_segments.len() <= 1);
+    }
+
+    #[test]
+    fn diagram_spatial_index_updates_only_moved_connection_segments() {
+        let mut index = DiagramSpatialIndex::default();
+        index.insert_connection_segment(
+            ConnectionSegmentRef {
+                connection_index: 7,
+                segment_index: 0,
+            },
+            HitBounds {
+                min: CorePoint { x: 0.0, y: 0.0 },
+                max: CorePoint { x: 20.0, y: 2.0 },
+            },
+        );
+        index.insert_connection_segment(
+            ConnectionSegmentRef {
+                connection_index: 8,
+                segment_index: 0,
+            },
+            HitBounds {
+                min: CorePoint { x: 0.0, y: 100.0 },
+                max: CorePoint { x: 20.0, y: 102.0 },
+            },
+        );
+
+        index.update_connection(
+            7,
+            [(
+                0,
+                HitBounds {
+                    min: CorePoint { x: 200.0, y: 0.0 },
+                    max: CorePoint { x: 220.0, y: 2.0 },
+                },
+            )],
+        );
+
+        assert!(index
+            .query(CorePoint { x: 10.0, y: 1.0 }, 2.0)
+            .connection_segments
+            .is_empty());
+        assert_eq!(
+            index
+                .query(CorePoint { x: 210.0, y: 1.0 }, 2.0)
+                .connection_segments,
+            vec![ConnectionSegmentRef {
+                connection_index: 7,
+                segment_index: 0,
+            }]
+        );
+        assert_eq!(
+            index
+                .query(CorePoint { x: 10.0, y: 101.0 }, 2.0)
+                .connection_segments,
+            vec![ConnectionSegmentRef {
+                connection_index: 8,
+                segment_index: 0,
+            }]
+        );
     }
 
     #[test]
