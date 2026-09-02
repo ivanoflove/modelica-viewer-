@@ -38,8 +38,8 @@ use modelica_core::{
 };
 use modelica_render::{
     connector_anchors, hit_test_connector_anchor, line_local_to_world, reanchor_connection_points,
-    resolve_connection_endpoints, resolved_graphic_contains_point, world_to_line_local,
-    ConnectorAnchor, PortKey,
+    resolve_connection_endpoints, resolved_graphic_contains_point,
+    resolved_graphic_contains_point_with_transform, world_to_line_local, ConnectorAnchor, PortKey,
 };
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
@@ -220,6 +220,64 @@ enum ConnectionHitTarget {
 struct ConnectionHit {
     connection_id: String,
     target: ConnectionHitTarget,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HitBounds {
+    min: CorePoint,
+    max: CorePoint,
+}
+
+impl HitBounds {
+    fn from_points(points: impl IntoIterator<Item = CorePoint>) -> Option<Self> {
+        let mut bounds = Self {
+            min: CorePoint {
+                x: f32::INFINITY,
+                y: f32::INFINITY,
+            },
+            max: CorePoint {
+                x: f32::NEG_INFINITY,
+                y: f32::NEG_INFINITY,
+            },
+        };
+        let mut any = false;
+        for point in points {
+            any = true;
+            bounds.min.x = bounds.min.x.min(point.x);
+            bounds.min.y = bounds.min.y.min(point.y);
+            bounds.max.x = bounds.max.x.max(point.x);
+            bounds.max.y = bounds.max.y.max(point.y);
+        }
+        any.then_some(bounds)
+    }
+
+    fn contains(self, point: CorePoint, tolerance: f32) -> bool {
+        let tolerance = tolerance.max(0.0);
+        point.x >= self.min.x - tolerance
+            && point.x <= self.max.x + tolerance
+            && point.y >= self.min.y - tolerance
+            && point.y <= self.max.y + tolerance
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ComponentHitItem {
+    id: String,
+    name: String,
+    bounds: HitBounds,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionHitItem {
+    id: String,
+    bounds: HitBounds,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiagramHitCache {
+    components: Vec<ComponentHitItem>,
+    connections: Vec<ConnectionHitItem>,
+    ports: Vec<ConnectorAnchor>,
 }
 
 #[derive(Clone, Debug)]
@@ -1111,6 +1169,7 @@ struct App {
     canvas_rect: Option<egui::Rect>,
     diagram_selection: DiagramSelection,
     hovered_port: Option<PortKey>,
+    diagram_hit_cache: DiagramHitCache,
     pointer_interaction: PointerInteraction,
     history: Vec<EditCommand>,
     redo_history: Vec<EditCommand>,
@@ -1410,6 +1469,7 @@ impl App {
             canvas_rect: None,
             diagram_selection: DiagramSelection::None,
             hovered_port: None,
+            diagram_hit_cache: DiagramHitCache::default(),
             pointer_interaction: PointerInteraction::None,
             history: Vec::new(),
             redo_history: Vec::new(),
@@ -1468,18 +1528,35 @@ impl App {
     ) -> Option<ConnectionHit> {
         let class_name = self.selected_class_name()?;
         let scene = self.document.as_ref()?.diagram(class_name)?;
-        hit_test_connection(&scene.connections, pointer_model, tolerance)
+        for item in self.diagram_hit_cache.connections.iter().rev() {
+            if !item.bounds.contains(pointer_model, tolerance) {
+                continue;
+            }
+            let Some(connection) = scene
+                .connections
+                .iter()
+                .find(|connection| connection.id == item.id)
+            else {
+                continue;
+            };
+            if let Some(hit) =
+                hit_test_connection(std::slice::from_ref(connection), pointer_model, tolerance)
+            {
+                return Some(hit);
+            }
+        }
+        None
     }
 
-    fn diagram_connector_anchors(&self) -> Option<Vec<ConnectorAnchor>> {
-        let class_name = self.selected_class_name()?;
-        let scene = self.document.as_ref()?.diagram(class_name)?;
-        Some(connector_anchors(scene))
+    fn diagram_connector_anchors(&self) -> Option<&[ConnectorAnchor]> {
+        self.selected_class_name()
+            .filter(|_| !self.diagram_hit_cache.ports.is_empty())
+            .map(|_| self.diagram_hit_cache.ports.as_slice())
     }
 
     fn hit_test_diagram_port(&self, pointer_model: CorePoint, tolerance: f32) -> Option<PortKey> {
         let anchors = self.diagram_connector_anchors()?;
-        hit_test_connector_anchor(&anchors, pointer_model, tolerance)
+        hit_test_connector_anchor(anchors, pointer_model, tolerance)
             .map(|anchor| anchor.key.clone())
     }
 
@@ -1700,27 +1777,35 @@ impl App {
                     self.begin_component_resize(component_name, handle);
                     return;
                 }
+                let hit_items = &self.diagram_hit_cache.components;
                 let Some((component_id, component_name, original_origin)) =
                     document.diagram(&class_name).and_then(|scene| {
-                        scene
-                            .components
+                        hit_items
                             .iter()
                             .rev()
-                            .find(|component| {
-                                component.editable
-                                    && component.visible
-                                    && diagram_component_contains_point(
-                                        component,
-                                        pointer_model,
-                                        tolerance,
-                                    )
-                            })
-                            .map(|component| {
-                                (
+                            .find_map(|item| {
+                                if !item.bounds.contains(pointer_model, tolerance) {
+                                    return None;
+                                }
+                                let component = scene.components.iter().find(|component| {
+                                    component.id == item.id
+                                        && component.name == item.name
+                                        && component.editable
+                                        && component.visible
+                                        && diagram_component_contains_point(
+                                            component,
+                                            pointer_model,
+                                            tolerance,
+                                        )
+                                })?;
+                                Some((
                                     component.id.clone(),
                                     component.name.clone(),
                                     component.origin,
-                                )
+                                ))
+                            })
+                            .map(|(component_id, component_name, origin)| {
+                                (component_id, component_name, origin)
                             })
                     })
                 else {
@@ -2014,6 +2099,8 @@ impl App {
             self.document.as_ref(),
             self.selected_class.as_deref(),
         );
+        self.diagram_hit_cache =
+            build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
     }
 
     fn finish_model_drag(&mut self, button: MouseButton) {
@@ -3069,7 +3156,7 @@ impl App {
                     icon_clip_rect,
                     selected_connection_points.as_deref(),
                     selected_component_overlay,
-                    diagram_anchors.as_deref(),
+                    diagram_anchors,
                     hovered_port.as_ref(),
                     selected_port.as_ref(),
                     zoom,
@@ -3146,6 +3233,7 @@ impl App {
                         self.pointer_interaction = PointerInteraction::None;
                         self.diagram_selection = DiagramSelection::None;
                         self.hovered_port = None;
+                        self.diagram_hit_cache = DiagramHitCache::default();
                         self.load_error = None;
                         self.update_title(None);
                     }
@@ -3188,6 +3276,8 @@ impl App {
             self.pointer_interaction = PointerInteraction::None;
             self.diagram_selection = DiagramSelection::None;
             self.hovered_port = None;
+            self.diagram_hit_cache =
+                build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
             self.fit_scene();
             self.update_title(None);
             self.window.request_redraw();
@@ -4397,6 +4487,53 @@ fn build_diagram_scene(
     gpu_scene_from_geometries(device, style_layout, geometries, "diagram")
 }
 
+fn build_diagram_hit_cache(
+    document: Option<&LoadedDocument>,
+    selected_class: Option<&str>,
+) -> DiagramHitCache {
+    let Some(scene) = document
+        .and_then(|document| selected_class.and_then(|class_name| document.diagram(class_name)))
+    else {
+        return DiagramHitCache::default();
+    };
+    let components = scene
+        .components
+        .iter()
+        .filter_map(|component| {
+            let extent = component
+                .placement_extent
+                .unwrap_or_else(default_component_extent);
+            let bounds = HitBounds::from_points(component_extent_corners(
+                component.origin,
+                extent,
+                component.rotation,
+            ))?;
+            Some(ComponentHitItem {
+                id: component.id.clone(),
+                name: component.name.clone(),
+                bounds,
+            })
+        })
+        .collect();
+    let connections = scene
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            let line = connection.line.as_ref()?;
+            let points = connection_world_points(line, &line.points);
+            Some(ConnectionHitItem {
+                id: connection.id.clone(),
+                bounds: HitBounds::from_points(points)?,
+            })
+        })
+        .collect();
+    DiagramHitCache {
+        components,
+        connections,
+        ports: connector_anchors(scene),
+    }
+}
+
 fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geometry]) {
     eprintln!(
         "diagram diagnostic: class={} components={} background={} connections={} gpu_geometries={}",
@@ -5352,12 +5489,11 @@ fn diagram_component_contains_point(
         y: -point.y,
     };
     icon.graphics.iter().any(|resolved| {
-        let mut candidate = resolved.clone();
-        candidate.transform = compose_transform(
+        let transform = compose_transform(
             diagram_flip,
             compose_transform(placement, resolved.transform),
         );
-        resolved_graphic_contains_point(&candidate, render_point, tolerance)
+        resolved_graphic_contains_point_with_transform(resolved, transform, render_point, tolerance)
     })
 }
 

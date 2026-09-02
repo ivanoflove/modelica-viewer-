@@ -46,12 +46,25 @@ pub fn resolved_graphic_contains_point(
     point: Point,
     tolerance: f32,
 ) -> bool {
-    let local = inverse_transform(point, graphic.transform);
-    let scale = graphic
-        .transform
+    resolved_graphic_contains_point_with_transform(graphic, graphic.transform, point, tolerance)
+}
+
+/// Hit test a resolved graphic using an explicit world transform.
+///
+/// Diagram callers can compose the component placement and coordinate-system
+/// flip once and pass it here, avoiding a temporary `ResolvedGraphic` clone in
+/// pointer-move paths.
+pub fn resolved_graphic_contains_point_with_transform(
+    graphic: &ResolvedGraphic,
+    transform: Transform2D,
+    point: Point,
+    tolerance: f32,
+) -> bool {
+    let local = inverse_transform(point, transform);
+    let scale = transform
         .scale_x
         .abs()
-        .min(graphic.transform.scale_y.abs())
+        .min(transform.scale_y.abs())
         .max(f32::EPSILON);
     graphic_contains_point(&graphic.graphic, local, tolerance / scale)
 }

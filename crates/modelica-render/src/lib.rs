@@ -19,7 +19,8 @@ pub use fill::{FillStyle, HatchPattern};
 pub use geometry::{Bounds, ModelPoint, ScreenPoint, Vec2};
 pub use hit_test::{
     graphic_contains_point, hit_test_graphics, hit_test_resolved_graphics,
-    resolved_graphic_contains_point, transform_point,
+    resolved_graphic_contains_point, resolved_graphic_contains_point_with_transform,
+    transform_point,
 };
 pub use line::{
     ArrowGeometry, ArrowKind, LineEnd, PathSegment, build_modelica_line_path, line_arrow_geometry,
