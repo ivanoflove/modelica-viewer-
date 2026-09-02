@@ -165,6 +165,54 @@ pub fn nearest_connector_anchor<'a>(
         .map(|(_, anchor)| anchor)
 }
 
+/// Return the hit distance for a connector's semantic point or visual bounds.
+///
+/// The semantic point is preferred. The visual bounds make larger connector
+/// graphics easy to select without changing the point used for topology.
+pub fn connector_anchor_hit_distance(
+    anchor: &ConnectorAnchor,
+    point: Point,
+    tolerance: f32,
+) -> Option<f32> {
+    let semantic_distance = distance(anchor.world_position, point);
+    if semantic_distance <= tolerance.max(0.0) {
+        return Some(semantic_distance);
+    }
+    let bounds = anchor.visual_bounds?;
+    let min_x = bounds.x - tolerance.max(0.0);
+    let min_y = bounds.y - tolerance.max(0.0);
+    let max_x = bounds.x + bounds.width + tolerance.max(0.0);
+    let max_y = bounds.y + bounds.height + tolerance.max(0.0);
+    if point.x < min_x || point.x > max_x || point.y < min_y || point.y > max_y {
+        return None;
+    }
+    let nearest_x = point.x.clamp(bounds.x, bounds.x + bounds.width);
+    let nearest_y = point.y.clamp(bounds.y, bounds.y + bounds.height);
+    Some(distance(
+        point,
+        Point {
+            x: nearest_x,
+            y: nearest_y,
+        },
+    ))
+}
+
+/// Find the nearest connector using both semantic and visual hit regions.
+pub fn hit_test_connector_anchor<'a>(
+    anchors: &'a [ConnectorAnchor],
+    point: Point,
+    tolerance: f32,
+) -> Option<&'a ConnectorAnchor> {
+    anchors
+        .iter()
+        .filter_map(|anchor| {
+            connector_anchor_hit_distance(anchor, point, tolerance)
+                .map(|distance| (distance, anchor))
+        })
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map(|(_, anchor)| anchor)
+}
+
 /// Resolve both line endpoints to semantic connector positions.
 pub fn resolve_connection_endpoints(
     scene: &DiagramScene,

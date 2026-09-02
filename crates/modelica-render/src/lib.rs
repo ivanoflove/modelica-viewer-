@@ -11,8 +11,9 @@ pub mod viewport;
 pub use connection_edit::{line_local_to_world, world_to_line_local};
 pub use connector::{
     ConnectionEndpointSide, ConnectorAnchor, ConnectorResolutionError, PortKey,
-    ResolvedConnectionEndpoints, connector_anchors, find_connector_anchor,
-    nearest_connector_anchor, resolve_connection_endpoints, strict_connection_points,
+    ResolvedConnectionEndpoints, connector_anchor_hit_distance, connector_anchors,
+    find_connector_anchor, hit_test_connector_anchor, nearest_connector_anchor,
+    resolve_connection_endpoints, strict_connection_points,
 };
 pub use fill::{FillStyle, HatchPattern};
 pub use geometry::{Bounds, ModelPoint, ScreenPoint, Vec2};

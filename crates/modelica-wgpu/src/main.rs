@@ -37,7 +37,10 @@ use modelica_core::{
     parse, resolve_diagram, Class, ClassKind, IconResolver, Library, LibraryKind, LibraryRegistry,
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
-use modelica_render::{line_local_to_world, resolved_graphic_contains_point, world_to_line_local};
+use modelica_render::{
+    connector_anchors, hit_test_connector_anchor, line_local_to_world,
+    resolved_graphic_contains_point, world_to_line_local, ConnectorAnchor, PortKey,
+};
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -181,6 +184,7 @@ enum MainView {
 enum DiagramSelection {
     #[default]
     None,
+    Port(PortKey),
     Component(String),
     Connection(String),
 }
@@ -1148,6 +1152,7 @@ struct App {
     modifiers: ModifiersState,
     canvas_rect: Option<egui::Rect>,
     diagram_selection: DiagramSelection,
+    hovered_port: Option<PortKey>,
     pointer_interaction: PointerInteraction,
     history: Vec<EditCommand>,
     redo_history: Vec<EditCommand>,
@@ -1446,6 +1451,7 @@ impl App {
             modifiers: ModifiersState::default(),
             canvas_rect: None,
             diagram_selection: DiagramSelection::None,
+            hovered_port: None,
             pointer_interaction: PointerInteraction::None,
             history: Vec::new(),
             redo_history: Vec::new(),
@@ -1505,6 +1511,28 @@ impl App {
         let class_name = self.selected_class_name()?;
         let scene = self.document.as_ref()?.diagram(class_name)?;
         hit_test_connection(&scene.connections, pointer_model, tolerance)
+    }
+
+    fn diagram_connector_anchors(&self) -> Option<Vec<ConnectorAnchor>> {
+        let class_name = self.selected_class_name()?;
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        Some(connector_anchors(scene))
+    }
+
+    fn hit_test_diagram_port(&self, pointer_model: CorePoint, tolerance: f32) -> Option<PortKey> {
+        let anchors = self.diagram_connector_anchors()?;
+        hit_test_connector_anchor(&anchors, pointer_model, tolerance)
+            .map(|anchor| anchor.key.clone())
+    }
+
+    fn update_hovered_diagram_port(&mut self) {
+        if self.main_view != MainView::Diagram || !self.pointer_over_canvas() {
+            self.hovered_port = None;
+            return;
+        }
+        let pointer_model = self.screen_to_model(self.cursor);
+        let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
+        self.hovered_port = self.hit_test_diagram_port(pointer_model, tolerance);
     }
 
     fn begin_connection_edit(&mut self, hit: ConnectionHit, pointer_model: CorePoint) {
@@ -1701,6 +1729,13 @@ impl App {
                 let Some(document) = self.document.as_ref() else {
                     return;
                 };
+                if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
+                    self.diagram_selection = DiagramSelection::Port(port.clone());
+                    self.hovered_port = Some(port);
+                    self.pointer_interaction = PointerInteraction::None;
+                    self.window.request_redraw();
+                    return;
+                }
                 if let Some((component_name, handle)) =
                     self.hit_test_selected_component_handle(pointer_model, tolerance)
                 {
@@ -2931,6 +2966,16 @@ impl App {
         let mut collapse_all_requested = false;
         let selected_connection_points = self.selected_connection_overlay_points();
         let selected_component_overlay = self.selected_component_overlay();
+        let diagram_anchors = if self.main_view == MainView::Diagram {
+            self.diagram_connector_anchors()
+        } else {
+            None
+        };
+        let hovered_port = self.hovered_port.clone();
+        let selected_port = match &self.diagram_selection {
+            DiagramSelection::Port(key) => Some(key.clone()),
+            _ => None,
+        };
         let zoom = self.zoom;
         let pan = self.pan;
         let viewport = [self.config.width, self.config.height];
@@ -2959,6 +3004,9 @@ impl App {
                     icon_clip_rect,
                     selected_connection_points.as_deref(),
                     selected_component_overlay,
+                    diagram_anchors.as_deref(),
+                    hovered_port.as_ref(),
+                    selected_port.as_ref(),
                     zoom,
                     pan,
                     viewport,
@@ -2981,6 +3029,7 @@ impl App {
         if previous_main_view != self.main_view {
             self.pointer_interaction = PointerInteraction::None;
             self.diagram_selection = DiagramSelection::None;
+            self.hovered_port = None;
         }
         if expand_all_requested {
             if let Some(document) = &self.document {
@@ -3031,6 +3080,7 @@ impl App {
                         self.canvas_rect = None;
                         self.pointer_interaction = PointerInteraction::None;
                         self.diagram_selection = DiagramSelection::None;
+                        self.hovered_port = None;
                         self.load_error = None;
                         self.update_title(None);
                     }
@@ -3072,6 +3122,7 @@ impl App {
             self.canvas_rect = None;
             self.pointer_interaction = PointerInteraction::None;
             self.diagram_selection = DiagramSelection::None;
+            self.hovered_port = None;
             self.fit_scene();
             self.update_title(None);
             self.window.request_redraw();
@@ -4120,6 +4171,9 @@ fn draw_diagram_selection_overlay(
     canvas_rect: Option<egui::Rect>,
     points: Option<&[CorePoint]>,
     component: Option<ComponentSelectionOverlay>,
+    anchors: Option<&[ConnectorAnchor]>,
+    hovered_port: Option<&PortKey>,
+    selected_port: Option<&PortKey>,
     zoom: f32,
     pan: [f32; 2],
     viewport: [u32; 2],
@@ -4189,6 +4243,58 @@ fn draw_diagram_selection_overlay(
                 egui::Rect::from_center_size(screen_corners[index], Vec2::splat(10.0)),
                 Rounding::same(2.0),
                 Stroke::new(1.0_f32, theme_surface()),
+            );
+        }
+    }
+    if let Some(anchors) = anchors {
+        for anchor in anchors {
+            let hovered = hovered_port.is_some_and(|key| key == &anchor.key);
+            let selected = selected_port.is_some_and(|key| key == &anchor.key);
+            if !hovered && !selected {
+                continue;
+            }
+            let center = to_screen(anchor.world_position);
+            let color = if selected {
+                accent
+            } else {
+                theme_accent_soft(190)
+            };
+            if let Some(bounds) = anchor.visual_bounds {
+                let corners = [
+                    to_screen(CorePoint {
+                        x: bounds.x,
+                        y: bounds.y,
+                    }),
+                    to_screen(CorePoint {
+                        x: bounds.x + bounds.width,
+                        y: bounds.y,
+                    }),
+                    to_screen(CorePoint {
+                        x: bounds.x + bounds.width,
+                        y: bounds.y + bounds.height,
+                    }),
+                    to_screen(CorePoint {
+                        x: bounds.x,
+                        y: bounds.y + bounds.height,
+                    }),
+                ];
+                for index in 0..corners.len() {
+                    painter.line_segment(
+                        [corners[index], corners[(index + 1) % corners.len()]],
+                        Stroke::new(if selected { 1.5_f32 } else { 1.0_f32 }, color),
+                    );
+                }
+            }
+            painter.circle_filled(center, if selected { 6.0 } else { 5.0 }, color);
+            painter.circle_stroke(
+                center,
+                if selected { 10.0 } else { 8.0 },
+                Stroke::new(1.5_f32, theme_surface()),
+            );
+            painter.circle_stroke(
+                center,
+                if selected { 10.0 } else { 8.0 },
+                Stroke::new(1.5_f32, color),
             );
         }
     }
@@ -6154,7 +6260,9 @@ fn main() {
                         }
                         WindowEvent::CursorMoved { position, .. } => {
                             app.cursor = position;
+                            app.update_hovered_diagram_port();
                             app.update_model_drag_preview(position);
+                            app.window.request_redraw();
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
                             if state == ElementState::Released {
