@@ -1604,6 +1604,10 @@ name = "modelica-core"
 version = "0.1.0"
 
 [[package]]
+name = "modelica-omc"
+version = "0.1.0"
+
+[[package]]
 name = "modelica-render"
 version = "0.1.0"
 dependencies = [
@@ -1620,6 +1624,7 @@ dependencies = [
  "egui-winit",
  "lyon",
  "modelica-core",
+ "modelica-omc",
  "modelica-render",
  "pollster",
  "rfd",

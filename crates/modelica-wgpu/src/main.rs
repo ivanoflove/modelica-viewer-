@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -37,6 +39,7 @@ use modelica_core::{
     parse, resolve_diagram, Class, ClassKind, IconResolver, Library, LibraryKind, LibraryRegistry,
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
+use modelica_omc::{OmcBackend, SemanticModel};
 use modelica_render::{line_local_to_world, resolved_graphic_contains_point, world_to_line_local};
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
@@ -6059,9 +6062,109 @@ fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
     button == MouseButton::Middle || (button == MouseButton::Left && control_pressed)
 }
 
+fn semantic_dump_cli(arguments: &[OsString]) -> Result<(), String> {
+    let class_name = arguments
+        .first()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "usage: modelica-wgpu --semantic-dump <qualified-class> [--model <file.mo>]".to_owned()
+        })?;
+
+    let mut model_path = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        match arguments[index].to_str() {
+            Some("--model") => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "--model requires a Modelica source file path".to_owned())?;
+                model_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            Some(option) => {
+                return Err(format!(
+                    "unknown semantic-dump option '{option}'; usage: modelica-wgpu --semantic-dump <qualified-class> [--model <file.mo>]"
+                ));
+            }
+            None => return Err("semantic-dump arguments must be valid UTF-8".to_owned()),
+        }
+    }
+
+    let (backend, version) = OmcBackend::detect().map_err(|error| error.to_string())?;
+    let model_path = model_path
+        .or_else(|| env::var_os("MODELICA_MODEL_FILE").map(PathBuf::from))
+        .ok_or_else(|| {
+            format!(
+                "OpenModelica {} is available, but no Modelica source was supplied; pass --model <file.mo> or set MODELICA_MODEL_FILE",
+                version.stdout.trim()
+            )
+        })?;
+    let model = backend
+        .load_semantic_model(&model_path, class_name)
+        .map_err(|error| error.to_string())?;
+    print_semantic_model(&model);
+    Ok(())
+}
+
+fn print_semantic_model(model: &SemanticModel) {
+    println!("class {}", model.class_name);
+    println!("components {}", model.components.len());
+    for component in &model.components {
+        println!(
+            "  {} kind={} resolved_type={}",
+            component.instance_path,
+            component.kind.as_deref().unwrap_or("unknown"),
+            component
+                .resolved_qualified_type
+                .as_deref()
+                .unwrap_or("unknown")
+        );
+    }
+    println!("connectors {}", model.connectors.len());
+    for connector in &model.connectors {
+        println!(
+            "  {} resolved_type={} iconGraphics={}",
+            connector.instance_path,
+            connector.resolved_type.as_deref().unwrap_or("unknown"),
+            connector.icon_graphics.len()
+        );
+    }
+    println!("connections {}", model.connections.len());
+    for connection in &model.connections {
+        println!(
+            "  {} -> {} Line.points={}",
+            connection.lhs,
+            connection.rhs,
+            connection.line_points.len()
+        );
+    }
+    for diagnostic in &model.diagnostics {
+        println!(
+            "diagnostic {}: {}{}",
+            diagnostic.code,
+            diagnostic.message,
+            diagnostic
+                .context
+                .as_deref()
+                .map(|context| format!(" ({context})"))
+                .unwrap_or_default()
+        );
+    }
+}
+
 #[allow(deprecated)]
 fn main() {
-    let input = env::args_os().nth(1).map(PathBuf::from);
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().and_then(|value| value.to_str()) == Some("--semantic-dump") {
+        if let Err(error) = semantic_dump_cli(&arguments[1..]) {
+            eprintln!("modelica-wgpu semantic dump failed: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    let input = arguments.first().cloned().map(PathBuf::from);
     let document = match input.as_deref() {
         Some(path) => match LoadedDocument::load(path) {
             Ok(document) => {
