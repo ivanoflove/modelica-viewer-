@@ -1526,12 +1526,16 @@ impl App {
         pointer_model: CorePoint,
         tolerance: f32,
     ) -> Option<ConnectionHit> {
+        let started = Instant::now();
+        let mut broad_candidates = 0;
+        let precise_started = Instant::now();
         let class_name = self.selected_class_name()?;
         let scene = self.document.as_ref()?.diagram(class_name)?;
         for item in self.diagram_hit_cache.connections.iter().rev() {
             if !item.bounds.contains(pointer_model, tolerance) {
                 continue;
             }
+            broad_candidates += 1;
             let Some(connection) = scene
                 .connections
                 .iter()
@@ -1542,8 +1546,24 @@ impl App {
             if let Some(hit) =
                 hit_test_connection(std::slice::from_ref(connection), pointer_model, tolerance)
             {
+                if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+                    eprintln!(
+                        "hit-test connection: broad_candidates={} precise_ms={:.3} total_ms={:.3}",
+                        broad_candidates,
+                        precise_started.elapsed().as_secs_f64() * 1000.0,
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 return Some(hit);
             }
+        }
+        if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+            eprintln!(
+                "hit-test connection: broad_candidates={} precise_ms={:.3} total_ms={:.3}",
+                broad_candidates,
+                precise_started.elapsed().as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
         None
     }
@@ -1555,9 +1575,63 @@ impl App {
     }
 
     fn hit_test_diagram_port(&self, pointer_model: CorePoint, tolerance: f32) -> Option<PortKey> {
+        let started = Instant::now();
         let anchors = self.diagram_connector_anchors()?;
-        hit_test_connector_anchor(anchors, pointer_model, tolerance)
-            .map(|anchor| anchor.key.clone())
+        let result = hit_test_connector_anchor(anchors, pointer_model, tolerance)
+            .map(|anchor| anchor.key.clone());
+        if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+            eprintln!(
+                "hit-test port: candidates={} total_ms={:.3}",
+                anchors.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        result
+    }
+
+    fn hit_test_diagram_component(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<(String, String, CorePoint)> {
+        let started = Instant::now();
+        let broad_started = Instant::now();
+        let hit_items = &self.diagram_hit_cache.components;
+        let class_name = self.selected_class_name()?;
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let broad_candidates = hit_items
+            .iter()
+            .filter(|item| item.bounds.contains(pointer_model, tolerance))
+            .count();
+        let broad_ms = broad_started.elapsed().as_secs_f64() * 1000.0;
+        let precise_started = Instant::now();
+        let result = hit_items.iter().rev().find_map(|item| {
+            if !item.bounds.contains(pointer_model, tolerance) {
+                return None;
+            }
+            let component = scene.components.iter().find(|component| {
+                component.id == item.id
+                    && component.name == item.name
+                    && component.editable
+                    && component.visible
+                    && diagram_component_contains_point(component, pointer_model, tolerance)
+            })?;
+            Some((
+                component.id.clone(),
+                component.name.clone(),
+                component.origin,
+            ))
+        });
+        if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+            eprintln!(
+                "hit-test component: broad_candidates={} broad_ms={:.3} precise_ms={:.3} total_ms={:.3}",
+                broad_candidates,
+                broad_ms,
+                precise_started.elapsed().as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        result
     }
 
     fn update_hovered_diagram_port(&mut self) {
@@ -1761,6 +1835,7 @@ impl App {
                 };
             }
             MainView::Diagram => {
+                let hit_test_started = Instant::now();
                 let Some(document) = self.document.as_ref() else {
                     return;
                 };
@@ -1777,42 +1852,19 @@ impl App {
                     self.begin_component_resize(component_name, handle);
                     return;
                 }
-                let hit_items = &self.diagram_hit_cache.components;
                 let Some((component_id, component_name, original_origin)) =
-                    document.diagram(&class_name).and_then(|scene| {
-                        hit_items
-                            .iter()
-                            .rev()
-                            .find_map(|item| {
-                                if !item.bounds.contains(pointer_model, tolerance) {
-                                    return None;
-                                }
-                                let component = scene.components.iter().find(|component| {
-                                    component.id == item.id
-                                        && component.name == item.name
-                                        && component.editable
-                                        && component.visible
-                                        && diagram_component_contains_point(
-                                            component,
-                                            pointer_model,
-                                            tolerance,
-                                        )
-                                })?;
-                                Some((
-                                    component.id.clone(),
-                                    component.name.clone(),
-                                    component.origin,
-                                ))
-                            })
-                            .map(|(component_id, component_name, origin)| {
-                                (component_id, component_name, origin)
-                            })
-                    })
+                    self.hit_test_diagram_component(pointer_model, tolerance)
                 else {
                     if let Some(hit) = self.hit_test_diagram_connection(pointer_model, tolerance) {
                         self.begin_connection_edit(hit, pointer_model);
                     } else {
                         self.diagram_selection = DiagramSelection::None;
+                    }
+                    if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+                        eprintln!(
+                            "hit-test mouse-down: total_ms={:.3}",
+                            hit_test_started.elapsed().as_secs_f64() * 1000.0
+                        );
                     }
                     return;
                 };
