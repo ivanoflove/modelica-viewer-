@@ -34,7 +34,7 @@ use modelica_core::scene::{
 use modelica_core::{
     apply_source_transaction,
     lexer::{tokenize, Token, TokenKind},
-    parse, resolve_diagram, Class, IconResolver, Library, LibraryKind, LibraryRegistry,
+    parse, resolve_diagram, Class, ClassKind, IconResolver, Library, LibraryKind, LibraryRegistry,
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
 use modelica_render::{line_local_to_world, resolved_graphic_contains_point, world_to_line_local};
@@ -845,10 +845,21 @@ enum FillMode {
     Sphere = 3,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DiagramRenderLayer {
+    Background,
+    Component,
+    Connection,
+    Connector,
+    Overlay,
+}
+
 struct Geometry {
     vertices: Vec<Vertex>,
     indices: Vec<u16>,
     style: StyleUniform,
+    layer: DiagramRenderLayer,
     edit_key: Option<String>,
     connection: Option<ConnectionGeometry>,
     component: Option<ComponentGeometry>,
@@ -4231,9 +4242,11 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
         }
         let bounds = (vertices > 0).then_some((min, max));
         eprintln!(
-            "diagram diagnostic component={} type={:?} owner={} origin=({:.2},{:.2}) rotation={:.2} placement={:?} icon_extent={:?} icon_graphics={} transform=translation({:.2},{:.2}) rotation({:.2}) scale({:.4},{:.4}) gpu_geometries={} vertices={} bounds={bounds:?}",
+            "diagram diagnostic component={} type={:?} class_kind={:?} editable={} owner={} origin=({:.2},{:.2}) rotation={:.2} placement={:?} icon_extent={:?} icon_graphics={} transform=translation({:.2},{:.2}) rotation({:.2}) scale({:.4},{:.4}) gpu_geometries={} vertices={} bounds={bounds:?}",
             component.name,
             component.resolved_type_qualified_name,
+            component.class_kind,
+            component.editable,
             component.source_owner,
             component.origin.x,
             component.origin.y,
@@ -4330,6 +4343,10 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         .background_graphics
         .iter()
         .flat_map(|graphic| core_graphic_geometry_from_graphic(graphic, diagram_flip))
+        .map(|mut geometry| {
+            geometry.layer = DiagramRenderLayer::Background;
+            geometry
+        })
         .collect::<Vec<_>>();
     for connection in &scene.connections {
         if let Some(line) = &connection.line {
@@ -4337,6 +4354,7 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
                 line_geometry(line, diagram_flip)
                     .into_iter()
                     .map(|mut geometry| {
+                        geometry.layer = DiagramRenderLayer::Connection;
                         geometry.edit_key = Some(connection.id.clone());
                         geometry.connection = Some(ConnectionGeometry {
                             line: line.clone(),
@@ -4356,6 +4374,14 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         };
         let placement = diagram_placement_transform(icon, component);
         let parent_component_transform = compose_transform(diagram_flip, placement);
+        let layer = if matches!(
+            component.class_kind,
+            Some(ClassKind::Connector | ClassKind::ExpandableConnector)
+        ) {
+            DiagramRenderLayer::Connector
+        } else {
+            DiagramRenderLayer::Component
+        };
         for resolved in &icon.graphics {
             let graphic_transform = compose_transform(placement, resolved.transform);
             let transform = compose_transform(diagram_flip, graphic_transform);
@@ -4363,6 +4389,7 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
                 core_graphic_geometry_from_graphic(&resolved.graphic, transform)
                     .into_iter()
                     .map(|mut geometry| {
+                        geometry.layer = layer;
                         geometry.edit_key = Some(component.id.clone());
                         geometry.component = Some(ComponentGeometry {
                             transform: parent_component_transform,
@@ -4372,6 +4399,9 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
             );
         }
     }
+    // Keep z-order independent from source/component iteration order. The
+    // egui selection handles are rendered in a later foreground pass.
+    geometries.sort_by_key(|geometry| geometry.layer);
     geometries
 }
 
@@ -4887,6 +4917,7 @@ where
             .collect(),
         indices: buffers.indices,
         style,
+        layer: DiagramRenderLayer::Component,
         edit_key: None,
         connection: None,
         component: None,
@@ -4924,6 +4955,7 @@ where
             mode: FillMode::Solid as u32,
             _padding: [0; 7],
         },
+        layer: DiagramRenderLayer::Component,
         edit_key: None,
         connection: None,
         component: None,
@@ -6625,6 +6657,161 @@ mod tests {
         assert!((color[0] - 0.21586).abs() < 0.001);
         assert!((color[1] - 0.05127).abs() < 0.001);
         assert_eq!(color[2], 1.0);
+    }
+
+    #[test]
+    fn diagram_layers_draw_connectors_after_opaque_components() {
+        let coordinate_system = modelica_core::scene::CoordinateSystem::default();
+        let icon_for = |owner: &str, graphic: CoreGraphic| {
+            Box::new(CoreIconScene {
+                owner_qualified_name: Some(owner.to_owned()),
+                coordinate_system,
+                graphics: vec![ResolvedGraphic {
+                    id: modelica_core::scene::GraphicId(format!("{owner}::graphic")),
+                    graphic,
+                    owner: modelica_core::scene::GraphicOwner {
+                        qualified_name: owner.to_owned(),
+                        kind: GraphicOwnerKind::Own,
+                        instance_name: None,
+                    },
+                    transform: Transform2D::identity(),
+                    editable: false,
+                }],
+                diagnostics: Vec::new(),
+            })
+        };
+        let component_for = |id: &str,
+                             name: &str,
+                             class_kind: ClassKind,
+                             icon: Box<CoreIconScene>,
+                             extent: modelica_core::scene::Extent| {
+            CoreComponentInstance {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                source_owner: "Synthetic".to_owned(),
+                type_name: name.to_owned(),
+                resolved_type_qualified_name: Some(name.to_owned()),
+                class_kind: Some(class_kind),
+                origin: CorePoint { x: 0.0, y: 0.0 },
+                rotation: 0.0,
+                placement_extent: Some(extent),
+                visible: true,
+                editable: true,
+                resolved_icon: Some(icon),
+            }
+        };
+        let rectangle = CoreGraphic::Rectangle(RectangleGraphic {
+            origin: CorePoint { x: 0.0, y: 0.0 },
+            rotation: 0.0,
+            extent: modelica_core::scene::Extent {
+                p1: CorePoint {
+                    x: -100.0,
+                    y: -100.0,
+                },
+                p2: CorePoint { x: 100.0, y: 100.0 },
+            },
+            line_color: [0, 0, 0],
+            fill_color: [255, 255, 255],
+            line_pattern: Some("LinePattern.Solid".to_owned()),
+            line_thickness: Some(1.0),
+            fill_pattern: Some("FillPattern.Solid".to_owned()),
+            radius: None,
+        });
+        let connector_graphic = |color| {
+            CoreGraphic::Ellipse(EllipseGraphic {
+                origin: CorePoint { x: 0.0, y: 0.0 },
+                rotation: 0.0,
+                extent: modelica_core::scene::Extent {
+                    p1: CorePoint { x: -20.0, y: -20.0 },
+                    p2: CorePoint { x: 20.0, y: 20.0 },
+                },
+                line_color: [0, 0, 0],
+                fill_color: color,
+                line_pattern: Some("LinePattern.Solid".to_owned()),
+                line_thickness: Some(1.0),
+                fill_pattern: Some("FillPattern.Solid".to_owned()),
+                start_angle: None,
+                end_angle: None,
+            })
+        };
+        let extent = modelica_core::scene::Extent {
+            p1: CorePoint {
+                x: -100.0,
+                y: -20.0,
+            },
+            p2: CorePoint { x: -60.0, y: 20.0 },
+        };
+        let extent_b = modelica_core::scene::Extent {
+            p1: CorePoint { x: 60.0, y: -20.0 },
+            p2: CorePoint { x: 100.0, y: 20.0 },
+        };
+        // Deliberately put connectors first and the opaque component last.
+        let scene = CoreDiagramScene {
+            class_qualified_name: Some("Synthetic".to_owned()),
+            class_kind: Some(ClassKind::Model),
+            coordinate_system,
+            background_graphics: Vec::new(),
+            components: vec![
+                component_for(
+                    "connector-a",
+                    "port_a",
+                    ClassKind::Connector,
+                    icon_for("FluidPort_a", connector_graphic([0, 127, 255])),
+                    extent,
+                ),
+                component_for(
+                    "connector-b",
+                    "port_b",
+                    ClassKind::ExpandableConnector,
+                    icon_for("FluidPort_b", connector_graphic([255, 127, 0])),
+                    extent_b,
+                ),
+                component_for(
+                    "component",
+                    "body",
+                    ClassKind::Model,
+                    icon_for("OpaqueBody", rectangle),
+                    modelica_core::scene::Extent {
+                        p1: CorePoint {
+                            x: -100.0,
+                            y: -100.0,
+                        },
+                        p2: CorePoint { x: 100.0, y: 100.0 },
+                    },
+                ),
+            ],
+            connections: Vec::new(),
+            diagnostics: Vec::new(),
+            content_bounds: None,
+        };
+
+        let geometries = core_diagram_geometry(&scene);
+        let layers = geometries
+            .iter()
+            .map(|geometry| geometry.layer)
+            .collect::<Vec<_>>();
+        assert!(layers.windows(2).all(|pair| pair[0] <= pair[1]));
+        let body_index = geometries
+            .iter()
+            .position(|geometry| geometry.edit_key.as_deref() == Some("component"))
+            .expect("opaque component geometry");
+        let connector_indices = geometries
+            .iter()
+            .enumerate()
+            .filter(|(_, geometry)| {
+                matches!(
+                    geometry.edit_key.as_deref(),
+                    Some("connector-a") | Some("connector-b")
+                )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(connector_indices.len(), 4);
+        assert!(connector_indices.iter().all(|index| *index > body_index));
+        assert_eq!(geometries[body_index].layer, DiagramRenderLayer::Component);
+        assert!(connector_indices
+            .iter()
+            .all(|index| geometries[*index].layer == DiagramRenderLayer::Connector));
     }
 
     #[test]
