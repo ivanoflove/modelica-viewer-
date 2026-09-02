@@ -1,0 +1,18 @@
+[package]
+name = "modelica-wgpu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1.16", features = ["derive"] }
+egui = "0.28.1"
+egui-wgpu = "0.28.1"
+egui-winit = "0.28.1"
+modelica-core = { path = "../modelica-core" }
+modelica-render = { path = "../modelica-render" }
+lyon = "1.0"
+pollster = "0.3"
+rfd = "0.14.1"
+wgpu = "0.20"
+winit = "0.29"
