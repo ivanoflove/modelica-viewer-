@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    env,
-    ffi::OsString,
-    fs,
+    env, fs,
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -39,7 +37,6 @@ use modelica_core::{
     parse, resolve_diagram, Class, ClassKind, IconResolver, Library, LibraryKind, LibraryRegistry,
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
-use modelica_omc::{OmcBackend, SemanticModel};
 use modelica_render::{line_local_to_world, resolved_graphic_contains_point, world_to_line_local};
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
@@ -1907,7 +1904,7 @@ impl App {
                     handle,
                     current,
                 );
-                let Some(icon) = original_component.resolved_icon.as_deref() else {
+                let Some(icon) = original_component.diagram_layer() else {
                     return;
                 };
                 let placement = diagram_placement_transform_for_extent(
@@ -4239,10 +4236,12 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
         geometries.len()
     );
     for component in &scene.components {
-        let Some(icon) = component.resolved_icon.as_deref() else {
+        let Some(icon) = component.diagram_layer() else {
             eprintln!(
-                "diagram diagnostic component={} type={:?} owner={} has no resolved icon",
+                "diagram diagnostic component={} type={:?} owner={} has no diagram layer (icon_graphics={} diagram_graphics={})",
                 component.name, component.resolved_type_qualified_name, component.source_owner
+                    , component.resolved_icon.as_deref().map_or(0, |scene| scene.graphics.len())
+                    , component.resolved_diagram.as_deref().map_or(0, |scene| scene.graphics.len())
             );
             continue;
         };
@@ -4265,7 +4264,7 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
         }
         let bounds = (vertices > 0).then_some((min, max));
         eprintln!(
-            "diagram diagnostic component={} type={:?} class_kind={:?} editable={} owner={} origin=({:.2},{:.2}) rotation={:.2} placement={:?} icon_extent={:?} icon_graphics={} transform=translation({:.2},{:.2}) rotation({:.2}) scale({:.4},{:.4}) gpu_geometries={} vertices={} bounds={bounds:?}",
+            "diagram diagnostic component={} type={:?} class_kind={:?} editable={} owner={} origin=({:.2},{:.2}) rotation={:.2} placement={:?} layer_extent={:?} icon_graphics={} diagram_graphics={} transform=translation({:.2},{:.2}) rotation({:.2}) scale({:.4},{:.4}) gpu_geometries={} vertices={} bounds={bounds:?}",
             component.name,
             component.resolved_type_qualified_name,
             component.class_kind,
@@ -4276,7 +4275,11 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
             component.rotation,
             component.placement_extent,
             icon.coordinate_system.extent,
-            icon.graphics.len(),
+            component.resolved_icon.as_deref().map_or(0, |scene| scene.graphics.len()),
+            component
+                .resolved_diagram
+                .as_deref()
+                .map_or(0, |scene| scene.graphics.len()),
             placement.translation.x,
             placement.translation.y,
             placement.rotation,
@@ -4393,7 +4396,7 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         if !component.visible {
             continue;
         }
-        let Some(icon) = component.resolved_icon.as_deref() else {
+        let Some(icon) = component.diagram_layer() else {
             continue;
         };
         let placement = diagram_placement_transform(icon, component);
@@ -5165,7 +5168,7 @@ fn diagram_component_contains_point(
     point: CorePoint,
     tolerance: f32,
 ) -> bool {
-    let Some(icon) = component.resolved_icon.as_deref() else {
+    let Some(icon) = component.diagram_layer() else {
         return false;
     };
     let diagram_flip = Transform2D {
@@ -5627,7 +5630,7 @@ fn connector_world_position(
     extent: modelica_core::scene::Extent,
     connector_path: &str,
 ) -> Option<CorePoint> {
-    let icon = component.resolved_icon.as_deref()?;
+    let icon = component.diagram_layer()?;
     let lookup_name = connector_lookup_name(connector_path);
     let graphic = icon.graphics.iter().find(|graphic| {
         graphic.owner.kind == GraphicOwnerKind::Connector
@@ -6062,109 +6065,9 @@ fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
     button == MouseButton::Middle || (button == MouseButton::Left && control_pressed)
 }
 
-fn semantic_dump_cli(arguments: &[OsString]) -> Result<(), String> {
-    let class_name = arguments
-        .first()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            "usage: modelica-wgpu --semantic-dump <qualified-class> [--model <file.mo>]".to_owned()
-        })?;
-
-    let mut model_path = None;
-    let mut index = 1;
-    while index < arguments.len() {
-        match arguments[index].to_str() {
-            Some("--model") => {
-                let value = arguments
-                    .get(index + 1)
-                    .ok_or_else(|| "--model requires a Modelica source file path".to_owned())?;
-                model_path = Some(PathBuf::from(value));
-                index += 2;
-            }
-            Some(option) => {
-                return Err(format!(
-                    "unknown semantic-dump option '{option}'; usage: modelica-wgpu --semantic-dump <qualified-class> [--model <file.mo>]"
-                ));
-            }
-            None => return Err("semantic-dump arguments must be valid UTF-8".to_owned()),
-        }
-    }
-
-    let (backend, version) = OmcBackend::detect().map_err(|error| error.to_string())?;
-    let model_path = model_path
-        .or_else(|| env::var_os("MODELICA_MODEL_FILE").map(PathBuf::from))
-        .ok_or_else(|| {
-            format!(
-                "OpenModelica {} is available, but no Modelica source was supplied; pass --model <file.mo> or set MODELICA_MODEL_FILE",
-                version.stdout.trim()
-            )
-        })?;
-    let model = backend
-        .load_semantic_model(&model_path, class_name)
-        .map_err(|error| error.to_string())?;
-    print_semantic_model(&model);
-    Ok(())
-}
-
-fn print_semantic_model(model: &SemanticModel) {
-    println!("class {}", model.class_name);
-    println!("components {}", model.components.len());
-    for component in &model.components {
-        println!(
-            "  {} kind={} resolved_type={}",
-            component.instance_path,
-            component.kind.as_deref().unwrap_or("unknown"),
-            component
-                .resolved_qualified_type
-                .as_deref()
-                .unwrap_or("unknown")
-        );
-    }
-    println!("connectors {}", model.connectors.len());
-    for connector in &model.connectors {
-        println!(
-            "  {} resolved_type={} iconGraphics={}",
-            connector.instance_path,
-            connector.resolved_type.as_deref().unwrap_or("unknown"),
-            connector.icon_graphics.len()
-        );
-    }
-    println!("connections {}", model.connections.len());
-    for connection in &model.connections {
-        println!(
-            "  {} -> {} Line.points={}",
-            connection.lhs,
-            connection.rhs,
-            connection.line_points.len()
-        );
-    }
-    for diagnostic in &model.diagnostics {
-        println!(
-            "diagnostic {}: {}{}",
-            diagnostic.code,
-            diagnostic.message,
-            diagnostic
-                .context
-                .as_deref()
-                .map(|context| format!(" ({context})"))
-                .unwrap_or_default()
-        );
-    }
-}
-
 #[allow(deprecated)]
 fn main() {
-    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.first().and_then(|value| value.to_str()) == Some("--semantic-dump") {
-        if let Err(error) = semantic_dump_cli(&arguments[1..]) {
-            eprintln!("modelica-wgpu semantic dump failed: {error}");
-            std::process::exit(2);
-        }
-        return;
-    }
-
-    let input = arguments.first().cloned().map(PathBuf::from);
+    let input = env::args_os().nth(1).map(PathBuf::from);
     let document = match input.as_deref() {
         Some(path) => match LoadedDocument::load(path) {
             Ok(document) => {
@@ -6822,6 +6725,7 @@ mod tests {
                 visible: true,
                 editable: true,
                 resolved_icon: Some(icon),
+                resolved_diagram: None,
             }
         };
         let rectangle = CoreGraphic::Rectangle(RectangleGraphic {
@@ -6987,9 +6891,16 @@ mod tests {
                 .resolved_icon
                 .as_deref()
                 .unwrap_or_else(|| panic!("{name} has no resolved icon"));
-            let placement = diagram_placement_transform(icon, component);
+            let diagram = component
+                .resolved_diagram
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} has no resolved Diagram layer"));
+            let layer = component
+                .diagram_layer()
+                .unwrap_or_else(|| panic!("{name} has no selected Diagram layer"));
+            let placement = diagram_placement_transform(layer, component);
             eprintln!(
-                "diagram diagnostic {name}: type={:?} owner={} origin=({:.1},{:.1}) rotation={:.1} placement=({:.1},{:.1})..({:.1},{:.1}) icon_extent=({:.1},{:.1})..({:.1},{:.1}) icon_graphics={} translation=({:.1},{:.1}) scale=({:.3},{:.3})",
+                "diagram diagnostic {name}: type={:?} owner={} origin=({:.1},{:.1}) rotation={:.1} placement=({:.1},{:.1})..({:.1},{:.1}) icon_extent=({:.1},{:.1})..({:.1},{:.1}) icon_graphics={} diagram_extent=({:.1},{:.1})..({:.1},{:.1}) diagram_graphics={} translation=({:.1},{:.1}) scale=({:.3},{:.3})",
                 component.resolved_type_qualified_name,
                 component.source_owner,
                 component.origin.x,
@@ -7004,12 +6915,18 @@ mod tests {
                 icon.coordinate_system.extent.p2.x,
                 icon.coordinate_system.extent.p2.y,
                 icon.graphics.len(),
+                diagram.coordinate_system.extent.p1.x,
+                diagram.coordinate_system.extent.p1.y,
+                diagram.coordinate_system.extent.p2.x,
+                diagram.coordinate_system.extent.p2.y,
+                diagram.graphics.len(),
                 placement.translation.x,
                 placement.translation.y,
                 placement.scale_x,
                 placement.scale_y,
             );
             assert!(icon.graphics.len() > 0, "{name} icon has no graphics");
+            assert!(diagram.graphics.len() > 0, "{name} Diagram has no graphics");
             assert!((placement.scale_x - expected_scale_x).abs() < 0.001);
             assert!((placement.scale_y - 0.1).abs() < 0.001);
             assert!(
@@ -7047,15 +6964,15 @@ mod tests {
                 max[0],
                 max[1]
             );
-            let expected_min_x = if name == "port_a" { -110.0 } else { 90.0 };
-            let expected_max_x = if name == "port_a" { -90.0 } else { 110.0 };
+            let expected_min_x = if name == "port_a" { -104.0 } else { 96.0 };
+            let expected_max_x = if name == "port_a" { -96.0 } else { 104.0 };
             // Stroke tessellation expands the filled extent by roughly half
             // the transformed line width, so bounds are checked with a small
             // renderer tolerance rather than against the raw placement box.
             assert!((min[0] - expected_min_x).abs() < 0.1);
             assert!((max[0] - expected_max_x).abs() < 0.1);
-            assert!((min[1] + 10.0).abs() < 0.1);
-            assert!((max[1] - 10.0).abs() < 0.1);
+            assert!((min[1] + 4.0).abs() < 0.1);
+            assert!((max[1] - 4.0).abs() < 0.1);
         }
     }
 }

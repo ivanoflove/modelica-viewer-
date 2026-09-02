@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
-use crate::ast::{Class, SourceRange};
+use crate::ast::{Class, ClassKind, SourceRange};
 use crate::diagnostics::Diagnostic;
 use crate::graphics::{
-    resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call,
+    resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call, resolve_icon_call,
 };
 use crate::lexer::{Token, TokenKind, tokenize};
 use crate::library::LibraryRegistry;
@@ -245,6 +245,7 @@ impl<'a> DiagramResolver<'a> {
                 visible: true,
                 editable: true,
                 resolved_icon: None,
+                resolved_diagram: None,
             };
 
             if let Some((component_class, component_source)) =
@@ -259,6 +260,13 @@ impl<'a> DiagramResolver<'a> {
                     &component_source,
                 );
                 component.resolved_icon = Some(Box::new(icon));
+                if matches!(
+                    component_class.kind,
+                    ClassKind::Connector | ClassKind::ExpandableConnector
+                ) {
+                    component.resolved_diagram =
+                        resolve_diagram_layer(&component_class, &component_source).map(Box::new);
+                }
             } else {
                 diagnostics.push(Diagnostic::warning(
                     "DIAGRAM_COMPONENT_TYPE_UNRESOLVED",
@@ -312,6 +320,30 @@ impl IconResolverAdapter {
     fn resolve(registry: &mut LibraryRegistry, class: &Class, source: &str) -> IconScene {
         crate::IconResolver::new(registry).resolve(class, source)
     }
+}
+
+fn resolve_diagram_layer(class: &Class, source: &str) -> Option<IconScene> {
+    let class_slice = class_owned_slice(class, source);
+    let tokens = tokenize(&class_slice);
+    let annotations = collect_annotations(&class_slice, &tokens);
+    let diagram = annotations
+        .iter()
+        .filter(|record| record.owner == AnnotationOwner::Class)
+        .find_map(|record| find_call(&record.annotation, "Diagram"))?;
+    let mut scene = resolve_icon_call(diagram);
+    scene.owner_qualified_name = Some(class.qualified_name.clone());
+    for (index, graphic) in scene.graphics.iter_mut().enumerate() {
+        graphic.id =
+            crate::scene::GraphicId(format!("{}:Diagram.graphics:{index}", class.qualified_name));
+        graphic.owner = crate::scene::GraphicOwner {
+            qualified_name: class.qualified_name.clone(),
+            kind: crate::scene::GraphicOwnerKind::Own,
+            instance_name: None,
+        };
+        graphic.transform = crate::scene::Transform2D::identity();
+        graphic.editable = false;
+    }
+    Some(scene)
 }
 
 fn mark_inherited_components(components: &mut [ComponentInstance]) {
@@ -772,7 +804,7 @@ fn calculate_bounds(
     for component in components {
         if let Some(extent) = component.placement_extent {
             include_extent(&mut bounds, extent, component.origin);
-        } else if let Some(icon) = component.resolved_icon.as_deref() {
+        } else if let Some(icon) = component.diagram_layer() {
             let extent = icon.coordinate_system.extent;
             include_point(
                 &mut bounds,
@@ -1018,11 +1050,17 @@ end Top;
     fn inherits_diagram_ports_graphics_and_connections() {
         let source = r#"
 connector FluidPort_a
-  annotation(Icon(graphics={Ellipse(extent={{-10,-10},{10,10}}, fillColor={0,128,255})}));
+  annotation(
+    Icon(graphics={Ellipse(extent={{-10,-10},{10,10}}, fillColor={0,128,255})}),
+    Diagram(graphics={Ellipse(extent={{-4,-4},{4,4}}, fillColor={0,128,255})})
+  );
 end FluidPort_a;
 
 connector FluidPort_b
-  annotation(Icon(graphics={Rectangle(extent={{-10,-10},{10,10}}, fillColor={0,128,255})}));
+  annotation(
+    Icon(graphics={Rectangle(extent={{-10,-10},{10,10}}, fillColor={0,128,255})}),
+    Diagram(graphics={Rectangle(extent={{-4,-4},{4,4}}, fillColor={0,128,255})})
+  );
 end FluidPort_b;
 
 partial model PartialTwoPort
@@ -1053,6 +1091,10 @@ end Child;
             component.name == "port_a"
                 && component.class_kind == Some(crate::ast::ClassKind::Connector)
                 && component
+                    .resolved_diagram
+                    .as_ref()
+                    .is_some_and(|diagram| !diagram.graphics.is_empty())
+                && component
                     .resolved_icon
                     .as_ref()
                     .is_some_and(|icon| !icon.graphics.is_empty())
@@ -1060,6 +1102,10 @@ end Child;
         assert!(scene.components.iter().any(|component| {
             component.name == "port_b"
                 && component.class_kind == Some(crate::ast::ClassKind::Connector)
+                && component
+                    .resolved_diagram
+                    .as_ref()
+                    .is_some_and(|diagram| !diagram.graphics.is_empty())
                 && component
                     .resolved_icon
                     .as_ref()
@@ -1145,6 +1191,12 @@ end Derived;
                     .resolved_icon
                     .as_ref()
                     .is_some_and(|icon| !icon.graphics.is_empty())
+            );
+            assert!(
+                component
+                    .resolved_diagram
+                    .as_ref()
+                    .is_some_and(|diagram| !diagram.graphics.is_empty())
             );
         }
         assert_eq!(partial_scene.debug_stats().connector_components, 2);

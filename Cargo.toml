@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/modelica-core",
-    "crates/modelica-omc",
     "crates/modelica-render",
     "crates/modelica-wgpu",
 ]

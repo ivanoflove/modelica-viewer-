@@ -208,6 +208,25 @@ pub struct ComponentInstance {
     /// directly editable until Modelica modifiers are supported.
     pub editable: bool,
     pub resolved_icon: Option<Box<IconScene>>,
+    /// Connector components use their Diagram layer in a parent Diagram,
+    /// falling back to the connector Icon when no Diagram layer exists.
+    pub resolved_diagram: Option<Box<IconScene>>,
+}
+
+impl ComponentInstance {
+    /// Select the graphic layer used when this component is placed in a
+    /// Diagram. This mirrors Modelica's connector rendering rule: connector
+    /// classes prefer their own Diagram annotation, while ordinary classes
+    /// always use Icon.
+    pub fn diagram_layer(&self) -> Option<&IconScene> {
+        match self.class_kind {
+            Some(ClassKind::Connector | ClassKind::ExpandableConnector) => self
+                .resolved_diagram
+                .as_deref()
+                .or(self.resolved_icon.as_deref()),
+            _ => self.resolved_icon.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
