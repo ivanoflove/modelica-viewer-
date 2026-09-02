@@ -1521,6 +1521,14 @@ impl App {
         }
     }
 
+    fn set_diagram_selection(&mut self, selection: DiagramSelection) -> bool {
+        if self.diagram_selection == selection {
+            return false;
+        }
+        self.diagram_selection = selection;
+        true
+    }
+
     fn hit_test_diagram_connection(
         &self,
         pointer_model: CorePoint,
@@ -1651,22 +1659,28 @@ impl App {
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        let Some(connection) = document.diagram(&class_name).and_then(|scene| {
-            scene
-                .connections
-                .iter()
-                .find(|connection| connection.id == hit.connection_id)
-        }) else {
+        let Some((connection_key, line_origin, line_rotation, original_points, source_before)) =
+            (|| {
+                let connection = document.diagram(&class_name).and_then(|scene| {
+                    scene
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == hit.connection_id)
+                })?;
+                let line = connection.line.as_ref()?;
+                let source_before = document.class_text(&class_name)?;
+                Some((
+                    connection.key.clone(),
+                    line.origin,
+                    line.rotation,
+                    line.points.clone(),
+                    source_before,
+                ))
+            })()
+        else {
             return;
         };
-        let Some(line) = connection.line.as_ref() else {
-            return;
-        };
-        let Some(source_before) = document.class_text(&class_name) else {
-            return;
-        };
-        let original_points = line.points.clone();
-        self.diagram_selection = DiagramSelection::Connection(hit.connection_id.clone());
+        self.set_diagram_selection(DiagramSelection::Connection(hit.connection_id.clone()));
         match hit.target {
             ConnectionHitTarget::Segment { index, orientation }
                 if index > 0 && index + 1 < original_points.len() =>
@@ -1674,11 +1688,11 @@ impl App {
                 self.pointer_interaction = PointerInteraction::MoveDiagramConnectionSegment {
                     button: MouseButton::Left,
                     connection_id: hit.connection_id,
-                    connection_key: connection.key.clone(),
+                    connection_key,
                     segment_index: index,
                     orientation,
-                    line_origin: line.origin,
-                    line_rotation: line.rotation,
+                    line_origin,
+                    line_rotation,
                     start_pointer_model: pointer_model,
                     original_points: original_points.clone(),
                     preview_points: original_points,
@@ -1840,10 +1854,9 @@ impl App {
                     return;
                 };
                 if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
-                    self.diagram_selection = DiagramSelection::Port(port.clone());
+                    self.set_diagram_selection(DiagramSelection::Port(port.clone()));
                     self.hovered_port = Some(port);
                     self.pointer_interaction = PointerInteraction::None;
-                    self.window.request_redraw();
                     return;
                 }
                 if let Some((component_name, handle)) =
@@ -1858,7 +1871,7 @@ impl App {
                     if let Some(hit) = self.hit_test_diagram_connection(pointer_model, tolerance) {
                         self.begin_connection_edit(hit, pointer_model);
                     } else {
-                        self.diagram_selection = DiagramSelection::None;
+                        self.set_diagram_selection(DiagramSelection::None);
                     }
                     if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
                         eprintln!(
@@ -1890,7 +1903,7 @@ impl App {
                         })
                     })
                     .collect();
-                self.diagram_selection = DiagramSelection::Component(component_name.clone());
+                self.set_diagram_selection(DiagramSelection::Component(component_name.clone()));
                 self.pointer_interaction = PointerInteraction::MoveDiagramComponent {
                     button: MouseButton::Left,
                     component_id,
@@ -6387,6 +6400,7 @@ fn main() {
                             app.window.request_redraw();
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
+                            let selection_before = app.diagram_selection.clone();
                             if state == ElementState::Released {
                                 app.finish_model_drag(button);
                             } else if app.canvas_event_allowed() {
@@ -6402,7 +6416,11 @@ fn main() {
                                     app.begin_model_drag();
                                 }
                             }
-                            app.window.request_redraw();
+                            let selection_changed = app.diagram_selection != selection_before;
+                            if egui_consumed || state == ElementState::Released || selection_changed
+                            {
+                                app.window.request_redraw();
+                            }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
                             if should_zoom_canvas(
