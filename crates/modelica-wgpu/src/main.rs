@@ -39,7 +39,8 @@ use modelica_core::{
 };
 use modelica_render::{
     connector_anchors, hit_test_connector_anchor, line_local_to_world,
-    resolved_graphic_contains_point, world_to_line_local, ConnectorAnchor, PortKey,
+    resolve_connection_endpoints, resolved_graphic_contains_point, world_to_line_local,
+    ConnectorAnchor, PortKey,
 };
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
@@ -5758,35 +5759,10 @@ fn connection_endpoints_match(
     scene: &CoreDiagramScene,
     connection: &modelica_core::scene::DiagramConnection,
 ) -> bool {
-    let Some(line) = connection.line.as_ref() else {
-        return true;
+    let Ok(endpoints) = resolve_connection_endpoints(scene, connection) else {
+        return false;
     };
-    let Some(rhs_index) = line.points.len().checked_sub(1) else {
-        return true;
-    };
-    let endpoints = [
-        (&connection.lhs, line.points[0]),
-        (&connection.rhs, line.points[rhs_index]),
-    ];
-    endpoints.into_iter().all(|(connector, local_point)| {
-        let Some(component) = scene
-            .components
-            .iter()
-            .find(|component| component.name == connector.component_name)
-        else {
-            return true;
-        };
-        let Some(extent) = component.placement_extent else {
-            return true;
-        };
-        let Some(connector_position) =
-            connector_world_position(component, extent, &connector.connector_path)
-        else {
-            return true;
-        };
-        let line_position = line_local_to_world(line, local_point);
-        distance_between(line_position, connector_position) <= 1.0e-4
-    })
+    endpoints.lhs_distance <= 1.0e-4 && endpoints.rhs_distance <= 1.0e-4
 }
 
 fn is_orthogonal_polyline(points: &[CorePoint]) -> bool {
