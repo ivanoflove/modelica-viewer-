@@ -8,7 +8,9 @@ pub mod hit_test;
 pub mod line;
 pub mod viewport;
 
-pub use connection_edit::{line_local_to_world, world_to_line_local};
+pub use connection_edit::{
+    ORTHOGONAL_EPSILON, canonicalize_orthogonal_points, line_local_to_world, world_to_line_local,
+};
 pub use connector::{
     ConnectionEndpointSide, ConnectorAnchor, ConnectorResolutionError, PortKey,
     ResolvedConnectionEndpoints, connector_anchor_hit_distance, connector_anchors,

@@ -149,11 +149,11 @@ pub fn find_connector_anchor<'a>(
 }
 
 /// Find the nearest connector within a model-space tolerance.
-pub fn nearest_connector_anchor<'a>(
-    anchors: &'a [ConnectorAnchor],
+pub fn nearest_connector_anchor(
+    anchors: &[ConnectorAnchor],
     point: Point,
     tolerance: f32,
-) -> Option<&'a ConnectorAnchor> {
+) -> Option<&ConnectorAnchor> {
     let tolerance = tolerance.max(0.0);
     anchors
         .iter()
@@ -198,11 +198,11 @@ pub fn connector_anchor_hit_distance(
 }
 
 /// Find the nearest connector using both semantic and visual hit regions.
-pub fn hit_test_connector_anchor<'a>(
-    anchors: &'a [ConnectorAnchor],
+pub fn hit_test_connector_anchor(
+    anchors: &[ConnectorAnchor],
     point: Point,
     tolerance: f32,
-) -> Option<&'a ConnectorAnchor> {
+) -> Option<&ConnectorAnchor> {
     anchors
         .iter()
         .filter_map(|anchor| {

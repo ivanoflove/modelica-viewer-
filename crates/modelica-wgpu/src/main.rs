@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -37,9 +38,10 @@ use modelica_core::{
     PackageLoader, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
 use modelica_render::{
-    connector_anchor_hit_distance, connector_anchors, line_local_to_world,
-    reanchor_connection_points, resolve_connection_endpoints, resolved_graphic_contains_point,
-    resolved_graphic_contains_point_with_transform, world_to_line_local, ConnectorAnchor, PortKey,
+    canonicalize_orthogonal_points, connector_anchor_hit_distance, connector_anchors,
+    line_local_to_world, reanchor_connection_points, resolve_connection_endpoints,
+    resolved_graphic_contains_point, resolved_graphic_contains_point_with_transform,
+    world_to_line_local, ConnectorAnchor, PortKey, ORTHOGONAL_EPSILON,
 };
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
@@ -55,7 +57,6 @@ const MSAA_SAMPLES: u32 = 4;
 const INITIAL_ZOOM: f32 = 3.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
-const ORTHOGONAL_EPSILON: f32 = 0.001;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -190,15 +191,11 @@ fn appearance_settings_path() -> Option<std::path::PathBuf> {
             roaming.unwrap_or_else(|| std::path::Path::new(&home).join("AppData/Roaming").into()),
         )
     } else if cfg!(target_os = "macos") {
-        std::path::Path::new(&home)
-            .join("Library/Application Support")
-            .into()
+        std::path::Path::new(&home).join("Library/Application Support")
     } else {
-        std::path::PathBuf::from(
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::Path::new(&home).join(".config")),
-        )
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(&home).join(".config"))
     };
     Some(base.join("modelica-viewer").join("settings.json"))
 }
@@ -247,10 +244,7 @@ fn save_appearance(theme: ThemeMode, accent: AccentTheme) {
         accent.key(),
     );
     if fs::write(&path, content).is_ok() {
-        eprintln!(
-            "modelica-wgpu: saved appearance to {}",
-            path.display()
-        );
+        eprintln!("modelica-wgpu: saved appearance to {}", path.display());
     }
 }
 
@@ -264,8 +258,7 @@ fn write_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), Strin
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
     ));
-    fs::write(&temp_path, contents)
-        .map_err(|error| format!("{}: {error}", temp_path.display()))?;
+    fs::write(&temp_path, contents).map_err(|error| format!("{}: {error}", temp_path.display()))?;
     if cfg!(target_os = "windows") {
         // Windows cannot rename over an existing file; move the original
         // aside first and restore it if the swap fails.
@@ -278,8 +271,7 @@ fn write_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), Strin
                 .map(|duration| duration.as_nanos())
                 .unwrap_or_default()
         ));
-        fs::rename(path, &backup_path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        fs::rename(path, &backup_path).map_err(|error| format!("{}: {error}", path.display()))?;
         if let Err(error) = fs::rename(&temp_path, path) {
             let _ = fs::rename(&backup_path, path);
             let _ = fs::remove_file(&temp_path);
@@ -288,8 +280,7 @@ fn write_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), Strin
         let _ = fs::remove_file(&backup_path);
         Ok(())
     } else {
-        fs::rename(&temp_path, path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        fs::rename(&temp_path, path).map_err(|error| format!("{}: {error}", path.display()))?;
         Ok(())
     }
 }
@@ -311,8 +302,7 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
         updated: String,
         qualified: String,
     }
-    let mut by_file =
-        std::collections::BTreeMap::<std::path::PathBuf, Vec<PendingEdit>>::new();
+    let mut by_file = std::collections::BTreeMap::<std::path::PathBuf, Vec<PendingEdit>>::new();
     for class in &document.class_sources {
         let Some(updated) = document.source_overrides.get(&class.qualified_name) else {
             continue;
@@ -337,8 +327,8 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
         // the edits never overlap inside one class and each class range comes
         // from the same parsed document.
         edits.sort_by(|left, right| right.start.cmp(&left.start));
-        let disk_original = fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let disk_original =
+            fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         for edit in &edits {
             if edit.end > disk_original.len() || disk_original.get(edit.start..edit.end).is_none() {
                 return Err(format!(
@@ -474,7 +464,14 @@ mod save_tests {
         // No leftover temp files next to the source.
         let leftovers = fs::read_dir(&directory)
             .unwrap()
-            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp-"))
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-")
+            })
             .count();
         assert_eq!(leftovers, 0);
         let _ = fs::remove_dir_all(&directory);
@@ -497,7 +494,10 @@ mod save_tests {
         fs::write(&path, format!("// externally edited\n{content}")).unwrap();
         let error = save_edited_classes(&mut document)
             .expect_err("save must refuse a file changed on disk");
-        assert!(error.contains("changed on disk"), "unexpected error: {error}");
+        assert!(
+            error.contains("changed on disk"),
+            "unexpected error: {error}"
+        );
         // The externally edited bytes must be preserved untouched.
         let disk = fs::read_to_string(&path).unwrap();
         assert!(disk.starts_with("// externally edited"));
@@ -524,18 +524,25 @@ mod save_tests {
             saved_class_text: HashMap::new(),
             source_versions: HashMap::new(),
         };
-        assert_eq!(save_edited_classes(&mut document).expect("save succeeds"), 0);
+        assert_eq!(
+            save_edited_classes(&mut document).expect("save succeeds"),
+            0
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), content);
         let _ = fs::remove_dir_all(&directory);
     }
 }
 
 #[cfg(test)]
-mod appearance_tests {    use super::*;
+mod appearance_tests {
+    use super::*;
 
     #[test]
     fn parse_defaults_for_empty_and_garbage_input() {
-        assert_eq!(parse_appearance_json(""), (ThemeMode::System, AccentTheme::Violet));
+        assert_eq!(
+            parse_appearance_json(""),
+            (ThemeMode::System, AccentTheme::Violet)
+        );
         assert_eq!(
             parse_appearance_json("not json at all"),
             (ThemeMode::System, AccentTheme::Violet)
@@ -1704,20 +1711,18 @@ impl GpuIconScene {
             if updated.vertices.len() != geometry.base_vertices.len()
                 || updated.indices.len() != geometry.index_count as usize
             {
-                geometry.vertex_buffer = device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
+                geometry.vertex_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("diagram connection preview vertices"),
                         contents: bytemuck::cast_slice(&updated.vertices),
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    },
-                );
-                geometry.index_buffer = device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
+                    });
+                geometry.index_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("diagram connection preview indices"),
                         contents: bytemuck::cast_slice(&updated.indices),
                         usage: wgpu::BufferUsages::INDEX,
-                    },
-                );
+                    });
             } else {
                 // Same topology: refresh only the vertex positions, which is
                 // the buffer created with COPY_DST.
@@ -1907,6 +1912,7 @@ struct App {
     scene: GpuIconScene,
     style_layout: wgpu::BindGroupLayout,
     document: Option<LoadedDocument>,
+    loading_document: Option<JoinHandle<Result<LoadedDocument, String>>>,
     load_error: Option<String>,
     selected_class: Option<String>,
     expanded_nodes: HashSet<String>,
@@ -2177,7 +2183,10 @@ impl App {
         let msaa_view = create_msaa_view(&device, &config);
         let egui_ctx = egui::Context::default();
         install_ui_fonts(&egui_ctx);
-        set_theme(ThemeMode::System.is_dark(window.theme()), AccentTheme::Violet);
+        set_theme(
+            ThemeMode::System.is_dark(window.theme()),
+            AccentTheme::Violet,
+        );
         configure_egui_style(&egui_ctx);
         eprintln!("modelica-wgpu: creating egui window state");
         let egui_state = egui_winit::State::new(
@@ -2213,6 +2222,7 @@ impl App {
             scene,
             style_layout,
             document,
+            loading_document: None,
             load_error: None,
             selected_class: None,
             expanded_nodes: HashSet::new(),
@@ -2873,7 +2883,7 @@ impl App {
                     x: current.x - start_pointer_model.x,
                     y: current.y - start_pointer_model.y,
                 };
-                let preview_points = translated_connection_segment(
+                let preview_points = translated_connection_segment_preview(
                     &original_points,
                     segment_index,
                     orientation,
@@ -3158,7 +3168,7 @@ impl App {
                     x: current.x - start_pointer_model.x,
                     y: current.y - start_pointer_model.y,
                 };
-                let after_points = translated_connection_segment(
+                let raw_after_points = translated_connection_segment(
                     &original_points,
                     segment_index,
                     orientation,
@@ -3166,6 +3176,7 @@ impl App {
                     line_rotation,
                     delta,
                 );
+                let after_points = canonicalize_orthogonal_points(&raw_after_points);
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
@@ -3189,13 +3200,14 @@ impl App {
                     x: current.x - start_pointer_model.x,
                     y: current.y - start_pointer_model.y,
                 };
-                let after_points = translated_connection_corner(
+                let raw_after_points = translated_connection_corner(
                     &original_points,
                     corner_index,
                     line_origin,
                     line_rotation,
                     delta,
                 );
+                let after_points = canonicalize_orthogonal_points(&raw_after_points);
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
@@ -3451,7 +3463,6 @@ impl App {
                     &resolved_diagram,
                     connection,
                     &edit.after_points,
-                    edit.after_points.len(),
                 )
             {
                 self.load_error = Some("Diagram edit did not preserve connection endpoints".into());
@@ -3580,12 +3591,7 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        if !connection_points_match_invariants(
-            &resolved_diagram,
-            connection,
-            &after_points,
-            after_points.len(),
-        ) {
+        if !connection_points_match_invariants(&resolved_diagram, connection, &after_points) {
             self.load_error = Some("Connection edit did not update Line.points".into());
             self.rebuild_selected_scenes();
             return;
@@ -3784,7 +3790,6 @@ impl App {
                     &resolved_diagram,
                     connection,
                     &edit.after_points,
-                    edit.after_points.len(),
                 )
             {
                 self.load_error =
@@ -3954,7 +3959,6 @@ impl App {
                     &resolved_diagram,
                     connection,
                     expected_points,
-                    expected_points.len(),
                 ) {
                     return;
                 }
@@ -4014,7 +4018,6 @@ impl App {
                             &resolved_diagram,
                             connection,
                             expected_points,
-                            expected_points.len(),
                         )
                     {
                         return;
@@ -4153,19 +4156,54 @@ impl App {
 
     /// Install a freshly parsed document into the viewer state and reset all
     /// per-class editing/selection state for the new library.
+    fn begin_document_load(&mut self, path: PathBuf) {
+        if self.loading_document.is_some() {
+            return;
+        }
+        eprintln!(
+            "modelica-wgpu: loading document in background: {}",
+            path.display()
+        );
+        self.load_error = None;
+        self.loading_document = Some(std::thread::spawn(move || LoadedDocument::load(&path)));
+        self.window.request_redraw();
+    }
+
+    fn poll_document_load(&mut self) {
+        let Some(handle) = self.loading_document.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            self.window.request_redraw();
+            return;
+        }
+        let handle = self
+            .loading_document
+            .take()
+            .expect("document load handle still present");
+        match handle.join() {
+            Ok(Ok(document)) => self.adopt_loaded_document(document),
+            Ok(Err(error)) => self.load_error = Some(error),
+            Err(_) => self.load_error = Some("Modelica document loading thread panicked".into()),
+        }
+        self.window.request_redraw();
+    }
+
+    /// Install a freshly parsed document into the viewer state and reset all
+    /// per-class editing/selection state for the new library.
     fn adopt_loaded_document(&mut self, document: LoadedDocument) {
         self.scene = build_scene(&self.device, &self.style_layout, Some(&document), None);
-        self.diagram_scene = build_diagram_scene(
-            &self.device,
-            &self.style_layout,
-            Some(&document),
-            None,
-        );
+        self.diagram_scene =
+            build_diagram_scene(&self.device, &self.style_layout, Some(&document), None);
         self.document = Some(document);
         self.selected_class = None;
         self.expanded_nodes.clear();
         if let Some(doc) = self.document.as_ref() {
-            expand_top_level(&mut self.expanded_nodes, &doc.package_name, &doc.class_names);
+            expand_top_level(
+                &mut self.expanded_nodes,
+                &doc.package_name,
+                &doc.class_names,
+            );
         }
         self.canvas_rect = None;
         self.pointer_interaction = PointerInteraction::None;
@@ -4177,6 +4215,8 @@ impl App {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.poll_document_load();
+        let document_loading = self.loading_document.is_some();
         let frame_started = Instant::now();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         set_theme(
@@ -4235,6 +4275,7 @@ impl App {
                 &mut expand_all_requested,
                 &mut collapse_all_requested,
                 load_error.as_deref(),
+                document_loading,
             );
             if main_view == MainView::Diagram {
                 draw_diagram_selection_overlay(
@@ -4298,7 +4339,7 @@ impl App {
             self.window.request_redraw();
         }
 
-        if open_requested || open_directory_requested {
+        if (open_requested || open_directory_requested) && !document_loading {
             let picked = if open_directory_requested {
                 FileDialog::new().pick_folder()
             } else {
@@ -4307,13 +4348,7 @@ impl App {
                     .pick_file()
             };
             if let Some(path) = picked {
-                match LoadedDocument::load(&path) {
-                    Ok(document) => self.adopt_loaded_document(document),
-                    Err(error) => {
-                        self.load_error = Some(error);
-                    }
-                }
-                self.window.request_redraw();
+                self.begin_document_load(path);
             }
         }
 
@@ -4683,12 +4718,14 @@ fn background_uniform() -> BackgroundUniform {
         [0.953, 0.957, 0.973] // --app-background: #f3f4f8
     };
     let strength = if is_dark_theme() { 0.12 } else { 0.025 };
-    let color = |factor: f32| [
-        base[0] * (1.0 - strength * factor),
-        base[1] * (1.0 - strength * factor),
-        base[2] * (1.0 - strength * factor),
-        1.0,
-    ];
+    let color = |factor: f32| {
+        [
+            base[0] * (1.0 - strength * factor),
+            base[1] * (1.0 - strength * factor),
+            base[2] * (1.0 - strength * factor),
+            1.0,
+        ]
+    };
     BackgroundUniform {
         top_left: color(0.0),
         top_right: color(0.25),
@@ -4713,16 +4750,22 @@ fn configure_egui_style(ctx: &egui::Context) {
     style.spacing.button_padding = Vec2::new(11.0, 8.0);
     style.spacing.interact_size = Vec2::new(40.0, 30.0);
     style.spacing.indent = 14.0;
-    style.text_styles
+    style
+        .text_styles
         .insert(egui::TextStyle::Small, ui_font(10.0));
-    style.text_styles
+    style
+        .text_styles
         .insert(egui::TextStyle::Body, ui_font(12.0));
-    style.text_styles
+    style
+        .text_styles
         .insert(egui::TextStyle::Button, ui_font(12.0));
-    style.text_styles
+    style
+        .text_styles
         .insert(egui::TextStyle::Heading, ui_semibold_font(18.0));
-    style.text_styles
-        .insert(egui::TextStyle::Monospace, FontId::new(12.0, FontFamily::Name(UI_FONT_MONO.into())));
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        FontId::new(12.0, FontFamily::Name(UI_FONT_MONO.into())),
+    );
 
     let mut visuals = if is_dark_theme() {
         egui::Visuals::dark()
@@ -4793,10 +4836,11 @@ fn draw_preview_ui(
     expand_all_requested: &mut bool,
     collapse_all_requested: &mut bool,
     load_error: Option<&str>,
+    document_loading: bool,
 ) {
     // Keep the global Electron-aligned spacing and widget treatment intact;
     // only update the palette when the user changes light/dark or accent.
-    let mut visuals = (*ctx.style()).visuals.clone();
+    let mut visuals = ctx.style().visuals.clone();
     visuals.override_text_color = Some(theme_text_primary());
     visuals.window_fill = theme_surface_raised(245);
     visuals.window_stroke = Stroke::new(1.0_f32, theme_border(28));
@@ -4911,7 +4955,7 @@ fn draw_preview_ui(
                     .fill(theme_surface_soft(210))
                     .stroke(Stroke::new(1.0_f32, theme_border(26)))
                     .rounding(Rounding::same(8.0));
-                    if ui.add(open_library).clicked() {
+                    if ui.add_enabled(!document_loading, open_library).clicked() {
                         *open_directory_requested = true;
                     }
                     let open_file = egui::Button::new(
@@ -4923,7 +4967,7 @@ fn draw_preview_ui(
                     .fill(theme_accent())
                     .stroke(Stroke::new(1.0_f32, theme_accent()))
                     .rounding(Rounding::same(8.0));
-                    if ui.add(open_file).clicked() {
+                    if ui.add_enabled(!document_loading, open_file).clicked() {
                         *open_requested = true;
                     }
                 });
@@ -5020,7 +5064,14 @@ fn draw_preview_ui(
                     *class_clicked = Some(clicked);
                 }
             }
-            if let Some(error) = load_error {
+            if document_loading {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("正在加载 Modelica 库…")
+                        .size(10.0)
+                        .color(theme_accent()),
+                );
+            } else if let Some(error) = load_error {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!("Load failed: {error}"))
@@ -5109,7 +5160,11 @@ fn draw_preview_ui(
                         })
                         .stroke(Stroke::new(
                             1.0_f32,
-                            if selected { theme_accent_soft(70) } else { Color32::TRANSPARENT },
+                            if selected {
+                                theme_accent_soft(70)
+                            } else {
+                                Color32::TRANSPARENT
+                            },
                         ))
                         .rounding(Rounding::same(8.0));
                         if ui.add(button).clicked() {
@@ -5268,11 +5323,7 @@ fn collect_expandable_paths(node: &TreeNode, output: &mut HashSet<String>) {
     }
 }
 
-fn expand_top_level(
-    expanded: &mut HashSet<String>,
-    package_name: &str,
-    class_names: &[String],
-) {
+fn expand_top_level(expanded: &mut HashSet<String>, package_name: &str, class_names: &[String]) {
     let root = build_tree(package_name, class_names);
     if !root.children.is_empty() {
         expanded.insert(root.qualified_name.clone());
@@ -7269,13 +7320,16 @@ fn connection_points_match_invariants(
     scene: &CoreDiagramScene,
     connection: &modelica_core::scene::DiagramConnection,
     expected_points: &[CorePoint],
-    expected_count: usize,
 ) -> bool {
     let Some(line) = connection.line.as_ref() else {
         return false;
     };
+    let Some((first, last)) = line.points.first().zip(line.points.last()) else {
+        return false;
+    };
     line.points == expected_points
-        && line.points.len() == expected_count
+        && line.points.len() >= 2
+        && distance_between(*first, *last) > ORTHOGONAL_EPSILON
         && is_orthogonal_polyline(&line.points)
         && connection_endpoints_match(scene, connection)
 }
@@ -7387,9 +7441,7 @@ fn translated_connection_segment(
         return original_points.to_vec();
     }
     let local_delta = world_delta_to_line_local(line_origin, line_rotation, delta);
-    if local_delta.x.abs() <= ORTHOGONAL_EPSILON
-        && local_delta.y.abs() <= ORTHOGONAL_EPSILON
-    {
+    if local_delta.x.abs() <= ORTHOGONAL_EPSILON && local_delta.y.abs() <= ORTHOGONAL_EPSILON {
         return original_points.to_vec();
     }
 
@@ -7494,6 +7546,68 @@ fn translated_connection_segment(
     points
 }
 
+/// Translate a segment for the live GPU preview without changing its topology.
+/// Endpoint bridges are added only by `translated_connection_segment` for the
+/// pointer-up source edit; during pointer movement we keep the original point
+/// count so the existing tessellation buffers can be updated in place.
+fn translated_connection_segment_preview(
+    original_points: &[CorePoint],
+    segment_index: usize,
+    orientation: ConnectionSegmentOrientation,
+    line_origin: CorePoint,
+    line_rotation: f32,
+    delta: CorePoint,
+) -> Vec<CorePoint> {
+    let translated = translated_connection_segment(
+        original_points,
+        segment_index,
+        orientation,
+        line_origin,
+        line_rotation,
+        delta,
+    );
+    if translated.len() == original_points.len() {
+        return translated;
+    }
+
+    let local_delta = world_delta_to_line_local(line_origin, line_rotation, delta);
+    let offset = match orientation {
+        ConnectionSegmentOrientation::Horizontal => CorePoint {
+            x: 0.0,
+            y: local_delta.y,
+        },
+        ConnectionSegmentOrientation::Vertical => CorePoint {
+            x: local_delta.x,
+            y: 0.0,
+        },
+    };
+    if offset.x.abs() <= ORTHOGONAL_EPSILON && offset.y.abs() <= ORTHOGONAL_EPSILON {
+        return original_points.to_vec();
+    }
+
+    let mut run_start = segment_index;
+    while run_start > 0
+        && segment_orientation(original_points[run_start - 1], original_points[run_start])
+            == Some(orientation)
+    {
+        run_start -= 1;
+    }
+    let mut run_end = segment_index;
+    while run_end + 1 < original_points.len() - 1
+        && segment_orientation(original_points[run_end + 1], original_points[run_end + 2])
+            == Some(orientation)
+    {
+        run_end += 1;
+    }
+
+    let mut preview = original_points.to_vec();
+    for point in &mut preview[run_start..=run_end + 1] {
+        point.x += offset.x;
+        point.y += offset.y;
+    }
+    preview
+}
+
 /// Move an inner polyline vertex ("corner") of a connection freely while the
 /// rest of the route stays a strictly axis-aligned polyline:
 ///
@@ -7509,8 +7623,7 @@ fn translated_connection_corner(
     line_rotation: f32,
     delta: CorePoint,
 ) -> Vec<CorePoint> {
-    if original_points.len() < 4 || corner_index == 0 || corner_index + 1 >= original_points.len()
-    {
+    if original_points.len() < 4 || corner_index == 0 || corner_index + 1 >= original_points.len() {
         return original_points.to_vec();
     }
     let local_delta = world_delta_to_line_local(line_origin, line_rotation, delta);
@@ -7587,36 +7700,6 @@ fn world_delta_to_line_local(
         x: local_target.x - local_origin.x,
         y: local_target.y - local_origin.y,
     }
-}
-
-#[cfg(test)]
-fn normalize_orthogonal_points(points: &[CorePoint]) -> Vec<CorePoint> {
-    let mut normalized = Vec::with_capacity(points.len());
-    for point in points {
-        if normalized
-            .last()
-            .is_some_and(|previous| distance_between(*previous, *point) <= ORTHOGONAL_EPSILON)
-        {
-            continue;
-        }
-        normalized.push(*point);
-    }
-    let mut index = 1;
-    while index + 1 < normalized.len() {
-        let previous = normalized[index - 1];
-        let current = normalized[index];
-        let next = normalized[index + 1];
-        let collinear = (previous.y - current.y).abs() <= ORTHOGONAL_EPSILON
-            && (current.y - next.y).abs() <= ORTHOGONAL_EPSILON
-            || (previous.x - current.x).abs() <= ORTHOGONAL_EPSILON
-                && (current.x - next.x).abs() <= ORTHOGONAL_EPSILON;
-        if collinear {
-            normalized.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-    normalized
 }
 
 fn format_modelica_points(points: &[CorePoint]) -> String {
@@ -7845,12 +7928,12 @@ fn main() {
                                 app.window.request_redraw();
                             }
                         }
-                        WindowEvent::MouseWheel { delta, .. } => {
+                        WindowEvent::MouseWheel { delta, .. }
                             if should_zoom_canvas(
                                 app.main_view,
                                 app.pointer_over_canvas(),
                                 app.modifiers.control_key(),
-                            ) {
+                            ) => {
                                 let amount = match delta {
                                     MouseScrollDelta::LineDelta(_, y) => y,
                                     MouseScrollDelta::PixelDelta(position) => {
@@ -7860,7 +7943,6 @@ fn main() {
                                 app.zoom_at_cursor(amount);
                                 app.window.request_redraw();
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -8174,6 +8256,28 @@ mod tests {
     }
 
     #[test]
+    fn canonicalized_connection_points_serialize_minimal_line() {
+        let source = "model Top\n equation\n  connect(a, b) annotation(Line(points={{0, 0}, {30, 0}, {30, 0}, {70, 0}, {70, 0}, {100, 0}}));\nend Top;";
+        let raw_points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let points = canonicalize_orthogonal_points(&raw_points);
+        let line_start = source.find("Line(").expect("Line annotation");
+        let line_end =
+            matching_delimiter(source, line_start + 4, b'(', b')').expect("Line close") + 1;
+        let edit = connection_points_edit(source, SourceRange::new(line_start, line_end), &points)
+            .expect("connection points edit");
+        let candidate = apply_validated_source_edits(source, vec![edit], 0)
+            .expect("apply canonical connection edit");
+        assert!(candidate.contains("points={{0, 0}, {100, 0}}"));
+    }
+
+    #[test]
     fn connection_points_edit_changes_only_line_points() {
         let source = "model Top\n equation\n  connect(a.port, b.port) annotation(Line(origin={5, 6}, points={{-40, 0}, {0, 0}, {40, 20}}, color={10, 20, 30}, thickness=1.5, pattern=LinePattern.Dash, smooth=Smooth.Bezier, arrow={Arrow.Start}, arrowSize=4));\nend Top;";
         let line_start = source.find("Line(").expect("Line annotation");
@@ -8387,10 +8491,7 @@ mod tests {
 
     #[test]
     fn two_point_line_drag_inserts_bridges_at_both_ports() {
-        let points = vec![
-            CorePoint { x: 0.0, y: 0.0 },
-            CorePoint { x: 100.0, y: 0.0 },
-        ];
+        let points = vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }];
         let after = translated_connection_segment(
             &points,
             0,
@@ -8414,6 +8515,27 @@ mod tests {
     }
 
     #[test]
+    fn segment_preview_keeps_point_count_until_pointer_up() {
+        let points = vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }];
+        let preview = translated_connection_segment_preview(
+            &points,
+            0,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: 40.0 },
+        );
+        assert_eq!(preview.len(), points.len());
+        assert_eq!(
+            preview,
+            vec![
+                CorePoint { x: 0.0, y: 40.0 },
+                CorePoint { x: 100.0, y: 40.0 },
+            ]
+        );
+    }
+
+    #[test]
     fn diagonal_connection_points_are_rejected_by_routing_policy() {
         assert!(!is_orthogonal_polyline(&[
             CorePoint { x: 0.0, y: 0.0 },
@@ -8424,25 +8546,6 @@ mod tests {
             CorePoint { x: 20.0, y: 0.0 },
             CorePoint { x: 20.0, y: 13.0 },
         ]));
-    }
-
-    #[test]
-    fn normalize_orthogonal_points_removes_duplicates_and_collinear_points() {
-        let points = vec![
-            CorePoint { x: 0.0, y: 0.0 },
-            CorePoint { x: 10.0, y: 0.0 },
-            CorePoint { x: 20.0, y: 0.0 },
-            CorePoint { x: 20.0, y: 0.0 },
-            CorePoint { x: 20.0, y: 20.0 },
-        ];
-        assert_eq!(
-            normalize_orthogonal_points(&points),
-            vec![
-                CorePoint { x: 0.0, y: 0.0 },
-                CorePoint { x: 20.0, y: 0.0 },
-                CorePoint { x: 20.0, y: 20.0 },
-            ]
-        );
     }
 
     #[test]
