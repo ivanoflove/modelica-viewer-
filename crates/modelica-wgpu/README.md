@@ -37,6 +37,14 @@ MODELICA_WGPU_PROFILE_DRAG=1 cargo run -p modelica-wgpu --release <package.mo>
 
 拖动时每秒输出一次 `drag-profile`，包含事件/帧数、p50/p95/worst frame，以及 input、snap、cached endpoint reanchor、preview upload、UI、encode 与 present 的累计 CPU 时间。
 
+加载 profiler 可通过以下命令启用：
+
+```text
+MODELICA_WGPU_PROFILE_LOAD=1 cargo run -p modelica-wgpu --release <package.mo>
+```
+
+它报告 metadata-first package load、class discovery、registry/source cache、tree、首次 UI，以及后续首次 Icon/Diagram resolve 和 GPU scene build 时间；每次首次 lazy resolve 只输出一行，不会为所有 class 预取场景。
+
 ## 外观与字体（与 Electron 客户端一致）
 
 - 主题 / 强调色与 Electron 版同一套 token（surface、text、border、accent），默认跟随系统、强调色 Violet。

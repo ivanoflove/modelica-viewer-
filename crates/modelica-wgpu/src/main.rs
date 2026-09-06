@@ -340,8 +340,9 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
                 ));
             }
             let expected = document
-                .saved_class_text
-                .get(&edit.qualified)
+                .source_cache
+                .get(&path)
+                .and_then(|source| source.get(edit.start..edit.end))
                 .ok_or_else(|| {
                     format!(
                         "no baseline snapshot for {} in {}; reload the library first",
@@ -361,11 +362,9 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
             disk.replace_range(edit.start..edit.end, &edit.updated);
         }
         write_file_atomic(&path, &disk)?;
-        for edit in &edits {
-            document
-                .saved_class_text
-                .insert(edit.qualified.clone(), edit.updated.clone());
-        }
+        document
+            .source_cache
+            .insert(path.clone(), Arc::<str>::from(disk));
         saved_files += 1;
     }
     Ok(saved_files)
@@ -385,7 +384,7 @@ mod save_tests {
         fs::write(&path, content).unwrap();
         let mut class_sources = Vec::new();
         let mut source_overrides = HashMap::new();
-        let mut saved_class_text = HashMap::new();
+        let mut source_cache = HashMap::new();
         for (qualified_name, marker, updated) in ranges {
             let start = content.find(marker).unwrap();
             let end = start + marker.len();
@@ -395,18 +394,21 @@ mod save_tests {
                 source_range: SourceRange::new(start, end),
             });
             source_overrides.insert((*qualified_name).to_owned(), (*updated).to_owned());
-            saved_class_text.insert((*qualified_name).to_owned(), (*marker).to_owned());
+            source_cache.insert(path.clone(), Arc::<str>::from(content));
         }
         let document = LoadedDocument {
             path: path.clone(),
             package_name: "SaveTest".to_owned(),
             class_names: Vec::new(),
             diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
+            tree: build_tree("SaveTest", &[]),
+            registry: LibraryRegistry::default(),
+            source_cache,
+            icons: HashMap::new(),
+            diagrams: HashMap::new(),
+            diagram_stats: HashMap::new(),
             class_sources,
             source_overrides,
-            saved_class_text,
             source_versions: HashMap::new(),
         };
         (document, path)
@@ -519,11 +521,14 @@ mod save_tests {
             package_name: "Noop".to_owned(),
             class_names: Vec::new(),
             diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
+            tree: build_tree("Noop", &[]),
+            registry: LibraryRegistry::default(),
+            source_cache: HashMap::new(),
+            icons: HashMap::new(),
+            diagrams: HashMap::new(),
+            diagram_stats: HashMap::new(),
             class_sources: Vec::new(),
             source_overrides: HashMap::new(),
-            saved_class_text: HashMap::new(),
             source_versions: HashMap::new(),
         };
         assert_eq!(
@@ -1015,21 +1020,115 @@ impl MainView {
     }
 }
 
-#[derive(Clone, Debug)]
+struct LoadProfile {
+    enabled: bool,
+    started: Instant,
+    package_load: Duration,
+    class_discovery: Duration,
+    registry_creation_index: Duration,
+    source_snapshot: Duration,
+    icon_resolve: Duration,
+    diagram_resolve: Duration,
+    icon_calls: usize,
+    diagram_calls: usize,
+}
+
+impl LoadProfile {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some(),
+            started: Instant::now(),
+            package_load: Duration::ZERO,
+            class_discovery: Duration::ZERO,
+            registry_creation_index: Duration::ZERO,
+            source_snapshot: Duration::ZERO,
+            icon_resolve: Duration::ZERO,
+            diagram_resolve: Duration::ZERO,
+            icon_calls: 0,
+            diagram_calls: 0,
+        }
+    }
+
+    fn micros(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1_000_000.0
+    }
+
+    fn report(
+        &self,
+        class_count: usize,
+        tree: Duration,
+        gpu_icon: Duration,
+        gpu_diagram: Duration,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "load-profile: file_package_load_us={:.1} package_loader_us={:.1} class_discovery_us={:.1} registry_creation_index_us={:.1} source_snapshot_cache_us={:.1} icon_resolve_us={:.1} diagram_resolve_us={:.1} ui_tree_us={:.1} gpu_icon_tessellation_upload_us={:.1} gpu_diagram_tessellation_upload_us={:.1} classes={} icon_calls={} diagram_calls={} total_load_us={:.1}",
+            Self::micros(self.package_load),
+            Self::micros(self.package_load),
+            Self::micros(self.class_discovery),
+            Self::micros(self.registry_creation_index),
+            Self::micros(self.source_snapshot),
+            Self::micros(self.icon_resolve),
+            Self::micros(self.diagram_resolve),
+            Self::micros(tree),
+            Self::micros(gpu_icon),
+            Self::micros(gpu_diagram),
+            class_count,
+            self.icon_calls,
+            self.diagram_calls,
+            Self::micros(self.started.elapsed()),
+        );
+    }
+}
+
 struct LoadedDocument {
     path: PathBuf,
     package_name: String,
     class_names: Vec<String>,
     diagnostics: usize,
-    icons: Vec<(String, CoreIconScene)>,
-    diagrams: Vec<(String, CoreDiagramScene)>,
+    tree: TreeNode,
+    registry: LibraryRegistry,
+    source_cache: HashMap<PathBuf, Arc<str>>,
+    icons: HashMap<ClassCacheKey, Arc<CoreIconScene>>,
+    diagrams: HashMap<ClassCacheKey, Arc<CoreDiagramScene>>,
+    diagram_stats: HashMap<String, DiagramUiStats>,
     class_sources: Vec<ClassSource>,
     source_overrides: HashMap<String, String>,
-    // Text the parser saw when the document was loaded (or what we last wrote
-    // to disk). Saving verifies the on-disk slice still matches before it
-    // applies an edit, so an externally modified file is never overwritten.
-    saved_class_text: HashMap<String, String>,
     source_versions: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ClassCacheKey {
+    qualified_name: String,
+    source_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiagramUiStats {
+    background: usize,
+    components: usize,
+    own_components: usize,
+    inherited_components: usize,
+    connectors: usize,
+    unresolved_components: usize,
+    unresolved_bases: usize,
+    connections: usize,
+}
+
+fn diagram_ui_stats(scene: &CoreDiagramScene) -> DiagramUiStats {
+    let stats = scene.debug_stats();
+    DiagramUiStats {
+        background: scene.background_graphics.len(),
+        components: scene.components.len(),
+        own_components: stats.own_components,
+        inherited_components: stats.inherited_components,
+        connectors: stats.connector_components,
+        unresolved_components: stats.unresolved_components,
+        unresolved_bases: stats.unresolved_bases,
+        connections: scene.connections.len(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1068,101 +1167,139 @@ struct UiDocument {
 
 impl LoadedDocument {
     fn load(path: &FsPath) -> Result<Self, String> {
-        fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let mut profile = LoadProfile::new();
+        let package_started = Instant::now();
         let package = PackageLoader
             .load(path)
             .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
+        profile.package_load = package_started.elapsed();
+        let discovery_started = Instant::now();
         let mut class_names = Vec::new();
         collect_class_names(&package, &mut class_names);
         class_names.sort();
         let mut class_sources = Vec::new();
         collect_class_sources(&package, &mut class_sources);
+        profile.class_discovery = discovery_started.elapsed();
+        let registry_started = Instant::now();
         let mut registry = LibraryRegistry::default();
         add_bundled_msl(&mut registry);
         registry.index_package(&package);
         registry.register_package(&package);
-        let icons = class_names
-            .iter()
-            .filter_map(|qualified_name| {
-                let (class, source) = registry.resolve_class(qualified_name)?;
-                Some((
-                    qualified_name.clone(),
-                    IconResolver::new(&mut registry).resolve(&class, &source),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let diagrams = class_names
-            .iter()
-            .filter_map(|qualified_name| {
-                let (class, source) = registry.resolve_class(qualified_name)?;
-                Some((
-                    qualified_name.clone(),
-                    resolve_diagram(&class, &source, &mut registry),
-                ))
-            })
-            .collect::<Vec<_>>();
-        // Snapshot the original text of every class once, so later disk saves
-        // can verify the on-disk slice still matches before applying edits.
-        let mut saved_class_text = HashMap::new();
-        let mut file_cache = HashMap::<PathBuf, String>::new();
+        profile.registry_creation_index = registry_started.elapsed();
+        let source_started = Instant::now();
+        let mut source_cache = HashMap::<PathBuf, Arc<str>>::new();
         for class in &class_sources {
-            if saved_class_text.contains_key(&class.qualified_name) {
+            if source_cache.contains_key(&class.source_file) {
                 continue;
             }
-            let source = match file_cache.get(&class.source_file) {
-                Some(source) => source.clone(),
-                None => match fs::read_to_string(&class.source_file) {
-                    Ok(source) => {
-                        file_cache.insert(class.source_file.clone(), source.clone());
-                        source
-                    }
-                    Err(_) => continue,
-                },
-            };
-            if let Some(slice) = source.get(class.source_range.start..class.source_range.end) {
-                saved_class_text.insert(class.qualified_name.clone(), slice.to_owned());
+            if let Some(source) = registry.source(&class.source_file) {
+                source_cache.insert(class.source_file.clone(), Arc::<str>::from(source));
             }
         }
-        Ok(Self {
+        profile.source_snapshot = source_started.elapsed();
+        let tree_started = Instant::now();
+        let tree = build_tree(&package.qualified_name, &class_names);
+        let tree_time = tree_started.elapsed();
+        let document = Self {
             path: path.to_owned(),
             package_name: package.qualified_name,
             class_names,
             diagnostics: package.diagnostics.len(),
-            icons,
-            diagrams,
+            tree,
+            registry,
+            source_cache,
+            icons: HashMap::new(),
+            diagrams: HashMap::new(),
+            diagram_stats: HashMap::new(),
             class_sources,
             source_overrides: HashMap::new(),
-            saved_class_text,
             source_versions: HashMap::new(),
-        })
+        };
+        profile.report(
+            document.class_names.len(),
+            tree_time,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        Ok(document)
+    }
+
+    fn cache_key(&self, class_name: &str) -> ClassCacheKey {
+        ClassCacheKey {
+            qualified_name: class_name.to_owned(),
+            source_version: self.source_version(class_name),
+        }
     }
 
     fn icon(&self, class_name: &str) -> Option<&CoreIconScene> {
-        self.icons
-            .iter()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+        self.icons.get(&self.cache_key(class_name)).map(Arc::as_ref)
     }
 
     fn diagram(&self, class_name: &str) -> Option<&CoreDiagramScene> {
         self.diagrams
-            .iter()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+            .get(&self.cache_key(class_name))
+            .map(Arc::as_ref)
     }
 
-    fn icon_mut(&mut self, class_name: &str) -> Option<&mut CoreIconScene> {
-        self.icons
-            .iter_mut()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+    fn ensure_icon(&mut self, class_name: &str) -> Option<&CoreIconScene> {
+        let key = self.cache_key(class_name);
+        if !self.icons.contains_key(&key) {
+            let started = Instant::now();
+            let (class, source) = self.registry.resolve_class(class_name)?;
+            let icon = IconResolver::new(&mut self.registry).resolve(&class, &source);
+            if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some() {
+                eprintln!(
+                    "load-profile: lazy_icon class={} resolve_us={:.1}",
+                    class_name,
+                    started.elapsed().as_secs_f64() * 1_000_000.0
+                );
+            }
+            self.icons.insert(key, Arc::new(icon));
+        }
+        self.icon(class_name)
     }
 
-    fn diagram_mut(&mut self, class_name: &str) -> Option<&mut CoreDiagramScene> {
+    fn ensure_diagram(&mut self, class_name: &str) -> Option<&CoreDiagramScene> {
+        let key = self.cache_key(class_name);
+        if !self.diagrams.contains_key(&key) {
+            let started = Instant::now();
+            let (class, source) = self.registry.resolve_class(class_name)?;
+            let diagram = resolve_diagram(&class, &source, &mut self.registry);
+            if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some() {
+                eprintln!(
+                    "load-profile: lazy_diagram class={} resolve_us={:.1}",
+                    class_name,
+                    started.elapsed().as_secs_f64() * 1_000_000.0
+                );
+            }
+            self.diagram_stats
+                .insert(class_name.to_owned(), diagram_ui_stats(&diagram));
+            self.diagrams.insert(key, Arc::new(diagram));
+        }
+        self.diagram(class_name)
+    }
+
+    fn invalidate_scenes(&mut self, class_name: &str) {
+        self.icons.retain(|key, _| key.qualified_name != class_name);
         self.diagrams
-            .iter_mut()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+            .retain(|key, _| key.qualified_name != class_name);
+        self.diagram_stats.remove(class_name);
+    }
+
+    fn set_resolved_scenes(
+        &mut self,
+        class_name: &str,
+        source: String,
+        icon: CoreIconScene,
+        diagram: CoreDiagramScene,
+    ) {
+        self.set_class_text(class_name, source);
+        self.icons
+            .insert(self.cache_key(class_name), Arc::new(icon));
+        self.diagram_stats
+            .insert(class_name.to_owned(), diagram_ui_stats(&diagram));
+        self.diagrams
+            .insert(self.cache_key(class_name), Arc::new(diagram));
     }
 
     fn class_source(&self, qualified_name: &str) -> Option<(String, String)> {
@@ -1173,7 +1310,7 @@ impl LoadedDocument {
         let text = if let Some(override_text) = self.source_overrides.get(qualified_name) {
             override_text.clone()
         } else {
-            let source = fs::read_to_string(&class.source_file).ok()?;
+            let source = self.source_cache.get(&class.source_file)?;
             source
                 .get(class.source_range.start..class.source_range.end)?
                 .to_owned()
@@ -1201,6 +1338,7 @@ impl LoadedDocument {
     fn set_class_text(&mut self, qualified_name: &str, text: String) {
         self.source_overrides
             .insert(qualified_name.to_owned(), text);
+        self.invalidate_scenes(qualified_name);
         let version = self
             .source_versions
             .entry(qualified_name.to_owned())
@@ -1209,18 +1347,12 @@ impl LoadedDocument {
     }
 
     fn resolve_candidate_scenes(
-        &self,
+        &mut self,
         qualified_name: &str,
         source: &str,
     ) -> Result<(CoreIconScene, CoreDiagramScene), String> {
-        let package = PackageLoader
-            .load(&self.path)
-            .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
-        let mut registry = LibraryRegistry::default();
-        add_bundled_msl(&mut registry);
-        registry.index_package(&package);
-        registry.register_package(&package);
-        let (mut class, _) = registry
+        let (mut class, _) = self
+            .registry
             .resolve_class(qualified_name)
             .ok_or_else(|| format!("class `{qualified_name}` was not found"))?;
         let parsed = parse(source, &class.source_file)
@@ -1231,8 +1363,8 @@ impl LoadedDocument {
             .ok_or_else(|| "candidate source contains no class".to_owned())?;
         class.source_range = SourceRange::new(0, source.len());
         class.children = parsed_class.children.clone();
-        let icon = IconResolver::new(&mut registry).resolve(&class, source);
-        let diagram = resolve_diagram(&class, source, &mut registry);
+        let icon = IconResolver::new(&mut self.registry).resolve(&class, source);
+        let diagram = resolve_diagram(&class, source, &mut self.registry);
         Ok((icon, diagram))
     }
 
@@ -1246,35 +1378,23 @@ impl LoadedDocument {
             .as_deref()
             .and_then(|class_name| self.icon(class_name))
             .map_or(0, |scene| scene.graphics.len());
-        let (
-            diagram_background,
-            diagram_components,
-            diagram_own_components,
-            diagram_inherited_components,
-            diagram_connectors,
-            diagram_unresolved_components,
-            diagram_unresolved_bases,
-            diagram_connections,
-        ) = selected_class
+        let stats = selected_class
             .as_ref()
-            .and_then(|class_name| self.diagram(class_name))
-            .map_or((0, 0, 0, 0, 0, 0, 0, 0), |scene| {
-                let stats = scene.debug_stats();
-                (
-                    scene.background_graphics.len(),
-                    scene.components.len(),
-                    stats.own_components,
-                    stats.inherited_components,
-                    stats.connector_components,
-                    stats.unresolved_components,
-                    stats.unresolved_bases,
-                    scene.connections.len(),
-                )
-            });
+            .and_then(|class_name| self.diagram_stats.get(class_name))
+            .copied()
+            .unwrap_or_default();
+        let diagram_background = stats.background;
+        let diagram_components = stats.components;
+        let diagram_own_components = stats.own_components;
+        let diagram_inherited_components = stats.inherited_components;
+        let diagram_connectors = stats.connectors;
+        let diagram_unresolved_components = stats.unresolved_components;
+        let diagram_unresolved_bases = stats.unresolved_bases;
+        let diagram_connections = stats.connections;
         UiDocument {
             package_name: self.package_name.clone(),
             class_names: self.class_names.clone(),
-            tree: build_tree(&self.package_name, &self.class_names),
+            tree: self.tree.clone(),
             selected_class,
             icon_graphics,
             diagram_background,
@@ -2207,7 +2327,10 @@ struct App {
     document: Option<LoadedDocument>,
     loading_document: Option<JoinHandle<Result<LoadedDocument, String>>>,
     load_error: Option<String>,
+    load_profile_started: Option<Instant>,
     selected_class: Option<String>,
+    icon_gpu_class: Option<String>,
+    diagram_gpu_class: Option<String>,
     ui_document: Option<UiDocument>,
     expanded_nodes: HashSet<String>,
     egui_ctx: egui::Context,
@@ -2475,8 +2598,10 @@ impl App {
             multiview: None,
         });
 
-        let scene = build_scene(&device, &style_layout, document.as_ref(), None);
-        let diagram_scene = build_diagram_scene(&device, &style_layout, document.as_ref(), None);
+        // Metadata-first startup: no selected class means no Icon/Diagram
+        // resolver and no GPU scene construction during package open.
+        let scene = build_scene(&device, &style_layout, None, None);
+        let diagram_scene = build_diagram_scene(&device, &style_layout, None, None);
         let msaa_view = create_msaa_view(&device, &config);
         let egui_ctx = egui::Context::default();
         install_ui_fonts(&egui_ctx);
@@ -2521,7 +2646,10 @@ impl App {
             document,
             loading_document: None,
             load_error: None,
+            load_profile_started: None,
             selected_class: None,
+            icon_gpu_class: None,
+            diagram_gpu_class: None,
             ui_document: None,
             expanded_nodes: HashSet::new(),
             egui_ctx,
@@ -3427,12 +3555,23 @@ impl App {
     }
 
     fn rebuild_selected_scenes(&mut self) {
+        // Rebuild only from already-resolved caches. This method is used after
+        // edits/undo, never as an implicit resolver for every class.
         self.scene = build_scene(
             &self.device,
             &self.style_layout,
             self.document.as_ref(),
             self.selected_class.as_deref(),
         );
+        self.icon_gpu_class = self
+            .selected_class
+            .as_deref()
+            .filter(|name| {
+                self.document
+                    .as_ref()
+                    .is_some_and(|document| document.icon(name).is_some())
+            })
+            .map(str::to_owned);
         self.connection_preview = None;
         self.diagram_scene = build_diagram_scene(
             &self.device,
@@ -3442,7 +3581,93 @@ impl App {
         );
         self.diagram_hit_cache =
             build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
+        self.diagram_gpu_class = self
+            .selected_class
+            .as_deref()
+            .filter(|name| {
+                self.document
+                    .as_ref()
+                    .is_some_and(|document| document.diagram(name).is_some())
+            })
+            .map(str::to_owned);
         self.refresh_ui_document();
+    }
+
+    fn ensure_selected_icon_scene(&mut self) {
+        let Some(class_name) = self.selected_class.clone() else {
+            self.scene = build_scene(&self.device, &self.style_layout, None, None);
+            return;
+        };
+        if self.icon_gpu_class.as_deref() == Some(class_name.as_str()) {
+            return;
+        }
+        let resolved = self
+            .document
+            .as_mut()
+            .and_then(|document| document.ensure_icon(&class_name))
+            .is_some();
+        if resolved {
+            let gpu_started = Instant::now();
+            self.scene = build_scene(
+                &self.device,
+                &self.style_layout,
+                self.document.as_ref(),
+                Some(&class_name),
+            );
+            self.icon_gpu_class = Some(class_name.clone());
+            self.refresh_ui_document();
+            if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some() {
+                eprintln!(
+                    "load-profile: gpu_icon_tessellation_upload class={} us={:.1}",
+                    class_name,
+                    gpu_started.elapsed().as_secs_f64() * 1_000_000.0
+                );
+            }
+        }
+    }
+
+    fn ensure_selected_diagram_scene(&mut self) {
+        let Some(class_name) = self.selected_class.clone() else {
+            self.diagram_scene = build_diagram_scene(&self.device, &self.style_layout, None, None);
+            self.diagram_hit_cache = DiagramHitCache::default();
+            return;
+        };
+        if self.diagram_gpu_class.as_deref() == Some(class_name.as_str()) {
+            return;
+        }
+        let resolved = self
+            .document
+            .as_mut()
+            .and_then(|document| document.ensure_diagram(&class_name))
+            .is_some();
+        if resolved {
+            let gpu_started = Instant::now();
+            self.diagram_scene = build_diagram_scene(
+                &self.device,
+                &self.style_layout,
+                self.document.as_ref(),
+                Some(&class_name),
+            );
+            self.diagram_hit_cache =
+                build_diagram_hit_cache(self.document.as_ref(), Some(&class_name));
+            self.diagram_gpu_class = Some(class_name.clone());
+            self.refresh_ui_document();
+            if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some() {
+                eprintln!(
+                    "load-profile: gpu_diagram_tessellation_upload class={} us={:.1}",
+                    class_name,
+                    gpu_started.elapsed().as_secs_f64() * 1_000_000.0
+                );
+            }
+        }
+    }
+
+    fn ensure_active_scene(&mut self) {
+        match self.main_view {
+            MainView::Icon => self.ensure_selected_icon_scene(),
+            MainView::Diagram => self.ensure_selected_diagram_scene(),
+            MainView::Source => {}
+        }
     }
 
     fn finish_model_drag(&mut self, button: MouseButton) {
@@ -3668,7 +3893,7 @@ impl App {
                 return;
             }
         };
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.document.as_mut().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -3684,13 +3909,12 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.set_resolved_scenes(
+            &class_name,
+            candidate.clone(),
+            resolved_icon,
+            resolved_diagram,
+        );
         self.history.push(EditCommand::MoveIconGraphic {
             class_name,
             graphic_id,
@@ -3814,7 +4038,7 @@ impl App {
                 return;
             }
         };
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.document.as_mut().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -3855,13 +4079,12 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.set_resolved_scenes(
+            &class_name,
+            candidate.clone(),
+            resolved_icon,
+            resolved_diagram,
+        );
         self.history.push(EditCommand::MoveDiagramComponent {
             class_name,
             component_id,
@@ -3956,7 +4179,7 @@ impl App {
             profile.source_patch = patch_started.elapsed();
         }
         let resolve_started = Instant::now();
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.document.as_mut().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -4005,13 +4228,12 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.set_resolved_scenes(
+            &class_name,
+            candidate.clone(),
+            resolved_icon,
+            resolved_diagram,
+        );
         if profile.enabled {
             profile.document_update = document_started.elapsed();
         }
@@ -4148,7 +4370,7 @@ impl App {
                 return;
             }
         };
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.document.as_mut().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -4198,13 +4420,12 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.set_resolved_scenes(
+            &class_name,
+            candidate.clone(),
+            resolved_icon,
+            resolved_diagram,
+        );
         self.history.push(EditCommand::ResizeDiagramComponent {
             class_name,
             component_id,
@@ -4236,7 +4457,7 @@ impl App {
                     before_geometry
                 };
                 let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
+                    self.document.as_mut().and_then(|document| {
                         document.resolve_candidate_scenes(class_name, source).ok()
                     })
                 else {
@@ -4250,13 +4471,12 @@ impl App {
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
-                document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.set_resolved_scenes(
+                    class_name,
+                    source.clone(),
+                    resolved_icon,
+                    resolved_diagram,
+                );
             }
             EditCommand::MoveDiagramComponent {
                 class_name,
@@ -4270,7 +4490,7 @@ impl App {
                 let source = if after { after_source } else { before_source };
                 let expected_origin = if after { *after_origin } else { *before_origin };
                 let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
+                    self.document.as_mut().and_then(|document| {
                         document.resolve_candidate_scenes(class_name, source).ok()
                     })
                 else {
@@ -4304,13 +4524,12 @@ impl App {
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
-                document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.set_resolved_scenes(
+                    class_name,
+                    source.clone(),
+                    resolved_icon,
+                    resolved_diagram,
+                );
             }
             EditCommand::MoveDiagramConnection {
                 class_name,
@@ -4338,9 +4557,12 @@ impl App {
                 else {
                     return;
                 };
-                let Some((resolved_icon, resolved_diagram)) = document
-                    .resolve_candidate_scenes(class_name, &candidate)
-                    .ok()
+                let Some((resolved_icon, resolved_diagram)) =
+                    self.document.as_mut().and_then(|document| {
+                        document
+                            .resolve_candidate_scenes(class_name, &candidate)
+                            .ok()
+                    })
                 else {
                     return;
                 };
@@ -4361,13 +4583,12 @@ impl App {
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
-                document.set_class_text(class_name, candidate);
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.set_resolved_scenes(
+                    class_name,
+                    candidate,
+                    resolved_icon,
+                    resolved_diagram,
+                );
             }
             EditCommand::ResizeDiagramComponent {
                 class_name,
@@ -4381,7 +4602,7 @@ impl App {
                 let source = if after { after_source } else { before_source };
                 let expected_extent = if after { after_extent } else { before_extent };
                 let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
+                    self.document.as_mut().and_then(|document| {
                         document.resolve_candidate_scenes(class_name, source).ok()
                     })
                 else {
@@ -4422,13 +4643,12 @@ impl App {
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
-                document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.set_resolved_scenes(
+                    class_name,
+                    source.clone(),
+                    resolved_icon,
+                    resolved_diagram,
+                );
             }
         }
         self.load_error = None;
@@ -4561,6 +4781,9 @@ impl App {
             path.display()
         );
         self.load_error = None;
+        self.load_profile_started = std::env::var_os("MODELICA_WGPU_PROFILE_LOAD")
+            .is_some()
+            .then(Instant::now);
         self.loading_document = Some(std::thread::spawn(move || LoadedDocument::load(&path)));
         self.window.request_redraw();
     }
@@ -4588,19 +4811,18 @@ impl App {
     /// Install a freshly parsed document into the viewer state and reset all
     /// per-class editing/selection state for the new library.
     fn adopt_loaded_document(&mut self, document: LoadedDocument) {
-        self.scene = build_scene(&self.device, &self.style_layout, Some(&document), None);
-        self.diagram_scene =
-            build_diagram_scene(&self.device, &self.style_layout, Some(&document), None);
+        // Install metadata only. Icon/Diagram scenes stay empty until the
+        // user explicitly opens the corresponding tab.
+        self.scene = build_scene(&self.device, &self.style_layout, None, None);
+        self.diagram_scene = build_diagram_scene(&self.device, &self.style_layout, None, None);
         self.document = Some(document);
         self.selected_class = None;
+        self.icon_gpu_class = None;
+        self.diagram_gpu_class = None;
         self.refresh_ui_document();
         self.expanded_nodes.clear();
         if let Some(doc) = self.document.as_ref() {
-            expand_top_level(
-                &mut self.expanded_nodes,
-                &doc.package_name,
-                &doc.class_names,
-            );
+            expand_top_level(&mut self.expanded_nodes, &doc.tree);
         }
         self.canvas_rect = None;
         self.pointer_interaction = PointerInteraction::None;
@@ -4608,6 +4830,14 @@ impl App {
         self.hovered_port = None;
         self.diagram_hit_cache = DiagramHitCache::default();
         self.load_error = None;
+        if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some() {
+            if let Some(started) = self.load_profile_started.take() {
+                eprintln!(
+                    "load-profile: time_to_first_ui_us={:.1}",
+                    started.elapsed().as_secs_f64() * 1_000_000.0
+                );
+            }
+        }
         self.update_title(None);
     }
 
@@ -4709,10 +4939,7 @@ impl App {
         if expand_all_requested {
             if let Some(document) = &self.document {
                 expanded_nodes.clear();
-                collect_expandable_paths(
-                    &build_tree(&document.package_name, &document.class_names),
-                    &mut expanded_nodes,
-                );
+                collect_expandable_paths(&document.tree, &mut expanded_nodes);
             }
         } else if collapse_all_requested {
             expanded_nodes.clear();
@@ -4730,6 +4957,7 @@ impl App {
         }
 
         if view_changed {
+            self.ensure_active_scene();
             self.fit_scene();
             self.window.request_redraw();
         }
@@ -4748,31 +4976,13 @@ impl App {
         }
 
         if let Some(class_name) = class_clicked {
-            let has_visual = self.document.as_ref().is_some_and(|document| {
-                document.icon(&class_name).is_some() || document.diagram(&class_name).is_some()
-            });
-            if has_visual {
-                self.scene = build_scene(
-                    &self.device,
-                    &self.style_layout,
-                    self.document.as_ref(),
-                    Some(&class_name),
-                );
-            } else {
-                self.scene = build_scene(
-                    &self.device,
-                    &self.style_layout,
-                    self.document.as_ref(),
-                    None,
-                );
-            }
-            self.diagram_scene = build_diagram_scene(
-                &self.device,
-                &self.style_layout,
-                self.document.as_ref(),
-                Some(&class_name),
-            );
+            // Selection is metadata/source-only. Resolving a visual scene is
+            // deferred until the user clicks Icon or Diagram.
             self.selected_class = Some(class_name);
+            self.scene = build_scene(&self.device, &self.style_layout, None, None);
+            self.diagram_scene = build_diagram_scene(&self.device, &self.style_layout, None, None);
+            self.icon_gpu_class = None;
+            self.diagram_gpu_class = None;
             self.refresh_ui_document();
             self.main_view = MainView::Source;
             self.canvas_rect = None;
@@ -4780,9 +4990,7 @@ impl App {
             self.connection_preview = None;
             self.diagram_selection = DiagramSelection::None;
             self.hovered_port = None;
-            self.diagram_hit_cache =
-                build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
-            self.fit_scene();
+            self.diagram_hit_cache = DiagramHitCache::default();
             self.update_title(None);
             self.window.request_redraw();
         }
@@ -5745,8 +5953,7 @@ fn collect_expandable_paths(node: &TreeNode, output: &mut HashSet<String>) {
     }
 }
 
-fn expand_top_level(expanded: &mut HashSet<String>, package_name: &str, class_names: &[String]) {
-    let root = build_tree(package_name, class_names);
+fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
     if !root.children.is_empty() {
         expanded.insert(root.qualified_name.clone());
     }
@@ -8522,6 +8729,7 @@ fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
 #[allow(deprecated)]
 fn main() {
     let input = env::args_os().nth(1).map(PathBuf::from);
+    let startup_started = Instant::now();
     let document = match input.as_deref() {
         Some(path) => match LoadedDocument::load(path) {
             Ok(document) => {
@@ -8554,7 +8762,14 @@ fn main() {
     );
     let mut app = pollster::block_on(App::new(window.clone(), document));
     if let Some(doc) = app.document.as_ref() {
-        expand_top_level(&mut app.expanded_nodes, &doc.package_name, &doc.class_names);
+        expand_top_level(&mut app.expanded_nodes, &doc.tree);
+    }
+    app.refresh_ui_document();
+    if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD").is_some() {
+        eprintln!(
+            "load-profile: time_to_first_ui_us={:.1}",
+            startup_started.elapsed().as_secs_f64() * 1_000_000.0
+        );
     }
     app.update_title(None);
     window.request_redraw();
@@ -8699,6 +8914,87 @@ fn main() {
 mod tests {
     use super::*;
     use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
+
+    #[test]
+    fn profile_lazy_scene_access_when_requested() {
+        if std::env::var_os("MODELICA_WGPU_PROFILE_LOAD_BENCHMARK").is_none() {
+            return;
+        }
+        let path =
+            PathBuf::from("/home/lnnp/Downloads/ThermoSysPro-master/ThermoSysPro/package.mo");
+        if !path.is_file() {
+            eprintln!("load-profile: benchmark package unavailable; skipped");
+            return;
+        }
+        let load_started = Instant::now();
+        let mut document = LoadedDocument::load(&path).expect("benchmark package loads");
+        let class = document
+            .class_names
+            .first()
+            .cloned()
+            .expect("benchmark package has a class");
+        let icon_started = Instant::now();
+        document.ensure_icon(&class).expect("lazy Icon resolves");
+        let icon_us = icon_started.elapsed();
+        let diagram_started = Instant::now();
+        document
+            .ensure_diagram(&class)
+            .expect("lazy Diagram resolves");
+        let diagram_us = diagram_started.elapsed();
+        let cached_started = Instant::now();
+        document
+            .ensure_diagram(&class)
+            .expect("cached Diagram resolves");
+        eprintln!(
+            "load-profile: benchmark class={} metadata_load_us={:.1} first_icon_us={:.1} first_diagram_us={:.1} second_diagram_cache_hit_us={:.1} total_us={:.1}",
+            class,
+            load_started.elapsed().as_secs_f64() * 1_000_000.0 - icon_us.as_secs_f64() * 1_000_000.0 - diagram_us.as_secs_f64() * 1_000_000.0,
+            icon_us.as_secs_f64() * 1_000_000.0,
+            diagram_us.as_secs_f64() * 1_000_000.0,
+            cached_started.elapsed().as_secs_f64() * 1_000_000.0,
+            load_started.elapsed().as_secs_f64() * 1_000_000.0,
+        );
+    }
+
+    #[test]
+    fn package_load_is_metadata_first_and_scene_resolution_is_cached() {
+        let package_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../demo-modelica/MyLibrary/package.mo");
+        let mut document = LoadedDocument::load(&package_path).expect("demo package loads");
+        assert!(!document.class_names.is_empty());
+        assert!(
+            document.icons.is_empty(),
+            "package load must not resolve Icons"
+        );
+        assert!(
+            document.diagrams.is_empty(),
+            "package load must not resolve Diagrams"
+        );
+        assert!(!document.source_cache.is_empty());
+        assert_eq!(document.tree.qualified_name, "MyLibrary");
+
+        let first = document
+            .ensure_diagram("MyLibrary.Resistor")
+            .expect("Resistor Diagram resolves")
+            .connections
+            .len();
+        assert_eq!(document.diagrams.len(), 1);
+        let second = document
+            .ensure_diagram("MyLibrary.Resistor")
+            .expect("cached Resistor Diagram resolves")
+            .connections
+            .len();
+        assert_eq!(first, second);
+        assert_eq!(
+            document.diagrams.len(),
+            1,
+            "second access must be a cache hit"
+        );
+
+        document.set_class_text("MyLibrary.Resistor", "model Resistor end Resistor;".into());
+        assert!(document.diagrams.is_empty());
+        assert!(document.icons.is_empty());
+    }
 
     fn connection_test_scene(
         lhs_position: CorePoint,
