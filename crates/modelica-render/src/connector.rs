@@ -7,13 +7,13 @@
 
 use std::collections::HashMap;
 
-use modelica_core::ClassKind;
 use modelica_core::scene::{
     ComponentInstance, ConnectorRef, DiagramConnection, DiagramScene, Extent, Graphic,
     GraphicOwnerKind, IconScene, Point, ResolvedGraphic, Transform2D,
 };
+use modelica_core::ClassKind;
 
-use crate::{Bounds, line_local_to_world, world_to_line_local};
+use crate::{line_local_to_world, world_to_line_local, Bounds};
 
 const DEFAULT_COMPONENT_EXTENT: Extent = Extent {
     p1: Point { x: -10.0, y: -10.0 },
