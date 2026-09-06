@@ -289,15 +289,18 @@ pub fn reanchor_connection_points(
     let lhs_before = result[0];
     result[0] = lhs;
     let rhs_index = result.len() - 1;
-    preserve_endpoint_axis(&mut result[1], lhs_before, points[1], lhs);
+    let lhs_neighbor = points
+        .get(1)
+        .copied()
+        .ok_or(ConnectorResolutionError::MissingLine)?;
+    preserve_endpoint_axis(&mut result[1], lhs_before, lhs_neighbor, lhs);
     let rhs_before = result[rhs_index];
     result[rhs_index] = rhs;
-    preserve_endpoint_axis(
-        &mut result[rhs_index - 1],
-        rhs_before,
-        points[rhs_index - 1],
-        rhs,
-    );
+    let rhs_neighbor = points
+        .get(rhs_index - 1)
+        .copied()
+        .ok_or(ConnectorResolutionError::MissingLine)?;
+    preserve_endpoint_axis(&mut result[rhs_index - 1], rhs_before, rhs_neighbor, rhs);
     Ok(result)
 }
 
@@ -725,12 +728,9 @@ mod tests {
         assert!((points.0.y - 50.0).abs() < 0.001);
         assert!((points.1.x - 0.0).abs() < 0.001);
         assert!((points.1.y + 50.0).abs() < 0.001);
-        let reanchored = reanchor_connection_points(
-            &scene,
-            &scene.connections[0],
-            &[point(4.0, 50.0), point(4.0, -50.0)],
-        )
-        .unwrap();
+        let raw_reanchored = vec![point(4.0, 50.0), point(4.0, -50.0)];
+        let reanchored =
+            reanchor_connection_points(&scene, &scene.connections[0], &raw_reanchored).unwrap();
         assert!((reanchored[0].x - points.0.x).abs() < 0.001);
         assert!((reanchored[1].x - points.1.x).abs() < 0.001);
 

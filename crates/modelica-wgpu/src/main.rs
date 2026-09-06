@@ -57,6 +57,7 @@ const MSAA_SAMPLES: u32 = 4;
 const INITIAL_ZOOM: f32 = 3.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
+const CONNECTION_SNAP_PIXELS: f32 = 8.0;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -2889,6 +2890,15 @@ impl App {
                     x: current.x - start_pointer_model.x,
                     y: current.y - start_pointer_model.y,
                 };
+                let delta = snap_connection_segment_delta(
+                    &original_points,
+                    segment_index,
+                    orientation,
+                    line_origin,
+                    line_rotation,
+                    delta,
+                    connection_snap_tolerance(self.zoom),
+                );
                 let preview_points = translated_connection_segment_preview(
                     &original_points,
                     segment_index,
@@ -3174,6 +3184,15 @@ impl App {
                     x: current.x - start_pointer_model.x,
                     y: current.y - start_pointer_model.y,
                 };
+                let delta = snap_connection_segment_delta(
+                    &original_points,
+                    segment_index,
+                    orientation,
+                    line_origin,
+                    line_rotation,
+                    delta,
+                    connection_snap_tolerance(self.zoom),
+                );
                 let raw_after_points = translated_connection_segment(
                     &original_points,
                     segment_index,
@@ -7500,6 +7519,101 @@ fn preserve_orthogonal_neighbor(
     }
 }
 
+fn connection_snap_tolerance(zoom: f32) -> f32 {
+    CONNECTION_SNAP_PIXELS / zoom.max(MIN_ZOOM)
+}
+
+/// Snap a segment's normal-axis drag to the nearest parallel axis in this
+/// connection. The input and output deltas are in world/model coordinates;
+/// candidate coordinates are compared in line-local coordinates so rotated
+/// Lines use the same geometry as translation and remain orthogonal.
+fn snap_connection_segment_delta(
+    original_points: &[CorePoint],
+    segment_index: usize,
+    orientation: ConnectionSegmentOrientation,
+    line_origin: CorePoint,
+    line_rotation: f32,
+    raw_delta: CorePoint,
+    model_snap_tolerance: f32,
+) -> CorePoint {
+    if original_points.len() < 2 || segment_index + 1 >= original_points.len() {
+        return raw_delta;
+    }
+
+    let local_delta = world_delta_to_line_local(line_origin, line_rotation, raw_delta);
+    let current_axis = match orientation {
+        ConnectionSegmentOrientation::Horizontal => {
+            original_points[segment_index].y + local_delta.y
+        }
+        ConnectionSegmentOrientation::Vertical => original_points[segment_index].x + local_delta.x,
+    };
+
+    let mut run_start = segment_index;
+    while run_start > 0
+        && segment_orientation(original_points[run_start - 1], original_points[run_start])
+            == Some(orientation)
+    {
+        run_start -= 1;
+    }
+    let mut run_end = segment_index;
+    while run_end + 1 < original_points.len() - 1
+        && segment_orientation(original_points[run_end + 1], original_points[run_end + 2])
+            == Some(orientation)
+    {
+        run_end += 1;
+    }
+
+    let axis_coordinate = |point: CorePoint| match orientation {
+        ConnectionSegmentOrientation::Horizontal => point.y,
+        ConnectionSegmentOrientation::Vertical => point.x,
+    };
+    let Some(last_point) = original_points.last().copied() else {
+        return raw_delta;
+    };
+    let mut candidates = vec![
+        axis_coordinate(original_points[0]),
+        axis_coordinate(last_point),
+    ];
+    for (index, pair) in original_points.windows(2).enumerate() {
+        if (run_start..=run_end).contains(&index) {
+            continue;
+        }
+        if segment_orientation(pair[0], pair[1]) == Some(orientation) {
+            candidates.push(axis_coordinate(pair[0]));
+        }
+    }
+
+    let Some((_, target_axis)) = candidates
+        .into_iter()
+        .map(|candidate| ((current_axis - candidate).abs(), candidate))
+        .filter(|(distance, _)| *distance <= model_snap_tolerance)
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+    else {
+        return raw_delta;
+    };
+
+    let snapped_local_delta = match orientation {
+        ConnectionSegmentOrientation::Horizontal => CorePoint {
+            x: local_delta.x,
+            y: target_axis - original_points[segment_index].y,
+        },
+        ConnectionSegmentOrientation::Vertical => CorePoint {
+            x: target_axis - original_points[segment_index].x,
+            y: local_delta.y,
+        },
+    };
+    line_local_delta_to_world(line_rotation, snapped_local_delta)
+}
+
+fn line_local_delta_to_world(line_rotation: f32, delta: CorePoint) -> CorePoint {
+    let angle = line_rotation.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    CorePoint {
+        x: delta.x * cos - delta.y * sin,
+        y: delta.x * sin + delta.y * cos,
+    }
+}
+
 fn translated_connection_segment(
     original_points: &[CorePoint],
     segment_index: usize,
@@ -8549,6 +8663,131 @@ mod tests {
             after,
             vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 },]
         );
+    }
+
+    #[test]
+    fn horizontal_segment_snaps_to_nearby_connection_axis() {
+        let before = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 20.0 },
+            CorePoint { x: 70.0, y: 20.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            before.clone(),
+        );
+        let snapped_delta = snap_connection_segment_delta(
+            &before,
+            2,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: -18.5 },
+            2.0,
+        );
+        assert_eq!(snapped_delta, CorePoint { x: 0.0, y: -20.0 });
+        let raw = translated_connection_segment(
+            &before,
+            2,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            snapped_delta,
+        );
+        let after = finalize_connection_route(&scene, &connection, &raw).expect("valid route");
+        assert_eq!(
+            after,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 },]
+        );
+        let (after_scene, after_connection) = connection_with_points(&scene, &connection, after);
+        assert!(connection_endpoints_match(&after_scene, &after_connection));
+    }
+
+    #[test]
+    fn horizontal_segment_outside_snap_threshold_follows_pointer() {
+        let points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 20.0 },
+            CorePoint { x: 70.0, y: 20.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let delta = snap_connection_segment_delta(
+            &points,
+            2,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: -17.0 },
+            2.0,
+        );
+        assert_eq!(delta, CorePoint { x: 0.0, y: -17.0 });
+        let moved = translated_connection_segment(
+            &points,
+            2,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            delta,
+        );
+        assert_eq!(moved[2].y, 3.0);
+        assert_eq!(moved[3].y, 3.0);
+    }
+
+    #[test]
+    fn vertical_segment_snaps_to_nearby_connection_axis() {
+        let points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 0.0, y: 30.0 },
+            CorePoint { x: 20.0, y: 30.0 },
+            CorePoint { x: 20.0, y: 70.0 },
+            CorePoint { x: 0.0, y: 70.0 },
+            CorePoint { x: 0.0, y: 100.0 },
+        ];
+        let delta = snap_connection_segment_delta(
+            &points,
+            2,
+            ConnectionSegmentOrientation::Vertical,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: -18.5, y: 0.0 },
+            2.0,
+        );
+        assert_eq!(delta, CorePoint { x: -20.0, y: 0.0 });
+    }
+
+    #[test]
+    fn segment_snap_chooses_nearest_candidate_axis() {
+        let points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 10.0 },
+            CorePoint { x: 80.0, y: 10.0 },
+            CorePoint { x: 80.0, y: 20.0 },
+            CorePoint { x: 120.0, y: 20.0 },
+        ];
+        // The current y is 3, so y=0 is closer than y=20.
+        let delta = snap_connection_segment_delta(
+            &points,
+            2,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: -7.0 },
+            20.0,
+        );
+        assert_eq!(delta, CorePoint { x: 0.0, y: -10.0 });
+    }
+
+    #[test]
+    fn connection_snap_tolerance_is_screen_pixel_based() {
+        assert_eq!(connection_snap_tolerance(1.0), 8.0);
+        assert_eq!(connection_snap_tolerance(4.0), 2.0);
     }
 
     #[test]
