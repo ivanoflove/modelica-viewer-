@@ -29,6 +29,14 @@ cargo run -p modelica-wgpu --release
 默认使用 `Fifo` vsync，观察显示器上的实际帧 pacing；如需区分显示同步和渲染吞吐，可用
 `MODELICA_WGPU_VSYNC=off cargo run -p modelica-wgpu --release` 做无同步对照。窗口启动日志会打印实际使用的 GPU adapter。
 
+连接线拖动的聚合 profiler（不在每个 mouse event 输出）可通过以下命令启用：
+
+```text
+MODELICA_WGPU_PROFILE_DRAG=1 cargo run -p modelica-wgpu --release <package.mo>
+```
+
+拖动时每秒输出一次 `drag-profile`，包含事件/帧数、p50/p95/worst frame，以及 input、snap、cached endpoint reanchor、preview upload、UI、encode 与 present 的累计 CPU 时间。
+
 ## 外观与字体（与 Electron 客户端一致）
 
 - 主题 / 强调色与 Electron 版同一套 token（surface、text、border、accent），默认跟随系统、强调色 Violet。
