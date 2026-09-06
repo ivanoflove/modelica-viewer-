@@ -29,6 +29,14 @@ cargo run -p modelica-wgpu --release
 默认使用 `Fifo` vsync，观察显示器上的实际帧 pacing；如需区分显示同步和渲染吞吐，可用
 `MODELICA_WGPU_VSYNC=off cargo run -p modelica-wgpu --release` 做无同步对照。窗口启动日志会打印实际使用的 GPU adapter。
 
+## 外观与字体（与 Electron 客户端一致）
+
+- 主题 / 强调色与 Electron 版同一套 token（surface、text、border、accent），默认跟随系统、强调色 Violet。
+- 启动时自动读取、修改时自动保存到跨平台设置文件 `settings.json`：Windows `%APPDATA%\modelica-viewer\`、macOS
+  `~/Library/Application Support/modelica-viewer/`、Linux `$XDG_CONFIG_HOME`（缺省 `~/.config`）下的 `modelica-viewer/`。
+- UI 字体按平台候选自动加载（Windows Inter/Noto、Linux/macOS 常见字体目录）；中文字体缺失时可用
+  `MODELICA_VIEWER_CJK_FONT=/path/to/CJK.ttf cargo run -p modelica-wgpu --release` 显式指定。
+
 ## 验收记录方式
 
 1. Windows 原生 MSVC：`cargo run -p modelica-wgpu --release`
