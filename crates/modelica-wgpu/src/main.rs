@@ -41,7 +41,7 @@ use modelica_render::{
     canonicalize_orthogonal_points, connector_anchor_hit_distance, connector_anchors,
     line_local_to_world, reanchor_connection_points, resolve_connection_endpoints,
     resolved_graphic_contains_point, resolved_graphic_contains_point_with_transform,
-    world_to_line_local, ConnectorAnchor, PortKey, ORTHOGONAL_EPSILON,
+    strict_connection_points, world_to_line_local, ConnectorAnchor, PortKey, ORTHOGONAL_EPSILON,
 };
 use rfd::FileDialog;
 use wgpu::util::DeviceExt;
@@ -326,7 +326,7 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
         // Later ranges first: earlier replacement offsets remain valid because
         // the edits never overlap inside one class and each class range comes
         // from the same parsed document.
-        edits.sort_by(|left, right| right.start.cmp(&left.start));
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
         let disk_original =
             fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         for edit in &edits {
@@ -963,6 +963,7 @@ struct ConnectionLineEdit {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum EditCommand {
     MoveIconGraphic {
         class_name: String,
@@ -2488,8 +2489,13 @@ impl App {
             let line = temporary_line(line_origin, line_rotation);
             let world_points = connection_world_points(&line, &original_points);
             let mut best: Option<(usize, f32)> = None;
-            for index in 1..world_points.len().saturating_sub(1) {
-                let distance = distance_between(world_points[index], pointer_model);
+            for (index, point) in world_points
+                .iter()
+                .enumerate()
+                .skip(1)
+                .take(world_points.len().saturating_sub(2))
+            {
+                let distance = distance_between(*point, pointer_model);
                 if distance <= tolerance && best.is_none_or(|(_, best)| distance < best) {
                     best = Some((index, distance));
                 }
@@ -3176,11 +3182,10 @@ impl App {
                     line_rotation,
                     delta,
                 );
-                let after_points = canonicalize_orthogonal_points(&raw_after_points);
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
-                    after_points,
+                    raw_after_points,
                     source_before,
                 );
             }
@@ -3207,11 +3212,10 @@ impl App {
                     line_rotation,
                     delta,
                 );
-                let after_points = canonicalize_orthogonal_points(&raw_after_points);
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
-                    after_points,
+                    raw_after_points,
                     source_before,
                 );
             }
@@ -3535,6 +3539,20 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
+        let Some(connection) = current_scene.connections.get(cache_connection_index) else {
+            self.load_error = Some("Connection edit lost its connection identity".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        let after_points = match finalize_connection_route(current_scene, connection, &after_points)
+        {
+            Ok(points) => points,
+            Err(error) => {
+                self.load_error = Some(format!("Connection edit rejected: {error}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+        };
         let patch_started = Instant::now();
         let edit = match connection_points_edit_for_key(
             &source_before,
@@ -3646,6 +3664,7 @@ impl App {
         self.load_error = None;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_diagram_component_resize(
         &mut self,
         component_id: String,
@@ -4819,6 +4838,7 @@ fn configure_egui_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_preview_ui(
     ctx: &egui::Context,
     main_view: &mut MainView,
@@ -5616,6 +5636,7 @@ fn diagram_preview(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_diagram_selection_overlay(
     ctx: &egui::Context,
     canvas_rect: Option<egui::Rect>,
@@ -7306,6 +7327,56 @@ fn connection_endpoints_match(
     endpoints.lhs_distance <= 1.0e-4 && endpoints.rhs_distance <= 1.0e-4
 }
 
+/// Anchor, simplify, and validate a route before it is serialized.
+///
+/// Re-anchoring is intentionally part of the fixed-point loop: replacing a
+/// bridge with its semantic endpoint can create a new duplicate or collinear
+/// vertex. Canonicalization therefore never gets to remove an endpoint, and
+/// the route is only accepted once both operations are stable.
+fn finalize_connection_route(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    raw_points: &[CorePoint],
+) -> Result<Vec<CorePoint>, String> {
+    if raw_points.len() < 2 {
+        return Err("connection route must contain at least two points".to_owned());
+    }
+
+    let mut points = raw_points.to_vec();
+    loop {
+        let anchored = reanchor_connection_points(scene, connection, &points)
+            .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
+        let canonical = canonicalize_orthogonal_points(&anchored);
+        if canonical == points {
+            points = canonical;
+            break;
+        }
+        points = canonical;
+    }
+
+    if points.len() < 2 {
+        return Err("connection route must contain at least two points".to_owned());
+    }
+    if !is_orthogonal_polyline(&points) {
+        return Err("connection route must remain orthogonal".to_owned());
+    }
+    if points
+        .windows(2)
+        .any(|pair| distance_between(pair[0], pair[1]) <= ORTHOGONAL_EPSILON)
+    {
+        return Err("connection route contains a zero-length segment".to_owned());
+    }
+
+    let (lhs, rhs) = strict_connection_points(scene, connection)
+        .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
+    if distance_between(points[0], lhs) > 1.0e-4
+        || distance_between(*points.last().expect("at least two points"), rhs) > 1.0e-4
+    {
+        return Err("connection route endpoints are not anchored".to_owned());
+    }
+    Ok(points)
+}
+
 fn is_orthogonal_polyline(points: &[CorePoint]) -> bool {
     points.windows(2).all(|pair| {
         let [first, second] = pair else {
@@ -7956,7 +8027,95 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modelica_core::scene::GraphicOwnerKind;
+    use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
+
+    fn connection_test_scene(
+        lhs_position: CorePoint,
+        rhs_position: CorePoint,
+        points: Vec<CorePoint>,
+    ) -> (CoreDiagramScene, DiagramConnection) {
+        let component = |id: &str, name: &str, origin: CorePoint| CoreComponentInstance {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            source_owner: "Test".to_owned(),
+            type_name: "Port".to_owned(),
+            resolved_type_qualified_name: Some("Test.Port".to_owned()),
+            class_kind: Some(ClassKind::Connector),
+            origin,
+            rotation: 0.0,
+            placement_extent: Some(modelica_core::scene::Extent {
+                p1: CorePoint {
+                    x: -100.0,
+                    y: -100.0,
+                },
+                p2: CorePoint { x: 100.0, y: 100.0 },
+            }),
+            visible: true,
+            editable: true,
+            resolved_icon: Some(Box::new(CoreIconScene {
+                owner_qualified_name: Some("Test.Port".to_owned()),
+                coordinate_system: modelica_core::scene::CoordinateSystem::default(),
+                graphics: Vec::new(),
+                diagnostics: Vec::new(),
+            })),
+            resolved_diagram: None,
+        };
+        let lhs = ConnectorRef {
+            component_name: "a".to_owned(),
+            connector_path: String::new(),
+        };
+        let rhs = ConnectorRef {
+            component_name: "b".to_owned(),
+            connector_path: String::new(),
+        };
+        let connection = DiagramConnection {
+            key: ConnectionKey::new("Test", lhs.clone(), rhs.clone(), 0),
+            id: "connection:test".to_owned(),
+            lhs,
+            rhs,
+            from: "a".to_owned(),
+            to: "b".to_owned(),
+            line: Some(LineGraphic {
+                origin: CorePoint { x: 0.0, y: 0.0 },
+                rotation: 0.0,
+                points,
+                color: [0, 0, 0],
+                pattern: None,
+                thickness: 1.0,
+                arrow: Vec::new(),
+                arrow_size: None,
+                smooth: None,
+            }),
+            source_range: None,
+            line_source_range: None,
+        };
+        let scene = CoreDiagramScene {
+            class_qualified_name: Some("Test".to_owned()),
+            class_kind: Some(ClassKind::Model),
+            coordinate_system: modelica_core::scene::CoordinateSystem::default(),
+            background_graphics: Vec::new(),
+            components: vec![
+                component("a-id", "a", lhs_position),
+                component("b-id", "b", rhs_position),
+            ],
+            connections: vec![connection.clone()],
+            diagnostics: Vec::new(),
+            content_bounds: None,
+        };
+        (scene, connection)
+    }
+
+    fn connection_with_points(
+        scene: &CoreDiagramScene,
+        connection: &DiagramConnection,
+        points: Vec<CorePoint>,
+    ) -> (CoreDiagramScene, DiagramConnection) {
+        let mut connection = connection.clone();
+        connection.line.as_mut().expect("test line").points = points;
+        let mut scene = scene.clone();
+        scene.connections = vec![connection.clone()];
+        (scene, connection)
+    }
 
     #[test]
     fn canvas_navigation_is_limited_to_icon_and_diagram_canvas_events() {
@@ -8256,7 +8415,144 @@ mod tests {
     }
 
     #[test]
-    fn canonicalized_connection_points_serialize_minimal_line() {
+    fn dragged_horizontal_detour_collapses_to_one_segment() {
+        let before = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 20.0 },
+            CorePoint { x: 70.0, y: 20.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            before.clone(),
+        );
+        let raw = translated_connection_segment(
+            &before,
+            2,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: -20.0 },
+        );
+        let after = finalize_connection_route(&scene, &connection, &raw).expect("valid route");
+        assert_eq!(
+            after,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 },]
+        );
+        let (after_scene, after_connection) = connection_with_points(&scene, &connection, after);
+        assert!(connection_endpoints_match(&after_scene, &after_connection));
+    }
+
+    #[test]
+    fn dragged_vertical_detour_collapses_to_one_segment() {
+        let before = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 0.0, y: 30.0 },
+            CorePoint { x: 20.0, y: 30.0 },
+            CorePoint { x: 20.0, y: 70.0 },
+            CorePoint { x: 0.0, y: 70.0 },
+            CorePoint { x: 0.0, y: 100.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 0.0, y: 100.0 },
+            before.clone(),
+        );
+        let raw = translated_connection_segment(
+            &before,
+            2,
+            ConnectionSegmentOrientation::Vertical,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: -20.0, y: 0.0 },
+        );
+        let after = finalize_connection_route(&scene, &connection, &raw).expect("valid route");
+        assert_eq!(
+            after,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 0.0, y: 100.0 },]
+        );
+    }
+
+    #[test]
+    fn final_route_reanchors_endpoints_before_canonicalization() {
+        let before = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            before,
+        );
+        let raw = vec![
+            CorePoint { x: 2.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 98.0, y: 0.0 },
+        ];
+        let after = finalize_connection_route(&scene, &connection, &raw).expect("valid route");
+        assert_eq!(
+            after,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 },]
+        );
+        let (after_scene, after_connection) = connection_with_points(&scene, &connection, after);
+        assert!(connection_endpoints_match(&after_scene, &after_connection));
+    }
+
+    #[test]
+    fn final_route_keeps_a_real_non_collinear_corner() {
+        let points = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 40.0 },
+            CorePoint { x: 100.0, y: 40.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 40.0 },
+            points.clone(),
+        );
+        let after = finalize_connection_route(&scene, &connection, &points).expect("valid route");
+        assert_eq!(after, points);
+        assert!(is_orthogonal_polyline(&after));
+        assert_ne!(
+            after,
+            vec![
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 100.0, y: 40.0 }
+            ]
+        );
+    }
+
+    #[test]
+    fn final_route_repeats_simplification_until_stable() {
+        let before = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 30.0, y: 0.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 70.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            before.clone(),
+        );
+        let after = finalize_connection_route(&scene, &connection, &before).expect("valid route");
+        assert_eq!(
+            after,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 },]
+        );
+    }
+
+    #[test]
+    fn finalized_connection_points_serialize_minimal_line() {
         let source = "model Top\n equation\n  connect(a, b) annotation(Line(points={{0, 0}, {30, 0}, {30, 0}, {70, 0}, {70, 0}, {100, 0}}));\nend Top;";
         let raw_points = vec![
             CorePoint { x: 0.0, y: 0.0 },
@@ -8266,7 +8562,13 @@ mod tests {
             CorePoint { x: 70.0, y: 0.0 },
             CorePoint { x: 100.0, y: 0.0 },
         ];
-        let points = canonicalize_orthogonal_points(&raw_points);
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            raw_points.clone(),
+        );
+        let points = finalize_connection_route(&scene, &connection, &raw_points)
+            .expect("valid finalized route");
         let line_start = source.find("Line(").expect("Line annotation");
         let line_end =
             matching_delimiter(source, line_start + 4, b'(', b')').expect("Line close") + 1;
@@ -9031,8 +9333,11 @@ mod tests {
                 placement.scale_x,
                 placement.scale_y,
             );
-            assert!(icon.graphics.len() > 0, "{name} icon has no graphics");
-            assert!(diagram.graphics.len() > 0, "{name} Diagram has no graphics");
+            assert!(!icon.graphics.is_empty(), "{name} icon has no graphics");
+            assert!(
+                !diagram.graphics.is_empty(),
+                "{name} Diagram has no graphics"
+            );
             assert!((placement.scale_x - expected_scale_x).abs() < 0.001);
             assert!((placement.scale_y - 0.1).abs() < 0.001);
             assert!(

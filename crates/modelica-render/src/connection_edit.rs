@@ -7,8 +7,8 @@ pub const ORTHOGONAL_EPSILON: f32 = 0.001;
 ///
 /// Only contiguous vertices are considered: a pair of parallel segments that
 /// is separated by a corner is never merged. The first and last input points
-/// are restored if reduction would leave fewer than two points so callers can
-/// still validate the semantic connection endpoints.
+/// are always preserved so callers can validate the semantic connection
+/// endpoints after reduction.
 pub fn canonicalize_orthogonal_points(points: &[Point]) -> Vec<Point> {
     if points.len() < 2 {
         return points.to_vec();
@@ -21,15 +21,29 @@ pub fn canonicalize_orthogonal_points(points: &[Point]) -> Vec<Point> {
     loop {
         let mut changed = false;
         let mut without_duplicates = Vec::with_capacity(canonical.len());
-        for point in canonical {
-            if without_duplicates
+        let last_index = canonical.len().saturating_sub(1);
+        for (index, point) in canonical.into_iter().enumerate() {
+            if index == last_index {
+                // The semantic endpoints must survive canonicalization even
+                // when a bridge collapses onto the endpoint. Remove nearby
+                // interior vertices instead of dropping the last point.
+                while without_duplicates.len() > 1
+                    && without_duplicates.last().is_some_and(|previous| {
+                        point_distance(*previous, point) <= ORTHOGONAL_EPSILON
+                    })
+                {
+                    without_duplicates.pop();
+                    changed = true;
+                }
+                without_duplicates.push(point);
+            } else if without_duplicates
                 .last()
                 .is_some_and(|previous| point_distance(*previous, point) <= ORTHOGONAL_EPSILON)
             {
                 changed = true;
-                continue;
+            } else {
+                without_duplicates.push(point);
             }
-            without_duplicates.push(point);
         }
 
         let mut without_collinear = Vec::with_capacity(without_duplicates.len());
@@ -181,6 +195,15 @@ mod tests {
     fn canonicalization_keeps_two_endpoint_minimum() {
         let points = [point(10.0, 10.0), point(10.0, 10.0)];
         assert_eq!(canonicalize_orthogonal_points(&points), points);
+    }
+
+    #[test]
+    fn canonicalization_preserves_last_endpoint_near_a_bridge() {
+        let points = [point(0.0, 0.0), point(100.0, 0.0), point(100.0005, 0.0)];
+        assert_eq!(
+            canonicalize_orthogonal_points(&points),
+            vec![point(0.0, 0.0), point(100.0005, 0.0)]
+        );
     }
 
     #[test]

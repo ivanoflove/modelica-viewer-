@@ -7,13 +7,13 @@
 
 use std::collections::HashMap;
 
-use modelica_core::ClassKind;
 use modelica_core::scene::{
     ComponentInstance, ConnectorRef, DiagramConnection, DiagramScene, Extent, Graphic,
     GraphicOwnerKind, IconScene, Point, ResolvedGraphic, Transform2D,
 };
+use modelica_core::ClassKind;
 
-use crate::{Bounds, line_local_to_world, world_to_line_local};
+use crate::{line_local_to_world, world_to_line_local, Bounds};
 
 const DEFAULT_COMPONENT_EXTENT: Extent = Extent {
     p1: Point { x: -10.0, y: -10.0 },
@@ -277,21 +277,27 @@ pub fn reanchor_connection_points(
         return Err(ConnectorResolutionError::MissingLine);
     }
     let (lhs, rhs) = strict_connection_points(scene, connection)?;
+    // With only two points there is no interior neighbor to adjust. Assign
+    // both semantic anchors directly; trying to preserve an endpoint axis
+    // would otherwise use the other endpoint as a neighbor and overwrite the
+    // first anchor.
+    if points.len() == 2 {
+        return Ok(vec![lhs, rhs]);
+    }
+
     let mut result = points.to_vec();
     let lhs_before = result[0];
     result[0] = lhs;
-    if result.len() >= 2 {
-        preserve_endpoint_axis(&mut result[1], lhs_before, points[1], lhs);
-        let rhs_index = result.len() - 1;
-        let rhs_before = result[rhs_index];
-        result[rhs_index] = rhs;
-        preserve_endpoint_axis(
-            &mut result[rhs_index - 1],
-            rhs_before,
-            points[rhs_index - 1],
-            rhs,
-        );
-    }
+    let rhs_index = result.len() - 1;
+    preserve_endpoint_axis(&mut result[1], lhs_before, points[1], lhs);
+    let rhs_before = result[rhs_index];
+    result[rhs_index] = rhs;
+    preserve_endpoint_axis(
+        &mut result[rhs_index - 1],
+        rhs_before,
+        points[rhs_index - 1],
+        rhs,
+    );
     Ok(result)
 }
 
@@ -727,5 +733,14 @@ mod tests {
         .unwrap();
         assert!((reanchored[0].x - points.0.x).abs() < 0.001);
         assert!((reanchored[1].x - points.1.x).abs() < 0.001);
+
+        // A two-point route has no interior neighbor. In particular, a raw
+        // horizontal pair must not let the rhs-axis adjustment overwrite the
+        // already fixed lhs semantic endpoint.
+        let raw_two_point = vec![point(4.0, 50.0), point(100.0, 50.0)];
+        let two_point =
+            reanchor_connection_points(&scene, &scene.connections[0], &raw_two_point).unwrap();
+        assert_eq!(two_point[0], points.0);
+        assert_eq!(two_point[1], points.1);
     }
 }
