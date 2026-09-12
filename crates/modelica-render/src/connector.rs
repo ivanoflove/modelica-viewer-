@@ -13,6 +13,7 @@ use modelica_core::scene::{
 };
 use modelica_core::ClassKind;
 
+use crate::connection_edit::ORTHOGONAL_EPSILON;
 use crate::{line_local_to_world, world_to_line_local, Bounds};
 
 const DEFAULT_COMPONENT_EXTENT: Extent = Extent {
@@ -277,12 +278,8 @@ pub fn reanchor_connection_points(
         return Err(ConnectorResolutionError::MissingLine);
     }
     let (lhs, rhs) = strict_connection_points(scene, connection)?;
-    // With only two points there is no interior neighbor to adjust. Assign
-    // both semantic anchors directly; trying to preserve an endpoint axis
-    // would otherwise use the other endpoint as a neighbor and overwrite the
-    // first anchor.
     if points.len() == 2 {
-        return Ok(vec![lhs, rhs]);
+        return Ok(reanchor_two_point_connection(points, lhs, rhs));
     }
 
     let mut result = points.to_vec();
@@ -302,6 +299,33 @@ pub fn reanchor_connection_points(
         .ok_or(ConnectorResolutionError::MissingLine)?;
     preserve_endpoint_axis(&mut result[rhs_index - 1], rhs_before, rhs_neighbor, rhs);
     Ok(result)
+}
+
+fn reanchor_two_point_connection(points: &[Point], lhs: Point, rhs: Point) -> Vec<Point> {
+    debug_assert_eq!(points.len(), 2);
+    if (lhs.x - rhs.x).abs() <= ORTHOGONAL_EPSILON || (lhs.y - rhs.y).abs() <= ORTHOGONAL_EPSILON {
+        return vec![lhs, rhs];
+    }
+
+    let lhs_before = points[0];
+    let rhs_before = points[1];
+    let lhs_moved = distance(lhs_before, lhs) > ORTHOGONAL_EPSILON;
+    let rhs_moved = distance(rhs_before, rhs) > ORTHOGONAL_EPSILON;
+    let was_horizontal = (lhs_before.y - rhs_before.y).abs() <= ORTHOGONAL_EPSILON;
+
+    let elbow = if was_horizontal {
+        if rhs_moved && !lhs_moved {
+            Point { x: lhs.x, y: rhs.y }
+        } else {
+            Point { x: rhs.x, y: lhs.y }
+        }
+    } else if rhs_moved && !lhs_moved {
+        Point { x: rhs.x, y: lhs.y }
+    } else {
+        Point { x: lhs.x, y: rhs.y }
+    };
+
+    vec![lhs, elbow, rhs]
 }
 
 fn is_connector_component(component: &ComponentInstance) -> bool {
@@ -742,5 +766,29 @@ mod tests {
             reanchor_connection_points(&scene, &scene.connections[0], &raw_two_point).unwrap();
         assert_eq!(two_point[0], points.0);
         assert_eq!(two_point[1], points.1);
+    }
+
+    #[test]
+    fn two_point_connection_adds_elbow_when_endpoint_moves_off_axis() {
+        let points = vec![point(0.0, 0.0), point(100.0, 0.0)];
+        let reanchored =
+            reanchor_two_point_connection(&points, point(20.0, 30.0), point(100.0, 0.0));
+
+        assert_eq!(
+            reanchored,
+            vec![point(20.0, 30.0), point(100.0, 30.0), point(100.0, 0.0),]
+        );
+    }
+
+    #[test]
+    fn two_point_connection_keeps_original_axis_near_stationary_endpoint() {
+        let points = vec![point(0.0, 0.0), point(0.0, 100.0)];
+        let reanchored =
+            reanchor_two_point_connection(&points, point(20.0, 0.0), point(0.0, 120.0));
+
+        assert_eq!(
+            reanchored,
+            vec![point(20.0, 0.0), point(20.0, 120.0), point(0.0, 120.0),]
+        );
     }
 }
