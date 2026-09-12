@@ -651,6 +651,57 @@ struct ConnectionHit {
     target: ConnectionHitTarget,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ConnectionEndpointConstraint {
+    Semantic { lhs: CorePoint, rhs: CorePoint },
+    FixedExisting { lhs: CorePoint, rhs: CorePoint },
+}
+
+impl ConnectionEndpointConstraint {
+    fn points(self) -> (CorePoint, CorePoint) {
+        match self {
+            Self::Semantic { lhs, rhs } | Self::FixedExisting { lhs, rhs } => (lhs, rhs),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Semantic { .. } => "Semantic",
+            Self::FixedExisting { .. } => "FixedExisting",
+        }
+    }
+}
+
+fn connection_edit_diagnostic(
+    connection: &modelica_core::scene::DiagramConnection,
+    selected_class: &str,
+    endpoint_constraint: Option<ConnectionEndpointConstraint>,
+    stage: &str,
+    detail: impl std::fmt::Display,
+) -> String {
+    let line_endpoints = connection.line.as_ref().and_then(|line| {
+        line.points
+            .first()
+            .copied()
+            .zip(line.points.last().copied())
+    });
+    let (lhs, rhs) = endpoint_constraint
+        .map(ConnectionEndpointConstraint::points)
+        .or(line_endpoints)
+        .map_or((None, None), |(lhs, rhs)| (Some(lhs), Some(rhs)));
+    let constraint = endpoint_constraint.map_or("Unavailable", |value| value.label());
+    format!(
+        "Connection edit {stage} failed: {detail}; id={}; key={:?}; owner={}; selected={}; lhs={:?}; rhs={:?}; line_source_range={:?}; constraint={constraint}",
+        connection.id,
+        connection.key,
+        connection.key.owner_class,
+        selected_class,
+        lhs,
+        rhs,
+        connection.line_source_range,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HitBounds {
     min: CorePoint,
@@ -999,7 +1050,7 @@ enum PointerInteraction {
         start_pointer_model: CorePoint,
         original_points: Vec<CorePoint>,
         preview_points: Vec<CorePoint>,
-        semantic_endpoints: (CorePoint, CorePoint),
+        endpoint_constraint: ConnectionEndpointConstraint,
         snap_axes: Vec<f32>,
         snapped_axis: Option<f32>,
         source_before: String,
@@ -1014,7 +1065,7 @@ enum PointerInteraction {
         start_pointer_model: CorePoint,
         original_points: Vec<CorePoint>,
         preview_points: Vec<CorePoint>,
-        semantic_endpoints: (CorePoint, CorePoint),
+        endpoint_constraint: ConnectionEndpointConstraint,
         source_before: String,
     },
     CreateDiagramConnection(ConnectionCreation),
@@ -1097,6 +1148,7 @@ enum EditCommand {
         connection_key: ConnectionKey,
         before_points: Vec<CorePoint>,
         after_points: Vec<CorePoint>,
+        endpoint_constraint: ConnectionEndpointConstraint,
     },
     CreateDiagramConnection {
         class_name: String,
@@ -3641,30 +3693,65 @@ impl App {
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        let Some((connection_key, line, original_points, semantic_endpoints, source_before)) =
-            (|| {
-                let scene = document.diagram(&class_name)?;
-                let connection = scene
-                    .connections
-                    .iter()
-                    .find(|connection| connection.id == hit.connection_id)?;
-                let line = connection.line.as_ref()?;
-                let source_before = document.class_text(&class_name)?;
-                // Connector resolution belongs at drag-start. The endpoints
-                // are immutable while a connection segment/corner is moved.
-                let semantic_endpoints = strict_connection_points(scene, connection)
-                    .unwrap_or((line.points.first().copied()?, line.points.last().copied()?));
-                Some((
-                    connection.key.clone(),
-                    line.clone(),
-                    line.points.clone(),
-                    semantic_endpoints,
-                    source_before,
-                ))
-            })()
-        else {
-            return;
-        };
+        let edit_data = (|| -> Result<
+            (
+                ConnectionKey,
+                LineGraphic,
+                Vec<CorePoint>,
+                ConnectionEndpointConstraint,
+                String,
+            ),
+            String,
+        > {
+            let scene = document
+                .diagram(&class_name)
+                .ok_or_else(|| "Connection edit could not find the selected Diagram".to_owned())?;
+            let connection = scene
+                .connections
+                .iter()
+                .find(|connection| connection.id == hit.connection_id)
+                .ok_or_else(|| "Connection edit lost its connection identity".to_owned())?;
+            let line = connection
+                .line
+                .as_ref()
+                .ok_or_else(|| "Connection has no editable Line annotation".to_owned())?;
+            let source_before = document
+                .class_text(&class_name)
+                .ok_or_else(|| "Connection edit could not load the selected source".to_owned())?;
+            connection_source_editable_in_class(connection, &class_name, &source_before)?;
+            let lhs = line
+                .points
+                .first()
+                .copied()
+                .ok_or_else(|| "Connection Line has no first point".to_owned())?;
+            let rhs = line
+                .points
+                .last()
+                .copied()
+                .ok_or_else(|| "Connection Line has no last point".to_owned())?;
+            // Connector resolution belongs at drag-start. The endpoint
+            // policy is immutable while a connection segment/corner moves.
+            let endpoint_constraint = match strict_connection_points(scene, connection) {
+                Ok((lhs, rhs)) => ConnectionEndpointConstraint::Semantic { lhs, rhs },
+                Err(_) => ConnectionEndpointConstraint::FixedExisting { lhs, rhs },
+            };
+            Ok((
+                connection.key.clone(),
+                line.clone(),
+                line.points.clone(),
+                endpoint_constraint,
+                source_before,
+            ))
+        })();
+        self.set_diagram_selection(DiagramSelection::Connection(hit.connection_id.clone()));
+        let (connection_key, line, original_points, endpoint_constraint, source_before) =
+            match edit_data {
+                Ok(data) => data,
+                Err(error) => {
+                    self.load_error = Some(error);
+                    return;
+                }
+            };
         let line_origin = line.origin;
         let line_rotation = line.rotation;
         let snap_axes = match &hit.target {
@@ -3714,7 +3801,7 @@ impl App {
                     start_pointer_model: pointer_model,
                     original_points: original_points.clone(),
                     preview_points: original_points,
-                    semantic_endpoints,
+                    endpoint_constraint,
                     source_before,
                 };
                 return;
@@ -3735,7 +3822,7 @@ impl App {
                     start_pointer_model: pointer_model,
                     original_points: original_points.clone(),
                     preview_points: original_points,
-                    semantic_endpoints,
+                    endpoint_constraint,
                     snap_axes,
                     snapped_axis: None,
                     source_before,
@@ -4162,7 +4249,7 @@ impl App {
                     line_rotation,
                     start_pointer_model,
                     original_points,
-                    semantic_endpoints,
+                    endpoint_constraint,
                     snap_axes,
                     snapped_axis,
                     preview_points,
@@ -4196,7 +4283,7 @@ impl App {
                         *line_origin,
                         *line_rotation,
                         delta,
-                        *semantic_endpoints,
+                        *endpoint_constraint,
                     );
                     let reanchor_elapsed = reanchor_started.elapsed();
                     let upload_started = Instant::now();
@@ -4219,7 +4306,7 @@ impl App {
                     line_rotation,
                     start_pointer_model,
                     original_points,
-                    semantic_endpoints,
+                    endpoint_constraint,
                     preview_points,
                     ..
                 } => {
@@ -4234,7 +4321,7 @@ impl App {
                         *line_origin,
                         *line_rotation,
                         delta,
-                        *semantic_endpoints,
+                        *endpoint_constraint,
                     );
                     let reanchor_elapsed = reanchor_started.elapsed();
                     let upload_started = Instant::now();
@@ -4559,7 +4646,7 @@ impl App {
                 line_rotation,
                 start_pointer_model,
                 original_points,
-                semantic_endpoints,
+                endpoint_constraint,
                 snap_axes,
                 mut snapped_axis,
                 source_before,
@@ -4589,12 +4676,13 @@ impl App {
                     line_origin,
                     line_rotation,
                     delta,
-                    semantic_endpoints,
+                    endpoint_constraint,
                 );
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
                     raw_after_points,
+                    endpoint_constraint,
                     source_before,
                 );
             }
@@ -4606,7 +4694,7 @@ impl App {
                 line_rotation,
                 start_pointer_model,
                 original_points,
-                semantic_endpoints,
+                endpoint_constraint,
                 source_before,
                 ..
             } => {
@@ -4621,12 +4709,13 @@ impl App {
                     line_origin,
                     line_rotation,
                     delta,
-                    semantic_endpoints,
+                    endpoint_constraint,
                 );
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
                     raw_after_points,
+                    endpoint_constraint,
                     source_before,
                 );
             }
@@ -5188,6 +5277,7 @@ impl App {
         connection_key: ConnectionKey,
         before_points: Vec<CorePoint>,
         after_points: Vec<CorePoint>,
+        endpoint_constraint: ConnectionEndpointConstraint,
         source_before: String,
     ) {
         if before_points == after_points {
@@ -5195,7 +5285,7 @@ impl App {
         }
         let mut profile = EditCommitProfile::new();
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
-            self.rebuild_selected_scenes();
+            self.load_error = Some("Connection edit has no selected class".into());
             return;
         };
         let Some(version) = self
@@ -5203,7 +5293,7 @@ impl App {
             .as_ref()
             .map(|document| document.source_version(&class_name))
         else {
-            self.rebuild_selected_scenes();
+            self.load_error = Some("Connection edit has no source version".into());
             return;
         };
         let Some(current_scene) = self
@@ -5211,7 +5301,7 @@ impl App {
             .as_ref()
             .and_then(|document| document.diagram(&class_name))
         else {
-            self.rebuild_selected_scenes();
+            self.load_error = Some("Connection edit has no selected Diagram".into());
             return;
         };
         let Some(cache_connection_index) = current_scene
@@ -5220,20 +5310,39 @@ impl App {
             .position(|connection| connection.key == connection_key)
         else {
             self.load_error = Some("Connection edit lost its connection identity".into());
-            self.rebuild_selected_scenes();
             return;
         };
         let Some(connection) = current_scene.connections.get(cache_connection_index) else {
             self.load_error = Some("Connection edit lost its connection identity".into());
-            self.rebuild_selected_scenes();
             return;
         };
-        let after_points = match finalize_connection_route(current_scene, connection, &after_points)
+        if let Err(error) =
+            connection_source_editable_in_class(connection, &class_name, &source_before)
         {
+            self.load_error = Some(connection_edit_diagnostic(
+                connection,
+                &class_name,
+                Some(endpoint_constraint),
+                "preflight",
+                error,
+            ));
+            return;
+        }
+        let after_points = match finalize_connection_route_with_constraint(
+            current_scene,
+            connection,
+            &after_points,
+            endpoint_constraint,
+        ) {
             Ok(points) => points,
             Err(error) => {
-                self.load_error = Some(format!("Connection edit rejected: {error}"));
-                self.rebuild_selected_scenes();
+                self.load_error = Some(connection_edit_diagnostic(
+                    connection,
+                    &class_name,
+                    Some(endpoint_constraint),
+                    "finalize",
+                    error,
+                ));
                 return;
             }
         };
@@ -5246,16 +5355,26 @@ impl App {
         ) {
             Ok(edit) => edit,
             Err(error) => {
-                self.load_error = Some(format!("Connection edit rejected: {error}"));
-                self.rebuild_selected_scenes();
+                self.load_error = Some(connection_edit_diagnostic(
+                    connection,
+                    &class_name,
+                    Some(endpoint_constraint),
+                    "source-edit",
+                    error,
+                ));
                 return;
             }
         };
         let candidate = match apply_validated_source_edits(&source_before, vec![edit], version) {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.load_error = Some(format!("Connection edit rejected: {error}"));
-                self.rebuild_selected_scenes();
+                self.load_error = Some(connection_edit_diagnostic(
+                    connection,
+                    &class_name,
+                    Some(endpoint_constraint),
+                    "transaction",
+                    error,
+                ));
                 return;
             }
         };
@@ -5270,8 +5389,13 @@ impl App {
         }) {
             Some(scenes) => scenes,
             None => {
-                self.load_error = Some("Connection edit could not resolve candidate source".into());
-                self.rebuild_selected_scenes();
+                self.load_error = Some(connection_edit_diagnostic(
+                    connection,
+                    &class_name,
+                    Some(endpoint_constraint),
+                    "candidate-resolve",
+                    "could not resolve candidate source",
+                ));
                 return;
             }
         };
@@ -5284,34 +5408,58 @@ impl App {
             .iter()
             .position(|connection| connection.key == connection_key)
         else {
-            self.load_error = Some("Connection edit lost its connection identity".into());
-            self.rebuild_selected_scenes();
+            self.load_error = Some(connection_edit_diagnostic(
+                connection,
+                &class_name,
+                Some(endpoint_constraint),
+                "identity",
+                "connection identity is no longer present",
+            ));
             return;
         };
         let Some(connection) = resolved_diagram.connections.get(resolved_connection_index) else {
-            self.load_error = Some("Connection edit lost its connection identity".into());
-            self.rebuild_selected_scenes();
+            self.load_error = Some(connection_edit_diagnostic(
+                connection,
+                &class_name,
+                Some(endpoint_constraint),
+                "identity",
+                "connection identity is no longer present",
+            ));
             return;
         };
-        if let Some(reason) =
-            connection_invariant_failure(&resolved_diagram, connection, &after_points)
-        {
-            self.load_error = Some(format!("Connection edit failed: {reason}"));
-            self.rebuild_selected_scenes();
+        if let Some(reason) = connection_invariant_failure_with_constraint(
+            &resolved_diagram,
+            connection,
+            &after_points,
+            Some(endpoint_constraint),
+        ) {
+            self.load_error = Some(connection_edit_diagnostic(
+                connection,
+                &class_name,
+                Some(endpoint_constraint),
+                "validation",
+                reason,
+            ));
             return;
         }
         let Some(canonical_line) = connection.line.clone() else {
-            self.load_error = Some("Connection edit lost its Line annotation".into());
-            self.rebuild_selected_scenes();
+            self.load_error = Some(connection_edit_diagnostic(
+                connection,
+                &class_name,
+                Some(endpoint_constraint),
+                "validation",
+                "Line annotation is missing",
+            ));
             return;
         };
+        let canonical_points = canonical_line.points.clone();
         let connection_id = connection.id.clone();
         if profile.enabled {
             profile.semantic_validation = validation_started.elapsed();
         }
         let document_started = Instant::now();
         let Some(document) = self.document.as_mut() else {
-            self.rebuild_selected_scenes();
+            self.load_error = Some("Connection edit lost its document".into());
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
@@ -5329,7 +5477,7 @@ impl App {
             &self.device,
             &self.queue,
             &connection_id,
-            &after_points,
+            &canonical_points,
         );
         if profile.enabled {
             profile.gpu_update = gpu_started.elapsed();
@@ -5344,7 +5492,8 @@ impl App {
             class_name,
             connection_key,
             before_points,
-            after_points,
+            after_points: canonical_points,
+            endpoint_constraint,
         });
         self.redo_history.clear();
         self.load_error = None;
@@ -5635,6 +5784,7 @@ impl App {
                 connection_key,
                 before_points,
                 after_points,
+                endpoint_constraint,
             } => {
                 let expected_points = if after { after_points } else { before_points };
                 let Some(document) = self.document.as_ref() else {
@@ -5669,11 +5819,14 @@ impl App {
                 else {
                     return;
                 };
-                if !connection_points_match_invariants(
+                if connection_invariant_failure_with_constraint(
                     &resolved_diagram,
                     connection,
                     expected_points,
-                ) {
+                    Some(*endpoint_constraint),
+                )
+                .is_some()
+                {
                     return;
                 }
                 let Some(document) = self.document.as_mut() else {
@@ -9231,19 +9384,47 @@ fn connection_endpoints_match(
 /// bridge with its semantic endpoint can create a new duplicate or collinear
 /// vertex. Canonicalization therefore never gets to remove an endpoint, and
 /// the route is only accepted once both operations are stable.
+#[cfg(test)]
 fn finalize_connection_route(
     scene: &CoreDiagramScene,
     connection: &modelica_core::scene::DiagramConnection,
     raw_points: &[CorePoint],
 ) -> Result<Vec<CorePoint>, String> {
+    let (lhs, rhs) = strict_connection_points(scene, connection)
+        .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
+    finalize_connection_route_with_constraint(
+        scene,
+        connection,
+        raw_points,
+        ConnectionEndpointConstraint::Semantic { lhs, rhs },
+    )
+}
+
+fn finalize_connection_route_with_constraint(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    raw_points: &[CorePoint],
+    endpoint_constraint: ConnectionEndpointConstraint,
+) -> Result<Vec<CorePoint>, String> {
     if raw_points.len() < 2 {
         return Err("connection route must contain at least two points".to_owned());
     }
 
+    let (lhs, rhs) = endpoint_constraint.points();
     let mut points = raw_points.to_vec();
     loop {
-        let anchored = reanchor_connection_points(scene, connection, &points)
-            .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
+        let anchored = match endpoint_constraint {
+            ConnectionEndpointConstraint::Semantic { .. } => {
+                reanchor_connection_points(scene, connection, &points)
+                    .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?
+            }
+            ConnectionEndpointConstraint::FixedExisting { .. } => {
+                let mut anchored = points.clone();
+                anchored[0] = lhs;
+                *anchored.last_mut().expect("at least two points") = rhs;
+                anchored
+            }
+        };
         let canonical = canonicalize_orthogonal_points(&anchored);
         if canonical == points {
             points = canonical;
@@ -9265,13 +9446,18 @@ fn finalize_connection_route(
         return Err("connection route contains a zero-length segment".to_owned());
     }
 
-    let (lhs, rhs) = strict_connection_points(scene, connection)
-        .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
     if distance_between(points[0], lhs) > DIAGRAM_GEOMETRY_EPSILON
         || distance_between(*points.last().expect("at least two points"), rhs)
             > DIAGRAM_GEOMETRY_EPSILON
     {
-        return Err("connection route endpoints are not anchored".to_owned());
+        return Err(match endpoint_constraint {
+            ConnectionEndpointConstraint::Semantic { .. } => {
+                "connection route endpoints are not anchored".to_owned()
+            }
+            ConnectionEndpointConstraint::FixedExisting { .. } => {
+                "fixed connection endpoints changed".to_owned()
+            }
+        });
     }
     Ok(points)
 }
@@ -9299,6 +9485,15 @@ fn connection_invariant_failure(
     connection: &modelica_core::scene::DiagramConnection,
     expected_points: &[CorePoint],
 ) -> Option<&'static str> {
+    connection_invariant_failure_with_constraint(scene, connection, expected_points, None)
+}
+
+fn connection_invariant_failure_with_constraint(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    expected_points: &[CorePoint],
+    endpoint_constraint: Option<ConnectionEndpointConstraint>,
+) -> Option<&'static str> {
     let Some(line) = connection.line.as_ref() else {
         return Some("connection points mismatch");
     };
@@ -9312,7 +9507,21 @@ fn connection_invariant_failure(
     {
         return Some("connection points mismatch");
     }
-    if !connection_endpoints_match(scene, connection) {
+    let endpoints_match = match endpoint_constraint {
+        Some(ConnectionEndpointConstraint::FixedExisting { lhs, rhs }) => {
+            point_nearly_equal(*first, lhs)
+                && point_nearly_equal(*line.points.last().expect("line has a last point"), rhs)
+        }
+        Some(ConnectionEndpointConstraint::Semantic { lhs, rhs }) => {
+            let Ok((resolved_lhs, resolved_rhs)) = strict_connection_points(scene, connection)
+            else {
+                return Some("endpoint anchor mismatch");
+            };
+            point_nearly_equal(resolved_lhs, lhs) && point_nearly_equal(resolved_rhs, rhs)
+        }
+        None => connection_endpoints_match(scene, connection),
+    };
+    if !endpoints_match {
         return Some("endpoint anchor mismatch");
     }
     None
@@ -9770,10 +9979,12 @@ fn build_connection_segment_drag_route(
     line_origin: CorePoint,
     line_rotation: f32,
     delta: CorePoint,
-    semantic_endpoints: (CorePoint, CorePoint),
+    endpoint_constraint: ConnectionEndpointConstraint,
 ) -> Vec<CorePoint> {
-    let anchored_points =
-        connection_drag_points_with_semantic_endpoints(original_points, semantic_endpoints);
+    let anchored_points = connection_drag_points_with_semantic_endpoints(
+        original_points,
+        endpoint_constraint.points(),
+    );
     translated_connection_segment(
         &anchored_points,
         segment_index,
@@ -9790,10 +10001,12 @@ fn build_connection_corner_drag_route(
     line_origin: CorePoint,
     line_rotation: f32,
     delta: CorePoint,
-    semantic_endpoints: (CorePoint, CorePoint),
+    endpoint_constraint: ConnectionEndpointConstraint,
 ) -> Vec<CorePoint> {
-    let anchored_points =
-        connection_drag_points_with_semantic_endpoints(original_points, semantic_endpoints);
+    let anchored_points = connection_drag_points_with_semantic_endpoints(
+        original_points,
+        endpoint_constraint.points(),
+    );
     translated_connection_corner(
         &anchored_points,
         corner_index,
@@ -9914,6 +10127,42 @@ fn connector_ref_text(reference: &ConnectorRef) -> String {
     } else {
         format!("{}.{}", reference.component_name, reference.connector_path)
     }
+}
+
+fn connection_source_editable_in_class(
+    connection: &modelica_core::scene::DiagramConnection,
+    class_name: &str,
+    source: &str,
+) -> Result<(), String> {
+    if connection.key.owner_class != class_name {
+        return Err(format!(
+            "Connection is inherited from {} and is read-only in {}",
+            connection.key.owner_class, class_name
+        ));
+    }
+    let line_source_range = connection
+        .line_source_range
+        .ok_or_else(|| "Connection has no editable Line source range".to_owned())?;
+    if line_source_range.start > line_source_range.end
+        || line_source_range.end > source.len()
+        || source
+            .get(line_source_range.start..line_source_range.end)
+            .is_none()
+    {
+        return Err("Connection Line source range is stale".to_owned());
+    }
+    let line_source = source
+        .get(line_source_range.start..line_source_range.end)
+        .expect("validated connection Line source range");
+    let line = parse_call(line_source)
+        .map_err(|error| format!("Connection Line annotation cannot be parsed: {error}"))?;
+    if line.name != "Line" {
+        return Err("Connection source range does not point to a Line annotation".to_owned());
+    }
+    if line.named("points").is_none() {
+        return Err("Connection Line has no points argument".to_owned());
+    }
+    Ok(())
 }
 
 fn new_connection_source_edit(
@@ -11258,7 +11507,10 @@ mod tests {
             CorePoint { x: 0.0, y: 0.0 },
             0.0,
             CorePoint { x: 0.0, y: 40.0 },
-            (points[0], points[1]),
+            ConnectionEndpointConstraint::Semantic {
+                lhs: points[0],
+                rhs: points[1],
+            },
         );
         let committed = translated_connection_segment(
             &points,
@@ -11958,11 +12210,116 @@ mod tests {
             CorePoint { x: 0.0, y: 0.0 },
             0.0,
             CorePoint { x: 0.0, y: 0.0 },
-            (CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 60.0, y: 0.0 }),
+            ConnectionEndpointConstraint::Semantic {
+                lhs: CorePoint { x: 0.0, y: 0.0 },
+                rhs: CorePoint { x: 60.0, y: 0.0 },
+            },
         );
         assert_eq!(anchored.first(), Some(&CorePoint { x: 0.0, y: 0.0 }));
         assert_eq!(anchored.last(), Some(&CorePoint { x: 60.0, y: 0.0 }));
         assert!(is_orthogonal_polyline(&anchored));
+    }
+
+    #[test]
+    fn fixed_existing_connection_route_does_not_require_semantic_anchors() {
+        let (scene, mut connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 0.0, y: 20.0 },
+                CorePoint { x: 100.0, y: 20.0 },
+                CorePoint { x: 100.0, y: 0.0 },
+            ],
+        );
+        connection.lhs.component_name = "missing".to_owned();
+        let expected = connection.line.as_ref().unwrap().points.clone();
+        let result = finalize_connection_route_with_constraint(
+            &scene,
+            &connection,
+            &expected,
+            ConnectionEndpointConstraint::FixedExisting {
+                lhs: expected[0],
+                rhs: *expected.last().unwrap(),
+            },
+        )
+        .expect("fixed endpoints should bypass semantic resolution");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn connection_edit_preflight_rejects_inherited_connection() {
+        let source = "model Child\n equation\nend Child;";
+        let (_, mut connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        connection.key.owner_class = "Base".to_owned();
+        let error = connection_source_editable_in_class(&connection, "Child", source)
+            .expect_err("inherited connections must be read-only");
+        assert!(error.contains("inherited from Base"));
+        assert!(error.contains("read-only in Child"));
+    }
+
+    #[test]
+    fn connection_edit_preflight_validates_current_class_line_source() {
+        let source =
+            "model Test\n equation\n  connect(a, b) annotation(Line(points={{0, 0}, {100, 0}}));\nend Test;";
+        let line_start = source.find("Line(").expect("Line annotation");
+        let line_end = source[line_start..]
+            .find(')')
+            .map(|offset| line_start + offset + 1)
+            .expect("Line annotation end");
+        let (_, mut connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        connection.line_source_range = Some(SourceRange::new(line_start, line_end));
+        connection.key.owner_class = "Test".to_owned();
+        connection_source_editable_in_class(&connection, "Test", source)
+            .expect("current class Line should be editable");
+    }
+
+    #[test]
+    fn multiple_connection_edits_resolve_each_current_source_range() {
+        let mut source = "model Top\n equation\n  connect(a, b) annotation(Line(points={{10, 0}, {20, 0}}));\n  connect(c, d) annotation(Line(points={{40, 0}, {50, 0}}));\nend Top;".to_owned();
+        let mut registry = LibraryRegistry::default();
+        for iteration in 0..20 {
+            let file = parse(&source, "Multiple.mo").expect("parse iteration");
+            registry
+                .register_source("Multiple.mo", &source)
+                .expect("reindex iteration");
+            let scene = resolve_diagram(&file.classes[0], &source, &mut registry);
+            assert_eq!(scene.connections.len(), 2);
+            for (index, key) in scene
+                .connections
+                .iter()
+                .map(|connection| connection.key.clone())
+                .enumerate()
+            {
+                let base = (10 + iteration + index * 30) as f32;
+                let edit = connection_points_edit_for_key(
+                    &source,
+                    &scene,
+                    &key,
+                    &[
+                        CorePoint { x: base, y: 0.0 },
+                        CorePoint {
+                            x: base + 10.0,
+                            y: 0.0,
+                        },
+                    ],
+                )
+                .expect("keyed line edit");
+                source =
+                    apply_validated_source_edits(&source, vec![edit], 0).expect("candidate source");
+            }
+        }
+        assert!(parse(&source, "Multiple.mo").is_ok());
+        assert!(source.contains("connect(a, b)"));
+        assert!(source.contains("connect(c, d)"));
     }
 
     #[test]
