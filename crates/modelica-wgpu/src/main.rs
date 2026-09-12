@@ -495,68 +495,6 @@ mod save_tests {
         );
         // Simulate an external editor shifting every offset.
         fs::write(&path, format!("// externally edited\n{content}")).unwrap();
-        let error = save_edited_classes(&mut document)
-            .expect_err("save must refuse a file changed on disk");
-        assert!(
-            error.contains("changed on disk"),
-            "unexpected error: {error}"
-        );
-        // The externally edited bytes must be preserved untouched.
-        let disk = fs::read_to_string(&path).unwrap();
-        assert!(disk.starts_with("// externally edited"));
-        assert!(disk.contains("class A model M end A"));
-        assert!(disk.contains("class B model N end B"));
-        let _ = fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn save_with_no_edits_is_a_noop() {
-        let directory = temp_directory("empty");
-        let content = "class A end A;";
-        let path = directory.join("Noop.mo");
-        fs::write(&path, content).unwrap();
-        let mut document = LoadedDocument {
-            path: path.clone(),
-            package_name: "Noop".to_owned(),
-            class_names: Vec::new(),
-            diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
-            class_sources: Vec::new(),
-            source_overrides: HashMap::new(),
-            saved_class_text: HashMap::new(),
-            source_versions: HashMap::new(),
-        };
-        assert_eq!(
-            save_edited_classes(&mut document).expect("save succeeds"),
-            0
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), content);
-        let _ = fs::remove_dir_all(&directory);
-    }
-}
-
-#[cfg(test)]
-mod appearance_tests {
-    use super::*;
-
-    #[test]
-    fn parse_defaults_for_empty_and_garbage_input() {
-        assert_eq!(
-            parse_appearance_json(""),
-            (ThemeMode::System, AccentTheme::Violet)
-        );
-        assert_eq!(
-            parse_appearance_json("not json at all"),
-            (ThemeMode::System, AccentTheme::Violet)
-        );
-    }
-
-    #[test]
-    fn parse_restores_saved_theme_and_accent() {
-        assert_eq!(
-            parse_appearance_json(r#"{"theme": "dark", "accent": "cyan"}"#),
-            (ThemeMode::Dark, AccentTheme::Cyan)
         );
         assert_eq!(
             parse_appearance_json(r#"{"theme":"light","accent":"orange"}"#),
@@ -744,130 +682,7 @@ impl DiagramSpatialIndex {
                 .component_indices
                 .push(index);
         }
-    }
 
-    fn insert_port(&mut self, index: usize, bounds: HitBounds) {
-        if self.port_query_marks.len() <= index {
-            self.port_query_marks.resize(index + 1, 0);
-        }
-        for cell in Self::cell_range(bounds) {
-            self.cells.entry(cell).or_default().port_indices.push(index);
-        }
-    }
-
-    fn insert_connection_segment(&mut self, segment: ConnectionSegmentRef, bounds: HitBounds) {
-        for cell in Self::cell_range(bounds) {
-            self.cells
-                .entry(cell)
-                .or_default()
-                .connection_segments
-                .push(segment);
-            self.connection_cells
-                .entry(segment.connection_index)
-                .or_default()
-                .push(cell);
-        }
-    }
-
-    fn remove_connection(&mut self, connection_index: usize) {
-        let Some(mut cells) = self.connection_cells.remove(&connection_index) else {
-            return;
-        };
-        cells.sort_unstable();
-        cells.dedup();
-        for cell in cells {
-            let mut remove_cell = false;
-            if let Some(bucket) = self.cells.get_mut(&cell) {
-                bucket
-                    .connection_segments
-                    .retain(|segment| segment.connection_index != connection_index);
-                remove_cell = bucket.component_indices.is_empty()
-                    && bucket.port_indices.is_empty()
-                    && bucket.connection_segments.is_empty();
-            }
-            if remove_cell {
-                self.cells.remove(&cell);
-            }
-        }
-    }
-
-    fn update_connection(
-        &mut self,
-        connection_index: usize,
-        segments: impl IntoIterator<Item = (usize, HitBounds)>,
-    ) {
-        self.remove_connection(connection_index);
-        for (segment_index, bounds) in segments {
-            self.insert_connection_segment(
-                ConnectionSegmentRef {
-                    connection_index,
-                    segment_index,
-                },
-                bounds,
-            );
-        }
-    }
-
-    fn query(&self, point: CorePoint, tolerance: f32) -> SpatialCandidates {
-        let tolerance = tolerance.max(0.0);
-        let bounds = HitBounds {
-            min: CorePoint {
-                x: point.x - tolerance,
-                y: point.y - tolerance,
-            },
-            max: CorePoint {
-                x: point.x + tolerance,
-                y: point.y + tolerance,
-            },
-        };
-        let mut candidates = SpatialCandidates::default();
-        for cell in Self::cell_range(bounds) {
-            let Some(bucket) = self.cells.get(&cell) else {
-                continue;
-            };
-            candidates
-                .component_indices
-                .extend(bucket.component_indices.iter().copied());
-            candidates
-                .port_indices
-                .extend(bucket.port_indices.iter().copied());
-            candidates
-                .connection_segments
-                .extend(bucket.connection_segments.iter().copied());
-        }
-        candidates.component_indices.sort_unstable();
-        candidates.component_indices.dedup();
-        candidates.port_indices.sort_unstable();
-        candidates.port_indices.dedup();
-        candidates
-            .connection_segments
-            .sort_unstable_by(|left, right| {
-                left.connection_index
-                    .cmp(&right.connection_index)
-                    .reverse()
-                    .then(left.segment_index.cmp(&right.segment_index))
-            });
-        candidates.connection_segments.dedup();
-        candidates
-    }
-
-    fn nearest_port(
-        &mut self,
-        point: CorePoint,
-        tolerance: f32,
-        exclude: Option<&PortKey>,
-        anchors: &[ConnectorAnchor],
-    ) -> Option<usize> {
-        let tolerance = tolerance.max(0.0);
-        self.port_query_generation = self.port_query_generation.wrapping_add(1);
-        if self.port_query_generation == 0 {
-            self.port_query_marks.fill(0);
-            self.port_query_generation = 1;
-        }
-        let generation = self.port_query_generation;
-        let bounds = HitBounds {
-            min: CorePoint {
-                x: point.x - tolerance,
                 y: point.y - tolerance,
             },
             max: CorePoint {
@@ -1053,6 +868,7 @@ struct ConnectionCreation {
     committed_points: Vec<CorePoint>,
     cursor_point: CorePoint,
     hovered_target: Option<usize>,
+    last_cursor_position: PhysicalPosition<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2103,42 +1919,24 @@ impl ConnectionCreationPreview {
         PreviewUpdateTiming { geometry, upload }
     }
 
-    fn freeze_waypoint(
-        &mut self,
-        queue: &wgpu::Queue,
-        anchor: CorePoint,
-        waypoint: CorePoint,
-        cursor_point: CorePoint,
-    ) -> PreviewUpdateTiming {
-        let geometry_started = Instant::now();
-        let previous_frozen_count = self.frozen_segment_count;
-        self.update_segment_vertices(previous_frozen_count, anchor, waypoint);
+    fn freeze_waypoint(&mut self, queue: &wgpu::Queue) -> PreviewUpdateTiming {
+        debug_assert!(self.dynamic_segment_count > 0);
         self.frozen_segment_count += 1;
-        let dynamic_segment_count = self.update_tail_vertices(
-            self.frozen_segment_count,
-            waypoint,
-            connection_creation_elbow(waypoint, cursor_point),
-            cursor_point,
-        );
-        self.dynamic_segment_count = dynamic_segment_count;
-        self.active_segment_count = self.frozen_segment_count + dynamic_segment_count;
-        let geometry = geometry_started.elapsed();
-        let upload = self.upload_active_range(queue, previous_frozen_count);
-        PreviewUpdateTiming { geometry, upload }
-    }
-
-    fn update_segment_vertices(&mut self, segment_index: usize, start: CorePoint, end: CorePoint) {
-        update_preview_connection_vertices(
-            &mut self.vertices[segment_index * 4..(segment_index + 1) * 4],
-            &[start, end],
-            CorePoint { x: 0.0, y: 0.0 },
-            0.0,
-            0.35,
-            Transform2D {
-                scale_y: -1.0,
-                ..Transform2D::identity()
-            },
-        );
+        self.dynamic_segment_count = self.dynamic_segment_count.saturating_sub(1);
+        self.active_segment_count = self.frozen_segment_count + self.dynamic_segment_count;
+        // The first dynamic segment is already the segment being frozen and
+        // the remaining tail is already resident in the adjacent slot. A
+        // normal click therefore changes metadata only. A full upload is
+        // needed only when this preview just grew beyond its capacity.
+        let upload = if self.needs_full_upload {
+            self.upload_active_range(queue, 0)
+        } else {
+            Duration::ZERO
+        };
+        PreviewUpdateTiming {
+            geometry: Duration::ZERO,
+            upload,
+        }
     }
 
     fn update_tail_vertices(
@@ -2222,6 +2020,16 @@ fn connection_creation_elbow(anchor: CorePoint, cursor_point: CorePoint) -> Opti
             }
         },
     )
+}
+
+fn connection_creation_tail_segment_count(anchor: CorePoint, cursor_point: CorePoint) -> usize {
+    if anchor == cursor_point {
+        0
+    } else if connection_creation_elbow(anchor, cursor_point).is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 fn append_connection_creation_tail(
@@ -2899,7 +2707,7 @@ struct App {
     connection_preview: Option<ConnectionPreviewMesh>,
     connection_creation_preview: Option<ConnectionCreationPreview>,
     pending_drag_position: Option<(PhysicalPosition<f64>, Instant)>,
-    pending_waypoint: Option<CorePoint>,
+    pending_waypoint: bool,
     pending_waypoint_queued_at: Option<Instant>,
     waypoint_frame_pending: bool,
     drag_profile: DragProfile,
@@ -3229,7 +3037,7 @@ impl App {
             connection_preview: None,
             connection_creation_preview: None,
             pending_drag_position: None,
-            pending_waypoint: None,
+            pending_waypoint: false,
             pending_waypoint_queued_at: None,
             waypoint_frame_pending: false,
             drag_profile: DragProfile::new(),
@@ -3255,6 +3063,458 @@ impl App {
         ))
     }
 
+    fn canvas_event_allowed(&self) -> bool {
+        canvas_event_allowed_for(self.main_view, self.pointer_over_canvas())
+    }
+
+    fn screen_to_model(&self, position: PhysicalPosition<f64>) -> CorePoint {
+        let x = (position.x as f32 - self.config.width as f32 * 0.5 - self.pan[0]) / self.zoom;
+        let screen_y =
+            (position.y as f32 - self.config.height as f32 * 0.5 - self.pan[1]) / self.zoom;
+        CorePoint {
+            x,
+            y: if self.main_view == MainView::Diagram {
+                -screen_y
+            } else {
+                screen_y
+            },
+        }
+    }
+
+    fn selected_class_name(&self) -> Option<&str> {
+        self.selected_class.as_deref()
+    }
+
+    fn refresh_ui_document(&mut self) {
+        self.ui_document = self
+            .document
+            .as_ref()
+            .map(|document| document.ui_summary(self.selected_class.as_deref()));
+    }
+
+    fn selected_connection_id(&self) -> Option<&str> {
+        match &self.diagram_selection {
+            DiagramSelection::Connection(connection_id) => Some(connection_id),
+            _ => None,
+        }
+    }
+
+    fn set_diagram_selection(&mut self, selection: DiagramSelection) -> bool {
+        if self.diagram_selection == selection {
+            return false;
+        }
+        self.diagram_selection = selection;
+        true
+    }
+
+    fn hit_test_diagram_connection(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<ConnectionHit> {
+        let started = Instant::now();
+        let class_name = self.selected_class_name()?;
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let query_started = Instant::now();
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let precise_started = Instant::now();
+        for segment in &candidates.connection_segments {
+            if let Some(hit) =
+                scene
+                    .connections
+                    .get(segment.connection_index)
+                    .and_then(|connection| {
+                        hit_test_connection_segment(
+                            connection,
+                            segment.segment_index,
+                            pointer_model,
+                            tolerance,
+                        )
+                    })
+            {
+                if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+                    eprintln!(
+                        "hit-test connection: spatial_query_us={:.1} connection_segment_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                        spatial_query_us,
+                        candidates.connection_segments.len(),
+                        precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                        started.elapsed().as_secs_f64() * 1_000_000.0
+                    );
+                }
+                return Some(hit);
+            }
+        }
+        if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+            eprintln!(
+                "hit-test connection: spatial_query_us={:.1} connection_segment_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                spatial_query_us,
+                candidates.connection_segments.len(),
+                precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                started.elapsed().as_secs_f64() * 1_000_000.0
+            );
+        }
+        None
+    }
+
+    fn diagram_connector_anchors(&self) -> Option<&[ConnectorAnchor]> {
+        self.selected_class_name()
+            .filter(|_| !self.diagram_hit_cache.ports.is_empty())
+            .map(|_| self.diagram_hit_cache.ports.as_slice())
+    }
+
+    fn diagram_anchor(&self, key: &PortKey) -> Option<&ConnectorAnchor> {
+        self.diagram_hit_cache
+            .ports
+            .iter()
+            .find(|anchor| anchor.key == *key)
+    }
+
+    fn hit_test_diagram_port(&self, pointer_model: CorePoint, tolerance: f32) -> Option<PortKey> {
+        let started = Instant::now();
+        let anchors = self.diagram_connector_anchors()?;
+        let query_started = Instant::now();
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let precise_started = Instant::now();
+        let result = candidates
+            .port_indices
+            .iter()
+            .filter_map(|index| anchors.get(*index))
+            .filter_map(|anchor| {
+                connector_anchor_hit_distance(anchor, pointer_model, tolerance)
+                    .map(|distance| (distance, anchor))
+            })
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, anchor)| anchor.key.clone());
+        if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+            eprintln!(
+                "hit-test port: spatial_query_us={:.1} port_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                spatial_query_us,
+                candidates.port_indices.len(),
+                precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                started.elapsed().as_secs_f64() * 1_000_000.0
+            );
+        }
+        result
+    }
+
+    fn hit_test_diagram_component(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<(String, String, CorePoint)> {
+        let started = Instant::now();
+        let class_name = self.selected_class_name()?;
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let query_started = Instant::now();
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
+        let precise_started = Instant::now();
+        let result = candidates.component_indices.iter().rev().find_map(|index| {
+            let item = self.diagram_hit_cache.components.get(*index)?;
+            if !item.bounds.contains(pointer_model, tolerance) {
+                return None;
+            }
+            let component = scene.components.get(item.scene_index)?;
+            if !component.editable
+                || !component.visible
+                || !diagram_component_contains_point(component, pointer_model, tolerance)
+            {
+                return None;
+            }
+            Some((
+                component.id.clone(),
+                component.name.clone(),
+                component.origin,
+            ))
+        });
+        if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
+            eprintln!(
+                "hit-test component: spatial_query_us={:.1} component_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
+                spatial_query_us,
+                candidates.component_indices.len(),
+                precise_started.elapsed().as_secs_f64() * 1_000_000.0,
+                started.elapsed().as_secs_f64() * 1_000_000.0
+            );
+        }
+        result
+    }
+
+    fn update_hovered_diagram_port(&mut self) -> bool {
+        let next_hovered = if self.main_view == MainView::Diagram && self.pointer_over_canvas() {
+            let pointer_model = self.screen_to_model(self.cursor);
+            let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
+            self.hit_test_diagram_port(pointer_model, tolerance)
+        } else {
+            None
+        };
+        if self.hovered_port == next_hovered {
+            return false;
+        }
+        self.hovered_port = next_hovered;
+        true
+    }
+
+    fn begin_connection_edit(&mut self, hit: ConnectionHit, pointer_model: CorePoint) {
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Some((connection_key, line, original_points, semantic_endpoints, source_before)) =
+            (|| {
+                let scene = document.diagram(&class_name)?;
+                let connection = scene
+                    .connections
+                    .iter()
+                    .find(|connection| connection.id == hit.connection_id)?;
+                let line = connection.line.as_ref()?;
+                let source_before = document.class_text(&class_name)?;
+                // Connector resolution belongs at drag-start. The endpoints
+                // are immutable while a connection segment/corner is moved.
+                let semantic_endpoints = strict_connection_points(scene, connection)
+                    .unwrap_or((line.points.first().copied()?, line.points.last().copied()?));
+                Some((
+                    connection.key.clone(),
+                    line.clone(),
+                    line.points.clone(),
+                    semantic_endpoints,
+                    source_before,
+                ))
+            })()
+        else {
+            return;
+        };
+        let line_origin = line.origin;
+        let line_rotation = line.rotation;
+        let snap_axes = match &hit.target {
+            ConnectionHitTarget::Segment { index, orientation } => {
+                connection_segment_snap_axes(&original_points, *index, *orientation)
+            }
+            ConnectionHitTarget::Line => Vec::new(),
+        };
+        self.connection_preview = Some(ConnectionPreviewMesh::new(
+            &self.device,
+            &self.style_layout,
+            hit.connection_id.clone(),
+            &line,
+            Transform2D {
+                scale_y: -1.0,
+                ..Transform2D::identity()
+            },
+        ));
+        self.set_diagram_selection(DiagramSelection::Connection(hit.connection_id.clone()));
+        // A corner (inner polyline vertex) can be dragged freely. Prefer the
+        // vertex handle over a segment slide when the pointer is close to it,
+        // so the highlighted vertex dots act as real grab handles.
+        if original_points.len() >= 4 {
+            let tolerance = 10.0 / self.zoom.max(MIN_ZOOM);
+            let line = temporary_line(line_origin, line_rotation);
+            let world_points = connection_world_points(&line, &original_points);
+            let mut best: Option<(usize, f32)> = None;
+            for (index, point) in world_points
+                .iter()
+                .enumerate()
+                .skip(1)
+                .take(world_points.len().saturating_sub(2))
+            {
+                let distance = distance_between(*point, pointer_model);
+                if distance <= tolerance && best.is_none_or(|(_, best)| distance < best) {
+                    best = Some((index, distance));
+                }
+            }
+            if let Some((corner_index, _)) = best {
+                self.pointer_interaction = PointerInteraction::MoveDiagramConnectionCorner {
+                    button: MouseButton::Left,
+                    connection_id: hit.connection_id,
+                    connection_key,
+                    corner_index,
+                    line_origin,
+                    line_rotation,
+                    start_pointer_model: pointer_model,
+                    original_points: original_points.clone(),
+                    preview_points: original_points,
+                    semantic_endpoints,
+                    source_before,
+                };
+                return;
+            }
+        }
+        match hit.target {
+            ConnectionHitTarget::Segment { index, orientation }
+                if index + 1 < original_points.len() =>
+            {
+                self.pointer_interaction = PointerInteraction::MoveDiagramConnectionSegment {
+                    button: MouseButton::Left,
+                    connection_id: hit.connection_id,
+                    connection_key,
+                    segment_index: index,
+                    orientation,
+                    line_origin,
+                    line_rotation,
+                    start_pointer_model: pointer_model,
+                    original_points: original_points.clone(),
+                    preview_points: original_points,
+                    semantic_endpoints,
+                    snap_axes,
+                    snapped_axis: None,
+                    source_before,
+                };
+            }
+            _ => self.connection_preview = None,
+        }
+    }
+
+    fn begin_connection_creation(&mut self, source: &ConnectorAnchor) {
+        self.connection_creation_profile.start();
+        self.connection_preview = None;
+        self.pending_waypoint = false;
+        self.pending_waypoint_queued_at = None;
+        self.waypoint_frame_pending = false;
+        self.pointer_interaction =
+            PointerInteraction::CreateDiagramConnection(ConnectionCreation {
+                source_port: source.key.clone(),
+                source_connector: source.connector_ref.clone(),
+                committed_points: {
+                    let mut points = Vec::with_capacity(INITIAL_CONNECTION_CREATION_SEGMENTS + 1);
+                    points.push(source.world_position);
+                    points
+                },
+                cursor_point: source.world_position,
+                hovered_target: None,
+                last_cursor_position: self.cursor,
+            });
+        self.connection_creation_preview = Some(ConnectionCreationPreview::new(
+            &self.device,
+            &self.style_layout,
+        ));
+        self.hovered_port = None;
+    }
+
+    fn selected_connection_overlay_points(&self) -> Option<Vec<CorePoint>> {
+        let connection_id = self.selected_connection_id()?;
+        let class_name = self.selected_class_name()?;
+        let connection = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .connections
+            .iter()
+            .find(|connection| connection.id == connection_id)?;
+        let line = connection.line.as_ref()?;
+        let points = match &self.pointer_interaction {
+            PointerInteraction::MoveDiagramConnectionSegment {
+                connection_id: active_id,
+                preview_points,
+                ..
+            } if active_id == connection_id => preview_points,
+            PointerInteraction::MoveDiagramConnectionCorner {
+                connection_id: active_id,
+                preview_points,
+                ..
+            } if active_id == connection_id => preview_points,
+            _ => &line.points,
+        };
+        Some(connection_world_points(line, points))
+    }
+
+    fn selected_component_overlay(&self) -> Option<ComponentSelectionOverlay> {
+        let component_name = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => component_name,
+            _ => return None,
+        };
+        let class_name = self.selected_class_name()?;
+        let component = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .components
+            .iter()
+            .find(|component| component.name == *component_name)?;
+        Some(ComponentSelectionOverlay {
+            origin: component.origin,
+            extent: component
+                .placement_extent
+                .unwrap_or(default_component_extent()),
+            rotation: component.rotation,
+        })
+    }
+
+    fn hit_test_selected_component_handle(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<(String, ResizeHandle)> {
+        let component_name = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => component_name,
+            _ => return None,
+        };
+        let overlay = self.selected_component_overlay()?;
+        component_extent_corners(overlay.origin, overlay.extent, overlay.rotation)
+            .iter()
+            .enumerate()
+            .find(|(_, corner)| distance_between(**corner, pointer_model) <= tolerance)
+            .map(|(index, _)| (component_name.clone(), ResizeHandle::Corner(index)))
+    }
+
+    fn begin_component_resize(&mut self, component_name: String, handle: ResizeHandle) {
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            return;
+        };
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Some(component) = document.diagram(&class_name).and_then(|scene| {
+            scene
+                .components
+                .iter()
+                .find(|component| component.name == component_name)
+                .cloned()
+        }) else {
+            return;
+        };
+        if !component.editable {
+            return;
+        }
+        let Some(source_before) = document.class_text(&class_name) else {
+            return;
+        };
+        let original_extent = component
+            .placement_extent
+            .unwrap_or(default_component_extent());
+        let connected_connections = document
+            .diagram(&class_name)
+            .map(|scene| connection_drag_snapshots(scene, &component_name))
+            .unwrap_or_default();
+        self.pointer_interaction = PointerInteraction::ResizeDiagramComponent {
+            button: MouseButton::Left,
+            component_id: component.id.clone(),
+            component_name,
+            handle,
+            original_component: component,
+            original_extent,
+            preview_extent: original_extent,
+            connected_connections,
+            source_before,
+        };
+    }
+
+    fn begin_model_drag(&mut self) {
+        let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
+            return;
+        };
+        let pointer_model = self.screen_to_model(self.cursor);
         let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
         match self.main_view {
             MainView::Icon => {
@@ -3373,7 +3633,19 @@ impl App {
                             original_line_points: line.points.clone(),
                             original_line_origin: line.origin,
                         })
-                    })                };
+                    })
+                    .collect();
+                self.set_diagram_selection(DiagramSelection::Component(component_name.clone()));
+                self.pointer_interaction = PointerInteraction::MoveDiagramComponent {
+                    button: MouseButton::Left,
+                    component_id,
+                    component_name,
+                    start_pointer_model: pointer_model,
+                    original_origin,
+                    preview_delta: CorePoint { x: 0.0, y: 0.0 },
+                    connected_connections,
+                    source_before,
+                };
             }
             MainView::Source => {}
         }
@@ -3418,6 +3690,9 @@ impl App {
         let current = self.screen_to_model(position);
         let zoom = self.zoom;
         if let PointerInteraction::CreateDiagramConnection(creation) = &self.pointer_interaction {
+            if creation.last_cursor_position == position {
+                return false;
+            }
             let cursor_started = Instant::now();
             let snap_started = Instant::now();
             let target = connection_creation_target(
@@ -3431,6 +3706,28 @@ impl App {
             let snap_elapsed = snap_started.elapsed();
             let target_index = target.map(|(index, _)| index);
             let target_point = target.map(|(_, point)| point).unwrap_or(current);
+            let anchor = creation
+                .committed_points
+                .last()
+                .copied()
+                .unwrap_or(target_point);
+            let required_segments = creation
+                .committed_points
+                .len()
+                .saturating_sub(1)
+                .saturating_add(connection_creation_tail_segment_count(anchor, target_point));
+            let buffer_reallocated =
+                self.connection_creation_preview
+                    .as_mut()
+                    .is_some_and(|preview| {
+                        preview.ensure_capacity(&self.device, &self.style_layout, required_segments)
+                    });
+            if buffer_reallocated {
+                self.connection_creation_profile
+                    .record_waypoint_gpu_buffer_allocation();
+                self.connection_creation_profile
+                    .record_waypoint_heap_allocation();
+            }
             let preview_started = Instant::now();
             let preview_timing = {
                 let pointer = &mut self.pointer_interaction;
@@ -3439,13 +3736,9 @@ impl App {
                 let PointerInteraction::CreateDiagramConnection(creation) = pointer else {
                     unreachable!("connection creation ended while updating its preview")
                 };
+                creation.last_cursor_position = position;
                 creation.cursor_point = target_point;
                 creation.hovered_target = target_index;
-                let anchor = creation
-                    .committed_points
-                    .last()
-                    .copied()
-                    .unwrap_or(creation.cursor_point);
                 preview
                     .as_mut()
                     .map(|preview| {
@@ -3793,7 +4086,7 @@ impl App {
         }
         self.pointer_interaction = PointerInteraction::None;
         self.pending_drag_position = None;
-        self.pending_waypoint = None;
+        self.pending_waypoint = false;
         self.pending_waypoint_queued_at = None;
         self.waypoint_frame_pending = false;
         self.connection_creation_preview = None;
@@ -3992,9 +4285,10 @@ impl App {
     }
 
     fn process_pending_waypoint(&mut self) {
-        let Some(_queued_point) = self.pending_waypoint.take() else {
+        if !self.pending_waypoint {
             return;
-        };
+        }
+        self.pending_waypoint = false;
         let input_delay = self
             .pending_waypoint_queued_at
             .take()
@@ -4007,13 +4301,13 @@ impl App {
         // flush_drag_preview() runs immediately before this method from the
         // redraw handler. The cached target therefore represents the latest
         // cursor position, without repeating the port spatial query here.
-        let current = self.screen_to_model(self.cursor);
         let started = Instant::now();
         let interaction =
             std::mem::replace(&mut self.pointer_interaction, PointerInteraction::None);
         let PointerInteraction::CreateDiagramConnection(mut creation) = interaction else {
             return;
         };
+        let current = creation.cursor_point;
         let cached_target = creation.hovered_target.and_then(|target_index| {
             self.diagram_hit_cache
                 .ports
@@ -4048,10 +4342,6 @@ impl App {
             self.connection_creation_profile.finish();
             return;
         };
-        let anchor = *creation
-            .committed_points
-            .last()
-            .expect("connection creation always has a source point");
         let state_started = Instant::now();
         let mut heap_allocated = false;
         if creation.committed_points.len() == creation.committed_points.capacity() {
@@ -4064,7 +4354,6 @@ impl App {
             heap_allocated = true;
         }
         creation.committed_points.push(waypoint);
-        creation.cursor_point = current;
         creation.hovered_target = None;
         let state_update = state_started.elapsed();
         if heap_allocated {
@@ -4091,7 +4380,7 @@ impl App {
         let timing = self
             .connection_creation_preview
             .as_mut()
-            .map(|preview| preview.freeze_waypoint(&self.queue, anchor, waypoint, current))
+            .map(|preview| preview.freeze_waypoint(&self.queue))
             .unwrap_or(PreviewUpdateTiming {
                 geometry: Duration::ZERO,
                 upload: Duration::ZERO,
@@ -5236,7 +5525,7 @@ impl App {
         self.canvas_rect = None;
         self.pointer_interaction = PointerInteraction::None;
         self.connection_creation_preview = None;
-        self.pending_waypoint = None;
+        self.pending_waypoint = false;
         self.pending_waypoint_queued_at = None;
         self.waypoint_frame_pending = false;
         self.diagram_selection = DiagramSelection::None;
@@ -6810,6 +7099,101 @@ fn draw_diagram_selection_overlay(
                 egui::Rect::from_center_size(screen_corners[index], Vec2::splat(10.0)),
                 Rounding::same(2.0),
                 Stroke::new(1.0_f32, theme_surface()),
+            );
+        }
+    }
+    if let Some(anchors) = anchors {
+        for anchor in anchors {
+            let hovered = hovered_port.is_some_and(|key| key == &anchor.key);
+            let selected = selected_port.is_some_and(|key| key == &anchor.key);
+            if !hovered && !selected {
+                continue;
+            }
+            let center = to_screen(anchor.world_position);
+            let color = if selected {
+                accent
+            } else {
+                theme_accent_soft(190)
+            };
+            if let Some(bounds) = anchor.visual_bounds {
+                let corners = [
+                    to_screen(CorePoint {
+                        x: bounds.x,
+                        y: bounds.y,
+                    }),
+                    to_screen(CorePoint {
+                        x: bounds.x + bounds.width,
+                        y: bounds.y,
+                    }),
+                    to_screen(CorePoint {
+                        x: bounds.x + bounds.width,
+                        y: bounds.y + bounds.height,
+                    }),
+                    to_screen(CorePoint {
+                        x: bounds.x,
+                        y: bounds.y + bounds.height,
+                    }),
+                ];
+                for index in 0..corners.len() {
+                    painter.line_segment(
+                        [corners[index], corners[(index + 1) % corners.len()]],
+                        Stroke::new(if selected { 1.5_f32 } else { 1.0_f32 }, color),
+                    );
+                }
+            }
+            painter.circle_filled(center, if selected { 6.0 } else { 5.0 }, color);
+            painter.circle_stroke(
+                center,
+                if selected { 10.0 } else { 8.0 },
+                Stroke::new(1.5_f32, theme_surface()),
+            );
+            painter.circle_stroke(
+                center,
+                if selected { 10.0 } else { 8.0 },
+                Stroke::new(1.5_f32, color),
+            );
+        }
+    }
+}
+
+fn build_scene(
+    device: &wgpu::Device,
+    style_layout: &wgpu::BindGroupLayout,
+    document: Option<&LoadedDocument>,
+    selected_class: Option<&str>,
+) -> GpuIconScene {
+    let geometries = document
+        .and_then(|document| selected_class.and_then(|name| document.icon(name)))
+        .map(core_icon_geometry)
+        .unwrap_or_default();
+    gpu_scene_from_geometries(device, style_layout, geometries, "icon")
+}
+
+fn build_diagram_scene(
+    device: &wgpu::Device,
+    style_layout: &wgpu::BindGroupLayout,
+    document: Option<&LoadedDocument>,
+    selected_class: Option<&str>,
+) -> GpuIconScene {
+    let diagram =
+        document.and_then(|document| selected_class.and_then(|name| document.diagram(name)));
+    let geometries = diagram.map(core_diagram_geometry).unwrap_or_default();
+    if std::env::var_os("MODELICA_WGPU_DEBUG_DIAGRAM").is_some() {
+        if let Some(scene) = diagram {
+            log_diagram_geometry_diagnostics(scene, &geometries);
+        } else {
+            eprintln!("diagram diagnostic: no selected DiagramScene");
+        }
+    }
+    gpu_scene_from_geometries(device, style_layout, geometries, "diagram")
+}
+
+fn build_diagram_hit_cache(
+    document: Option<&LoadedDocument>,
+    selected_class: Option<&str>,
+) -> DiagramHitCache {
+    let Some(scene) = document
+        .and_then(|document| selected_class.and_then(|class_name| document.diagram(class_name)))
     else {
         return DiagramHitCache::default();
     };
@@ -6907,7 +7291,31 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
             .iter()
             .filter(|geometry| geometry.edit_key.as_deref() == Some(component.id.as_str()))
             .collect::<Vec<_>>();
-
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut vertices = 0;
+        for geometry in &component_geometries {
+            vertices += geometry.vertices.len();
+            for vertex in &geometry.vertices {
+                min[0] = min[0].min(vertex.position[0]);
+                min[1] = min[1].min(vertex.position[1]);
+                max[0] = max[0].max(vertex.position[0]);
+                max[1] = max[1].max(vertex.position[1]);
+            }
+        }
+        let bounds = (vertices > 0).then_some((min, max));
+        eprintln!(
+            "diagram diagnostic component={} type={:?} class_kind={:?} editable={} owner={} origin=({:.2},{:.2}) rotation={:.2} placement={:?} layer_extent={:?} icon_graphics={} diagram_graphics={} transform=translation({:.2},{:.2}) rotation({:.2}) scale({:.4},{:.4}) gpu_geometries={} vertices={} bounds={bounds:?}",
+            component.name,
+            component.resolved_type_qualified_name,
+            component.class_kind,
+            component.editable,
+            component.source_owner,
+            component.origin.x,
+            component.origin.y,
+            component.rotation,
+            component.placement_extent,
+            icon.coordinate_system.extent,
             component.resolved_icon.as_deref().map_or(0, |scene| scene.graphics.len()),
             component
                 .resolved_diagram
@@ -6965,115 +7373,7 @@ fn gpu_scene_from_geometries(
             GpuGeometry {
                 vertex_buffer,
                 index_buffer,
-                index_count: geometry.indices.len() as u32,
-                style_bind_group,
-                base_vertices,
-                layer: geometry.layer,
-                edit_key: geometry.edit_key,
-                connection: geometry.connection,
-                component: geometry.component,
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut layer_indices = std::array::from_fn(|_| Vec::new());
-    for (index, geometry) in gpu_geometries.iter().enumerate() {
-        layer_indices[geometry.layer.index()].push(index);
-    }
-    GpuIconScene {
-        geometries: gpu_geometries,
-        layer_indices,
-        bounds,
-    }
-}
 
-fn core_icon_geometry(scene: &CoreIconScene) -> Vec<Geometry> {
-    scene
-        .graphics
-        .iter()
-        .flat_map(|resolved| {
-            let edit_key = resolved.editable.then(|| resolved.id.0.clone());
-            core_graphic_geometry(resolved)
-                .into_iter()
-                .map(move |mut geometry| {
-                    geometry.edit_key = edit_key.clone();
-                    geometry
-                })
-        })
-        .collect()
-}
-
-fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
-    let diagram_flip = Transform2D {
-        scale_y: -1.0,
-        ..Transform2D::identity()
-    };
-    let mut geometries = scene
-        .background_graphics
-        .iter()
-        .flat_map(|graphic| core_graphic_geometry_from_graphic(graphic, diagram_flip))
-        .map(|mut geometry| {
-            geometry.layer = DiagramRenderLayer::Background;
-            geometry
-        })
-        .collect::<Vec<_>>();
-    for connection in &scene.connections {
-        if let Some(line) = &connection.line {
-            geometries.extend(
-                line_geometry(line, diagram_flip)
-                    .into_iter()
-                    .map(|mut geometry| {
-                        geometry.layer = DiagramRenderLayer::Connection;
-                        geometry.edit_key = Some(connection.id.clone());
-                        geometry.connection = Some(ConnectionGeometry {
-                            line: line.clone(),
-                            transform: diagram_flip,
-                        });
-                        geometry
-                    }),
-            );
-        }
-    }
-    for component in &scene.components {
-        if !component.visible {
-            continue;
-        }
-        let Some(icon) = component.diagram_layer() else {
-            continue;
-        };
-        let placement = diagram_placement_transform(icon, component);
-        let parent_component_transform = compose_transform(diagram_flip, placement);
-        let layer = if matches!(
-            component.class_kind,
-            Some(ClassKind::Connector | ClassKind::ExpandableConnector)
-        ) {
-            DiagramRenderLayer::Connector
-        } else {
-            DiagramRenderLayer::Component
-        };
-        for resolved in &icon.graphics {
-            let graphic_transform = compose_transform(placement, resolved.transform);
-            let transform = compose_transform(diagram_flip, graphic_transform);
-            geometries.extend(
-                core_graphic_geometry_from_graphic(&resolved.graphic, transform)
-                    .into_iter()
-                    .map(|mut geometry| {
-                        geometry.layer = layer;
-                        geometry.edit_key = Some(component.id.clone());
-                        geometry.component = Some(ComponentGeometry {
-                            transform: parent_component_transform,
-                        });
-                        geometry
-                    }),
-            );
-        }
-    }
-    // Keep z-order independent from source/component iteration order. The
-    // egui selection handles are rendered in a later foreground pass.
-    geometries.sort_by_key(|geometry| geometry.layer);
-    geometries
-}
-
-fn core_graphic_geometry(resolved: &ResolvedGraphic) -> Vec<Geometry> {
     core_graphic_geometry_from_graphic(&resolved.graphic, resolved.transform)
 }
 
@@ -7886,154 +8186,7 @@ fn hit_test_connection_segment(
     let start = line
         .points
         .get(segment_index)
-        .map(|point| line_local_to_world(line, *point))?;
-    let end = line
-        .points
-        .get(segment_index + 1)
-        .map(|point| line_local_to_world(line, *point))?;
-    if distance_to_segment(pointer, start, end) > tolerance {
-        return None;
-    }
-    let target = match line
-        .points
-        .get(segment_index..=segment_index.saturating_add(1))
-        .and_then(|pair| pair.first().zip(pair.get(1)))
-        .and_then(|(start, end)| segment_orientation(*start, *end))
-    {
-        Some(orientation) => ConnectionHitTarget::Segment {
-            index: segment_index,
-            orientation,
-        },
-        None => ConnectionHitTarget::Line,
-    };
-    Some(ConnectionHit {
-        connection_id: connection.id.clone(),
-        target,
-    })
-}
-
-fn distance_between(first: CorePoint, second: CorePoint) -> f32 {
-    ((first.x - second.x).powi(2) + (first.y - second.y).powi(2)).sqrt()
-}
-
-fn distance_to_segment(point: CorePoint, start: CorePoint, end: CorePoint) -> f32 {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let length_squared = dx * dx + dy * dy;
-    if length_squared <= f32::EPSILON {
-        return distance_between(point, start);
-    }
-    let projection =
-        (((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared).clamp(0.0, 1.0);
-    distance_between(
-        point,
-        CorePoint {
-            x: start.x + projection * dx,
-            y: start.y + projection * dy,
-        },
-    )
-}
-
-fn segment_orientation(start: CorePoint, end: CorePoint) -> Option<ConnectionSegmentOrientation> {
-    if (start.y - end.y).abs() <= ORTHOGONAL_EPSILON {
-        Some(ConnectionSegmentOrientation::Horizontal)
-    } else if (start.x - end.x).abs() <= ORTHOGONAL_EPSILON {
-        Some(ConnectionSegmentOrientation::Vertical)
-    } else {
-        None
-    }
-}
-
-fn annotation_calls(source: &str) -> Vec<(usize, AnnotationCall)> {
-    let tokens = tokenize(source);
-    let mut calls = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
-        if token.text != "annotation" || token.kind != TokenKind::Keyword {
-            continue;
-        }
-        let Some(open) = next_significant_token(&tokens, index + 1) else {
-            continue;
-        };
-        if tokens[open].text != "(" {
-            continue;
-        }
-        let Some(close) = matching_paren_tokens(&tokens, open) else {
-            continue;
-        };
-        let Some(call_source) = source.get(token.start..tokens[close].end) else {
-            continue;
-        };
-        let Ok(call) = parse_call(call_source) else {
-            continue;
-        };
-        calls.push((token.start, call));
-    }
-    calls
-}
-
-fn next_significant_token(tokens: &[Token], mut index: usize) -> Option<usize> {
-    while index < tokens.len()
-        && matches!(
-            tokens[index].kind,
-            TokenKind::Whitespace | TokenKind::Comment
-        )
-    {
-        index += 1;
-    }
-    (index < tokens.len()).then_some(index)
-}
-
-fn matching_paren_tokens(tokens: &[Token], open: usize) -> Option<usize> {
-    let mut depth = 0;
-    for (index, token) in tokens.iter().enumerate().skip(open) {
-        if token.text == "(" {
-            depth += 1;
-        } else if token.text == ")" {
-            depth -= 1;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-fn nested_call<'a>(call: &'a AnnotationCall, name: &str) -> Option<&'a AnnotationCall> {
-    call.args.iter().find_map(|entry| {
-        entry
-            .value
-            .as_call()
-            .filter(|candidate| candidate.name == name)
-    })
-}
-
-fn is_graphic_call(call: &AnnotationCall) -> bool {
-    matches!(
-        call.name.as_str(),
-        "Line" | "Polygon" | "Rectangle" | "Ellipse" | "Text" | "Bitmap"
-    )
-}
-
-fn matching_delimiter(source: &str, start: usize, open: u8, close: u8) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut depth = 0;
-    let mut quoted = false;
-    for (index, byte) in bytes.iter().enumerate().skip(start) {
-        if *byte == b'"' {
-            quoted = !quoted;
-            continue;
-        }
-        if quoted {
-            continue;
-        }
-        if *byte == open {
-            depth += 1;
-        } else if *byte == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
+        .map(|point| line_local_to_world(line, *point))?;        }
     }
     None
 }
@@ -8265,13 +8418,6 @@ fn extent_edit_for_call(
     let extent_text = format_modelica_extent(extent);
     if let Some(entry) = call
         .args
-        .iter()
-        .find(|entry| entry.name.as_deref() == Some("extent"))
-    {
-        let (start, end) = value_range_for_entry(source, annotation_start, entry)?;
-        return Some(SourceEdit {
-            start,
-            end,
             expected_text: Some(source.get(start..end)?.to_owned()),
             replacement: extent_text,
         });
@@ -9291,27 +9437,30 @@ fn main() {
                             }
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
-                            let selection_before = app.diagram_selection.clone();
+                            // A connection-creation click must not clone the
+                            // current selection before entering its hot path.
+                            let selection_before = (!app.connection_creation_active())
+                                .then(|| app.diagram_selection.clone());
                             if state == ElementState::Released {
                                 if app.connection_creation_active() && button == MouseButton::Right {
                                     app.cancel_connection_creation();
                                 } else if app.connection_creation_active()
                                     && button == MouseButton::Left
                                 {
-                                    // Keep input handling tiny. The latest
-                                    // cursor/snap state and preview update are
-                                    // consumed together by RedrawRequested.
-                                    app.pending_waypoint =
-                                        Some(app.screen_to_model(app.cursor));
-                                    app.pending_waypoint_queued_at = Some(Instant::now());
-                                    app.window.request_redraw();
+                                    // Waypoints are committed on press. The
+                                    // matching release is intentionally inert.
                                 } else {
                                     app.finish_model_drag(button);
                                 }
                             } else if app.connection_creation_active() {
-                                // A second left press is a waypoint click. The
-                                // release path commits the waypoint or finishes
-                                // on a snapped target; it must not restart hit testing.
+                                if button == MouseButton::Left {
+                                    // Keep input handling tiny. The latest
+                                    // cursor/snap state and preview metadata are
+                                    // consumed together by RedrawRequested.
+                                    app.pending_waypoint = true;
+                                    app.pending_waypoint_queued_at = Some(Instant::now());
+                                    app.window.request_redraw();
+                                }
                             } else if app.canvas_event_allowed() {
                                 if wants_pan(button, app.modifiers.control_key()) {
                                     app.pointer_interaction = PointerInteraction::Pan {
@@ -9325,7 +9474,8 @@ fn main() {
                                     app.begin_model_drag();
                                 }
                             }
-                            let selection_changed = app.diagram_selection != selection_before;
+                            let selection_changed = selection_before
+                                .is_some_and(|selection_before| app.diagram_selection != selection_before);
                             if egui_consumed || state == ElementState::Released || selection_changed
                             {
                                 app.window.request_redraw();
