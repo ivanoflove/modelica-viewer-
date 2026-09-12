@@ -60,6 +60,7 @@ const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
 const CONNECTION_SNAP_ENTER_PIXELS: f32 = 8.0;
 const CONNECTION_SNAP_EXIT_PIXELS: f32 = 12.0;
+const CONNECTION_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -1744,6 +1745,8 @@ struct GpuGeometry {
     index_count: u32,
     style_bind_group: wgpu::BindGroup,
     base_vertices: Vec<Vertex>,
+    vertex_capacity: usize,
+    index_capacity: usize,
     layer: DiagramRenderLayer,
     edit_key: Option<String>,
     connection: Option<ConnectionGeometry>,
@@ -1835,32 +1838,53 @@ impl GpuIconScene {
                 continue;
             };
 
-            // Endpoint editing can add a bridge vertex, which changes the
-            // tessellation size. When it does, recreate both buffers (vertex
-            // buffers carry COPY_DST for cheap per-frame updates, index
-            // buffers do not, so unchanged indices are never rewritten).
-            if updated.vertices.len() != geometry.base_vertices.len()
-                || updated.indices.len() != geometry.index_count as usize
+            if updated.vertices.len() > geometry.vertex_capacity
+                || updated.indices.len() > geometry.index_capacity
             {
+                let vertex_capacity = geometry
+                    .vertex_capacity
+                    .max(updated.vertices.len())
+                    .saturating_mul(2)
+                    .max(updated.vertices.len());
+                let index_capacity = geometry
+                    .index_capacity
+                    .max(updated.indices.len())
+                    .saturating_mul(2)
+                    .max(updated.indices.len());
+                let mut vertices = vec![
+                    Vertex {
+                        position: [0.0; 2],
+                        local: [0.0; 2],
+                    };
+                    vertex_capacity
+                ];
+                vertices[..updated.vertices.len()].copy_from_slice(&updated.vertices);
+                let mut indices = vec![0_u16; index_capacity];
+                indices[..updated.indices.len()].copy_from_slice(&updated.indices);
                 geometry.vertex_buffer =
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("diagram connection preview vertices"),
-                        contents: bytemuck::cast_slice(&updated.vertices),
+                        contents: bytemuck::cast_slice(&vertices),
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     });
                 geometry.index_buffer =
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("diagram connection preview indices"),
-                        contents: bytemuck::cast_slice(&updated.indices),
-                        usage: wgpu::BufferUsages::INDEX,
+                        contents: bytemuck::cast_slice(&indices),
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                     });
+                geometry.vertex_capacity = vertex_capacity;
+                geometry.index_capacity = index_capacity;
             } else {
-                // Same topology: refresh only the vertex positions, which is
-                // the buffer created with COPY_DST.
                 queue.write_buffer(
                     &geometry.vertex_buffer,
                     0,
                     bytemuck::cast_slice(&updated.vertices),
+                );
+                queue.write_buffer(
+                    &geometry.index_buffer,
+                    0,
+                    bytemuck::cast_slice(&updated.indices),
                 );
             }
             geometry.index_count = updated.indices.len() as u32;
@@ -1892,14 +1916,33 @@ impl GpuIconScene {
     }
 }
 
-/// Fixed-topology line mesh used only while a connection is being dragged.
-/// It deliberately keeps one quad per original segment: no Lyon work, no
-/// topology allocation, and no GPU buffer creation can occur on mouse move.
+const CONNECTION_PREVIEW_EXTRA_SEGMENTS: usize = 4;
+const MIN_CONNECTION_PREVIEW_SEGMENTS: usize = 8;
+
+fn connection_preview_segment_capacity(segment_count: usize) -> usize {
+    segment_count
+        .saturating_add(CONNECTION_PREVIEW_EXTRA_SEGMENTS)
+        .max(MIN_CONNECTION_PREVIEW_SEGMENTS)
+}
+
+fn connection_preview_indices(segment_capacity: usize) -> Vec<u16> {
+    (0..segment_capacity)
+        .flat_map(|segment| {
+            let base = (segment * 4) as u16;
+            [base, base + 1, base + 2, base, base + 2, base + 3]
+        })
+        .collect()
+}
+
+/// Persistent variable-topology line mesh used while a connection is being
+/// dragged. Endpoint routing can add bridge segments, so the mesh reserves
+/// spare quad slots at drag start and only updates the active vertex prefix.
 struct ConnectionPreviewMesh {
     connection_id: String,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    index_count: u32,
+    active_segment_count: usize,
+    segment_capacity: usize,
     style_bind_group: wgpu::BindGroup,
     vertices: Vec<Vertex>,
     line_origin: CorePoint,
@@ -1917,19 +1960,23 @@ impl ConnectionPreviewMesh {
         transform: Transform2D,
     ) -> Self {
         let segment_count = line.points.len().saturating_sub(1);
-        let vertices = preview_connection_vertices(
+        let segment_capacity = connection_preview_segment_capacity(segment_count);
+        let initial_vertices = preview_connection_vertices(
             &line.points,
             line.origin,
             line.rotation,
             line.thickness,
             transform,
         );
-        let indices = (0..segment_count)
-            .flat_map(|segment| {
-                let base = (segment * 4) as u16;
-                [base, base + 1, base + 2, base, base + 2, base + 3]
-            })
-            .collect::<Vec<_>>();
+        let mut vertices = vec![
+            Vertex {
+                position: [0.0; 2],
+                local: [0.0; 2],
+            };
+            segment_capacity * 4
+        ];
+        vertices[..initial_vertices.len()].copy_from_slice(&initial_vertices);
+        let indices = connection_preview_indices(segment_capacity);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("connection drag preview vertices"),
             contents: bytemuck::cast_slice(&vertices),
@@ -1964,7 +2011,8 @@ impl ConnectionPreviewMesh {
             connection_id,
             vertex_buffer,
             index_buffer,
-            index_count: indices.len() as u32,
+            active_segment_count: segment_count,
+            segment_capacity,
             style_bind_group,
             vertices,
             line_origin: line.origin,
@@ -1975,15 +2023,30 @@ impl ConnectionPreviewMesh {
     }
 
     fn update(&mut self, queue: &wgpu::Queue, points: &[CorePoint]) {
+        let segment_count = points.len().saturating_sub(1);
+        if segment_count > self.segment_capacity {
+            debug_assert!(
+                segment_count <= self.segment_capacity,
+                "connection preview route exceeded its reserved capacity"
+            );
+            return;
+        }
         update_preview_connection_vertices(
-            &mut self.vertices,
+            &mut self.vertices[..segment_count * 4],
             points,
             self.line_origin,
             self.line_rotation,
             self.line_thickness,
             self.transform,
         );
-        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
+        self.active_segment_count = segment_count;
+        if segment_count > 0 {
+            queue.write_buffer(
+                &self.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.vertices[..segment_count * 4]),
+            );
+        }
     }
 }
 
@@ -3418,30 +3481,40 @@ impl App {
             .query(pointer_model, tolerance);
         let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
         let precise_started = Instant::now();
+        let selected_connection_id = self.selected_connection_id();
+        let mut best: Option<(ConnectionHit, f32, bool, usize, usize)> = None;
         for segment in &candidates.connection_segments {
-            if let Some(hit) =
-                scene
-                    .connections
-                    .get(segment.connection_index)
-                    .and_then(|connection| {
-                        hit_test_connection_segment(
-                            connection,
-                            segment.segment_index,
-                            pointer_model,
-                            tolerance,
-                        )
-                    })
-            {
-                if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
-                    eprintln!(
-                        "hit-test connection: spatial_query_us={:.1} connection_segment_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
-                        spatial_query_us,
-                        candidates.connection_segments.len(),
-                        precise_started.elapsed().as_secs_f64() * 1_000_000.0,
-                        started.elapsed().as_secs_f64() * 1_000_000.0
-                    );
-                }
-                return Some(hit);
+            let Some(connection) = scene.connections.get(segment.connection_index) else {
+                continue;
+            };
+            let Some((hit, distance)) = hit_test_connection_segment_with_distance(
+                connection,
+                segment.segment_index,
+                pointer_model,
+                tolerance,
+            ) else {
+                continue;
+            };
+            let selected = selected_connection_id == Some(connection.id.as_str());
+            let best_key =
+                best.as_ref()
+                    .map(|(_, distance, selected, connection_index, segment_index)| {
+                        (*distance, *selected, *connection_index, *segment_index)
+                    });
+            if connection_hit_candidate_is_better(
+                distance,
+                selected,
+                segment.connection_index,
+                segment.segment_index,
+                best_key,
+            ) {
+                best = Some((
+                    hit,
+                    distance,
+                    selected,
+                    segment.connection_index,
+                    segment.segment_index,
+                ));
             }
         }
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
@@ -3453,7 +3526,7 @@ impl App {
                 started.elapsed().as_secs_f64() * 1_000_000.0
             );
         }
-        None
+        best.map(|(hit, _, _, _, _)| hit)
     }
 
     fn diagram_connector_anchors(&self) -> Option<&[ConnectorAnchor]> {
@@ -4116,15 +4189,13 @@ impl App {
                     );
                     let snap_elapsed = snap_started.elapsed();
                     let reanchor_started = Instant::now();
-                    let next_points = reanchor_connection_points_cached(
-                        &translated_connection_segment_preview(
-                            original_points,
-                            *segment_index,
-                            *orientation,
-                            *line_origin,
-                            *line_rotation,
-                            delta,
-                        ),
+                    let next_points = build_connection_segment_drag_route(
+                        original_points,
+                        *segment_index,
+                        *orientation,
+                        *line_origin,
+                        *line_rotation,
+                        delta,
                         *semantic_endpoints,
                     );
                     let reanchor_elapsed = reanchor_started.elapsed();
@@ -4157,14 +4228,12 @@ impl App {
                         y: current.y - start_pointer_model.y,
                     };
                     let reanchor_started = Instant::now();
-                    let next_points = reanchor_connection_points_cached(
-                        &translated_connection_corner(
-                            original_points,
-                            *corner_index,
-                            *line_origin,
-                            *line_rotation,
-                            delta,
-                        ),
+                    let next_points = build_connection_corner_drag_route(
+                        original_points,
+                        *corner_index,
+                        *line_origin,
+                        *line_rotation,
+                        delta,
                         *semantic_endpoints,
                     );
                     let reanchor_elapsed = reanchor_started.elapsed();
@@ -4440,7 +4509,7 @@ impl App {
             std::mem::replace(&mut self.pointer_interaction, PointerInteraction::None);
         self.pending_drag_position = None;
         // Pointer-up is the boundary where the static Lyon scene may be
-        // rebuilt; the fixed preview mesh is never used for committed output.
+        // committed; the persistent preview mesh is never used for committed output.
         self.connection_preview = None;
         match interaction {
             PointerInteraction::Pan { .. } => {}
@@ -4490,6 +4559,7 @@ impl App {
                 line_rotation,
                 start_pointer_model,
                 original_points,
+                semantic_endpoints,
                 snap_axes,
                 mut snapped_axis,
                 source_before,
@@ -4512,13 +4582,14 @@ impl App {
                         connection_snap_exit_tolerance(self.zoom),
                     ),
                 );
-                let raw_after_points = translated_connection_segment(
+                let raw_after_points = build_connection_segment_drag_route(
                     &original_points,
                     segment_index,
                     orientation,
                     line_origin,
                     line_rotation,
                     delta,
+                    semantic_endpoints,
                 );
                 self.commit_diagram_connection_move(
                     connection_key,
@@ -4535,6 +4606,7 @@ impl App {
                 line_rotation,
                 start_pointer_model,
                 original_points,
+                semantic_endpoints,
                 source_before,
                 ..
             } => {
@@ -4543,12 +4615,13 @@ impl App {
                     x: current.x - start_pointer_model.x,
                     y: current.y - start_pointer_model.y,
                 };
-                let raw_after_points = translated_connection_corner(
+                let raw_after_points = build_connection_corner_drag_route(
                     &original_points,
                     corner_index,
                     line_origin,
                     line_rotation,
                     delta,
+                    semantic_endpoints,
                 );
                 self.commit_diagram_connection_move(
                     connection_key,
@@ -6219,7 +6292,7 @@ impl App {
                             preview.index_buffer.slice(..),
                             wgpu::IndexFormat::Uint16,
                         );
-                        pass.draw_indexed(0..preview.index_count, 0, 0..1);
+                        pass.draw_indexed(0..(preview.active_segment_count * 6) as u32, 0, 0..1);
                     }
                     if let Some(preview) = self.connection_creation_preview.as_ref() {
                         pass.set_bind_group(1, &preview.style_bind_group, &[]);
@@ -7706,15 +7779,35 @@ fn gpu_scene_from_geometries(
     let gpu_geometries = geometries
         .into_iter()
         .map(|geometry| {
+            let (vertex_capacity, index_capacity) = if geometry.connection.is_some() {
+                connection_mesh_buffer_capacity(geometry.vertices.len(), geometry.indices.len())
+            } else {
+                (geometry.vertices.len(), geometry.indices.len())
+            };
+            let mut vertex_contents = vec![
+                Vertex {
+                    position: [0.0; 2],
+                    local: [0.0; 2],
+                };
+                vertex_capacity
+            ];
+            vertex_contents[..geometry.vertices.len()].copy_from_slice(&geometry.vertices);
+            let mut index_contents = vec![0_u16; index_capacity];
+            index_contents[..geometry.indices.len()].copy_from_slice(&geometry.indices);
+            let index_usage = if geometry.connection.is_some() {
+                wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST
+            } else {
+                wgpu::BufferUsages::INDEX
+            };
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("{label} vertices")),
-                contents: bytemuck::cast_slice(&geometry.vertices),
+                contents: bytemuck::cast_slice(&vertex_contents),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("{label} indices")),
-                contents: bytemuck::cast_slice(&geometry.indices),
-                usage: wgpu::BufferUsages::INDEX,
+                contents: bytemuck::cast_slice(&index_contents),
+                usage: index_usage,
             });
             let style_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("{label} style")),
@@ -7736,6 +7829,8 @@ fn gpu_scene_from_geometries(
                 index_count: geometry.indices.len() as u32,
                 style_bind_group,
                 base_vertices,
+                vertex_capacity,
+                index_capacity,
                 layer: geometry.layer,
                 edit_key: geometry.edit_key,
                 connection: geometry.connection,
@@ -7752,6 +7847,13 @@ fn gpu_scene_from_geometries(
         layer_indices,
         bounds,
     }
+}
+
+fn connection_mesh_buffer_capacity(vertex_count: usize, index_count: usize) -> (usize, usize) {
+    (
+        vertex_count.saturating_mul(2).saturating_add(32),
+        index_count.saturating_mul(2).saturating_add(48),
+    )
 }
 
 fn core_icon_geometry(scene: &CoreIconScene) -> Vec<Geometry> {
@@ -8611,45 +8713,43 @@ fn hit_test_connection(
     pointer: CorePoint,
     tolerance: f32,
 ) -> Option<ConnectionHit> {
-    for connection in connections.iter().rev() {
-        let Some(line) = connection.line.as_ref() else {
-            continue;
-        };
-        let points = connection_world_points(line, &line.points);
-        for (index, pair) in points.windows(2).enumerate() {
-            let [start, end] = pair else {
+    let mut best: Option<(ConnectionHit, f32, usize, usize)> = None;
+    for (connection_index, connection) in connections.iter().enumerate() {
+        let line = connection.line.as_ref();
+        for segment_index in 0..line.map_or(0, |line| line.points.len().saturating_sub(1)) {
+            let Some((hit, distance)) = hit_test_connection_segment_with_distance(
+                connection,
+                segment_index,
+                pointer,
+                tolerance,
+            ) else {
                 continue;
             };
-            if distance_to_segment(pointer, *start, *end) > tolerance {
-                continue;
+            let best_key = best
+                .as_ref()
+                .map(|(_, distance, connection_index, segment_index)| {
+                    (*distance, false, *connection_index, *segment_index)
+                });
+            if connection_hit_candidate_is_better(
+                distance,
+                false,
+                connection_index,
+                segment_index,
+                best_key,
+            ) {
+                best = Some((hit, distance, connection_index, segment_index));
             }
-            // Modelica stores Line.points in the line-local coordinate
-            // system. Use that same system for the edit axis; the drag delta
-            // is converted back to local coordinates before patching source.
-            let target = match line
-                .points
-                .get(index..=index.saturating_add(1))
-                .and_then(|pair| pair.first().zip(pair.get(1)))
-                .and_then(|(start, end)| segment_orientation(*start, *end))
-            {
-                Some(orientation) => ConnectionHitTarget::Segment { index, orientation },
-                None => ConnectionHitTarget::Line,
-            };
-            return Some(ConnectionHit {
-                connection_id: connection.id.clone(),
-                target,
-            });
         }
     }
-    None
+    best.map(|(hit, _, _, _)| hit)
 }
 
-fn hit_test_connection_segment(
+fn hit_test_connection_segment_with_distance(
     connection: &modelica_core::scene::DiagramConnection,
     segment_index: usize,
     pointer: CorePoint,
     tolerance: f32,
-) -> Option<ConnectionHit> {
+) -> Option<(ConnectionHit, f32)> {
     let line = connection.line.as_ref()?;
     let start = line
         .points
@@ -8659,7 +8759,8 @@ fn hit_test_connection_segment(
         .points
         .get(segment_index + 1)
         .map(|point| line_local_to_world(line, *point))?;
-    if distance_to_segment(pointer, start, end) > tolerance {
+    let distance = distance_to_segment(pointer, start, end);
+    if distance > tolerance {
         return None;
     }
     let target = match line
@@ -8674,10 +8775,38 @@ fn hit_test_connection_segment(
         },
         None => ConnectionHitTarget::Line,
     };
-    Some(ConnectionHit {
-        connection_id: connection.id.clone(),
-        target,
-    })
+    Some((
+        ConnectionHit {
+            connection_id: connection.id.clone(),
+            target,
+        },
+        distance,
+    ))
+}
+
+fn connection_hit_candidate_is_better(
+    candidate_distance: f32,
+    candidate_selected: bool,
+    candidate_connection_index: usize,
+    candidate_segment_index: usize,
+    best: Option<(f32, bool, usize, usize)>,
+) -> bool {
+    let Some((best_distance, best_selected, best_connection_index, best_segment_index)) = best
+    else {
+        return true;
+    };
+    if candidate_distance + CONNECTION_HIT_DISTANCE_TIE_EPSILON < best_distance {
+        return true;
+    }
+    if (candidate_distance - best_distance).abs() > CONNECTION_HIT_DISTANCE_TIE_EPSILON {
+        return false;
+    }
+    if candidate_selected != best_selected {
+        return candidate_selected;
+    }
+    candidate_connection_index > best_connection_index
+        || (candidate_connection_index == best_connection_index
+            && candidate_segment_index < best_segment_index)
 }
 
 fn distance_between(first: CorePoint, second: CorePoint) -> f32 {
@@ -9494,45 +9623,6 @@ fn snap_connection_segment_delta(
     line_local_delta_to_world(line_rotation, snapped_local_delta)
 }
 
-/// Fast preview-only endpoint correction. Full connector resolution remains
-/// mandatory on pointer-up; this function uses semantic endpoints captured at
-/// drag-start and never walks connector graphics on cursor movement.
-fn reanchor_connection_points_cached(
-    points: &[CorePoint],
-    (lhs, rhs): (CorePoint, CorePoint),
-) -> Vec<CorePoint> {
-    if points.len() <= 2 {
-        return vec![lhs, rhs];
-    }
-    let mut result = points.to_vec();
-    let lhs_before = result[0];
-    result[0] = lhs;
-    preserve_cached_endpoint_axis(&mut result[1], lhs_before, points[1], lhs);
-    let rhs_index = result.len() - 1;
-    let rhs_before = result[rhs_index];
-    result[rhs_index] = rhs;
-    preserve_cached_endpoint_axis(
-        &mut result[rhs_index - 1],
-        rhs_before,
-        points[rhs_index - 1],
-        rhs,
-    );
-    result
-}
-
-fn preserve_cached_endpoint_axis(
-    neighbor: &mut CorePoint,
-    endpoint_before: CorePoint,
-    neighbor_before: CorePoint,
-    endpoint_after: CorePoint,
-) {
-    if (endpoint_before.y - neighbor_before.y).abs() <= ORTHOGONAL_EPSILON {
-        neighbor.y = endpoint_after.y;
-    } else if (endpoint_before.x - neighbor_before.x).abs() <= ORTHOGONAL_EPSILON {
-        neighbor.x = endpoint_after.x;
-    }
-}
-
 fn line_local_delta_to_world(line_rotation: f32, delta: CorePoint) -> CorePoint {
     let angle = line_rotation.to_radians();
     let (sin, cos) = angle.sin_cos();
@@ -9659,66 +9749,58 @@ fn translated_connection_segment(
     points
 }
 
-/// Translate a segment for the live GPU preview without changing its topology.
-/// Endpoint bridges are added only by `translated_connection_segment` for the
-/// pointer-up source edit; during pointer movement we keep the original point
-/// count so the existing tessellation buffers can be updated in place.
-fn translated_connection_segment_preview(
+fn connection_drag_points_with_semantic_endpoints(
+    original_points: &[CorePoint],
+    (lhs, rhs): (CorePoint, CorePoint),
+) -> Vec<CorePoint> {
+    let mut points = original_points.to_vec();
+    if let Some(first) = points.first_mut() {
+        *first = lhs;
+    }
+    if let Some(last) = points.last_mut() {
+        *last = rhs;
+    }
+    points
+}
+
+fn build_connection_segment_drag_route(
     original_points: &[CorePoint],
     segment_index: usize,
     orientation: ConnectionSegmentOrientation,
     line_origin: CorePoint,
     line_rotation: f32,
     delta: CorePoint,
+    semantic_endpoints: (CorePoint, CorePoint),
 ) -> Vec<CorePoint> {
-    let translated = translated_connection_segment(
-        original_points,
+    let anchored_points =
+        connection_drag_points_with_semantic_endpoints(original_points, semantic_endpoints);
+    translated_connection_segment(
+        &anchored_points,
         segment_index,
         orientation,
         line_origin,
         line_rotation,
         delta,
-    );
-    if translated.len() == original_points.len() {
-        return translated;
-    }
+    )
+}
 
-    let local_delta = world_delta_to_line_local(line_origin, line_rotation, delta);
-    let offset = match orientation {
-        ConnectionSegmentOrientation::Horizontal => CorePoint {
-            x: 0.0,
-            y: local_delta.y,
-        },
-        ConnectionSegmentOrientation::Vertical => CorePoint {
-            x: local_delta.x,
-            y: 0.0,
-        },
-    };
-    if offset.x.abs() <= ORTHOGONAL_EPSILON && offset.y.abs() <= ORTHOGONAL_EPSILON {
-        return original_points.to_vec();
-    }
-
-    let mut run_start = segment_index;
-    while run_start > 0
-        && segment_orientation(original_points[run_start - 1], original_points[run_start])
-            == Some(orientation)
-    {
-        run_start -= 1;
-    }
-    let mut run_end = segment_index;
-    while run_end + 1 < original_points.len() - 1
-        && segment_orientation(original_points[run_end + 1], original_points[run_end + 2])
-            == Some(orientation)
-    {
-        run_end += 1;
-    }
-
-    let mut preview = original_points.to_vec();
-    for point in &mut preview[run_start..=run_end + 1] {
-        point.x += offset.x;
-        point.y += offset.y;
-    }
-    preview
+fn build_connection_corner_drag_route(
+    original_points: &[CorePoint],
+    corner_index: usize,
+    line_origin: CorePoint,
+    line_rotation: f32,
+    delta: CorePoint,
+    semantic_endpoints: (CorePoint, CorePoint),
+) -> Vec<CorePoint> {
+    let anchored_points =
+        connection_drag_points_with_semantic_endpoints(original_points, semantic_endpoints);
+    translated_connection_corner(
+        &anchored_points,
+        corner_index,
+        line_origin,
+        line_rotation,
+        delta,
+    )
 }
 
 /// Move an inner polyline vertex ("corner") of a connection freely while the
@@ -11167,9 +11249,18 @@ mod tests {
     }
 
     #[test]
-    fn segment_preview_keeps_point_count_until_pointer_up() {
+    fn connection_segment_drag_route_matches_commit_route_and_adds_bridges() {
         let points = vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }];
-        let preview = translated_connection_segment_preview(
+        let preview = build_connection_segment_drag_route(
+            &points,
+            0,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: 40.0 },
+            (points[0], points[1]),
+        );
+        let committed = translated_connection_segment(
             &points,
             0,
             ConnectionSegmentOrientation::Horizontal,
@@ -11177,12 +11268,14 @@ mod tests {
             0.0,
             CorePoint { x: 0.0, y: 40.0 },
         );
-        assert_eq!(preview.len(), points.len());
+        assert_eq!(preview, committed);
         assert_eq!(
             preview,
             vec![
+                CorePoint { x: 0.0, y: 0.0 },
                 CorePoint { x: 0.0, y: 40.0 },
                 CorePoint { x: 100.0, y: 40.0 },
+                CorePoint { x: 100.0, y: 0.0 },
             ]
         );
     }
@@ -11383,6 +11476,58 @@ mod tests {
                 orientation: ConnectionSegmentOrientation::Vertical,
             }
         ));
+    }
+
+    #[test]
+    fn connection_hit_test_prefers_nearest_then_selected_connection() {
+        assert!(connection_hit_candidate_is_better(
+            1.0,
+            false,
+            0,
+            0,
+            Some((2.0, false, 1, 0)),
+        ));
+        assert!(connection_hit_candidate_is_better(
+            1.0,
+            true,
+            0,
+            0,
+            Some((1.0, false, 1, 0)),
+        ));
+        assert!(connection_hit_candidate_is_better(
+            1.0,
+            false,
+            2,
+            0,
+            Some((1.0, false, 1, 0)),
+        ));
+        assert!(!connection_hit_candidate_is_better(
+            1.0002,
+            false,
+            2,
+            0,
+            Some((1.0, false, 1, 0)),
+        ));
+    }
+
+    #[test]
+    fn connection_hit_test_chooses_nearest_over_connection_iteration_order() {
+        let (_, mut nearer) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let (_, mut farther) = connection_test_scene(
+            CorePoint { x: 0.0, y: 2.0 },
+            CorePoint { x: 100.0, y: 2.0 },
+            vec![CorePoint { x: 0.0, y: 2.0 }, CorePoint { x: 100.0, y: 2.0 }],
+        );
+        nearer.id = "connection:nearer".to_owned();
+        farther.id = "connection:farther".to_owned();
+
+        let hit = hit_test_connection(&[farther, nearer], CorePoint { x: 50.0, y: 0.25 }, 3.0)
+            .expect("nearest connection hit");
+        assert_eq!(hit.connection_id, "connection:nearer");
     }
 
     #[test]
@@ -11796,15 +11941,23 @@ mod tests {
     }
 
     #[test]
-    fn cached_semantic_endpoints_anchor_preview_route() {
+    fn semantic_endpoints_are_used_by_connection_drag_route() {
         let points = vec![
-            CorePoint { x: 10.0, y: 0.0 },
-            CorePoint { x: 10.0, y: 20.0 },
-            CorePoint { x: 50.0, y: 20.0 },
-            CorePoint { x: 50.0, y: 0.0 },
+            CorePoint { x: 0.00005, y: 0.0 },
+            CorePoint { x: 0.0, y: 20.0 },
+            CorePoint { x: 60.0, y: 20.0 },
+            CorePoint {
+                x: 60.00005,
+                y: 0.0,
+            },
         ];
-        let anchored = reanchor_connection_points_cached(
+        let anchored = build_connection_segment_drag_route(
             &points,
+            1,
+            ConnectionSegmentOrientation::Horizontal,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            CorePoint { x: 0.0, y: 0.0 },
             (CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 60.0, y: 0.0 }),
         );
         assert_eq!(anchored.first(), Some(&CorePoint { x: 0.0, y: 0.0 }));
