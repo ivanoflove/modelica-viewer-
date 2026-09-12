@@ -4807,8 +4807,8 @@ impl App {
             self.load_error = Some("Connection creation lost its new connection identity".into());
             return;
         };
-        if !connection_points_match_invariants(&resolved_diagram, connection, &points) {
-            self.load_error = Some("Connection creation did not preserve its endpoints".into());
+        if let Some(reason) = connection_invariant_failure(&resolved_diagram, connection, &points) {
+            self.load_error = Some(format!("Connection creation failed: {reason}"));
             return;
         }
         let connection_id = connection.id.clone();
@@ -4950,13 +4950,16 @@ impl App {
             y: before_origin.y + delta.y,
         };
         let mut reanchored_scene = current_scene.clone();
-        if let Some(component) = reanchored_scene
+        let Some(component) = reanchored_scene
             .components
             .iter_mut()
             .find(|component| component.id == component_id)
-        {
-            component.origin = after_origin;
-        }
+        else {
+            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        component.origin = after_origin;
         let mut source_edits = Vec::with_capacity(connected_connections.len() + 1);
         let component_edit =
             match component_origin_edit(&source_before, &component_name, after_origin) {
@@ -5034,7 +5037,22 @@ impl App {
                 return;
             }
         };
-        for edit in &connection_edits {
+        let Some(resolved_component) = resolved_diagram
+            .components
+            .iter()
+            .find(|component| component.id == component_id)
+        else {
+            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+            self.rebuild_selected_scenes();
+            return;
+        };
+        if !point_nearly_equal(resolved_component.origin, after_origin) {
+            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+            self.rebuild_selected_scenes();
+            return;
+        }
+        let canonical_after_origin = resolved_component.origin;
+        for edit in &mut connection_edits {
             let Some(connection) = resolved_diagram
                 .connections
                 .iter()
@@ -5047,17 +5065,25 @@ impl App {
             if connection
                 .line
                 .as_ref()
-                .is_none_or(|line| line.origin != edit.line_origin)
-                || !connection_points_match_invariants(
-                    &resolved_diagram,
-                    connection,
-                    &edit.after_points,
-                )
+                .is_none_or(|line| !point_nearly_equal(line.origin, edit.line_origin))
             {
-                self.load_error = Some("Diagram edit did not preserve connection endpoints".into());
+                self.load_error = Some("Diagram edit failed: connection points mismatch".into());
                 self.rebuild_selected_scenes();
                 return;
             }
+            if let Some(reason) =
+                connection_invariant_failure(&resolved_diagram, connection, &edit.after_points)
+            {
+                self.load_error = Some(format!("Diagram edit failed: {reason}"));
+                self.rebuild_selected_scenes();
+                return;
+            }
+            let line = connection
+                .line
+                .as_ref()
+                .expect("connection invariant check requires a line");
+            edit.after_points = line.points.clone();
+            edit.line_origin = line.origin;
         }
         let Some(document) = self.document.as_mut() else {
             self.rebuild_selected_scenes();
@@ -5074,7 +5100,7 @@ impl App {
             class_name,
             component_id,
             before_origin,
-            after_origin,
+            after_origin: canonical_after_origin,
             before_source: source_before,
             after_source: candidate,
             connection_edits,
@@ -5194,8 +5220,10 @@ impl App {
             self.rebuild_selected_scenes();
             return;
         };
-        if !connection_points_match_invariants(&resolved_diagram, connection, &after_points) {
-            self.load_error = Some("Connection edit did not update Line.points".into());
+        if let Some(reason) =
+            connection_invariant_failure(&resolved_diagram, connection, &after_points)
+        {
+            self.load_error = Some(format!("Connection edit failed: {reason}"));
             self.rebuild_selected_scenes();
             return;
         }
@@ -5389,15 +5417,17 @@ impl App {
             if connection
                 .line
                 .as_ref()
-                .is_none_or(|line| line.origin != edit.line_origin)
-                || !connection_points_match_invariants(
-                    &resolved_diagram,
-                    connection,
-                    &edit.after_points,
-                )
+                .is_none_or(|line| !point_nearly_equal(line.origin, edit.line_origin))
             {
                 self.load_error =
-                    Some("Component resize did not update connection geometry".into());
+                    Some("Component resize failed: connection points mismatch".into());
+                self.rebuild_selected_scenes();
+                return;
+            }
+            if let Some(reason) =
+                connection_invariant_failure(&resolved_diagram, connection, &edit.after_points)
+            {
+                self.load_error = Some(format!("Component resize failed: {reason}"));
                 self.rebuild_selected_scenes();
                 return;
             }
@@ -5485,7 +5515,8 @@ impl App {
                     return;
                 };
                 if !resolved_diagram.components.iter().any(|component| {
-                    component.id == *component_id && component.origin == expected_origin
+                    component.id == *component_id
+                        && point_nearly_equal(component.origin, expected_origin)
                 }) {
                     return;
                 }
@@ -5505,7 +5536,13 @@ impl App {
                     let Some(line) = connection.line.as_ref() else {
                         return;
                     };
-                    if line.origin != edit.line_origin || line.points != *expected_points {
+                    if !point_nearly_equal(line.origin, edit.line_origin)
+                        || !connection_points_match_invariants(
+                            &resolved_diagram,
+                            connection,
+                            expected_points,
+                        )
+                    {
                         return;
                     }
                 }
@@ -5649,7 +5686,7 @@ impl App {
                     let Some(line) = connection.line.as_ref() else {
                         return;
                     };
-                    if line.origin != edit.line_origin
+                    if !point_nearly_equal(line.origin, edit.line_origin)
                         || !connection_points_match_invariants(
                             &resolved_diagram,
                             connection,
@@ -9033,6 +9070,21 @@ fn default_component_extent() -> modelica_core::scene::Extent {
     }
 }
 
+const DIAGRAM_GEOMETRY_EPSILON: f32 = 1.0e-4;
+
+fn point_nearly_equal(first: CorePoint, second: CorePoint) -> bool {
+    (first.x - second.x).abs() <= DIAGRAM_GEOMETRY_EPSILON
+        && (first.y - second.y).abs() <= DIAGRAM_GEOMETRY_EPSILON
+}
+
+fn points_nearly_equal(first: &[CorePoint], second: &[CorePoint]) -> bool {
+    first.len() == second.len()
+        && first
+            .iter()
+            .zip(second)
+            .all(|(first, second)| point_nearly_equal(*first, *second))
+}
+
 fn connection_endpoints_match(
     scene: &CoreDiagramScene,
     connection: &modelica_core::scene::DiagramConnection,
@@ -9040,7 +9092,8 @@ fn connection_endpoints_match(
     let Ok(endpoints) = resolve_connection_endpoints(scene, connection) else {
         return false;
     };
-    endpoints.lhs_distance <= 1.0e-4 && endpoints.rhs_distance <= 1.0e-4
+    endpoints.lhs_distance <= DIAGRAM_GEOMETRY_EPSILON
+        && endpoints.rhs_distance <= DIAGRAM_GEOMETRY_EPSILON
 }
 
 /// Anchor, simplify, and validate a route before it is serialized.
@@ -9085,8 +9138,9 @@ fn finalize_connection_route(
 
     let (lhs, rhs) = strict_connection_points(scene, connection)
         .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
-    if distance_between(points[0], lhs) > 1.0e-4
-        || distance_between(*points.last().expect("at least two points"), rhs) > 1.0e-4
+    if distance_between(points[0], lhs) > DIAGRAM_GEOMETRY_EPSILON
+        || distance_between(*points.last().expect("at least two points"), rhs)
+            > DIAGRAM_GEOMETRY_EPSILON
     {
         return Err("connection route endpoints are not anchored".to_owned());
     }
@@ -9108,17 +9162,31 @@ fn connection_points_match_invariants(
     connection: &modelica_core::scene::DiagramConnection,
     expected_points: &[CorePoint],
 ) -> bool {
+    connection_invariant_failure(scene, connection, expected_points).is_none()
+}
+
+fn connection_invariant_failure(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    expected_points: &[CorePoint],
+) -> Option<&'static str> {
     let Some(line) = connection.line.as_ref() else {
-        return false;
+        return Some("connection points mismatch");
     };
     let Some((first, last)) = line.points.first().zip(line.points.last()) else {
-        return false;
+        return Some("connection points mismatch");
     };
-    line.points == expected_points
-        && line.points.len() >= 2
-        && distance_between(*first, *last) > ORTHOGONAL_EPSILON
-        && is_orthogonal_polyline(&line.points)
-        && connection_endpoints_match(scene, connection)
+    if !points_nearly_equal(&line.points, expected_points)
+        || line.points.len() < 2
+        || distance_between(*first, *last) <= ORTHOGONAL_EPSILON
+        || !is_orthogonal_polyline(&line.points)
+    {
+        return Some("connection points mismatch");
+    }
+    if !connection_endpoints_match(scene, connection) {
+        return Some("endpoint anchor mismatch");
+    }
+    None
 }
 
 fn connection_drag_snapshots(
@@ -10398,6 +10466,43 @@ mod tests {
     }
 
     #[test]
+    fn serialized_geometry_precision_is_tolerated_by_commit_validation() {
+        let raw_origin = CorePoint {
+            x: 12.345_679,
+            y: -27.654_322,
+        };
+        let serialized_origin = CorePoint {
+            x: 12.345679,
+            y: -27.654322,
+        };
+        assert!(point_nearly_equal(raw_origin, serialized_origin));
+
+        let raw_points = [
+            raw_origin,
+            CorePoint {
+                x: 40.123_455,
+                y: -27.654_322,
+            },
+        ];
+        let serialized_points = [
+            serialized_origin,
+            CorePoint {
+                x: 40.123_46,
+                y: -27.654_322,
+            },
+        ];
+        assert!(points_nearly_equal(&raw_points, &serialized_points));
+        assert_eq!(format_modelica_point(raw_origin), "{12.345679, -27.654322}");
+        assert!(!point_nearly_equal(
+            raw_origin,
+            CorePoint {
+                x: raw_origin.x + DIAGRAM_GEOMETRY_EPSILON * 2.0,
+                y: raw_origin.y,
+            }
+        ));
+    }
+
+    #[test]
     fn component_resize_patches_only_placement_extent_and_preserves_mirror_order() {
         let source = "model Parent\n  Child p annotation(Placement(transformation(origin={20, 30}, extent={{10, 10}, {-10, -10}}, rotation=12)));\nend Parent;";
         let extent = modelica_core::scene::Extent {
@@ -10496,6 +10601,42 @@ mod tests {
                 CorePoint { x: 50.0, y: 25.0 },
             ]
         );
+    }
+
+    #[test]
+    fn connection_validation_tolerates_serialized_line_point_quantization() {
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let expected_points = vec![
+            CorePoint {
+                x: 0.000049,
+                y: 0.0,
+            },
+            CorePoint {
+                x: 100.000049,
+                y: 0.0,
+            },
+        ];
+        let (serialized_scene, serialized_connection) = connection_with_points(
+            &scene,
+            &connection,
+            vec![
+                CorePoint { x: 0.00005, y: 0.0 },
+                CorePoint {
+                    x: 100.00005,
+                    y: 0.0,
+                },
+            ],
+        );
+
+        assert!(connection_points_match_invariants(
+            &serialized_scene,
+            &serialized_connection,
+            &expected_points,
+        ));
     }
 
     #[test]
