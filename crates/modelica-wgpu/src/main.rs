@@ -4640,48 +4640,16 @@ impl App {
             PointerInteraction::MoveDiagramConnectionSegment {
                 connection_id: _connection_id,
                 connection_key,
-                segment_index,
-                orientation,
-                line_origin,
-                line_rotation,
-                start_pointer_model,
                 original_points,
+                preview_points,
                 endpoint_constraint,
-                snap_axes,
-                mut snapped_axis,
                 source_before,
                 ..
             } => {
-                let current = self.screen_to_model(self.cursor);
-                let delta = CorePoint {
-                    x: current.x - start_pointer_model.x,
-                    y: current.y - start_pointer_model.y,
-                };
-                let delta = snap_connection_segment_delta_cached(
-                    connection_segment_axis(&original_points, segment_index, orientation),
-                    orientation,
-                    line_rotation,
-                    delta,
-                    &snap_axes,
-                    &mut snapped_axis,
-                    (
-                        connection_snap_tolerance(self.zoom),
-                        connection_snap_exit_tolerance(self.zoom),
-                    ),
-                );
-                let raw_after_points = build_connection_segment_drag_route(
-                    &original_points,
-                    segment_index,
-                    orientation,
-                    line_origin,
-                    line_rotation,
-                    delta,
-                    endpoint_constraint,
-                );
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
-                    raw_after_points,
+                    preview_points,
                     endpoint_constraint,
                     source_before,
                 );
@@ -4689,32 +4657,16 @@ impl App {
             PointerInteraction::MoveDiagramConnectionCorner {
                 connection_id: _connection_id,
                 connection_key,
-                corner_index,
-                line_origin,
-                line_rotation,
-                start_pointer_model,
-                original_points,
                 endpoint_constraint,
+                original_points,
+                preview_points,
                 source_before,
                 ..
             } => {
-                let current = self.screen_to_model(self.cursor);
-                let delta = CorePoint {
-                    x: current.x - start_pointer_model.x,
-                    y: current.y - start_pointer_model.y,
-                };
-                let raw_after_points = build_connection_corner_drag_route(
-                    &original_points,
-                    corner_index,
-                    line_origin,
-                    line_rotation,
-                    delta,
-                    endpoint_constraint,
-                );
                 self.commit_diagram_connection_move(
                     connection_key,
                     original_points,
-                    raw_after_points,
+                    preview_points,
                     endpoint_constraint,
                     source_before,
                 );
@@ -10433,8 +10385,16 @@ fn main() {
                                     suppress
                                 } else {
                                     false
-                                };
+                            };
                             if state == ElementState::Released {
+                                if button == MouseButton::Left
+                                    && app.connection_drag_active()
+                                    && !app.connection_creation_active()
+                                {
+                                    // The last CursorMoved may still be coalesced. Flush it before
+                                    // taking the route that the user actually saw on screen.
+                                    app.flush_drag_preview();
+                                }
                                 if app.connection_creation_active() && button == MouseButton::Right {
                                     app.cancel_connection_creation();
                                 } else if app.connection_creation_active()
