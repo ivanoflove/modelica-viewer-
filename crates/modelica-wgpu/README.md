@@ -43,6 +43,10 @@ MODELICA_WGPU_PROFILE_DRAG=1 cargo run -p modelica-wgpu --release <package.mo>
 MODELICA_WGPU_PROFILE_CANCEL=1 cargo run -p modelica-wgpu --release <package.mo>
 ```
 
+取消 profiler 同时输出取消事件到首个成功 present 的端到端链路：
+`[CANCEL PROFILE]` 是取消函数内部，`[CANCEL E2E]` 还会拆分首帧等待、preview flush、egui、scene encode、submit、present 和实际 redraw 次数。
+达到 20 个样本后会输出 p50/p95/worst 汇总；profiler 不会等待 GPU。
+
 日志中的 `[CANCEL PROFILE]` 会拆分瞬态回滚、受影响连接、预览清理、选择更新和 GPU 写入；取消路径不会触发完整 Diagram 解析或命中缓存重建。
 
 ## 外观与字体（与 Electron 客户端一致）

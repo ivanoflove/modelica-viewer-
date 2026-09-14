@@ -785,6 +785,159 @@ fn trace_cancel_profile(
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PendingCancelProfile {
+    generation: u64,
+    started: Instant,
+    cancel_completed_at: Instant,
+    interaction: &'static str,
+    connection_count: usize,
+    cancel_cpu: Duration,
+    first_redraw_at: Option<Instant>,
+    redraw_count: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CancelRedrawTiming {
+    generation: u64,
+    first_redraw_at: Instant,
+    redraw_count: u32,
+    flush_drag_preview: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CancelFrameTiming {
+    ui: Duration,
+    egui_tessellation: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
+    present: Duration,
+    frame_total: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CancelE2ESample {
+    interaction: &'static str,
+    end_to_end: Duration,
+}
+
+struct CancelE2EProfile {
+    enabled: bool,
+    samples: Vec<CancelE2ESample>,
+}
+
+impl CancelE2EProfile {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("MODELICA_WGPU_PROFILE_CANCEL").is_some(),
+            samples: Vec::with_capacity(32),
+        }
+    }
+
+    fn record(
+        &mut self,
+        pending: PendingCancelProfile,
+        redraw: CancelRedrawTiming,
+        frame: CancelFrameTiming,
+        finished_at: Instant,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let micros = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
+        let input_to_cancel_end = pending
+            .cancel_completed_at
+            .saturating_duration_since(pending.started);
+        let redraw_wait = redraw
+            .first_redraw_at
+            .saturating_duration_since(pending.cancel_completed_at);
+        let end_to_end = finished_at.saturating_duration_since(pending.started);
+        eprintln!(
+            "[CANCEL REDRAW] generation={} redraw_count={} redraw_wait_us={:.1}",
+            redraw.generation,
+            redraw.redraw_count,
+            micros(redraw_wait),
+        );
+        eprintln!(
+            "[CANCEL E2E] generation={} interaction={} connections={} input_to_cancel_end_us={:.1} cancel_cpu_us={:.1} redraw_wait_us={:.1} flush_drag_preview_us={:.1} ui_us={:.1} scene_encode_us={:.1} queue_submit_us={:.1} present_us={:.1} frame_total_us={:.1} end_to_end_us={:.1} redraw_count={}",
+            pending.generation,
+            pending.interaction,
+            pending.connection_count,
+            micros(input_to_cancel_end),
+            micros(pending.cancel_cpu),
+            micros(redraw_wait),
+            micros(redraw.flush_drag_preview),
+            micros(frame.ui + frame.egui_tessellation),
+            micros(frame.scene_encode),
+            micros(frame.queue_submit),
+            micros(frame.present),
+            micros(frame.frame_total),
+            micros(end_to_end),
+            redraw.redraw_count,
+        );
+        self.samples.push(CancelE2ESample {
+            interaction: pending.interaction,
+            end_to_end,
+        });
+        if self.samples.len() >= 20 && self.samples.len() % 20 == 0 {
+            self.report_summary();
+        }
+    }
+
+    fn report_summary(&self) {
+        let mut samples = self
+            .samples
+            .iter()
+            .map(|sample| sample.end_to_end)
+            .collect::<Vec<_>>();
+        samples.sort_unstable();
+        let percentile = |percent: f32| {
+            let index = ((samples.len().saturating_sub(1)) as f32 * percent).round() as usize;
+            samples.get(index).copied().unwrap_or_default()
+        };
+        let micros = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
+        eprintln!(
+            "[CANCEL E2E SUMMARY] samples={} p50_us={:.1} p95_us={:.1} worst_us={:.1}",
+            samples.len(),
+            micros(percentile(0.50)),
+            micros(percentile(0.95)),
+            micros(percentile(1.0)),
+        );
+        for interaction in [
+            "MoveDiagramComponent",
+            "ResizeDiagramComponent",
+            "MoveDiagramConnectionSegment",
+            "MoveDiagramConnectionCorner",
+            "CreateDiagramConnection",
+            "DeselectDiagram",
+        ] {
+            let mut interaction_samples = self
+                .samples
+                .iter()
+                .filter(|sample| sample.interaction == interaction)
+                .map(|sample| sample.end_to_end)
+                .collect::<Vec<_>>();
+            if interaction_samples.is_empty() {
+                continue;
+            }
+            interaction_samples.sort_unstable();
+            let percentile = |percent: f32| {
+                let index = ((interaction_samples.len().saturating_sub(1)) as f32 * percent).round()
+                    as usize;
+                interaction_samples.get(index).copied().unwrap_or_default()
+            };
+            eprintln!(
+                "[CANCEL E2E SUMMARY] interaction={} samples={} p50_us={:.1} p95_us={:.1} worst_us={:.1}",
+                interaction,
+                interaction_samples.len(),
+                micros(percentile(0.50)),
+                micros(percentile(0.95)),
+                micros(percentile(1.0)),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct HitBounds {
     min: CorePoint,
     max: CorePoint,
@@ -3326,6 +3479,9 @@ struct App {
     waypoint_frame_pending: bool,
     waypoint_profile_frames_remaining: u8,
     suppress_next_pointer_release_redraw: bool,
+    cancel_generation: u64,
+    pending_cancel_profile: Option<PendingCancelProfile>,
+    cancel_e2e_profile: CancelE2EProfile,
     drag_profile: DragProfile,
     connection_creation_profile: ConnectionCreationProfile,
     history: Vec<EditCommand>,
@@ -3659,6 +3815,9 @@ impl App {
             waypoint_frame_pending: false,
             waypoint_profile_frames_remaining: 0,
             suppress_next_pointer_release_redraw: false,
+            cancel_generation: 0,
+            pending_cancel_profile: None,
+            cancel_e2e_profile: CancelE2EProfile::new(),
             drag_profile: DragProfile::new(),
             connection_creation_profile: ConnectionCreationProfile::new(),
             history: Vec::new(),
@@ -4621,6 +4780,59 @@ impl App {
         !matches!(self.pointer_interaction, PointerInteraction::None)
     }
 
+    fn begin_cancel_profile(
+        &mut self,
+        interaction: &'static str,
+        connection_count: usize,
+        started: Instant,
+        cancel_completed_at: Instant,
+        cancel_cpu: Duration,
+    ) {
+        if !self.cancel_e2e_profile.enabled {
+            return;
+        }
+        self.cancel_generation = self.cancel_generation.wrapping_add(1);
+        self.pending_cancel_profile = Some(PendingCancelProfile {
+            generation: self.cancel_generation,
+            started,
+            cancel_completed_at,
+            interaction,
+            connection_count,
+            cancel_cpu,
+            first_redraw_at: None,
+            redraw_count: 0,
+        });
+    }
+
+    fn begin_cancel_redraw(&mut self) -> Option<CancelRedrawTiming> {
+        let profile = self.pending_cancel_profile.as_mut()?;
+        let now = Instant::now();
+        profile.redraw_count = profile.redraw_count.saturating_add(1);
+        let first_redraw_at = *profile.first_redraw_at.get_or_insert(now);
+        Some(CancelRedrawTiming {
+            generation: profile.generation,
+            first_redraw_at,
+            redraw_count: profile.redraw_count,
+            flush_drag_preview: Duration::ZERO,
+        })
+    }
+
+    fn finish_cancel_profile(
+        &mut self,
+        redraw: CancelRedrawTiming,
+        frame: CancelFrameTiming,
+        finished_at: Instant,
+    ) {
+        let Some(pending) = self.pending_cancel_profile.take() else {
+            return;
+        };
+        if pending.generation != redraw.generation {
+            return;
+        }
+        self.cancel_e2e_profile
+            .record(pending, redraw, frame, finished_at);
+    }
+
     fn connection_creation_active(&self) -> bool {
         matches!(
             self.pointer_interaction,
@@ -5220,10 +5432,19 @@ impl App {
         self.suppress_next_pointer_release_redraw = true;
         let preview_cleanup = cleanup_started.elapsed();
         let gpu_upload = rollback_component + rollback_connections;
+        let cancel_completed_at = Instant::now();
+        let cancel_cpu = cancel_completed_at.saturating_duration_since(total_started);
+        self.begin_cancel_profile(
+            interaction_name,
+            connection_count,
+            total_started,
+            cancel_completed_at,
+            cancel_cpu,
+        );
         trace_cancel_profile(
             interaction_name,
             connection_count,
-            total_started.elapsed(),
+            cancel_cpu,
             rollback_component,
             rollback_connections,
             preview_cleanup,
@@ -5246,10 +5467,18 @@ impl App {
         let hover_changed = self.hovered_port.take().is_some();
         let changed = selection_changed || hover_changed;
         if changed {
+            let completed_at = Instant::now();
+            self.begin_cancel_profile(
+                "DeselectDiagram",
+                0,
+                total_started,
+                completed_at,
+                completed_at.saturating_duration_since(total_started),
+            );
             trace_cancel_profile(
                 "DeselectDiagram",
                 0,
-                total_started.elapsed(),
+                completed_at.saturating_duration_since(total_started),
                 Duration::ZERO,
                 Duration::ZERO,
                 Duration::ZERO,
@@ -7207,7 +7436,10 @@ impl App {
         self.update_title(None);
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    fn render(
+        &mut self,
+        cancel_redraw: Option<CancelRedrawTiming>,
+    ) -> Result<(), wgpu::SurfaceError> {
         self.poll_document_load();
         let document_loading = self.loading_document.is_some();
         let frame_started = Instant::now();
@@ -7417,7 +7649,9 @@ impl App {
             );
             self.background_dirty = false;
         }
-        let profile_enabled = self.drag_profile.enabled || self.connection_creation_profile.enabled;
+        let profile_enabled = self.drag_profile.enabled
+            || self.connection_creation_profile.enabled
+            || self.cancel_e2e_profile.enabled;
         let egui_tessellation_started = profile_enabled.then(Instant::now);
         let paint_jobs = self
             .egui_ctx
@@ -7425,6 +7659,7 @@ impl App {
         if let Some(started) = egui_tessellation_started {
             egui_tessellation = started.elapsed();
         }
+        let scene_encode_started = Instant::now();
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: self.window.scale_factor() as f32,
@@ -7590,16 +7825,37 @@ impl App {
                 .render(&mut ui_pass, &paint_jobs, &screen_descriptor);
         }
         command_buffers.push(encoder.finish());
+        let scene_encode = scene_encode_started.elapsed();
+        let queue_submit_started = Instant::now();
         self.queue.submit(command_buffers);
+        let queue_submit = queue_submit_started.elapsed();
         let render_encode = render_encode_started.elapsed();
         let gpu_uploaded = frame_started.elapsed();
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+        let present_started = Instant::now();
         frame.present();
+        let present = present_started.elapsed();
 
         let total = frame_started.elapsed();
+        let finished_at = Instant::now();
         let total_ms = total.as_secs_f64() * 1000.0;
+        if let Some(mut cancel_redraw) = cancel_redraw {
+            cancel_redraw.flush_drag_preview = Duration::ZERO;
+            self.finish_cancel_profile(
+                cancel_redraw,
+                CancelFrameTiming {
+                    ui: ui_done,
+                    egui_tessellation,
+                    scene_encode,
+                    queue_submit,
+                    present,
+                    frame_total: total,
+                },
+                finished_at,
+            );
+        }
         if self.interactive_drag_active() {
             self.drag_profile.record_frame(
                 ui_done,
@@ -12007,9 +12263,14 @@ fn main() {
                             app.window.request_redraw();
                         }
                         WindowEvent::RedrawRequested => {
+                            let mut cancel_redraw = app.begin_cancel_redraw();
+                            let flush_started = Instant::now();
                             app.flush_drag_preview();
+                            if let Some(redraw) = cancel_redraw.as_mut() {
+                                redraw.flush_drag_preview = flush_started.elapsed();
+                            }
                             app.process_pending_waypoint();
-                            match app.render() {
+                            match app.render(cancel_redraw) {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                                 app.resize(app.window.inner_size())
