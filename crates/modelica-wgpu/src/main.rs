@@ -9746,6 +9746,10 @@ fn nested_call<'a>(call: &'a AnnotationCall, name: &str) -> Option<&'a Annotatio
     })
 }
 
+fn placement_transformation_call(call: &AnnotationCall) -> Option<&AnnotationCall> {
+    nested_call(call, "transformation").or_else(|| nested_call(call, "iconTransformation"))
+}
+
 fn is_graphic_call(call: &AnnotationCall) -> bool {
     matches!(
         call.name.as_str(),
@@ -9981,7 +9985,7 @@ fn component_origin_edit(
         let Some(placement) = nested_call(&annotation, "Placement") else {
             continue;
         };
-        let Some(transformation) = nested_call(placement, "transformation") else {
+        let Some(transformation) = placement_transformation_call(placement) else {
             continue;
         };
         return origin_edit_for_call(source, annotation_start, transformation, origin)
@@ -10012,7 +10016,7 @@ fn component_extent_edit(
         let Some(placement) = nested_call(&annotation, "Placement") else {
             continue;
         };
-        let Some(transformation) = nested_call(placement, "transformation") else {
+        let Some(transformation) = placement_transformation_call(placement) else {
             continue;
         };
         return extent_edit_for_call(source, annotation_start, transformation, extent)
@@ -11698,6 +11702,31 @@ mod tests {
         assert!(candidate.contains("origin={40, 50}"));
         assert!(candidate.contains("extent={{-5, -6}, {5, 6}}"));
         assert!(candidate.contains("rotation=12"));
+    }
+
+    #[test]
+    fn component_edit_supports_icon_transformation_placement() {
+        let source = "model Parent\n  Child p annotation(Placement(iconTransformation(origin={20, 30}, extent={{-5, -6}, {5, 6}}, rotation=12)));\nend Parent;";
+        let candidate = patch_component_origin(source, "p", CorePoint { x: 40.0, y: 50.0 }, 0)
+            .expect("component source patch with iconTransformation");
+        assert!(candidate.contains("origin={40, 50}"));
+        assert!(candidate.contains("extent={{-5, -6}, {5, 6}}"));
+        assert!(candidate.contains("rotation=12"));
+
+        let edit = component_extent_edit(
+            &candidate,
+            "p",
+            modelica_core::scene::Extent {
+                p1: CorePoint { x: -8.0, y: -9.0 },
+                p2: CorePoint { x: 8.0, y: 9.0 },
+            },
+        )
+        .expect("iconTransformation extent edit");
+        let updated = apply_validated_source_edits(&candidate, vec![edit], 0)
+            .expect("iconTransformation extent source patch");
+        assert!(updated.contains("extent={{-8, -9}, {8, 9}}"));
+        assert!(updated.contains("origin={40, 50}"));
+        assert!(updated.contains("rotation=12"));
     }
 
     #[test]
