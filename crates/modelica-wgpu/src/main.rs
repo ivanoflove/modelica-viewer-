@@ -3818,6 +3818,8 @@ impl App {
             .query(pointer_model, tolerance);
         let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
         let precise_started = Instant::now();
+        let mut placement_fallback = None;
+        let mut placement_candidate_count = 0;
         let result = candidates.component_indices.iter().rev().find_map(|index| {
             let item = self.diagram_hit_cache.components.get(*index)?;
             if !item.bounds.contains(pointer_model, tolerance) {
@@ -3827,9 +3829,17 @@ impl App {
             if !component.editable || !component.visible {
                 return None;
             }
+            placement_candidate_count += 1;
             let graphic_hit = diagram_component_contains_point(component, pointer_model, tolerance);
             let body_hit = point_in_component_placement_extent(component, pointer_model, tolerance);
-            if !graphic_hit && !body_hit {
+            if !graphic_hit {
+                if body_hit {
+                    placement_fallback = Some((
+                        component.id.clone(),
+                        component.name.clone(),
+                        component.origin,
+                    ));
+                }
                 return None;
             }
             Some((
@@ -3837,6 +3847,11 @@ impl App {
                 component.name.clone(),
                 component.origin,
             ))
+        });
+        let result = result.or_else(|| {
+            (placement_candidate_count == 1)
+                .then_some(placement_fallback)
+                .flatten()
         });
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
             eprintln!(
@@ -4158,6 +4173,35 @@ impl App {
             .map(|(index, _)| (component_name.clone(), ResizeHandle::Corner(index)))
     }
 
+    fn hit_test_selected_component_body(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<(String, String, CorePoint)> {
+        let component_name = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => component_name,
+            _ => return None,
+        };
+        let class_name = self.selected_class_name()?;
+        let component = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .components
+            .iter()
+            .find(|component| component.name == *component_name)?;
+        if !component.editable || !component.visible {
+            return None;
+        }
+        point_in_component_placement_extent(component, pointer_model, tolerance).then(|| {
+            (
+                component.id.clone(),
+                component.name.clone(),
+                component.origin,
+            )
+        })
+    }
+
     fn begin_component_resize(&mut self, component_name: String, handle: ResizeHandle) {
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
             return;
@@ -4268,6 +4312,12 @@ impl App {
                     }
                     return;
                 }
+                if let Some((component_name, handle)) =
+                    self.hit_test_selected_component_handle(pointer_model, tolerance)
+                {
+                    self.begin_component_resize(component_name, handle);
+                    return;
+                }
                 if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
                     let source = self
                         .diagram_anchor(&port)
@@ -4282,10 +4332,37 @@ impl App {
                     }
                     return;
                 }
-                if let Some((component_name, handle)) =
-                    self.hit_test_selected_component_handle(pointer_model, tolerance)
+                if let Some((component_id, component_name, original_origin)) =
+                    self.hit_test_selected_component_body(pointer_model, tolerance)
                 {
-                    self.begin_component_resize(component_name, handle);
+                    let Some(source_before) = document.class_text(&class_name) else {
+                        return;
+                    };
+                    let connected_connections = document
+                        .diagram(&class_name)
+                        .map(|scene| connection_drag_snapshots(scene, &component_name))
+                        .unwrap_or_default();
+                    let component_connection_previews =
+                        document.diagram(&class_name).map(|scene| {
+                            ComponentConnectionPreviewSet::new(
+                                &self.device,
+                                &self.style_layout,
+                                scene,
+                                &connected_connections,
+                            )
+                        });
+                    self.component_connection_previews = component_connection_previews;
+                    self.pointer_interaction = PointerInteraction::MoveDiagramComponent {
+                        button: MouseButton::Left,
+                        component_id,
+                        component_name,
+                        start_pointer_model: pointer_model,
+                        original_origin,
+                        preview_origin: original_origin,
+                        preview_delta: CorePoint { x: 0.0, y: 0.0 },
+                        connected_connections,
+                        source_before,
+                    };
                     return;
                 }
                 let Some((component_id, component_name, original_origin)) =
