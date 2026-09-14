@@ -791,6 +791,8 @@ struct PendingCancelProfile {
     cancel_completed_at: Instant,
     interaction: &'static str,
     connection_count: usize,
+    preview_stats: PreviewResourceStats,
+    preview_cleanup: Duration,
     cancel_cpu: Duration,
     first_redraw_at: Option<Instant>,
     redraw_count: u32,
@@ -814,10 +816,24 @@ struct CancelFrameTiming {
     frame_total: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PreviewResourceStats {
+    preview_count: usize,
+    preview_buffer_count: usize,
+    preview_segment_count: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CancelE2ESample {
     interaction: &'static str,
+    connection_count: usize,
+    cancel_cpu: Duration,
+    first_frame: Duration,
     end_to_end: Duration,
+    preview_cleanup: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
+    present: Duration,
 }
 
 struct CancelE2EProfile {
@@ -850,6 +866,7 @@ impl CancelE2EProfile {
         let redraw_wait = redraw
             .first_redraw_at
             .saturating_duration_since(pending.cancel_completed_at);
+        let first_frame = redraw_wait + frame.frame_total;
         let end_to_end = finished_at.saturating_duration_since(pending.started);
         eprintln!(
             "[CANCEL REDRAW] generation={} redraw_count={} redraw_wait_us={:.1}",
@@ -858,12 +875,16 @@ impl CancelE2EProfile {
             micros(redraw_wait),
         );
         eprintln!(
-            "[CANCEL E2E] generation={} interaction={} connections={} input_to_cancel_end_us={:.1} cancel_cpu_us={:.1} redraw_wait_us={:.1} flush_drag_preview_us={:.1} ui_us={:.1} scene_encode_us={:.1} queue_submit_us={:.1} present_us={:.1} frame_total_us={:.1} end_to_end_us={:.1} redraw_count={}",
+            "[CANCEL E2E] generation={} interaction={} connections={} preview_count={} preview_buffer_count={} preview_segment_count={} input_to_cancel_end_us={:.1} cancel_cpu_us={:.1} preview_cleanup_us={:.1} redraw_wait_us={:.1} flush_drag_preview_us={:.1} ui_us={:.1} scene_encode_us={:.1} queue_submit_us={:.1} present_us={:.1} frame_total_us={:.1} first_frame_us={:.1} end_to_end_us={:.1} redraw_count={}",
             pending.generation,
             pending.interaction,
             pending.connection_count,
+            pending.preview_stats.preview_count,
+            pending.preview_stats.preview_buffer_count,
+            pending.preview_stats.preview_segment_count,
             micros(input_to_cancel_end),
             micros(pending.cancel_cpu),
+            micros(pending.preview_cleanup),
             micros(redraw_wait),
             micros(redraw.flush_drag_preview),
             micros(frame.ui + frame.egui_tessellation),
@@ -876,7 +897,14 @@ impl CancelE2EProfile {
         );
         self.samples.push(CancelE2ESample {
             interaction: pending.interaction,
+            connection_count: pending.connection_count,
+            cancel_cpu: pending.cancel_cpu,
+            first_frame,
             end_to_end,
+            preview_cleanup: pending.preview_cleanup,
+            scene_encode: frame.scene_encode,
+            queue_submit: frame.queue_submit,
+            present: frame.present,
         });
         if self.samples.len() >= 20 && self.samples.len() % 20 == 0 {
             self.report_summary();
@@ -902,6 +930,67 @@ impl CancelE2EProfile {
             micros(percentile(0.95)),
             micros(percentile(1.0)),
         );
+        let mut connection_counts = self
+            .samples
+            .iter()
+            .map(|sample| sample.connection_count)
+            .collect::<Vec<_>>();
+        connection_counts.sort_unstable();
+        connection_counts.dedup();
+        for connection_count in connection_counts {
+            let group = self
+                .samples
+                .iter()
+                .filter(|sample| sample.connection_count == connection_count)
+                .collect::<Vec<_>>();
+            let percentile = |values: Vec<Duration>, percent: f32| {
+                let mut values = values;
+                values.sort_unstable();
+                let index = ((values.len().saturating_sub(1)) as f32 * percent).round() as usize;
+                values.get(index).copied().unwrap_or_default()
+            };
+            let summarize = |select: fn(&CancelE2ESample) -> Duration| {
+                (
+                    percentile(group.iter().map(|sample| select(*sample)).collect(), 0.50),
+                    percentile(group.iter().map(|sample| select(*sample)).collect(), 0.95),
+                    percentile(group.iter().map(|sample| select(*sample)).collect(), 1.0),
+                )
+            };
+            let (cancel_p50, cancel_p95, cancel_worst) = summarize(|sample| sample.cancel_cpu);
+            let (first_p50, first_p95, first_worst) = summarize(|sample| sample.first_frame);
+            let (e2e_p50, e2e_p95, e2e_worst) = summarize(|sample| sample.end_to_end);
+            let (cleanup_p50, cleanup_p95, cleanup_worst) =
+                summarize(|sample| sample.preview_cleanup);
+            let (encode_p50, encode_p95, encode_worst) = summarize(|sample| sample.scene_encode);
+            let (submit_p50, submit_p95, submit_worst) = summarize(|sample| sample.queue_submit);
+            let (present_p50, present_p95, present_worst) = summarize(|sample| sample.present);
+            eprintln!(
+                "[CANCEL SCALE] connections={} samples={} cancel_cpu_us={:.1}/{:.1}/{:.1} first_frame_us={:.1}/{:.1}/{:.1} end_to_end_us={:.1}/{:.1}/{:.1} preview_cleanup_us={:.1}/{:.1}/{:.1} scene_encode_us={:.1}/{:.1}/{:.1} queue_submit_us={:.1}/{:.1}/{:.1} present_us={:.1}/{:.1}/{:.1}",
+                connection_count,
+                group.len(),
+                micros(cancel_p50),
+                micros(cancel_p95),
+                micros(cancel_worst),
+                micros(first_p50),
+                micros(first_p95),
+                micros(first_worst),
+                micros(e2e_p50),
+                micros(e2e_p95),
+                micros(e2e_worst),
+                micros(cleanup_p50),
+                micros(cleanup_p95),
+                micros(cleanup_worst),
+                micros(encode_p50),
+                micros(encode_p95),
+                micros(encode_worst),
+                micros(submit_p50),
+                micros(submit_p95),
+                micros(submit_worst),
+                micros(present_p50),
+                micros(present_p95),
+                micros(present_worst),
+            );
+        }
         for interaction in [
             "MoveDiagramComponent",
             "ResizeDiagramComponent",
@@ -2441,6 +2530,21 @@ impl ComponentConnectionPreviewSet {
         self.previews
             .iter()
             .any(|preview| preview.connection_id == connection_id)
+    }
+
+    fn resource_stats(&self) -> PreviewResourceStats {
+        PreviewResourceStats {
+            preview_count: self.previews.len(),
+            // Each preview owns a vertex buffer, an index buffer and a style
+            // uniform buffer. The uniform buffer is retained by its bind
+            // group even though the mesh does not store a second handle.
+            preview_buffer_count: self.previews.len().saturating_mul(3),
+            preview_segment_count: self
+                .previews
+                .iter()
+                .map(|preview| preview.segment_capacity)
+                .sum(),
+        }
     }
 
     fn update(&mut self, queue: &wgpu::Queue, connection_id: &str, points: &[CorePoint]) -> bool {
@@ -4784,6 +4888,8 @@ impl App {
         &mut self,
         interaction: &'static str,
         connection_count: usize,
+        preview_stats: PreviewResourceStats,
+        preview_cleanup: Duration,
         started: Instant,
         cancel_completed_at: Instant,
         cancel_cpu: Duration,
@@ -4798,6 +4904,8 @@ impl App {
             cancel_completed_at,
             interaction,
             connection_count,
+            preview_stats,
+            preview_cleanup,
             cancel_cpu,
             first_redraw_at: None,
             redraw_count: 0,
@@ -5341,6 +5449,11 @@ impl App {
         let interaction =
             std::mem::replace(&mut self.pointer_interaction, PointerInteraction::None);
         self.pending_drag_position = None;
+        let preview_stats = self
+            .component_connection_previews
+            .as_ref()
+            .map(ComponentConnectionPreviewSet::resource_stats)
+            .unwrap_or_default();
         let mut rollback_component = Duration::ZERO;
         let mut rollback_connections = Duration::ZERO;
         match interaction {
@@ -5437,6 +5550,8 @@ impl App {
         self.begin_cancel_profile(
             interaction_name,
             connection_count,
+            preview_stats,
+            preview_cleanup,
             total_started,
             cancel_completed_at,
             cancel_cpu,
@@ -5471,6 +5586,8 @@ impl App {
             self.begin_cancel_profile(
                 "DeselectDiagram",
                 0,
+                PreviewResourceStats::default(),
+                Duration::ZERO,
                 total_started,
                 completed_at,
                 completed_at.saturating_duration_since(total_started),
