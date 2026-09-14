@@ -151,6 +151,21 @@ pub fn connector_anchors(scene: &DiagramScene) -> Vec<ConnectorAnchor> {
         }
         anchors.extend(public.into_values());
     }
+    anchors.sort_by(|left, right| {
+        left.owner_component_id
+            .cmp(&right.owner_component_id)
+            .then_with(|| {
+                left.connector_ref
+                    .connector_path
+                    .cmp(&right.connector_ref.connector_path)
+            })
+            .then_with(|| {
+                left.key
+                    .owner_component_id
+                    .cmp(&right.key.owner_component_id)
+            })
+            .then_with(|| left.key.connector_path.cmp(&right.key.connector_path))
+    });
     anchors
 }
 

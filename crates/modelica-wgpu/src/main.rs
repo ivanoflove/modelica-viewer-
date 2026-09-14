@@ -63,6 +63,7 @@ const MAX_ZOOM: f32 = 24.0;
 const CONNECTION_SNAP_ENTER_PIXELS: f32 = 8.0;
 const CONNECTION_SNAP_EXIT_PIXELS: f32 = 12.0;
 const CONNECTION_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
+const PORT_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -1000,7 +1001,13 @@ impl DiagramSpatialIndex {
                 else {
                     continue;
                 };
-                if nearest.is_none_or(|(best_distance, _)| distance < best_distance) {
+                if nearest.is_none_or(|(best_distance, best_index)| {
+                    let Some(best_anchor) = anchors.get(best_index) else {
+                        return true;
+                    };
+                    compare_connector_anchor_hits(distance, anchor, best_distance, best_anchor)
+                        == std::cmp::Ordering::Less
+                }) {
                     nearest = Some((distance, port_index));
                 }
             }
@@ -2167,13 +2174,10 @@ impl ConnectionPreviewMesh {
     }
 
     fn update(&mut self, queue: &wgpu::Queue, points: &[CorePoint]) -> bool {
-        if !valid_interactive_connection_route(points) {
+        if !self.can_update(points) {
             return false;
         }
         let segment_count = points.len().saturating_sub(1);
-        if segment_count > self.segment_capacity {
-            return false;
-        }
         update_preview_connection_vertices(
             &mut self.vertices[..segment_count * 4],
             points,
@@ -2191,6 +2195,11 @@ impl ConnectionPreviewMesh {
             );
         }
         true
+    }
+
+    fn can_update(&self, points: &[CorePoint]) -> bool {
+        valid_interactive_connection_route(points)
+            && points.len().saturating_sub(1) <= self.segment_capacity
     }
 }
 
@@ -2242,6 +2251,15 @@ impl ComponentConnectionPreviewSet {
             .iter_mut()
             .find(|preview| preview.connection_id == connection_id)
             .is_some_and(|preview| preview.update(queue, points))
+    }
+
+    fn can_update_all(&self, routes: &[(String, Vec<CorePoint>)]) -> bool {
+        routes.iter().all(|(connection_id, points)| {
+            self.previews
+                .iter()
+                .find(|preview| preview.connection_id == *connection_id)
+                .is_some_and(|preview| preview.can_update(points))
+        })
     }
 }
 
@@ -3789,7 +3807,9 @@ impl App {
             .filter_map(|anchor| {
                 hit_distance(anchor, pointer_model, tolerance).map(|distance| (distance, anchor))
             })
-            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .min_by(|(left_distance, left), (right_distance, right)| {
+                compare_connector_anchor_hits(*left_distance, left, *right_distance, right)
+            })
             .map(|(_, anchor)| anchor.key.clone());
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
             eprintln!(
@@ -3801,6 +3821,32 @@ impl App {
             );
         }
         result
+    }
+
+    fn hit_test_diagram_port_for_component(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+        component_id: &str,
+    ) -> Option<PortKey> {
+        let anchors = self.diagram_connector_anchors()?;
+        let candidates = self
+            .diagram_hit_cache
+            .spatial_index
+            .query(pointer_model, tolerance);
+        candidates
+            .port_indices
+            .iter()
+            .filter_map(|index| anchors.get(*index))
+            .filter(|anchor| anchor.owner_component_id == component_id)
+            .filter_map(|anchor| {
+                connector_anchor_active_hit_distance(anchor, pointer_model, tolerance)
+                    .map(|distance| (distance, anchor))
+            })
+            .min_by(|(left_distance, left), (right_distance, right)| {
+                compare_connector_anchor_hits(*left_distance, left, *right_distance, right)
+            })
+            .map(|(_, anchor)| anchor.key.clone())
     }
 
     fn hit_test_diagram_component(
@@ -4224,7 +4270,7 @@ impl App {
         // ports. Let the strict semantic port hit keep ownership of the
         // actual blue point so selected components remain connectable.
         if self
-            .hit_test_diagram_port(pointer_model, tolerance)
+            .hit_test_diagram_port_for_component(pointer_model, tolerance, &component.id)
             .is_some()
         {
             return None;
@@ -4236,6 +4282,27 @@ impl App {
                 component.origin,
             )
         })
+    }
+
+    fn hit_test_selected_component_port(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<PortKey> {
+        let component_name = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => component_name,
+            _ => return None,
+        };
+        let class_name = self.selected_class_name()?;
+        let component_id = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .components
+            .iter()
+            .find(|component| component.name == *component_name)
+            .map(|component| component.id.as_str())?;
+        self.hit_test_diagram_port_for_component(pointer_model, tolerance, component_id)
     }
 
     fn begin_component_resize(&mut self, component_name: String, handle: ResizeHandle) {
@@ -4264,10 +4331,16 @@ impl App {
             .placement_extent
             .unwrap_or(default_component_extent());
         self.component_connection_previews = None;
-        let connected_connections = document
-            .diagram(&class_name)
-            .map(|scene| connection_drag_snapshots(scene, &component_name))
-            .unwrap_or_default();
+        let Some(scene) = document.diagram(&class_name) else {
+            return;
+        };
+        if let Err(error) =
+            component_connection_drag_preflight(scene, &component_name, &class_name, &source_before)
+        {
+            self.load_error = Some(format!("Component resize rejected: {error}"));
+            return;
+        }
+        let connected_connections = connection_drag_snapshots(scene, &component_name);
         self.pointer_interaction = PointerInteraction::ResizeDiagramComponent {
             button: MouseButton::Left,
             component_id: component.id.clone(),
@@ -4360,10 +4433,19 @@ impl App {
                     let Some(source_before) = document.class_text(&class_name) else {
                         return;
                     };
-                    let connected_connections = document
-                        .diagram(&class_name)
-                        .map(|scene| connection_drag_snapshots(scene, &component_name))
-                        .unwrap_or_default();
+                    let Some(scene) = document.diagram(&class_name) else {
+                        return;
+                    };
+                    if let Err(error) = component_connection_drag_preflight(
+                        scene,
+                        &component_name,
+                        &class_name,
+                        &source_before,
+                    ) {
+                        self.load_error = Some(format!("Component drag rejected: {error}"));
+                        return;
+                    }
+                    let connected_connections = connection_drag_snapshots(scene, &component_name);
                     let component_connection_previews =
                         document.diagram(&class_name).map(|scene| {
                             ComponentConnectionPreviewSet::new(
@@ -4385,6 +4467,21 @@ impl App {
                         connected_connections,
                         source_before,
                     };
+                    return;
+                }
+                if let Some(port) = self.hit_test_selected_component_port(pointer_model, tolerance)
+                {
+                    let source = self
+                        .diagram_anchor(&port)
+                        .filter(|anchor| anchor.editable)
+                        .cloned();
+                    self.set_diagram_selection(DiagramSelection::Port(port.clone()));
+                    self.hovered_port = Some(port);
+                    if let Some(source) = source {
+                        self.begin_connection_creation(&source);
+                    } else {
+                        self.pointer_interaction = PointerInteraction::None;
+                    }
                     return;
                 }
                 if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
@@ -4420,10 +4517,19 @@ impl App {
                 let Some(source_before) = document.class_text(&class_name) else {
                     return;
                 };
-                let connected_connections = document
-                    .diagram(&class_name)
-                    .map(|scene| connection_drag_snapshots(scene, &component_name))
-                    .unwrap_or_default();
+                let Some(scene) = document.diagram(&class_name) else {
+                    return;
+                };
+                if let Err(error) = component_connection_drag_preflight(
+                    scene,
+                    &component_name,
+                    &class_name,
+                    &source_before,
+                ) {
+                    self.load_error = Some(format!("Component drag rejected: {error}"));
+                    return;
+                }
+                let connected_connections = connection_drag_snapshots(scene, &component_name);
                 let component_connection_previews = document.diagram(&class_name).map(|scene| {
                     ComponentConnectionPreviewSet::new(
                         &self.device,
@@ -4589,9 +4695,6 @@ impl App {
                 x: current.x - start_pointer_model.x,
                 y: current.y - start_pointer_model.y,
             };
-            let preview_started = Instant::now();
-            self.diagram_scene
-                .preview_translation(&self.queue, &component_id, [delta.x, -delta.y]);
             let route_started = Instant::now();
             let preview_routes = match &self.pointer_interaction {
                 PointerInteraction::MoveDiagramComponent {
@@ -4600,23 +4703,91 @@ impl App {
                 } => connected_connections
                     .iter()
                     .map(|snapshot| {
-                        (
-                            snapshot.connection_id.clone(),
-                            connection_route_for_component_translation(
-                                &snapshot.base_route_points,
+                        let route = connection_route_for_component_translation(
+                            &snapshot.base_route_points,
+                            snapshot.original_line_origin,
+                            snapshot.original_line_rotation,
+                            snapshot.original_endpoint_points,
+                            snapshot.moved_first_endpoint,
+                            snapshot.moved_last_endpoint,
+                            delta,
+                        );
+                        let points = if valid_interactive_connection_route(&route) {
+                            route
+                        } else {
+                            let local_delta = world_delta_to_line_local(
                                 snapshot.original_line_origin,
                                 snapshot.original_line_rotation,
-                                snapshot.original_endpoint_points,
+                                delta,
+                            );
+                            manhattan_component_translation_route(
+                                &snapshot.base_route_points,
+                                if snapshot.moved_first_endpoint {
+                                    translated_point(
+                                        snapshot.original_endpoint_points.0,
+                                        local_delta,
+                                    )
+                                } else {
+                                    snapshot.original_endpoint_points.0
+                                },
+                                if snapshot.moved_last_endpoint {
+                                    translated_point(
+                                        snapshot.original_endpoint_points.1,
+                                        local_delta,
+                                    )
+                                } else {
+                                    snapshot.original_endpoint_points.1
+                                },
                                 snapshot.moved_first_endpoint,
                                 snapshot.moved_last_endpoint,
-                                delta,
-                            ),
-                        )
+                            )
+                        };
+                        (snapshot.connection_id.clone(), points)
                     })
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
             let route_elapsed = route_started.elapsed();
+            let routes_accepted = if preview_routes.is_empty() {
+                true
+            } else {
+                self.component_connection_previews
+                    .as_ref()
+                    .is_some_and(|previews| previews.can_update_all(&preview_routes))
+            };
+            if !routes_accepted {
+                if let PointerInteraction::MoveDiagramComponent {
+                    connected_connections,
+                    ..
+                } = &self.pointer_interaction
+                {
+                    for (snapshot, (_connection_id, points)) in
+                        connected_connections.iter().zip(&preview_routes)
+                    {
+                        let reason = if !valid_interactive_connection_route(points) {
+                            "invalid route"
+                        } else {
+                            "preview mesh rejected route"
+                        };
+                        trace_component_drag_issue(
+                            &component_id,
+                            &snapshot.connection_key,
+                            reason,
+                            snapshot,
+                            points,
+                        );
+                    }
+                }
+                return true;
+            }
+            if let Some(previews) = self.component_connection_previews.as_mut() {
+                for (connection_id, points) in &preview_routes {
+                    debug_assert!(previews.update(&self.queue, connection_id, points));
+                }
+            }
+            let preview_started = Instant::now();
+            self.diagram_scene
+                .preview_translation(&self.queue, &component_id, [delta.x, -delta.y]);
             if let PointerInteraction::MoveDiagramComponent {
                 preview_origin,
                 preview_delta,
@@ -4629,36 +4800,9 @@ impl App {
                     y: original_origin.y + delta.y,
                 };
                 *preview_delta = delta;
-                for (snapshot, (connection_id, points)) in
-                    connected_connections.iter_mut().zip(preview_routes)
+                for (snapshot, (_, points)) in connected_connections.iter_mut().zip(&preview_routes)
                 {
-                    if !valid_interactive_connection_route(&points) {
-                        trace_component_drag_issue(
-                            &component_id,
-                            &snapshot.connection_key,
-                            "invalid route",
-                            snapshot,
-                            &points,
-                        );
-                        continue;
-                    }
-                    let updated =
-                        self.component_connection_previews
-                            .as_mut()
-                            .is_some_and(|previews| {
-                                previews.update(&self.queue, &connection_id, &points)
-                            });
-                    if updated {
-                        snapshot.preview_points = points;
-                    } else {
-                        trace_component_drag_issue(
-                            &component_id,
-                            &snapshot.connection_key,
-                            "preview mesh rejected route",
-                            snapshot,
-                            &points,
-                        );
-                    }
+                    snapshot.preview_points = points.clone();
                 }
             }
             self.drag_profile.record_preview(
@@ -9547,6 +9691,40 @@ fn connector_anchor_active_hit_distance(
     (distance <= tolerance.max(0.0)).then_some(distance)
 }
 
+fn compare_connector_anchors_stably(
+    left: &ConnectorAnchor,
+    right: &ConnectorAnchor,
+) -> std::cmp::Ordering {
+    left.owner_component_id
+        .cmp(&right.owner_component_id)
+        .then_with(|| {
+            left.connector_ref
+                .connector_path
+                .cmp(&right.connector_ref.connector_path)
+        })
+        .then_with(|| {
+            left.key
+                .owner_component_id
+                .cmp(&right.key.owner_component_id)
+        })
+        .then_with(|| left.key.connector_path.cmp(&right.key.connector_path))
+}
+
+fn compare_connector_anchor_hits(
+    left_distance: f32,
+    left: &ConnectorAnchor,
+    right_distance: f32,
+    right: &ConnectorAnchor,
+) -> std::cmp::Ordering {
+    let distance_order = if (left_distance - right_distance).abs() <= PORT_HIT_DISTANCE_TIE_EPSILON
+    {
+        std::cmp::Ordering::Equal
+    } else {
+        left_distance.total_cmp(&right_distance)
+    };
+    distance_order.then_with(|| compare_connector_anchors_stably(left, right))
+}
+
 #[cfg(test)]
 fn hit_test_connection(
     connections: &[modelica_core::scene::DiagramConnection],
@@ -10333,6 +10511,50 @@ fn connection_drag_snapshots(
         .collect()
 }
 
+fn component_connection_drag_preflight(
+    scene: &CoreDiagramScene,
+    component_name: &str,
+    class_name: &str,
+    source: &str,
+) -> Result<(), String> {
+    for connection in scene.connections.iter().filter(|connection| {
+        connection.lhs.component_name == component_name
+            || connection.rhs.component_name == component_name
+    }) {
+        connection_source_editable_in_class(connection, class_name, source).map_err(|error| {
+            format!(
+                "connection {} cannot be moved with component: {error}",
+                connection.id
+            )
+        })?;
+        let line = connection.line.as_ref().ok_or_else(|| {
+            format!(
+                "connection {} has no editable Line annotation",
+                connection.id
+            )
+        })?;
+        if line.points.len() < 2 {
+            return Err(format!(
+                "connection {} has fewer than two Line points",
+                connection.id
+            ));
+        }
+        resolve_connection_endpoints(scene, connection).map_err(|error| {
+            format!(
+                "connection {} has unresolved connector endpoints: {error:?}",
+                connection.id
+            )
+        })?;
+        if canonical_connection_points(scene, connection).len() < 2 {
+            return Err(format!(
+                "connection {} has no usable orthogonal route",
+                connection.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn connection_route_for_component_translation(
     base_route_points: &[CorePoint],
     line_origin: CorePoint,
@@ -10406,12 +10628,39 @@ fn two_point_component_translation_route(
     moved_first_endpoint: bool,
     moved_last_endpoint: bool,
 ) -> Vec<CorePoint> {
+    manhattan_component_translation_route(
+        base_route_points,
+        lhs,
+        rhs,
+        moved_first_endpoint,
+        moved_last_endpoint,
+    )
+}
+
+fn manhattan_component_translation_route(
+    base_route_points: &[CorePoint],
+    lhs: CorePoint,
+    rhs: CorePoint,
+    moved_first_endpoint: bool,
+    moved_last_endpoint: bool,
+) -> Vec<CorePoint> {
     if (lhs.x - rhs.x).abs() <= ORTHOGONAL_EPSILON || (lhs.y - rhs.y).abs() <= ORTHOGONAL_EPSILON {
         return vec![lhs, rhs];
     }
-    let was_horizontal =
-        (base_route_points[0].y - base_route_points[1].y).abs() <= ORTHOGONAL_EPSILON;
-    let elbow = if was_horizontal {
+    let first_horizontal = base_route_points
+        .first()
+        .zip(base_route_points.get(1))
+        .is_some_and(|(first, second)| (first.y - second.y).abs() <= ORTHOGONAL_EPSILON);
+    let last_horizontal = base_route_points
+        .get(base_route_points.len().saturating_sub(2))
+        .zip(base_route_points.last())
+        .is_some_and(|(previous, last)| (previous.y - last.y).abs() <= ORTHOGONAL_EPSILON);
+    let horizontal_first = if moved_last_endpoint && !moved_first_endpoint {
+        last_horizontal
+    } else {
+        first_horizontal
+    };
+    let elbow = if horizontal_first {
         if moved_last_endpoint && !moved_first_endpoint {
             CorePoint { x: lhs.x, y: rhs.y }
         } else {
@@ -13569,6 +13818,31 @@ mod tests {
     }
 
     #[test]
+    fn component_translation_manhattan_fallback_keeps_invalid_preview_orthogonal() {
+        let base_route = vec![
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 0.0 },
+            CorePoint { x: 40.0, y: 30.0 },
+        ];
+        let fallback = manhattan_component_translation_route(
+            &base_route,
+            CorePoint { x: 20.0, y: 15.0 },
+            CorePoint { x: 40.0, y: 30.0 },
+            true,
+            false,
+        );
+        assert_eq!(
+            fallback,
+            vec![
+                CorePoint { x: 20.0, y: 15.0 },
+                CorePoint { x: 40.0, y: 15.0 },
+                CorePoint { x: 40.0, y: 30.0 },
+            ]
+        );
+        assert!(valid_interactive_connection_route(&fallback));
+    }
+
+    #[test]
     fn component_translation_route_preserves_reversed_complex_line_order() {
         let points = vec![
             CorePoint { x: 50.0, y: 0.0 },
@@ -13943,6 +14217,50 @@ mod tests {
                 Some(&anchors[0].key),
                 &anchors,
             ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn nearest_port_tie_breaks_by_stable_anchor_identity() {
+        let anchors = vec![
+            ConnectorAnchor {
+                key: PortKey::new("z-component", "port"),
+                connector_ref: ConnectorRef {
+                    component_name: "z-component".to_owned(),
+                    connector_path: "port".to_owned(),
+                },
+                world_position: CorePoint { x: 0.0, y: 0.0 },
+                visual_bounds: None,
+                qualified_type: None,
+                owner_component_id: "z-component".to_owned(),
+                editable: true,
+            },
+            ConnectorAnchor {
+                key: PortKey::new("a-component", "port"),
+                connector_ref: ConnectorRef {
+                    component_name: "a-component".to_owned(),
+                    connector_path: "port".to_owned(),
+                },
+                world_position: CorePoint { x: 0.0, y: 0.0 },
+                visual_bounds: None,
+                qualified_type: None,
+                owner_component_id: "a-component".to_owned(),
+                editable: true,
+            },
+        ];
+        let mut spatial_index = DiagramSpatialIndex::default();
+        for port_index in 0..anchors.len() {
+            spatial_index.insert_port(
+                port_index,
+                HitBounds {
+                    min: CorePoint { x: -1.0, y: -1.0 },
+                    max: CorePoint { x: 1.0, y: 1.0 },
+                },
+            );
+        }
+        assert_eq!(
+            spatial_index.nearest_port(CorePoint { x: 0.0, y: 0.0 }, 1.0, None, &anchors),
             Some(1)
         );
     }
