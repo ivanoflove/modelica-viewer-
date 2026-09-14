@@ -37,6 +37,14 @@ MODELICA_WGPU_PROFILE_DRAG=1 cargo run -p modelica-wgpu --release <package.mo>
 
 拖动时每秒输出一次 `drag-profile`，包含事件/帧数、p50/p95/worst frame，以及 input、snap、cached endpoint reanchor、preview upload、UI、encode 与 present 的累计 CPU 时间。
 
+取消拖动与取消选择的路径可单独计时：
+
+```text
+MODELICA_WGPU_PROFILE_CANCEL=1 cargo run -p modelica-wgpu --release <package.mo>
+```
+
+日志中的 `[CANCEL PROFILE]` 会拆分瞬态回滚、受影响连接、预览清理、选择更新和 GPU 写入；取消路径不会触发完整 Diagram 解析或命中缓存重建。
+
 ## 外观与字体（与 Electron 客户端一致）
 
 - 主题 / 强调色与 Electron 版同一套 token（surface、text、border、accent），默认跟随系统、强调色 Violet。

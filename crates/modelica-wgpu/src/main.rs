@@ -755,6 +755,35 @@ fn trace_component_drag_issue(
     }
 }
 
+fn trace_cancel_profile(
+    interaction: &str,
+    connections: usize,
+    total: Duration,
+    rollback_component: Duration,
+    rollback_connections: Duration,
+    preview_cleanup: Duration,
+    selection_update: Duration,
+    hit_cache_rebuild: Duration,
+    scene_rebuild: Duration,
+    gpu_upload: Duration,
+) {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_CANCEL").is_none() {
+        return;
+    }
+    let micros = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
+    eprintln!(
+        "[CANCEL PROFILE] interaction={interaction} connections={connections} total_us={:.1} rollback_component_us={:.1} rollback_connections_us={:.1} preview_cleanup_us={:.1} selection_update_us={:.1} hit_cache_rebuild_us={:.1} scene_rebuild_us={:.1} gpu_upload_us={:.1}",
+        micros(total),
+        micros(rollback_component),
+        micros(rollback_connections),
+        micros(preview_cleanup),
+        micros(selection_update),
+        micros(hit_cache_rebuild),
+        micros(scene_rebuild),
+        micros(gpu_upload),
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HitBounds {
     min: CorePoint,
@@ -3296,7 +3325,7 @@ struct App {
     pending_waypoint_queued_at: Option<Instant>,
     waypoint_frame_pending: bool,
     waypoint_profile_frames_remaining: u8,
-    suppress_next_creation_left_release_redraw: bool,
+    suppress_next_pointer_release_redraw: bool,
     drag_profile: DragProfile,
     connection_creation_profile: ConnectionCreationProfile,
     history: Vec<EditCommand>,
@@ -3629,7 +3658,7 @@ impl App {
             pending_waypoint_queued_at: None,
             waypoint_frame_pending: false,
             waypoint_profile_frames_remaining: 0,
-            suppress_next_creation_left_release_redraw: false,
+            suppress_next_pointer_release_redraw: false,
             drag_profile: DragProfile::new(),
             connection_creation_profile: ConnectionCreationProfile::new(),
             history: Vec::new(),
@@ -4157,7 +4186,7 @@ impl App {
         self.pending_waypoint_queued_at = None;
         self.waypoint_frame_pending = false;
         self.waypoint_profile_frames_remaining = 0;
-        self.suppress_next_creation_left_release_redraw = false;
+        self.suppress_next_pointer_release_redraw = false;
         self.pointer_interaction =
             PointerInteraction::CreateDiagramConnection(ConnectionCreation {
                 source_port: source.key.clone(),
@@ -4417,7 +4446,7 @@ impl App {
                     && spatial_candidates.port_indices.is_empty()
                     && spatial_candidates.connection_segments.is_empty()
                 {
-                    self.set_diagram_selection(DiagramSelection::None);
+                    self.clear_diagram_selection();
                     self.pointer_interaction = PointerInteraction::None;
                     if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
                         eprintln!(
@@ -4521,7 +4550,7 @@ impl App {
                     if let Some(hit) = self.hit_test_diagram_connection(pointer_model, tolerance) {
                         self.begin_connection_edit(hit, pointer_model);
                     } else {
-                        self.set_diagram_selection(DiagramSelection::None);
+                        self.clear_diagram_selection();
                     }
                     if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
                         eprintln!(
@@ -4586,6 +4615,10 @@ impl App {
                 | PointerInteraction::MoveDiagramConnectionCorner { .. }
                 | PointerInteraction::CreateDiagramConnection(..)
         )
+    }
+
+    fn pointer_interaction_active(&self) -> bool {
+        !matches!(self.pointer_interaction, PointerInteraction::None)
     }
 
     fn connection_creation_active(&self) -> bool {
@@ -5064,24 +5097,169 @@ impl App {
         &mut self,
         component_id: &str,
         _connected_connections: &[ConnectionDragSnapshot],
-    ) {
+    ) -> Duration {
+        let started = Instant::now();
         self.diagram_scene
             .preview_translation(&self.queue, component_id, [0.0, 0.0]);
+        started.elapsed()
     }
 
-    fn cancel_connection_creation(&mut self) {
-        if !self.connection_creation_active() {
-            return;
-        }
-        self.pointer_interaction = PointerInteraction::None;
+    fn cancel_pointer_interaction(&mut self) -> bool {
+        let (interaction_name, connection_count) = match &self.pointer_interaction {
+            PointerInteraction::None => return false,
+            PointerInteraction::Pan { .. } => ("Pan", 0),
+            PointerInteraction::MoveIconGraphic { .. } => ("MoveIconGraphic", 0),
+            PointerInteraction::MoveDiagramComponent {
+                connected_connections,
+                ..
+            } => ("MoveDiagramComponent", connected_connections.len()),
+            PointerInteraction::MoveDiagramConnectionSegment { .. } => {
+                ("MoveDiagramConnectionSegment", 1)
+            }
+            PointerInteraction::MoveDiagramConnectionCorner { .. } => {
+                ("MoveDiagramConnectionCorner", 1)
+            }
+            PointerInteraction::CreateDiagramConnection(_) => ("CreateDiagramConnection", 0),
+            PointerInteraction::ResizeDiagramComponent {
+                connected_connections,
+                ..
+            } => ("ResizeDiagramComponent", connected_connections.len()),
+        };
+        let total_started = Instant::now();
+        let interaction =
+            std::mem::replace(&mut self.pointer_interaction, PointerInteraction::None);
         self.pending_drag_position = None;
+        let mut rollback_component = Duration::ZERO;
+        let mut rollback_connections = Duration::ZERO;
+        match interaction {
+            PointerInteraction::Pan { start_pan, .. } => {
+                let started = Instant::now();
+                if self.pan != start_pan {
+                    self.pan = start_pan;
+                    self.update_view_uniform();
+                }
+                rollback_component = started.elapsed();
+            }
+            PointerInteraction::MoveIconGraphic { graphic_id, .. } => {
+                let started = Instant::now();
+                self.scene
+                    .preview_translation(&self.queue, &graphic_id, [0.0, 0.0]);
+                rollback_component = started.elapsed();
+            }
+            PointerInteraction::MoveDiagramComponent {
+                component_id,
+                connected_connections,
+                ..
+            } => {
+                rollback_component =
+                    self.rollback_component_preview(&component_id, &connected_connections);
+            }
+            PointerInteraction::MoveDiagramConnectionSegment { .. }
+            | PointerInteraction::MoveDiagramConnectionCorner { .. } => {}
+            PointerInteraction::CreateDiagramConnection(_) => {
+                self.connection_creation_profile.finish();
+            }
+            PointerInteraction::ResizeDiagramComponent {
+                component_id,
+                original_component,
+                connected_connections,
+                ..
+            } => {
+                let started = Instant::now();
+                if let Some(icon) = original_component.diagram_layer() {
+                    let original_transform = compose_transform(
+                        Transform2D {
+                            scale_y: -1.0,
+                            ..Transform2D::identity()
+                        },
+                        diagram_placement_transform(icon, &original_component),
+                    );
+                    self.diagram_scene.preview_component_resize(
+                        &self.queue,
+                        &component_id,
+                        original_transform,
+                    );
+                }
+                rollback_component = started.elapsed();
+
+                let started = Instant::now();
+                for snapshot in &connected_connections {
+                    let points = if snapshot.base_route_points.len() >= 2 {
+                        &snapshot.base_route_points
+                    } else {
+                        &snapshot.source_line_points
+                    };
+                    if points.len() >= 2 {
+                        self.diagram_scene.preview_connection_points(
+                            &self.device,
+                            &self.queue,
+                            &snapshot.connection_id,
+                            points,
+                        );
+                    }
+                }
+                rollback_connections = started.elapsed();
+            }
+            PointerInteraction::None => unreachable!("cancelled interaction was not active"),
+        }
+
+        let selection_started = Instant::now();
+        if interaction_name == "CreateDiagramConnection" {
+            self.hovered_port = None;
+        }
+        let selection_update = selection_started.elapsed();
+
+        let cleanup_started = Instant::now();
+        self.connection_preview = None;
+        self.component_connection_previews = None;
+        self.connection_creation_preview = None;
         self.pending_waypoint = false;
         self.pending_waypoint_queued_at = None;
         self.waypoint_frame_pending = false;
         self.waypoint_profile_frames_remaining = 0;
-        self.connection_creation_preview = None;
-        self.hovered_port = None;
-        self.connection_creation_profile.finish();
+        self.suppress_next_pointer_release_redraw = true;
+        let preview_cleanup = cleanup_started.elapsed();
+        let gpu_upload = rollback_component + rollback_connections;
+        trace_cancel_profile(
+            interaction_name,
+            connection_count,
+            total_started.elapsed(),
+            rollback_component,
+            rollback_connections,
+            preview_cleanup,
+            selection_update,
+            Duration::ZERO,
+            Duration::ZERO,
+            gpu_upload,
+        );
+        true
+    }
+
+    fn cancel_connection_creation(&mut self) -> bool {
+        self.connection_creation_active() && self.cancel_pointer_interaction()
+    }
+
+    fn clear_diagram_selection(&mut self) -> bool {
+        let total_started = Instant::now();
+        let selection_started = Instant::now();
+        let selection_changed = self.set_diagram_selection(DiagramSelection::None);
+        let hover_changed = self.hovered_port.take().is_some();
+        let changed = selection_changed || hover_changed;
+        if changed {
+            trace_cancel_profile(
+                "DeselectDiagram",
+                0,
+                total_started.elapsed(),
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                selection_started.elapsed(),
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+        }
+        changed
     }
 
     fn finish_model_drag(&mut self, button: MouseButton) {
@@ -5579,7 +5757,7 @@ impl App {
                 &component_name,
                 "no selected class",
             );
-            self.rollback_component_preview(&component_id, &connected_connections);
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
         let Some(version) = self
@@ -5593,7 +5771,7 @@ impl App {
                 &component_name,
                 "no source version",
             );
-            self.rollback_component_preview(&component_id, &connected_connections);
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
         let Some(current_scene) = self
@@ -5608,7 +5786,7 @@ impl App {
                 &component_name,
                 "no diagram scene",
             );
-            self.rollback_component_preview(&component_id, &connected_connections);
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
         let Some(_) = current_scene
@@ -5623,7 +5801,7 @@ impl App {
                 "component id not found in current scene",
             );
             self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-            self.rollback_component_preview(&component_id, &connected_connections);
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
         trace_component_edit(
@@ -5643,7 +5821,7 @@ impl App {
                         &error,
                     );
                     self.load_error = Some(format!("Diagram edit rejected: {error}"));
-                    self.rollback_component_preview(&component_id, &connected_connections);
+                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
                     return;
                 }
             };
@@ -5664,7 +5842,7 @@ impl App {
                         &error,
                     );
                     self.load_error = Some(format!("Diagram edit rejected: {error}"));
-                    self.rollback_component_preview(&component_id, &connected_connections);
+                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
                     return;
                 }
             };
@@ -5691,7 +5869,7 @@ impl App {
                     );
                     self.load_error =
                         Some("Diagram edit could not resolve candidate source".into());
-                    self.rollback_component_preview(&component_id, &connected_connections);
+                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
                     return;
                 }
             };
@@ -5713,7 +5891,7 @@ impl App {
                 "component id not found after resolve",
             );
             self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-            self.rollback_component_preview(&component_id, &connected_connections);
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
         if !point_nearly_equal(resolved_component.origin, after_origin) {
@@ -5727,7 +5905,7 @@ impl App {
                 ),
             );
             self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-            self.rollback_component_preview(&component_id, &connected_connections);
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         }
         let canonical_after_origin = resolved_component.origin;
@@ -6016,7 +6194,7 @@ impl App {
         }
         let component_transform = {
             let Some(document) = self.document.as_mut() else {
-                self.rollback_component_preview(&component_id, &connected_connections);
+                let _ = self.rollback_component_preview(&component_id, &connected_connections);
                 return;
             };
             document.set_class_text(&class_name, candidate.clone());
@@ -7021,7 +7199,7 @@ impl App {
         self.pending_waypoint_queued_at = None;
         self.waypoint_frame_pending = false;
         self.waypoint_profile_frames_remaining = 0;
-        self.suppress_next_creation_left_release_redraw = false;
+        self.suppress_next_pointer_release_redraw = false;
         self.diagram_selection = DiagramSelection::None;
         self.hovered_port = None;
         self.diagram_hit_cache = DiagramHitCache::default();
@@ -7133,6 +7311,7 @@ impl App {
             self.connection_preview = None;
             self.component_connection_previews = None;
             self.connection_creation_preview = None;
+            self.suppress_next_pointer_release_redraw = false;
             self.diagram_selection = DiagramSelection::None;
             self.hovered_port = None;
         }
@@ -7210,6 +7389,7 @@ impl App {
             self.connection_preview = None;
             self.component_connection_previews = None;
             self.connection_creation_preview = None;
+            self.suppress_next_pointer_release_redraw = false;
             self.diagram_selection = DiagramSelection::None;
             self.hovered_port = None;
             self.diagram_hit_cache =
@@ -11851,9 +12031,9 @@ fn main() {
                             if !egui_consumed {
                                 match event.physical_key {
                                     PhysicalKey::Code(KeyCode::Escape)
-                                        if app.connection_creation_active() =>
+                                        if app.pointer_interaction_active() =>
                                     {
-                                        app.cancel_connection_creation();
+                                        app.cancel_pointer_interaction();
                                     }
                                     PhysicalKey::Code(KeyCode::KeyR) => {
                                         app.fit_scene();
@@ -11922,15 +12102,15 @@ fn main() {
                             // current selection before entering its hot path.
                             let selection_before = (!app.connection_creation_active())
                                 .then(|| app.diagram_selection.clone());
-                            let inert_creation_release =
-                                if state == ElementState::Released && button == MouseButton::Left {
-                                    let suppress =
-                                        app.suppress_next_creation_left_release_redraw;
-                                    app.suppress_next_creation_left_release_redraw = false;
+                            let inert_pointer_release =
+                                if state == ElementState::Released {
+                                    let suppress = app.suppress_next_pointer_release_redraw;
+                                    app.suppress_next_pointer_release_redraw = false;
                                     suppress
                                 } else {
                                     false
-                            };
+                                };
+                            let mut interaction_changed = false;
                             if state == ElementState::Released {
                                 if button == MouseButton::Left
                                     && app.interactive_drag_active()
@@ -11950,6 +12130,10 @@ fn main() {
                                 } else {
                                     app.finish_model_drag(button);
                                 }
+                            } else if button == MouseButton::Right
+                                && app.pointer_interaction_active()
+                            {
+                                interaction_changed = app.cancel_pointer_interaction();
                             } else if app.connection_creation_active() {
                                 if button == MouseButton::Left {
                                     // Keep input handling tiny. The latest
@@ -11960,7 +12144,10 @@ fn main() {
                                     app.window.request_redraw();
                                 }
                             } else if app.canvas_event_allowed() {
-                                if wants_pan(button, app.modifiers.control_key()) {
+                                if button == MouseButton::Right {
+                                    interaction_changed = app.clear_diagram_selection();
+                                    app.suppress_next_pointer_release_redraw = true;
+                                } else if wants_pan(button, app.modifiers.control_key()) {
                                     app.pointer_interaction = PointerInteraction::Pan {
                                         button,
                                         start_pointer: app.cursor,
@@ -11976,13 +12163,21 @@ fn main() {
                                 && button == MouseButton::Left
                                 && app.connection_creation_active()
                             {
-                                app.suppress_next_creation_left_release_redraw = true;
+                                app.suppress_next_pointer_release_redraw = true;
                             }
                             let selection_changed = selection_before
                                 .is_some_and(|selection_before| app.diagram_selection != selection_before);
+                            if state == ElementState::Pressed
+                                && button == MouseButton::Left
+                                && !app.pointer_interaction_active()
+                                && selection_changed
+                            {
+                                app.suppress_next_pointer_release_redraw = true;
+                            }
                             if egui_consumed
-                                || (state == ElementState::Released && !inert_creation_release)
+                                || (state == ElementState::Released && !inert_pointer_release)
                                 || selection_changed
+                                || interaction_changed
                             {
                                 app.window.request_redraw();
                             }
@@ -14740,5 +14935,73 @@ mod tests {
             spatial_index.nearest_port(CorePoint { x: 0.0, y: 0.0 }, 1.0, None, &anchors),
             Some(1)
         );
+    }
+
+    #[test]
+    fn component_drag_snapshots_only_track_touching_connections() {
+        let (base_scene, template) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let make_connection =
+            |lhs_name: &str, lhs_path: String, rhs_name: &str, rhs_path: String, index: usize| {
+                let lhs = ConnectorRef {
+                    component_name: lhs_name.to_owned(),
+                    connector_path: lhs_path,
+                    subscripts: Vec::new(),
+                };
+                let rhs = ConnectorRef {
+                    component_name: rhs_name.to_owned(),
+                    connector_path: rhs_path,
+                    subscripts: Vec::new(),
+                };
+                let mut connection = template.clone();
+                connection.id = format!("connection:{lhs_name}:{index}");
+                connection.key = ConnectionKey::new("Test", lhs.clone(), rhs.clone(), index);
+                connection.lhs = lhs;
+                connection.rhs = rhs;
+                connection.from = lhs_name.to_owned();
+                connection.to = rhs_name.to_owned();
+                connection.line.as_mut().expect("test line").points = vec![
+                    CorePoint {
+                        x: index as f32 * 10.0,
+                        y: 0.0,
+                    },
+                    CorePoint {
+                        x: index as f32 * 10.0 + 5.0,
+                        y: 0.0,
+                    },
+                ];
+                connection
+            };
+
+        let mut scene = base_scene;
+        scene.connections = (0..10)
+            .map(|index| {
+                make_connection(
+                    "a",
+                    format!("port[{index}]"),
+                    &format!("sink{index}"),
+                    String::new(),
+                    index,
+                )
+            })
+            .chain((0..40).map(|index| {
+                make_connection(
+                    "other_a",
+                    format!("port[{index}]"),
+                    &format!("other_b{index}"),
+                    String::new(),
+                    index + 10,
+                )
+            }))
+            .collect();
+
+        let snapshots = connection_drag_snapshots(&scene, "a", "Test", "");
+        assert_eq!(snapshots.len(), 10);
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.connection_key.lhs.component_name == "a"));
     }
 }
