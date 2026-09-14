@@ -742,8 +742,9 @@ fn trace_component_drag_issue(
 ) {
     if std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_DRAG").is_some() {
         eprintln!(
-            "[COMPONENT DRAG] component_id={component_id} connection_key={connection_key:?} reason={reason} original_points={:?} preview_points={preview_points:?} first_anchor={:?} last_anchor={:?} moved_first={} moved_last={}",
-            snapshot.original_line_points,
+            "[COMPONENT DRAG] component_id={component_id} connection_key={connection_key:?} reason={reason} source_points={:?} base_route={:?} preview_points={preview_points:?} first_anchor={:?} last_anchor={:?} moved_first={} moved_last={}",
+            snapshot.source_line_points,
+            snapshot.base_route_points,
             snapshot.original_endpoint_points.0,
             snapshot.original_endpoint_points.1,
             snapshot.moved_first_endpoint,
@@ -995,7 +996,8 @@ impl DiagramSpatialIndex {
                 if !anchor.editable || exclude.is_some_and(|key| anchor.key == *key) {
                     continue;
                 }
-                let Some(distance) = connector_anchor_hit_distance(anchor, point, tolerance) else {
+                let Some(distance) = connector_anchor_active_hit_distance(anchor, point, tolerance)
+                else {
                     continue;
                 };
                 if nearest.is_none_or(|(best_distance, _)| distance < best_distance) {
@@ -1021,7 +1023,8 @@ fn connection_creation_target(
         if let Some(anchor) = anchors.get(index) {
             if anchor.editable
                 && anchor.key != *source_port
-                && connector_anchor_hit_distance(anchor, pointer_model, exit_tolerance).is_some()
+                && connector_anchor_active_hit_distance(anchor, pointer_model, exit_tolerance)
+                    .is_some()
             {
                 return Some((index, anchor.world_position));
             }
@@ -1145,7 +1148,8 @@ enum ConnectionEndpoint {
 struct ConnectionDragSnapshot {
     connection_id: String,
     connection_key: ConnectionKey,
-    original_line_points: Vec<CorePoint>,
+    source_line_points: Vec<CorePoint>,
+    base_route_points: Vec<CorePoint>,
     original_line_origin: CorePoint,
     original_line_rotation: f32,
     original_endpoint_points: (CorePoint, CorePoint),
@@ -3690,9 +3694,11 @@ impl App {
             let Some(connection) = scene.connections.get(segment.connection_index) else {
                 continue;
             };
+            let canonical_points = canonical_connection_points(scene, connection);
             let Some((hit, distance)) = hit_test_connection_segment_with_distance(
                 connection,
                 segment.segment_index,
+                &canonical_points,
                 pointer_model,
                 tolerance,
             ) else {
@@ -3746,6 +3752,27 @@ impl App {
     }
 
     fn hit_test_diagram_port(&self, pointer_model: CorePoint, tolerance: f32) -> Option<PortKey> {
+        self.hit_test_diagram_port_with(
+            pointer_model,
+            tolerance,
+            connector_anchor_active_hit_distance,
+        )
+    }
+
+    fn hit_test_diagram_hover_port(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+    ) -> Option<PortKey> {
+        self.hit_test_diagram_port_with(pointer_model, tolerance, connector_anchor_hit_distance)
+    }
+
+    fn hit_test_diagram_port_with(
+        &self,
+        pointer_model: CorePoint,
+        tolerance: f32,
+        hit_distance: fn(&ConnectorAnchor, CorePoint, f32) -> Option<f32>,
+    ) -> Option<PortKey> {
         let started = Instant::now();
         let anchors = self.diagram_connector_anchors()?;
         let query_started = Instant::now();
@@ -3760,8 +3787,7 @@ impl App {
             .iter()
             .filter_map(|index| anchors.get(*index))
             .filter_map(|anchor| {
-                connector_anchor_hit_distance(anchor, pointer_model, tolerance)
-                    .map(|distance| (distance, anchor))
+                hit_distance(anchor, pointer_model, tolerance).map(|distance| (distance, anchor))
             })
             .min_by(|(left, _), (right, _)| left.total_cmp(right))
             .map(|(_, anchor)| anchor.key.clone());
@@ -3798,10 +3824,12 @@ impl App {
                 return None;
             }
             let component = scene.components.get(item.scene_index)?;
-            if !component.editable
-                || !component.visible
-                || !diagram_component_contains_point(component, pointer_model, tolerance)
-            {
+            if !component.editable || !component.visible {
+                return None;
+            }
+            let graphic_hit = diagram_component_contains_point(component, pointer_model, tolerance);
+            let body_hit = point_in_component_placement_extent(component, pointer_model, tolerance);
+            if !graphic_hit && !body_hit {
                 return None;
             }
             Some((
@@ -3826,7 +3854,7 @@ impl App {
         let next_hovered = if self.main_view == MainView::Diagram && self.pointer_over_canvas() {
             let pointer_model = self.screen_to_model(self.cursor);
             let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
-            self.hit_test_diagram_port(pointer_model, tolerance)
+            self.hit_test_diagram_hover_port(pointer_model, tolerance)
         } else {
             None
         };
@@ -3862,10 +3890,12 @@ impl App {
                 .iter()
                 .find(|connection| connection.id == hit.connection_id)
                 .ok_or_else(|| "Connection edit lost its connection identity".to_owned())?;
-            let line = connection
+            let raw_line = connection
                 .line
                 .as_ref()
                 .ok_or_else(|| "Connection has no editable Line annotation".to_owned())?;
+            let mut line = raw_line.clone();
+            line.points = canonical_connection_points(scene, connection);
             let source_before = document
                 .class_text(&class_name)
                 .ok_or_else(|| "Connection edit could not load the selected source".to_owned())?;
@@ -3881,8 +3911,8 @@ impl App {
                 .copied()
                 .ok_or_else(|| "Connection Line has no last point".to_owned())?;
             if std::env::var_os("MODELICA_WGPU_PROFILE_CONNECTION_ORDER").is_some() {
-                let first_world = line_local_to_world(line, lhs);
-                let last_world = line_local_to_world(line, rhs);
+                let first_world = line_local_to_world(&line, lhs);
+                let last_world = line_local_to_world(&line, rhs);
                 match resolve_connection_endpoints(scene, connection) {
                     Ok(endpoints) => {
                         let forward_error = distance_between(first_world, endpoints.lhs.world_position)
@@ -4058,14 +4088,13 @@ impl App {
     fn selected_connection_overlay_points(&self) -> Option<Vec<CorePoint>> {
         let connection_id = self.selected_connection_id()?;
         let class_name = self.selected_class_name()?;
-        let connection = self
-            .document
-            .as_ref()?
-            .diagram(class_name)?
+        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let connection = scene
             .connections
             .iter()
             .find(|connection| connection.id == connection_id)?;
-        let line = connection.line.as_ref()?;
+        let raw_line = connection.line.as_ref()?;
+        let canonical_points = canonical_connection_points(scene, connection);
         let points = match &self.pointer_interaction {
             PointerInteraction::MoveDiagramConnectionSegment {
                 connection_id: active_id,
@@ -4077,9 +4106,9 @@ impl App {
                 preview_points,
                 ..
             } if active_id == connection_id => preview_points,
-            _ => &line.points,
+            _ => &canonical_points,
         };
-        Some(connection_world_points(line, points))
+        Some(connection_world_points(raw_line, points))
     }
 
     fn selected_component_overlay(&self) -> Option<ComponentSelectionOverlay> {
@@ -4461,7 +4490,7 @@ impl App {
                         (
                             snapshot.connection_id.clone(),
                             connection_route_for_component_translation(
-                                &snapshot.original_line_points,
+                                &snapshot.base_route_points,
                                 snapshot.original_line_origin,
                                 snapshot.original_line_rotation,
                                 snapshot.original_endpoint_points,
@@ -4740,7 +4769,7 @@ impl App {
                                 let Ok(preview_points) = reanchor_connection_points(
                                     &preview_scene,
                                     connection,
-                                    &snapshot.original_line_points,
+                                    &snapshot.base_route_points,
                                 ) else {
                                     continue;
                                 };
@@ -5430,7 +5459,7 @@ impl App {
             source_edits.push(edit);
             connection_edits.push(ConnectionLineEdit {
                 connection_key: snapshot.connection_key.clone(),
-                before_points: snapshot.original_line_points.clone(),
+                before_points: snapshot.source_line_points.clone(),
                 after_points,
                 line_origin: snapshot.original_line_origin,
             });
@@ -6036,7 +6065,7 @@ impl App {
             let after_points = match reanchor_connection_points(
                 &reanchored_scene,
                 connection,
-                &snapshot.original_line_points,
+                &snapshot.base_route_points,
             ) {
                 Ok(points) => points,
                 Err(error) => {
@@ -6063,7 +6092,7 @@ impl App {
             source_edits.push(edit);
             connection_edits.push(ConnectionLineEdit {
                 connection_key: snapshot.connection_key.clone(),
-                before_points: snapshot.original_line_points.clone(),
+                before_points: snapshot.source_line_points.clone(),
                 after_points,
                 line_origin: snapshot.original_line_origin,
             });
@@ -8306,7 +8335,8 @@ fn build_diagram_hit_cache(
         let Some(line) = connection.line.as_ref() else {
             continue;
         };
-        let points = connection_world_points(line, &line.points);
+        let canonical_points = canonical_connection_points(scene, connection);
+        let points = connection_world_points(line, &canonical_points);
         for (segment_index, pair) in points.windows(2).enumerate() {
             let [start, end] = pair else {
                 continue;
@@ -8519,6 +8549,23 @@ fn core_icon_geometry(scene: &CoreIconScene) -> Vec<Geometry> {
         .collect()
 }
 
+/// Return the route used by every interactive/rendering path.
+///
+/// Source annotations are allowed to carry endpoints that are slightly stale
+/// relative to the resolved connector instances. Keep the source untouched,
+/// but anchor the displayed route to the semantic connector positions so the
+/// line, hit cache, overlays, and component-drag previews agree.
+fn canonical_connection_points(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+) -> Vec<CorePoint> {
+    let Some(line) = connection.line.as_ref() else {
+        return Vec::new();
+    };
+    reanchor_connection_points(scene, connection, &line.points)
+        .unwrap_or_else(|_| line.points.clone())
+}
+
 fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
     let diagram_flip = Transform2D {
         scale_y: -1.0,
@@ -8535,19 +8582,19 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         .collect::<Vec<_>>();
     for connection in &scene.connections {
         if let Some(line) = &connection.line {
-            geometries.extend(
-                line_geometry(line, diagram_flip)
-                    .into_iter()
-                    .map(|mut geometry| {
-                        geometry.layer = DiagramRenderLayer::Connection;
-                        geometry.edit_key = Some(connection.id.clone());
-                        geometry.connection = Some(ConnectionGeometry {
-                            line: line.clone(),
-                            transform: diagram_flip,
-                        });
-                        geometry
-                    }),
-            );
+            let mut display_line = line.clone();
+            display_line.points = canonical_connection_points(scene, connection);
+            geometries.extend(line_geometry(&display_line, diagram_flip).into_iter().map(
+                |mut geometry| {
+                    geometry.layer = DiagramRenderLayer::Connection;
+                    geometry.edit_key = Some(connection.id.clone());
+                    geometry.connection = Some(ConnectionGeometry {
+                        line: display_line.clone(),
+                        transform: diagram_flip,
+                    });
+                    geometry
+                },
+            ));
         }
     }
     for component in &scene.components {
@@ -9347,11 +9394,44 @@ fn diagram_component_contains_point(
     })
 }
 
+fn point_in_component_placement_extent(
+    component: &CoreComponentInstance,
+    point: CorePoint,
+    tolerance: f32,
+) -> bool {
+    let extent = component
+        .placement_extent
+        .unwrap_or_else(default_component_extent);
+    let local = inverse_transform_point(
+        point,
+        Transform2D {
+            translation: component.origin,
+            rotation: component.rotation,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        },
+    );
+    let tolerance = tolerance.max(0.0);
+    local.x >= extent.p1.x.min(extent.p2.x) - tolerance
+        && local.x <= extent.p1.x.max(extent.p2.x) + tolerance
+        && local.y >= extent.p1.y.min(extent.p2.y) - tolerance
+        && local.y <= extent.p1.y.max(extent.p2.y) + tolerance
+}
+
 fn connection_world_points(line: &LineGraphic, points: &[CorePoint]) -> Vec<CorePoint> {
     points
         .iter()
         .map(|point| line_local_to_world(line, *point))
         .collect()
+}
+
+fn connector_anchor_active_hit_distance(
+    anchor: &ConnectorAnchor,
+    point: CorePoint,
+    tolerance: f32,
+) -> Option<f32> {
+    let distance = distance_between(anchor.world_position, point);
+    (distance <= tolerance.max(0.0)).then_some(distance)
 }
 
 #[cfg(test)]
@@ -9364,9 +9444,13 @@ fn hit_test_connection(
     for (connection_index, connection) in connections.iter().enumerate() {
         let line = connection.line.as_ref();
         for segment_index in 0..line.map_or(0, |line| line.points.len().saturating_sub(1)) {
+            let Some(line) = line else {
+                continue;
+            };
             let Some((hit, distance)) = hit_test_connection_segment_with_distance(
                 connection,
                 segment_index,
+                &line.points,
                 pointer,
                 tolerance,
             ) else {
@@ -9394,24 +9478,22 @@ fn hit_test_connection(
 fn hit_test_connection_segment_with_distance(
     connection: &modelica_core::scene::DiagramConnection,
     segment_index: usize,
+    points: &[CorePoint],
     pointer: CorePoint,
     tolerance: f32,
 ) -> Option<(ConnectionHit, f32)> {
     let line = connection.line.as_ref()?;
-    let start = line
-        .points
+    let start = points
         .get(segment_index)
         .map(|point| line_local_to_world(line, *point))?;
-    let end = line
-        .points
+    let end = points
         .get(segment_index + 1)
         .map(|point| line_local_to_world(line, *point))?;
     let distance = distance_to_segment(pointer, start, end);
     if distance > tolerance {
         return None;
     }
-    let target = match line
-        .points
+    let target = match points
         .get(segment_index..=segment_index.saturating_add(1))
         .and_then(|pair| pair.first().zip(pair.get(1)))
         .and_then(|(start, end)| segment_orientation(*start, *end))
@@ -10086,7 +10168,13 @@ fn connection_drag_snapshots(
                 return None;
             }
             let line = connection.line.as_ref()?;
-            let (Some(first), Some(last)) = (line.points.first(), line.points.last()) else {
+            if line.points.len() < 2 {
+                return None;
+            }
+            let base_route_points = canonical_connection_points(scene, connection);
+            let (Some(base_first), Some(base_last)) =
+                (base_route_points.first(), base_route_points.last())
+            else {
                 return None;
             };
             let (original_endpoint_points, moved_first_endpoint, moved_last_endpoint) = match (
@@ -10107,7 +10195,7 @@ fn connection_drag_snapshots(
                     (points, first, last)
                 }
                 _ => (
-                    (*first, *last),
+                    (*base_first, *base_last),
                     connection.lhs.component_name == component_name,
                     connection.rhs.component_name == component_name,
                 ),
@@ -10115,11 +10203,12 @@ fn connection_drag_snapshots(
             Some(ConnectionDragSnapshot {
                 connection_id: connection.id.clone(),
                 connection_key: connection.key.clone(),
-                original_line_points: line.points.clone(),
+                source_line_points: line.points.clone(),
+                base_route_points: base_route_points.clone(),
                 original_line_origin: line.origin,
                 original_line_rotation: line.rotation,
                 original_endpoint_points,
-                preview_points: line.points.clone(),
+                preview_points: base_route_points,
                 moved_first_endpoint,
                 moved_last_endpoint,
             })
@@ -10128,7 +10217,7 @@ fn connection_drag_snapshots(
 }
 
 fn connection_route_for_component_translation(
-    original_points: &[CorePoint],
+    base_route_points: &[CorePoint],
     line_origin: CorePoint,
     line_rotation: f32,
     original_endpoint_points: (CorePoint, CorePoint),
@@ -10136,8 +10225,8 @@ fn connection_route_for_component_translation(
     moved_last_endpoint: bool,
     world_delta: CorePoint,
 ) -> Vec<CorePoint> {
-    if original_points.len() < 2 || (!moved_first_endpoint && !moved_last_endpoint) {
-        return original_points.to_vec();
+    if base_route_points.len() < 2 || (!moved_first_endpoint && !moved_last_endpoint) {
+        return base_route_points.to_vec();
     }
     let local_delta = world_delta_to_line_local(line_origin, line_rotation, world_delta);
     let (original_lhs, original_rhs) = original_endpoint_points;
@@ -10152,9 +10241,9 @@ fn connection_route_for_component_translation(
         original_rhs
     };
 
-    if original_points.len() == 2 {
+    if base_route_points.len() == 2 {
         return two_point_component_translation_route(
-            original_points,
+            base_route_points,
             lhs,
             rhs,
             moved_first_endpoint,
@@ -10163,13 +10252,13 @@ fn connection_route_for_component_translation(
     }
 
     let mut points =
-        connection_drag_points_with_semantic_endpoints(original_points, original_endpoint_points);
+        connection_drag_points_with_semantic_endpoints(base_route_points, original_endpoint_points);
     if moved_first_endpoint {
         points[0] = lhs;
         preserve_orthogonal_neighbor(
             &mut points[1],
             original_lhs,
-            original_points[1],
+            base_route_points[1],
             local_delta,
         );
     }
@@ -10179,7 +10268,7 @@ fn connection_route_for_component_translation(
         preserve_orthogonal_neighbor(
             &mut points[last_index - 1],
             original_rhs,
-            original_points[last_index - 1],
+            base_route_points[last_index - 1],
             local_delta,
         );
     }
@@ -10194,7 +10283,7 @@ fn translated_point(point: CorePoint, delta: CorePoint) -> CorePoint {
 }
 
 fn two_point_component_translation_route(
-    original_points: &[CorePoint],
+    base_route_points: &[CorePoint],
     lhs: CorePoint,
     rhs: CorePoint,
     moved_first_endpoint: bool,
@@ -10203,7 +10292,8 @@ fn two_point_component_translation_route(
     if (lhs.x - rhs.x).abs() <= ORTHOGONAL_EPSILON || (lhs.y - rhs.y).abs() <= ORTHOGONAL_EPSILON {
         return vec![lhs, rhs];
     }
-    let was_horizontal = (original_points[0].y - original_points[1].y).abs() <= ORTHOGONAL_EPSILON;
+    let was_horizontal =
+        (base_route_points[0].y - base_route_points[1].y).abs() <= ORTHOGONAL_EPSILON;
     let elbow = if was_horizontal {
         if moved_last_endpoint && !moved_first_endpoint {
             CorePoint { x: lhs.x, y: rhs.y }
@@ -12533,6 +12623,104 @@ mod tests {
             zoom = (zoom * 0.9).clamp(MIN_ZOOM, MAX_ZOOM);
         }
         assert_eq!(zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn canonical_connection_route_anchors_static_geometry_to_ports() {
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 30.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+
+        let points = canonical_connection_points(&scene, &connection);
+        assert_eq!(
+            points,
+            vec![
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 0.0, y: 30.0 },
+                CorePoint { x: 100.0, y: 30.0 },
+            ]
+        );
+
+        let geometries = core_diagram_geometry(&scene);
+        let geometry = geometries
+            .iter()
+            .find(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .expect("canonical connection geometry");
+        assert_eq!(
+            geometry
+                .connection
+                .as_ref()
+                .expect("connection metadata")
+                .line
+                .points,
+            points
+        );
+    }
+
+    #[test]
+    fn component_placement_extent_is_a_precise_drag_fallback() {
+        let (mut scene, _) = connection_test_scene(
+            CorePoint { x: 40.0, y: 25.0 },
+            CorePoint { x: 140.0, y: 25.0 },
+            vec![
+                CorePoint { x: 40.0, y: 25.0 },
+                CorePoint { x: 140.0, y: 25.0 },
+            ],
+        );
+        scene.components[0].placement_extent = Some(modelica_core::scene::Extent {
+            p1: CorePoint { x: -20.0, y: -10.0 },
+            p2: CorePoint { x: 20.0, y: 10.0 },
+        });
+        scene.components[0].rotation = 90.0;
+        let component = &scene.components[0];
+
+        assert!(point_in_component_placement_extent(
+            component,
+            CorePoint { x: 35.0, y: 25.0 },
+            0.0,
+        ));
+        assert!(!point_in_component_placement_extent(
+            component,
+            CorePoint { x: 70.0, y: 25.0 },
+            0.0,
+        ));
+        assert!(!diagram_component_contains_point(
+            component,
+            CorePoint { x: 35.0, y: 25.0 },
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn port_active_hit_region_uses_semantic_center_not_visual_bounds() {
+        let anchor = ConnectorAnchor {
+            key: PortKey::new("component", "port"),
+            connector_ref: ConnectorRef {
+                component_name: "component".to_owned(),
+                connector_path: "port".to_owned(),
+            },
+            world_position: CorePoint { x: 0.0, y: 0.0 },
+            visual_bounds: Some(modelica_render::Bounds {
+                x: -100.0,
+                y: -100.0,
+                width: 200.0,
+                height: 200.0,
+            }),
+            qualified_type: None,
+            owner_component_id: "component".to_owned(),
+            editable: true,
+        };
+
+        assert!(
+            connector_anchor_active_hit_distance(&anchor, CorePoint { x: 7.0, y: 0.0 }, 8.0,)
+                .is_some()
+        );
+        assert!(
+            connector_anchor_active_hit_distance(&anchor, CorePoint { x: 20.0, y: 0.0 }, 8.0,)
+                .is_none()
+        );
     }
 
     #[test]
