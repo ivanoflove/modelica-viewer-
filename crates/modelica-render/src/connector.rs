@@ -23,8 +23,8 @@ const DEFAULT_COMPONENT_EXTENT: Extent = Extent {
 
 /// Stable identity for a connector in a Diagram.
 ///
-/// `connector_path` is the complete public connector path, including nested
-/// names and array subscripts (for example `bus.signal` or `ports[1]`).
+/// `connector_path` contains nested names without the terminal array
+/// subscripts. Array element identity lives in `ConnectorRef::subscripts`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PortKey {
     pub owner_component_id: String,
@@ -104,22 +104,29 @@ pub fn connector_anchors(scene: &DiagramScene) -> Vec<ConnectorAnchor> {
         let placement = component_placement_transform(layer, component);
 
         if is_connector_component(component) {
-            anchors.push(ConnectorAnchor {
+            let base = ConnectorRef::with_component_path(&component.name, "");
+            let world_position = transform_point(Point { x: 0.0, y: 0.0 }, placement);
+            let visual_bounds = scene_visual_bounds(layer, placement);
+            let template = ConnectorAnchor {
                 key: PortKey::new(&component.id, ""),
-                connector_ref: ConnectorRef {
-                    component_name: component.name.clone(),
-                    connector_path: String::new(),
-                },
-                world_position: transform_point(Point { x: 0.0, y: 0.0 }, placement),
-                visual_bounds: scene_visual_bounds(layer, placement),
+                connector_ref: base.clone(),
+                world_position,
+                visual_bounds,
                 qualified_type: component.resolved_type_qualified_name.clone(),
                 owner_component_id: component.id.clone(),
                 editable: component.editable,
-            });
+            };
+            anchors.extend(expand_array_anchors(
+                scene,
+                component,
+                &base,
+                template,
+                &component.dimensions,
+            ));
             continue;
         }
 
-        let mut public = HashMap::<String, ConnectorAnchor>::new();
+        let mut public = HashMap::<ConnectorRef, (ConnectorAnchor, Vec<String>)>::new();
         for graphic in &layer.graphics {
             if graphic.owner.kind != GraphicOwnerKind::Connector {
                 continue;
@@ -127,29 +134,43 @@ pub fn connector_anchors(scene: &DiagramScene) -> Vec<ConnectorAnchor> {
             let Some(path) = graphic.owner.instance_name.as_deref() else {
                 continue;
             };
-            let path = path.to_owned();
+            let connector_ref = ConnectorRef::with_component_path(&component.name, path);
+            let graphic_dimensions = graphic.owner.dimensions.clone();
             let connector_transform = compose_transform(placement, graphic.transform);
             let world_position = transform_point(Point { x: 0.0, y: 0.0 }, connector_transform);
             let visual_bounds = resolved_graphic_bounds(graphic, connector_transform);
             public
-                .entry(path.clone())
-                .and_modify(|anchor| {
+                .entry(connector_ref.clone())
+                .and_modify(|(anchor, dimensions)| {
                     anchor.visual_bounds = union_bounds(anchor.visual_bounds, visual_bounds);
+                    if dimensions.is_empty() {
+                        *dimensions = graphic_dimensions.clone();
+                    }
                 })
-                .or_insert_with(|| ConnectorAnchor {
-                    key: PortKey::new(&component.id, path.clone()),
-                    connector_ref: ConnectorRef {
-                        component_name: component.name.clone(),
-                        connector_path: path,
-                    },
-                    world_position,
-                    visual_bounds,
-                    qualified_type: Some(graphic.owner.qualified_name.clone()),
-                    owner_component_id: component.id.clone(),
-                    editable: component.editable,
+                .or_insert_with(|| {
+                    (
+                        ConnectorAnchor {
+                            key: PortKey::new(&component.id, connector_ref.connector_path_text()),
+                            connector_ref,
+                            world_position,
+                            visual_bounds,
+                            qualified_type: Some(graphic.owner.qualified_name.clone()),
+                            owner_component_id: component.id.clone(),
+                            editable: component.editable,
+                        },
+                        graphic_dimensions,
+                    )
                 });
         }
-        anchors.extend(public.into_values());
+        for (base, (template, dimensions)) in public {
+            anchors.extend(expand_array_anchors(
+                scene,
+                component,
+                &base,
+                template,
+                &dimensions,
+            ));
+        }
     }
     anchors.sort_by(|left, right| {
         left.owner_component_id
@@ -158,6 +179,11 @@ pub fn connector_anchors(scene: &DiagramScene) -> Vec<ConnectorAnchor> {
                 left.connector_ref
                     .connector_path
                     .cmp(&right.connector_ref.connector_path)
+            })
+            .then_with(|| {
+                left.connector_ref
+                    .subscripts
+                    .cmp(&right.connector_ref.subscripts)
             })
             .then_with(|| {
                 left.key
@@ -169,15 +195,120 @@ pub fn connector_anchors(scene: &DiagramScene) -> Vec<ConnectorAnchor> {
     anchors
 }
 
+fn expand_array_anchors(
+    scene: &DiagramScene,
+    component: &ComponentInstance,
+    base: &ConnectorRef,
+    template: ConnectorAnchor,
+    dimensions: &[String],
+) -> Vec<ConnectorAnchor> {
+    let mut references = scene
+        .connections
+        .iter()
+        .flat_map(|connection| [&connection.lhs, &connection.rhs])
+        .filter(|reference| {
+            reference.component_name == component.name
+                && reference.connector_path == base.connector_path
+        })
+        .filter(|reference| base.subscripts.is_empty() || reference == &base)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !base.subscripts.is_empty() {
+        references.push(base.clone());
+    } else {
+        references.extend(
+            constant_array_subscripts(dimensions)
+                .into_iter()
+                .map(|subscripts| ConnectorRef {
+                    component_name: component.name.clone(),
+                    connector_path: base.connector_path.clone(),
+                    subscripts,
+                }),
+        );
+    }
+    if references.is_empty() {
+        references.push(base.clone());
+    }
+    references.sort_by(|left, right| left.subscripts.cmp(&right.subscripts));
+    references.dedup();
+
+    references
+        .into_iter()
+        .map(|connector_ref| {
+            let mut anchor = template.clone();
+            anchor.key = PortKey::new(&component.id, connector_ref.connector_path_text());
+            anchor.connector_ref = connector_ref;
+            anchor
+        })
+        .collect()
+}
+
+fn constant_array_subscripts(dimensions: &[String]) -> Vec<Vec<String>> {
+    if dimensions.is_empty() {
+        return Vec::new();
+    }
+    let mut combinations = vec![Vec::new()];
+    for dimension in dimensions {
+        let sizes = split_dimension_values(dimension)
+            .into_iter()
+            .map(|value| value.parse::<usize>().ok())
+            .collect::<Option<Vec<_>>>();
+        let Some(sizes) = sizes else {
+            return Vec::new();
+        };
+        if sizes.contains(&0) {
+            return Vec::new();
+        }
+        for size in sizes {
+            combinations = combinations
+                .into_iter()
+                .flat_map(|prefix| {
+                    (1..=size).map(move |index| {
+                        let mut subscripts = prefix.clone();
+                        subscripts.push(index.to_string());
+                        subscripts
+                    })
+                })
+                .collect();
+        }
+    }
+    combinations
+}
+
+fn split_dimension_values(value: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut paren_depth = 0;
+    let mut brace_depth = 0;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            '{' => brace_depth += 1,
+            '}' => brace_depth -= 1,
+            ',' if paren_depth == 0 && brace_depth == 0 => {
+                result.push(value[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        result.push(last.to_owned());
+    }
+    result
+}
+
 /// Find a connector using the topology reference from a `connect` equation.
 pub fn find_connector_anchor<'a>(
     anchors: &'a [ConnectorAnchor],
     connector: &ConnectorRef,
 ) -> Option<&'a ConnectorAnchor> {
-    anchors.iter().find(|anchor| {
-        anchor.connector_ref.component_name == connector.component_name
-            && anchor.connector_ref.connector_path == connector.connector_path
-    })
+    anchors
+        .iter()
+        .find(|anchor| anchor.connector_ref == *connector)
 }
 
 /// Find the nearest connector within a model-space tolerance.
@@ -257,16 +388,36 @@ pub fn resolve_connection_endpoints(
         return Err(ConnectorResolutionError::MissingLine);
     };
     let anchors = connector_anchors(scene);
-    let lhs = find_connector_anchor(&anchors, &connection.lhs)
-        .cloned()
-        .ok_or(ConnectorResolutionError::MissingEndpoint {
-            side: ConnectionEndpointSide::Lhs,
-        })?;
-    let rhs = find_connector_anchor(&anchors, &connection.rhs)
-        .cloned()
-        .ok_or(ConnectorResolutionError::MissingEndpoint {
-            side: ConnectionEndpointSide::Rhs,
-        })?;
+    let lhs = match find_connector_anchor(&anchors, &connection.lhs).cloned() {
+        Some(anchor) => anchor,
+        None => {
+            report_missing_connector(
+                scene,
+                connection,
+                ConnectionEndpointSide::Lhs,
+                &connection.lhs,
+                &anchors,
+            );
+            return Err(ConnectorResolutionError::MissingEndpoint {
+                side: ConnectionEndpointSide::Lhs,
+            });
+        }
+    };
+    let rhs = match find_connector_anchor(&anchors, &connection.rhs).cloned() {
+        Some(anchor) => anchor,
+        None => {
+            report_missing_connector(
+                scene,
+                connection,
+                ConnectionEndpointSide::Rhs,
+                &connection.rhs,
+                &anchors,
+            );
+            return Err(ConnectorResolutionError::MissingEndpoint {
+                side: ConnectionEndpointSide::Rhs,
+            });
+        }
+    };
     let lhs_line_position = line_local_to_world(line, line.points[0]);
     let rhs_line_position = line_local_to_world(line, line.points[rhs_index]);
     let forward_error = distance(lhs.world_position, lhs_line_position)
@@ -286,6 +437,28 @@ pub fn resolve_connection_endpoints(
         lhs_line_position,
         rhs_line_position,
     })
+}
+
+fn report_missing_connector(
+    scene: &DiagramScene,
+    connection: &DiagramConnection,
+    side: ConnectionEndpointSide,
+    reference: &ConnectorRef,
+    anchors: &[ConnectorAnchor],
+) {
+    let available = anchors
+        .iter()
+        .filter(|anchor| anchor.connector_ref.component_name == reference.component_name)
+        .map(|anchor| anchor.connector_ref.text())
+        .collect::<Vec<_>>();
+    eprintln!(
+        "[CONNECTOR RESOLVE] class={} connection={} side={side:?} ref={} component={} subscripts={:?} available={available:?}",
+        scene.class_qualified_name.as_deref().unwrap_or("<unknown>"),
+        connection.id,
+        reference.text(),
+        reference.component_name,
+        reference.subscripts,
+    );
 }
 
 /// Return line-local positions that are strictly anchored to the connectors.
@@ -630,6 +803,7 @@ mod tests {
             name: name.into(),
             source_owner: "Example".into(),
             type_name: "Port".into(),
+            dimensions: Vec::new(),
             resolved_type_qualified_name: Some("Example.Port".into()),
             class_kind: kind,
             origin,
@@ -676,6 +850,7 @@ mod tests {
                         qualified_name: "Example.Port".into(),
                         kind: GraphicOwnerKind::Own,
                         instance_name: None,
+                        dimensions: Vec::new(),
                     },
                     Transform2D::identity(),
                 ),
@@ -687,6 +862,117 @@ mod tests {
         assert_eq!(anchors[0].key, PortKey::new("port-id", ""));
         assert_eq!(anchors[0].connector_ref.component_name, "port_a");
         assert_eq!(anchors[0].world_position, point(-90.0, 20.0));
+    }
+
+    #[test]
+    fn vector_connector_anchors_are_created_from_dimensions_and_connections() {
+        let mut ports = component(
+            "ports-id",
+            "ports",
+            Some(ClassKind::Connector),
+            point(0.0, 0.0),
+            Extent {
+                p1: point(-10.0, -10.0),
+                p2: point(10.0, 10.0),
+            },
+            layer(
+                "Example.FluidPorts_a",
+                GraphicOwner {
+                    qualified_name: "Example.FluidPorts_a".into(),
+                    kind: GraphicOwnerKind::Own,
+                    instance_name: None,
+                    dimensions: Vec::new(),
+                },
+                Transform2D::identity(),
+            ),
+        );
+        ports.dimensions = vec!["3".into()];
+        let lhs = ConnectorRef::parse("ports[1]");
+        let rhs = ConnectorRef::parse("ports[2]");
+        let connection = DiagramConnection {
+            key: modelica_core::scene::ConnectionKey::new(
+                "Example.Top",
+                lhs.clone(),
+                rhs.clone(),
+                0,
+            ),
+            id: "connection:ports[1]->ports[2]".into(),
+            lhs,
+            rhs,
+            from: "ports[1]".into(),
+            to: "ports[2]".into(),
+            line: Some(LineGraphic {
+                origin: point(0.0, 0.0),
+                rotation: 0.0,
+                points: vec![point(0.0, 0.0), point(0.0, 0.0)],
+                color: [0, 0, 0],
+                pattern: None,
+                thickness: 1.0,
+                arrow: Vec::new(),
+                arrow_size: None,
+                smooth: None,
+            }),
+            source_range: None,
+            line_source_range: None,
+        };
+        let scene = scene(vec![ports], Some(connection));
+        let anchors = connector_anchors(&scene);
+        assert_eq!(anchors.len(), 3);
+        assert!(find_connector_anchor(&anchors, &ConnectorRef::parse("ports[1]")).is_some());
+        assert!(find_connector_anchor(&anchors, &ConnectorRef::parse("ports[2]")).is_some());
+        assert!(find_connector_anchor(&anchors, &ConnectorRef::parse("ports[3]")).is_some());
+        assert_eq!(anchors[0].key.owner_component_id, "ports-id");
+        let endpoints = resolve_connection_endpoints(&scene, &scene.connections[0]).unwrap();
+        assert_eq!(endpoints.lhs.connector_ref, ConnectorRef::parse("ports[1]"));
+        assert_eq!(endpoints.rhs.connector_ref, ConnectorRef::parse("ports[2]"));
+    }
+
+    #[test]
+    fn nested_vector_connector_anchors_keep_each_connect_reference() {
+        let mixer = component(
+            "mixer-id",
+            "mixer",
+            Some(ClassKind::Model),
+            point(0.0, 0.0),
+            Extent {
+                p1: point(-100.0, -100.0),
+                p2: point(100.0, 100.0),
+            },
+            layer(
+                "Example.Mixer",
+                GraphicOwner {
+                    qualified_name: "Example.FluidPorts_a".into(),
+                    kind: GraphicOwnerKind::Connector,
+                    instance_name: Some("ports".into()),
+                    dimensions: vec!["3".into()],
+                },
+                Transform2D::identity(),
+            ),
+        );
+        let lhs = ConnectorRef::parse("mixer.ports[1]");
+        let rhs = ConnectorRef::parse("mixer.ports[2]");
+        let connection = DiagramConnection {
+            key: modelica_core::scene::ConnectionKey::new(
+                "Example.Top",
+                lhs.clone(),
+                rhs.clone(),
+                0,
+            ),
+            id: "connection:mixer.ports[1]->mixer.ports[2]".into(),
+            lhs,
+            rhs,
+            from: "mixer.ports[1]".into(),
+            to: "mixer.ports[2]".into(),
+            line: None,
+            source_range: None,
+            line_source_range: None,
+        };
+        let scene = scene(vec![mixer], Some(connection));
+        let anchors = connector_anchors(&scene);
+        assert_eq!(anchors.len(), 3);
+        assert!(find_connector_anchor(&anchors, &ConnectorRef::parse("mixer.ports[1]")).is_some());
+        assert!(find_connector_anchor(&anchors, &ConnectorRef::parse("mixer.ports[2]")).is_some());
+        assert!(find_connector_anchor(&anchors, &ConnectorRef::parse("mixer.ports[3]")).is_some());
     }
 
     #[test]
@@ -707,6 +993,7 @@ mod tests {
                         qualified_name: "Example.Port".into(),
                         kind: GraphicOwnerKind::Connector,
                         instance_name: Some("bus.signal[1]".into()),
+                        dimensions: Vec::new(),
                     },
                     Transform2D {
                         translation: point(50.0, 0.0),
@@ -720,7 +1007,8 @@ mod tests {
         );
         let anchors = connector_anchors(&scene);
         assert_eq!(anchors[0].key.connector_path, "bus.signal[1]");
-        assert_eq!(anchors[0].connector_ref.connector_path, "bus.signal[1]");
+        assert_eq!(anchors[0].connector_ref.connector_path, "bus.signal");
+        assert_eq!(anchors[0].connector_ref.subscripts, vec!["1"]);
         assert_eq!(anchors[0].world_position, point(50.0, 0.0));
     }
 
@@ -742,6 +1030,7 @@ mod tests {
                         qualified_name: "Example.Port".into(),
                         kind: GraphicOwnerKind::Own,
                         instance_name: None,
+                        dimensions: Vec::new(),
                     },
                     Transform2D::identity(),
                 ),
@@ -761,6 +1050,7 @@ mod tests {
                         qualified_name: "Example.Port".into(),
                         kind: GraphicOwnerKind::Own,
                         instance_name: None,
+                        dimensions: Vec::new(),
                     },
                     Transform2D::identity(),
                 ),
@@ -783,10 +1073,12 @@ mod tests {
                 ConnectorRef {
                     component_name: "a".into(),
                     connector_path: String::new(),
+                    subscripts: Vec::new(),
                 },
                 ConnectorRef {
                     component_name: "b".into(),
                     connector_path: String::new(),
+                    subscripts: Vec::new(),
                 },
                 0,
             ),
@@ -794,10 +1086,12 @@ mod tests {
             lhs: ConnectorRef {
                 component_name: "a".into(),
                 connector_path: String::new(),
+                subscripts: Vec::new(),
             },
             rhs: ConnectorRef {
                 component_name: "b".into(),
                 connector_path: String::new(),
+                subscripts: Vec::new(),
             },
             from: "a".into(),
             to: "b".into(),
@@ -848,6 +1142,7 @@ mod tests {
                         qualified_name: "Example.Port".into(),
                         kind: GraphicOwnerKind::Own,
                         instance_name: None,
+                        dimensions: Vec::new(),
                     },
                     Transform2D::identity(),
                 ),
@@ -867,6 +1162,7 @@ mod tests {
                         qualified_name: "Example.Port".into(),
                         kind: GraphicOwnerKind::Own,
                         instance_name: None,
+                        dimensions: Vec::new(),
                     },
                     Transform2D::identity(),
                 ),
@@ -878,10 +1174,12 @@ mod tests {
                 ConnectorRef {
                     component_name: "a".into(),
                     connector_path: String::new(),
+                    subscripts: Vec::new(),
                 },
                 ConnectorRef {
                     component_name: "b".into(),
                     connector_path: String::new(),
+                    subscripts: Vec::new(),
                 },
                 0,
             ),
@@ -889,10 +1187,12 @@ mod tests {
             lhs: ConnectorRef {
                 component_name: "a".into(),
                 connector_path: String::new(),
+                subscripts: Vec::new(),
             },
             rhs: ConnectorRef {
                 component_name: "b".into(),
                 connector_path: String::new(),
+                subscripts: Vec::new(),
             },
             from: "a".into(),
             to: "b".into(),

@@ -191,6 +191,7 @@ impl<'a> IconResolver<'a> {
                     qualified_name: graphic.owner.qualified_name,
                     kind: GraphicOwnerKind::Connector,
                     instance_name: Some(nested_instance_name),
+                    dimensions: component.dimensions.clone(),
                 };
                 graphic.transform = compose_transform(placement, graphic.transform);
                 graphic.editable = false;
@@ -230,6 +231,7 @@ fn stamp_own_graphics(scene: &mut IconScene, class: &Class) {
             qualified_name: class.qualified_name.clone(),
             kind: GraphicOwnerKind::Own,
             instance_name: None,
+            dimensions: Vec::new(),
         };
         graphic.transform = Transform2D::identity();
         graphic.editable = true;
@@ -256,6 +258,7 @@ struct PlacementTransform {
 struct ComponentPlacement {
     type_name: String,
     name: String,
+    dimensions: Vec<String>,
     visible: bool,
     icon_visible: Option<bool>,
     transformation: Option<PlacementTransform>,
@@ -306,6 +309,7 @@ fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacem
         result.push(ComponentPlacement {
             type_name: declaration.declared_type_name,
             name: declaration.instance_name,
+            dimensions: declaration.dimensions,
             visible: placement
                 .named("visible")
                 .and_then(parse_bool_value)
@@ -641,6 +645,7 @@ fn fallback_base_icon(base_name: &str) -> Option<IconScene> {
                 qualified_name: base_name.to_owned(),
                 kind: GraphicOwnerKind::Own,
                 instance_name: None,
+                dimensions: Vec::new(),
             },
             transform: Transform2D::identity(),
             editable: true,
@@ -947,6 +952,35 @@ end Parent;
         assert!(scene.graphics.iter().any(|graphic| {
             graphic.owner.kind == GraphicOwnerKind::Connector
                 && graphic.owner.instance_name.as_deref() == Some("bus.signal")
+        }));
+    }
+
+    #[test]
+    fn propagates_nested_connector_array_dimensions_to_public_graphics() {
+        let source = r#"
+connector Signal
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end Signal;
+
+model Parent
+  Signal ports[3] annotation(Placement(transformation(extent={{-20,-20},{20,20}})));
+end Parent;
+"#;
+        let file = parse(source, "NestedVectorConnectors.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("NestedVectorConnectors.mo", source)
+            .expect("index source");
+        let scene = IconResolver::new(&mut registry).resolve(&file.classes[1], source);
+        let connector_graphics = scene
+            .graphics
+            .iter()
+            .filter(|graphic| graphic.owner.kind == GraphicOwnerKind::Connector)
+            .collect::<Vec<_>>();
+        assert!(!connector_graphics.is_empty());
+        assert!(connector_graphics.iter().all(|graphic| {
+            graphic.owner.instance_name.as_deref() == Some("ports")
+                && graphic.owner.dimensions == vec!["3"]
         }));
     }
 
