@@ -7,14 +7,14 @@
 
 use std::collections::HashMap;
 
+use modelica_core::ClassKind;
 use modelica_core::scene::{
     ComponentInstance, ConnectorRef, DiagramConnection, DiagramScene, Extent, Graphic,
     GraphicOwnerKind, IconScene, Point, ResolvedGraphic, Transform2D,
 };
-use modelica_core::ClassKind;
 
 use crate::connection_edit::ORTHOGONAL_EPSILON;
-use crate::{line_local_to_world, world_to_line_local, Bounds};
+use crate::{Bounds, line_local_to_world, world_to_line_local};
 
 const DEFAULT_COMPONENT_EXTENT: Extent = Extent {
     p1: Point { x: -10.0, y: -10.0 },
@@ -57,10 +57,26 @@ pub struct ConnectorAnchor {
 pub struct ResolvedConnectionEndpoints {
     pub lhs: ConnectorAnchor,
     pub rhs: ConnectorAnchor,
+    /// Geometric order of the parsed Line points. Modelica's `connect(lhs,
+    /// rhs)` argument order does not require `Line.points` to use the same
+    /// direction.
+    pub point_order: ConnectionPointOrder,
     pub lhs_line_position: Point,
     pub rhs_line_position: Point,
     pub lhs_distance: f32,
     pub rhs_distance: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionPointOrder {
+    LhsToRhs,
+    RhsToLhs,
+}
+
+impl ConnectionPointOrder {
+    pub fn is_lhs_first(self) -> bool {
+        matches!(self, Self::LhsToRhs)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,9 +254,18 @@ pub fn resolve_connection_endpoints(
         })?;
     let lhs_line_position = line_local_to_world(line, line.points[0]);
     let rhs_line_position = line_local_to_world(line, line.points[rhs_index]);
+    let forward_error = distance(lhs.world_position, lhs_line_position)
+        + distance(rhs.world_position, rhs_line_position);
+    let reverse_error = distance(rhs.world_position, lhs_line_position)
+        + distance(lhs.world_position, rhs_line_position);
     Ok(ResolvedConnectionEndpoints {
         lhs_distance: distance(lhs.world_position, lhs_line_position),
         rhs_distance: distance(rhs.world_position, rhs_line_position),
+        point_order: if forward_error <= reverse_error {
+            ConnectionPointOrder::LhsToRhs
+        } else {
+            ConnectionPointOrder::RhsToLhs
+        },
         lhs,
         rhs,
         lhs_line_position,
@@ -257,9 +282,17 @@ pub fn strict_connection_points(
     let Some(line) = connection.line.as_ref() else {
         return Err(ConnectorResolutionError::MissingLine);
     };
+    let (first, last) = match endpoints.point_order {
+        ConnectionPointOrder::LhsToRhs => {
+            (endpoints.lhs.world_position, endpoints.rhs.world_position)
+        }
+        ConnectionPointOrder::RhsToLhs => {
+            (endpoints.rhs.world_position, endpoints.lhs.world_position)
+        }
+    };
     Ok((
-        world_to_line_local(line, endpoints.lhs.world_position),
-        world_to_line_local(line, endpoints.rhs.world_position),
+        world_to_line_local(line, first),
+        world_to_line_local(line, last),
     ))
 }
 
@@ -277,27 +310,41 @@ pub fn reanchor_connection_points(
     if points.is_empty() {
         return Err(ConnectorResolutionError::MissingLine);
     }
-    let (lhs, rhs) = strict_connection_points(scene, connection)?;
+    let endpoints = resolve_connection_endpoints(scene, connection)?;
+    let line = connection
+        .line
+        .as_ref()
+        .ok_or(ConnectorResolutionError::MissingLine)?;
+    let (first_world, last_world) = match endpoints.point_order {
+        ConnectionPointOrder::LhsToRhs => {
+            (endpoints.lhs.world_position, endpoints.rhs.world_position)
+        }
+        ConnectionPointOrder::RhsToLhs => {
+            (endpoints.rhs.world_position, endpoints.lhs.world_position)
+        }
+    };
+    let first = world_to_line_local(line, first_world);
+    let last = world_to_line_local(line, last_world);
     if points.len() == 2 {
-        return Ok(reanchor_two_point_connection(points, lhs, rhs));
+        return Ok(reanchor_two_point_connection(points, first, last));
     }
 
     let mut result = points.to_vec();
     let lhs_before = result[0];
-    result[0] = lhs;
+    result[0] = first;
     let rhs_index = result.len() - 1;
     let lhs_neighbor = points
         .get(1)
         .copied()
         .ok_or(ConnectorResolutionError::MissingLine)?;
-    preserve_endpoint_axis(&mut result[1], lhs_before, lhs_neighbor, lhs);
+    preserve_endpoint_axis(&mut result[1], lhs_before, lhs_neighbor, first);
     let rhs_before = result[rhs_index];
-    result[rhs_index] = rhs;
+    result[rhs_index] = last;
     let rhs_neighbor = points
         .get(rhs_index - 1)
         .copied()
         .ok_or(ConnectorResolutionError::MissingLine)?;
-    preserve_endpoint_axis(&mut result[rhs_index - 1], rhs_before, rhs_neighbor, rhs);
+    preserve_endpoint_axis(&mut result[rhs_index - 1], rhs_before, rhs_neighbor, last);
     Ok(result)
 }
 
@@ -766,6 +813,116 @@ mod tests {
             reanchor_connection_points(&scene, &scene.connections[0], &raw_two_point).unwrap();
         assert_eq!(two_point[0], points.0);
         assert_eq!(two_point[1], points.1);
+    }
+
+    #[test]
+    fn reanchor_preserves_reversed_line_point_order_for_complex_routes() {
+        let components = vec![
+            component(
+                "a-id",
+                "a",
+                Some(ClassKind::Connector),
+                point(-40.0, 10.0),
+                Extent {
+                    p1: point(-10.0, -10.0),
+                    p2: point(10.0, 10.0),
+                },
+                layer(
+                    "Example.Port",
+                    GraphicOwner {
+                        qualified_name: "Example.Port".into(),
+                        kind: GraphicOwnerKind::Own,
+                        instance_name: None,
+                    },
+                    Transform2D::identity(),
+                ),
+            ),
+            component(
+                "b-id",
+                "b",
+                Some(ClassKind::Connector),
+                point(50.0, 0.0),
+                Extent {
+                    p1: point(-10.0, -10.0),
+                    p2: point(10.0, 10.0),
+                },
+                layer(
+                    "Example.Port",
+                    GraphicOwner {
+                        qualified_name: "Example.Port".into(),
+                        kind: GraphicOwnerKind::Own,
+                        instance_name: None,
+                    },
+                    Transform2D::identity(),
+                ),
+            ),
+        ];
+        let connection = DiagramConnection {
+            key: modelica_core::scene::ConnectionKey::new(
+                "Example.Top",
+                ConnectorRef {
+                    component_name: "a".into(),
+                    connector_path: String::new(),
+                },
+                ConnectorRef {
+                    component_name: "b".into(),
+                    connector_path: String::new(),
+                },
+                0,
+            ),
+            id: "connection:reversed".into(),
+            lhs: ConnectorRef {
+                component_name: "a".into(),
+                connector_path: String::new(),
+            },
+            rhs: ConnectorRef {
+                component_name: "b".into(),
+                connector_path: String::new(),
+            },
+            from: "a".into(),
+            to: "b".into(),
+            line: Some(LineGraphic {
+                origin: point(0.0, 0.0),
+                rotation: 0.0,
+                points: vec![
+                    point(50.0, 0.0),
+                    point(50.0, 30.0),
+                    point(-20.0, 30.0),
+                    point(-20.0, 0.0),
+                    point(-50.0, 0.0),
+                ],
+                color: [0, 0, 0],
+                pattern: None,
+                thickness: 1.0,
+                arrow: Vec::new(),
+                arrow_size: None,
+                smooth: None,
+            }),
+            source_range: None,
+            line_source_range: None,
+        };
+        let scene = scene(components, Some(connection));
+        let endpoints = resolve_connection_endpoints(&scene, &scene.connections[0]).unwrap();
+        assert_eq!(endpoints.point_order, ConnectionPointOrder::RhsToLhs);
+        let strict = strict_connection_points(&scene, &scene.connections[0]).unwrap();
+        assert_eq!(strict, (point(50.0, 0.0), point(-40.0, 10.0)));
+
+        let reanchored = reanchor_connection_points(
+            &scene,
+            &scene.connections[0],
+            &scene.connections[0].line.as_ref().unwrap().points,
+        )
+        .unwrap();
+        assert_eq!(
+            reanchored,
+            vec![
+                point(50.0, 0.0),
+                point(50.0, 30.0),
+                point(-20.0, 30.0),
+                point(-20.0, 10.0),
+                point(-40.0, 10.0),
+            ]
+        );
     }
 
     #[test]
