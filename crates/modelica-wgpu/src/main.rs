@@ -393,1819 +393,7 @@ mod save_tests {
         let mut source_overrides = HashMap::new();
         let mut saved_class_text = HashMap::new();
         for (qualified_name, marker, updated) in ranges {
-            let start = content.find(marker).unwrap();
-            let end = start + marker.len();
-            class_sources.push(ClassSource {
-                qualified_name: (*qualified_name).to_owned(),
-                source_file: path.clone(),
-                source_range: SourceRange::new(start, end),
-            });
-            source_overrides.insert((*qualified_name).to_owned(), (*updated).to_owned());
-            saved_class_text.insert((*qualified_name).to_owned(), (*marker).to_owned());
-        }
-        let document = LoadedDocument {
-            path: path.clone(),
-            package_name: "SaveTest".to_owned(),
-            class_names: Vec::new(),
-            diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
-            class_sources,
-            source_overrides,
-            saved_class_text,
-            source_versions: HashMap::new(),
-        };
-        (document, path)
-    }
-
-    fn temp_directory(label: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "modelica-wgpu-save-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        directory
-    }
-
-    #[test]
-    fn save_replaces_only_the_edited_class_range() {
-        let directory = temp_directory("single");
-        let content = "within X; class A model M end A; class B model N end B;";
-        let mut document = temp_document(
-            &directory,
-            "Single.mo",
-            content,
-            &[("X.A", "class A model M end A", "class A model M2 end A")],
-        )
-        .0;
-        let saved = save_edited_classes(&mut document).expect("save succeeds");
-        assert_eq!(saved, 1);
-        let result = fs::read_to_string(&document.path).unwrap();
-        assert!(result.contains("class A model M2 end A"));
-        assert!(result.contains("class B model N end B"));
-        assert!(!result.contains("class A model M end A"));
-        let _ = fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn save_applies_back_to_front_when_two_classes_share_a_file() {
-        let directory = temp_directory("shared");
-        let content = "class A model M end A; class B model N end B;";
-        let (mut document, path) = temp_document(
-            &directory,
-            "Shared.mo",
-            content,
-            &[
-                ("B", "class B model N end B", "class B model N2 end B"),
-                ("A", "class A model M end A", "class A model M2 end A"),
-            ],
-        );
-        let saved = save_edited_classes(&mut document).expect("save succeeds");
-        assert_eq!(saved, 1);
-        let result = fs::read_to_string(&path).unwrap();
-        assert!(result.contains("class A model M2 end A"));
-        assert!(result.contains("class B model N2 end B"));
-        // No leftover temp files next to the source.
-        let leftovers = fs::read_dir(&directory)
-            .unwrap()
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".tmp-")
-            })
-            .count();
-        assert_eq!(leftovers, 0);
-        let _ = fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn save_refuses_to_overwrite_a_file_changed_on_disk() {
-        let directory = temp_directory("tamper");
-        let content = "class A model M end A; class B model N end B;";
-        let (mut document, path) = temp_document(
-            &directory,
-            "Tamper.mo",
-            content,
-            &[
-                ("B", "class B model N end B", "class B model N2 end B"),
-                ("A", "class A model M end A", "class A model M2 end A"),
-            ],
-        );
-        // Simulate an external editor shifting every offset.
-        fs::write(&path, format!("// externally edited\n{content}")).unwrap();
-        let error = save_edited_classes(&mut document)
-            .expect_err("save must refuse a file changed on disk");
-        assert!(
-            error.contains("changed on disk"),
-            "unexpected error: {error}"
-        );
-        // The externally edited bytes must be preserved untouched.
-        let disk = fs::read_to_string(&path).unwrap();
-        assert!(disk.starts_with("// externally edited"));
-        assert!(disk.contains("class A model M end A"));
-        assert!(disk.contains("class B model N end B"));
-        let _ = fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn save_with_no_edits_is_a_noop() {
-        let directory = temp_directory("empty");
-        let content = "class A end A;";
-        let path = directory.join("Noop.mo");
-        fs::write(&path, content).unwrap();
-        let mut document = LoadedDocument {
-            path: path.clone(),
-            package_name: "Noop".to_owned(),
-            class_names: Vec::new(),
-            diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
-            class_sources: Vec::new(),
-            source_overrides: HashMap::new(),
-            saved_class_text: HashMap::new(),
-            source_versions: HashMap::new(),
-        };
-        assert_eq!(
-            save_edited_classes(&mut document).expect("save succeeds"),
-            0
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), content);
-        let _ = fs::remove_dir_all(&directory);
-    }
-}
-
-#[cfg(test)]
-mod appearance_tests {
-    use super::*;
-
-    #[test]
-    fn parse_defaults_for_empty_and_garbage_input() {
-        assert_eq!(
-            parse_appearance_json(""),
-            (ThemeMode::System, AccentTheme::Violet)
-        );
-        assert_eq!(
-            parse_appearance_json("not json at all"),
-            (ThemeMode::System, AccentTheme::Violet)
-        );
-    }
-
-    #[test]
-    fn parse_restores_saved_theme_and_accent() {
-        assert_eq!(
-            parse_appearance_json(r#"{"theme": "dark", "accent": "cyan"}"#),
-            (ThemeMode::Dark, AccentTheme::Cyan)
-        );
-        assert_eq!(
-            parse_appearance_json(r#"{"theme":"light","accent":"orange"}"#),
-            (ThemeMode::Light, AccentTheme::Orange)
-        );
-    }
-
-    #[test]
-    fn unknown_fields_fall_back_to_defaults() {
-        assert_eq!(
-            parse_appearance_json(r#"{"theme": "purple", "accent": "magenta"}"#),
-            (ThemeMode::System, AccentTheme::Violet)
-        );
-    }
-
-    #[test]
-    fn accent_key_mapping_round_trips() {
-        for accent in [
-            AccentTheme::Violet,
-            AccentTheme::Blue,
-            AccentTheme::Cyan,
-            AccentTheme::Orange,
-        ] {
-            assert_eq!(AccentTheme::from_key(accent.key()), Some(accent));
-        }
-        assert_eq!(AccentTheme::from_key("nope"), None);
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct StyleUniform {
-    color: [f32; 4],
-    edge_color: [f32; 4],
-    gradient: [f32; 4],
-    mode: u32,
-    // WGSL rounds the vec3 tail and the enclosing uniform struct to 16-byte
-    // alignment. Keep the host-side buffer at the shader's 80-byte size.
-    // Rust arrays are tightly packed while WGSL aligns the trailing vec3 to
-    // a 16-byte boundary. The extra words keep the uploaded buffer at the
-    // shader's 80-byte size.
-    _padding: [u32; 7],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MainView {
-    Source,
-    Icon,
-    Diagram,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum DiagramSelection {
-    #[default]
-    None,
-    Port(PortKey),
-    Component(String),
-    Connection(String),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResizeHandle {
-    Corner(usize),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ComponentSelectionOverlay {
-    origin: CorePoint,
-    extent: modelica_core::scene::Extent,
-    rotation: f32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConnectionSegmentOrientation {
-    Horizontal,
-    Vertical,
-}
-
-#[derive(Clone, Debug)]
-enum ConnectionHitTarget {
-    Segment {
-        index: usize,
-        orientation: ConnectionSegmentOrientation,
-    },
-    Line,
-}
-
-#[derive(Clone, Debug)]
-struct ConnectionHit {
-    connection_id: String,
-    target: ConnectionHitTarget,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ConnectionEndpointConstraint {
-    Semantic { lhs: CorePoint, rhs: CorePoint },
-    FixedExisting { lhs: CorePoint, rhs: CorePoint },
-}
-
-impl ConnectionEndpointConstraint {
-    fn points(self) -> (CorePoint, CorePoint) {
-        match self {
-            Self::Semantic { lhs, rhs } | Self::FixedExisting { lhs, rhs } => (lhs, rhs),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Semantic { .. } => "Semantic",
-            Self::FixedExisting { .. } => "FixedExisting",
-        }
-    }
-}
-
-fn connection_edit_diagnostic(
-    connection: &modelica_core::scene::DiagramConnection,
-    selected_class: &str,
-    endpoint_constraint: Option<ConnectionEndpointConstraint>,
-    stage: &str,
-    detail: impl std::fmt::Display,
-) -> String {
-    let line_endpoints = connection.line.as_ref().and_then(|line| {
-        line.points
-            .first()
-            .copied()
-            .zip(line.points.last().copied())
-    });
-    let (lhs, rhs) = endpoint_constraint
-        .map(ConnectionEndpointConstraint::points)
-        .or(line_endpoints)
-        .map_or((None, None), |(lhs, rhs)| (Some(lhs), Some(rhs)));
-    let constraint = endpoint_constraint.map_or("Unavailable", |value| value.label());
-    format!(
-        "Connection edit {stage} failed: {detail}; id={}; key={:?}; owner={}; selected={}; lhs={:?}; rhs={:?}; line_source_range={:?}; constraint={constraint}",
-        connection.id,
-        connection.key,
-        connection.key.owner_class,
-        selected_class,
-        lhs,
-        rhs,
-        connection.line_source_range,
-    )
-}
-
-fn trace_connection_edit(
-    stage: &str,
-    connection_key: &ConnectionKey,
-    endpoint_constraint: ConnectionEndpointConstraint,
-    detail: impl std::fmt::Display,
-) {
-    if std::env::var_os("MODELICA_WGPU_TRACE_CONNECTION_EDIT").is_some() {
-        eprintln!(
-            "[CONNECTION EDIT] stage={stage} key={connection_key:?} constraint={} {detail}",
-            endpoint_constraint.label(),
-        );
-    }
-}
-
-fn trace_component_edit(
-    stage: &str,
-    component_id: &str,
-    component_name: &str,
-    detail: impl std::fmt::Display,
-) {
-    if std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_EDIT").is_some()
-        || std::env::var_os("MODELICA_WGPU_TRACE_CONNECTION_EDIT").is_some()
-    {
-        eprintln!(
-            "[COMPONENT EDIT] stage={stage} id={component_id} name={component_name} {detail}"
-        );
-    }
-}
-
-fn trace_component_drag_issue(
-    component_id: &str,
-    connection_key: &ConnectionKey,
-    reason: &str,
-    snapshot: &ConnectionDragSnapshot,
-    preview_points: &[CorePoint],
-) {
-    if std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_DRAG").is_some() {
-        eprintln!(
-            "[COMPONENT DRAG] component_id={component_id} connection_key={connection_key:?} reason={reason} source_points={:?} base_route={:?} preview_points={preview_points:?} first_anchor={:?} last_anchor={:?} moved_first={} moved_last={}",
-            snapshot.source_line_points,
-            snapshot.base_route_points,
-            snapshot.original_endpoint_points.0,
-            snapshot.original_endpoint_points.1,
-            snapshot.moved_first_endpoint,
-            snapshot.moved_last_endpoint,
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HitBounds {
-    min: CorePoint,
-    max: CorePoint,
-}
-
-impl HitBounds {
-    fn from_points(points: impl IntoIterator<Item = CorePoint>) -> Option<Self> {
-        let mut bounds = Self {
-            min: CorePoint {
-                x: f32::INFINITY,
-                y: f32::INFINITY,
-            },
-            max: CorePoint {
-                x: f32::NEG_INFINITY,
-                y: f32::NEG_INFINITY,
-            },
-        };
-        let mut any = false;
-        for point in points {
-            any = true;
-            bounds.min.x = bounds.min.x.min(point.x);
-            bounds.min.y = bounds.min.y.min(point.y);
-            bounds.max.x = bounds.max.x.max(point.x);
-            bounds.max.y = bounds.max.y.max(point.y);
-        }
-        any.then_some(bounds)
-    }
-
-    fn contains(self, point: CorePoint, tolerance: f32) -> bool {
-        let tolerance = tolerance.max(0.0);
-        point.x >= self.min.x - tolerance
-            && point.x <= self.max.x + tolerance
-            && point.y >= self.min.y - tolerance
-            && point.y <= self.max.y + tolerance
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct GridCell {
-    x: i32,
-    y: i32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ConnectionSegmentRef {
-    connection_index: usize,
-    segment_index: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct HitBucket {
-    component_indices: Vec<usize>,
-    port_indices: Vec<usize>,
-    connection_segments: Vec<ConnectionSegmentRef>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SpatialCandidates {
-    component_indices: Vec<usize>,
-    port_indices: Vec<usize>,
-    connection_segments: Vec<ConnectionSegmentRef>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct DiagramSpatialIndex {
-    cells: HashMap<GridCell, HitBucket>,
-    connection_cells: HashMap<usize, Vec<GridCell>>,
-    port_query_marks: Vec<u32>,
-    port_query_generation: u32,
-}
-
-impl DiagramSpatialIndex {
-    fn cell_for(point: CorePoint) -> GridCell {
-        GridCell {
-            x: (point.x / DIAGRAM_HIT_GRID_CELL_SIZE).floor() as i32,
-            y: (point.y / DIAGRAM_HIT_GRID_CELL_SIZE).floor() as i32,
-        }
-    }
-
-    fn cell_range(bounds: HitBounds) -> impl Iterator<Item = GridCell> {
-        let min = Self::cell_for(bounds.min);
-        let max = Self::cell_for(bounds.max);
-        (min.x..=max.x).flat_map(move |x| (min.y..=max.y).map(move |y| GridCell { x, y }))
-    }
-
-    fn insert_component(&mut self, index: usize, bounds: HitBounds) {
-        for cell in Self::cell_range(bounds) {
-            self.cells
-                .entry(cell)
-                .or_default()
-                .component_indices
-                .push(index);
-        }
-    }
-
-    fn insert_port(&mut self, index: usize, bounds: HitBounds) {
-        if self.port_query_marks.len() <= index {
-            self.port_query_marks.resize(index + 1, 0);
-        }
-        for cell in Self::cell_range(bounds) {
-            self.cells.entry(cell).or_default().port_indices.push(index);
-        }
-    }
-
-    fn insert_connection_segment(&mut self, segment: ConnectionSegmentRef, bounds: HitBounds) {
-        for cell in Self::cell_range(bounds) {
-            self.cells
-                .entry(cell)
-                .or_default()
-                .connection_segments
-                .push(segment);
-            self.connection_cells
-                .entry(segment.connection_index)
-                .or_default()
-                .push(cell);
-        }
-    }
-
-    fn remove_connection(&mut self, connection_index: usize) {
-        let Some(mut cells) = self.connection_cells.remove(&connection_index) else {
-            return;
-        };
-        cells.sort_unstable();
-        cells.dedup();
-        for cell in cells {
-            let mut remove_cell = false;
-            if let Some(bucket) = self.cells.get_mut(&cell) {
-                bucket
-                    .connection_segments
-                    .retain(|segment| segment.connection_index != connection_index);
-                remove_cell = bucket.component_indices.is_empty()
-                    && bucket.port_indices.is_empty()
-                    && bucket.connection_segments.is_empty();
-            }
-            if remove_cell {
-                self.cells.remove(&cell);
-            }
-        }
-    }
-
-    fn update_connection(
-        &mut self,
-        connection_index: usize,
-        segments: impl IntoIterator<Item = (usize, HitBounds)>,
-    ) {
-        self.remove_connection(connection_index);
-        for (segment_index, bounds) in segments {
-            self.insert_connection_segment(
-                ConnectionSegmentRef {
-                    connection_index,
-                    segment_index,
-                },
-                bounds,
-            );
-        }
-    }
-
-    fn query(&self, point: CorePoint, tolerance: f32) -> SpatialCandidates {
-        let tolerance = tolerance.max(0.0);
-        let bounds = HitBounds {
-            min: CorePoint {
-                x: point.x - tolerance,
-                y: point.y - tolerance,
-            },
-            max: CorePoint {
-                x: point.x + tolerance,
-                y: point.y + tolerance,
-            },
-        };
-        let mut candidates = SpatialCandidates::default();
-        for cell in Self::cell_range(bounds) {
-            let Some(bucket) = self.cells.get(&cell) else {
-                continue;
-            };
-            candidates
-                .component_indices
-                .extend(bucket.component_indices.iter().copied());
-            candidates
-                .port_indices
-                .extend(bucket.port_indices.iter().copied());
-            candidates
-                .connection_segments
-                .extend(bucket.connection_segments.iter().copied());
-        }
-        candidates.component_indices.sort_unstable();
-        candidates.component_indices.dedup();
-        candidates.port_indices.sort_unstable();
-        candidates.port_indices.dedup();
-        candidates
-            .connection_segments
-            .sort_unstable_by(|left, right| {
-                left.connection_index
-                    .cmp(&right.connection_index)
-                    .reverse()
-                    .then(left.segment_index.cmp(&right.segment_index))
-            });
-        candidates.connection_segments.dedup();
-        candidates
-    }
-
-    fn nearest_port(
-        &mut self,
-        point: CorePoint,
-        tolerance: f32,
-        exclude: Option<&PortKey>,
-        anchors: &[ConnectorAnchor],
-    ) -> Option<usize> {
-        let tolerance = tolerance.max(0.0);
-        self.port_query_generation = self.port_query_generation.wrapping_add(1);
-        if self.port_query_generation == 0 {
-            self.port_query_marks.fill(0);
-            self.port_query_generation = 1;
-        }
-        let generation = self.port_query_generation;
-        let bounds = HitBounds {
-            min: CorePoint {
-                x: point.x - tolerance,
-                y: point.y - tolerance,
-            },
-            max: CorePoint {
-                x: point.x + tolerance,
-                y: point.y + tolerance,
-            },
-        };
-        let mut nearest = None;
-        for cell in Self::cell_range(bounds) {
-            let Some(bucket) = self.cells.get(&cell) else {
-                continue;
-            };
-            for &port_index in &bucket.port_indices {
-                if self.port_query_marks.get(port_index).copied() == Some(generation) {
-                    continue;
-                }
-                if let Some(mark) = self.port_query_marks.get_mut(port_index) {
-                    *mark = generation;
-                }
-                let Some(anchor) = anchors.get(port_index) else {
-                    continue;
-                };
-                if !anchor.editable || exclude.is_some_and(|key| anchor.key == *key) {
-                    continue;
-                }
-                let Some(distance) = connector_anchor_active_hit_distance(anchor, point, tolerance)
-                else {
-                    continue;
-                };
-                if nearest.is_none_or(|(best_distance, best_index)| {
-                    let Some(best_anchor) = anchors.get(best_index) else {
-                        return true;
-                    };
-                    compare_connector_anchor_hits(distance, anchor, best_distance, best_anchor)
-                        == std::cmp::Ordering::Less
-                }) {
-                    nearest = Some((distance, port_index));
-                }
-            }
-        }
-        nearest.map(|(_, index)| index)
-    }
-}
-
-fn connection_creation_target(
-    spatial_index: &mut DiagramSpatialIndex,
-    anchors: &[ConnectorAnchor],
-    zoom: f32,
-    source_port: &PortKey,
-    hovered_target: Option<usize>,
-    pointer_model: CorePoint,
-) -> Option<(usize, CorePoint)> {
-    let enter_tolerance = CONNECTION_SNAP_ENTER_PIXELS / zoom.max(MIN_ZOOM);
-    let exit_tolerance = CONNECTION_SNAP_EXIT_PIXELS / zoom.max(MIN_ZOOM);
-    if let Some(index) = hovered_target {
-        if let Some(anchor) = anchors.get(index) {
-            if anchor.editable
-                && anchor.key != *source_port
-                && connector_anchor_active_hit_distance(anchor, pointer_model, exit_tolerance)
-                    .is_some()
-            {
-                return Some((index, anchor.world_position));
-            }
-        }
-    }
-    let index =
-        spatial_index.nearest_port(pointer_model, enter_tolerance, Some(source_port), anchors)?;
-    let anchor = anchors.get(index)?;
-    Some((index, anchor.world_position))
-}
-
-#[derive(Clone, Debug)]
-struct ComponentHitItem {
-    scene_index: usize,
-    bounds: HitBounds,
-}
-
-#[derive(Clone, Debug, Default)]
-struct DiagramHitCache {
-    components: Vec<ComponentHitItem>,
-    ports: Vec<ConnectorAnchor>,
-    spatial_index: DiagramSpatialIndex,
-}
-
-impl DiagramHitCache {
-    fn update_connection(&mut self, connection_index: usize, line: &LineGraphic) {
-        let points = connection_world_points(line, &line.points);
-        let segments = points
-            .windows(2)
-            .enumerate()
-            .filter_map(|(segment_index, pair)| {
-                let [start, end] = pair else {
-                    return None;
-                };
-                HitBounds::from_points([*start, *end]).map(|bounds| (segment_index, bounds))
-            });
-        self.spatial_index
-            .update_connection(connection_index, segments);
-    }
-}
-
-#[derive(Clone, Debug)]
-enum PointerInteraction {
-    None,
-    Pan {
-        button: MouseButton,
-        start_pointer: PhysicalPosition<f64>,
-        start_pan: [f32; 2],
-    },
-    MoveIconGraphic {
-        button: MouseButton,
-        graphic_id: String,
-        start_pointer_model: CorePoint,
-        original_geometry: CoreGraphic,
-        preview_delta: CorePoint,
-        source_before: String,
-    },
-    MoveDiagramComponent {
-        button: MouseButton,
-        component_id: String,
-        component_name: String,
-        start_pointer_model: CorePoint,
-        original_origin: CorePoint,
-        preview_origin: CorePoint,
-        preview_delta: CorePoint,
-        connected_connections: Vec<ConnectionDragSnapshot>,
-        source_before: String,
-    },
-    MoveDiagramConnectionSegment {
-        button: MouseButton,
-        connection_id: String,
-        connection_key: ConnectionKey,
-        segment_index: usize,
-        orientation: ConnectionSegmentOrientation,
-        line_origin: CorePoint,
-        line_rotation: f32,
-        start_pointer_model: CorePoint,
-        original_points: Vec<CorePoint>,
-        preview_points: Vec<CorePoint>,
-        endpoint_constraint: ConnectionEndpointConstraint,
-        snap_axes: Vec<f32>,
-        snapped_axis: Option<f32>,
-        source_before: String,
-    },
-    MoveDiagramConnectionCorner {
-        button: MouseButton,
-        connection_id: String,
-        connection_key: ConnectionKey,
-        corner_index: usize,
-        line_origin: CorePoint,
-        line_rotation: f32,
-        start_pointer_model: CorePoint,
-        original_points: Vec<CorePoint>,
-        preview_points: Vec<CorePoint>,
-        endpoint_constraint: ConnectionEndpointConstraint,
-        source_before: String,
-    },
-    CreateDiagramConnection(ConnectionCreation),
-    ResizeDiagramComponent {
-        button: MouseButton,
-        component_id: String,
-        component_name: String,
-        handle: ResizeHandle,
-        original_component: CoreComponentInstance,
-        original_extent: modelica_core::scene::Extent,
-        preview_extent: modelica_core::scene::Extent,
-        connected_connections: Vec<ConnectionDragSnapshot>,
-        source_before: String,
-    },
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConnectionEndpoint {
-    Lhs,
-    Rhs,
-    Both,
-}
-
-#[derive(Clone, Debug)]
-struct ConnectionDragSnapshot {
-    connection_id: String,
-    connection_key: ConnectionKey,
-    source_line_points: Vec<CorePoint>,
-    base_route_points: Vec<CorePoint>,
-    original_line_origin: CorePoint,
-    original_line_rotation: f32,
-    original_endpoint_points: (CorePoint, CorePoint),
-    preview_points: Vec<CorePoint>,
-    preview_route_valid: bool,
-    moved_first_endpoint: bool,
-    moved_last_endpoint: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ConnectionCreation {
-    source_port: PortKey,
-    source_connector: ConnectorRef,
-    committed_points: Vec<CorePoint>,
-    cursor_point: CorePoint,
-    hovered_target: Option<usize>,
-    last_cursor_position: PhysicalPosition<f64>,
-    tail_orientation: Option<TailOrientation>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TailOrientation {
-    HorizontalFirst,
-    VerticalFirst,
-}
-
-#[derive(Clone, Debug)]
-struct ConnectionLineEdit {
-    connection_key: ConnectionKey,
-    before_points: Vec<CorePoint>,
-    after_points: Vec<CorePoint>,
-    line_origin: CorePoint,
-}
-
-#[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
-enum EditCommand {
-    MoveIconGraphic {
-        class_name: String,
-        graphic_id: String,
-        before_geometry: CoreGraphic,
-        after_geometry: CoreGraphic,
-        before_source: String,
-        after_source: String,
-    },
-    MoveDiagramComponent {
-        class_name: String,
-        component_id: String,
-        before_origin: CorePoint,
-        after_origin: CorePoint,
-        before_source: String,
-        after_source: String,
-        connection_edits: Vec<ConnectionLineEdit>,
-    },
-    MoveDiagramConnection {
-        class_name: String,
-        connection_key: ConnectionKey,
-        before_points: Vec<CorePoint>,
-        after_points: Vec<CorePoint>,
-        endpoint_constraint: ConnectionEndpointConstraint,
-    },
-    CreateDiagramConnection {
-        class_name: String,
-        connection_key: ConnectionKey,
-        before_source: String,
-        after_source: String,
-    },
-    ResizeDiagramComponent {
-        class_name: String,
-        component_id: String,
-        before_extent: modelica_core::scene::Extent,
-        after_extent: modelica_core::scene::Extent,
-        before_source: String,
-        after_source: String,
-        connection_edits: Vec<ConnectionLineEdit>,
-    },
-}
-
-impl MainView {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Source => "Source",
-            Self::Icon => "Icon",
-            Self::Diagram => "Diagram",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct LoadedDocument {
-    path: PathBuf,
-    package_name: String,
-    class_names: Vec<String>,
-    diagnostics: usize,
-    icons: Vec<(String, CoreIconScene)>,
-    diagrams: Vec<(String, CoreDiagramScene)>,
-    class_sources: Vec<ClassSource>,
-    source_overrides: HashMap<String, String>,
-    // Text the parser saw when the document was loaded (or what we last wrote
-    // to disk). Saving verifies the on-disk slice still matches before it
-    // applies an edit, so an externally modified file is never overwritten.
-    saved_class_text: HashMap<String, String>,
-    source_versions: HashMap<String, u64>,
-}
-
-#[derive(Clone, Debug)]
-struct ClassSource {
-    qualified_name: String,
-    source_file: PathBuf,
-    source_range: SourceRange,
-}
-
-#[derive(Clone, Debug)]
-struct TreeNode {
-    name: String,
-    qualified_name: String,
-    class_name: Option<String>,
-    children: Vec<TreeNode>,
-}
-
-#[derive(Clone, Debug)]
-struct UiDocument {
-    package_name: String,
-    class_names: Vec<String>,
-    tree: TreeNode,
-    selected_class: Option<String>,
-    icon_graphics: usize,
-    diagram_background: usize,
-    diagram_components: usize,
-    diagram_own_components: usize,
-    diagram_inherited_components: usize,
-    diagram_connectors: usize,
-    diagram_unresolved_components: usize,
-    diagram_unresolved_bases: usize,
-    diagram_connections: usize,
-    source_name: String,
-    source_lines: Vec<String>,
-}
-
-impl LoadedDocument {
-    fn load(path: &FsPath) -> Result<Self, String> {
-        fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let package = PackageLoader
-            .load(path)
-            .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
-        let mut class_names = Vec::new();
-        collect_class_names(&package, &mut class_names);
-        class_names.sort();
-        let mut class_sources = Vec::new();
-        collect_class_sources(&package, &mut class_sources);
-        let mut registry = LibraryRegistry::default();
-        add_bundled_msl(&mut registry);
-        registry.index_package(&package);
-        registry.register_package(&package);
-        let icons = class_names
-            .iter()
-            .filter_map(|qualified_name| {
-                let (class, source) = registry.resolve_class(qualified_name)?;
-                Some((
-                    qualified_name.clone(),
-                    IconResolver::new(&mut registry).resolve(&class, &source),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let diagrams = class_names
-            .iter()
-            .filter_map(|qualified_name| {
-                let (class, source) = registry.resolve_class(qualified_name)?;
-                Some((
-                    qualified_name.clone(),
-                    resolve_diagram(&class, &source, &mut registry),
-                ))
-            })
-            .collect::<Vec<_>>();
-        // Snapshot the original text of every class once, so later disk saves
-        // can verify the on-disk slice still matches before applying edits.
-        let mut saved_class_text = HashMap::new();
-        let mut file_cache = HashMap::<PathBuf, String>::new();
-        for class in &class_sources {
-            if saved_class_text.contains_key(&class.qualified_name) {
-                continue;
-            }
-            let source = match file_cache.get(&class.source_file) {
-                Some(source) => source.clone(),
-                None => match fs::read_to_string(&class.source_file) {
-                    Ok(source) => {
-                        file_cache.insert(class.source_file.clone(), source.clone());
-                        source
-                    }
-                    Err(_) => continue,
-                },
-            };
-            if let Some(slice) = source.get(class.source_range.start..class.source_range.end) {
-                saved_class_text.insert(class.qualified_name.clone(), slice.to_owned());
-            }
-        }
-        Ok(Self {
-            path: path.to_owned(),
-            package_name: package.qualified_name,
-            class_names,
-            diagnostics: package.diagnostics.len(),
-            icons,
-            diagrams,
-            class_sources,
-            source_overrides: HashMap::new(),
-            saved_class_text,
-            source_versions: HashMap::new(),
-        })
-    }
-
-    fn icon(&self, class_name: &str) -> Option<&CoreIconScene> {
-        self.icons
-            .iter()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
-    }
-
-    fn diagram(&self, class_name: &str) -> Option<&CoreDiagramScene> {
-        self.diagrams
-            .iter()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
-    }
-
-    fn icon_mut(&mut self, class_name: &str) -> Option<&mut CoreIconScene> {
-        self.icons
-            .iter_mut()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
-    }
-
-    fn diagram_mut(&mut self, class_name: &str) -> Option<&mut CoreDiagramScene> {
-        self.diagrams
-            .iter_mut()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
-    }
-
-    fn class_source(&self, qualified_name: &str) -> Option<(String, String)> {
-        let class = self
-            .class_sources
-            .iter()
-            .find(|class| class.qualified_name == qualified_name)?;
-        let text = if let Some(override_text) = self.source_overrides.get(qualified_name) {
-            override_text.clone()
-        } else {
-            let source = fs::read_to_string(&class.source_file).ok()?;
-            source
-                .get(class.source_range.start..class.source_range.end)?
-                .to_owned()
-        };
-        let source_name = class
-            .source_file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Modelica source")
-            .to_owned();
-        Some((source_name, text))
-    }
-
-    fn class_text(&self, qualified_name: &str) -> Option<String> {
-        self.class_source(qualified_name).map(|(_, source)| source)
-    }
-
-    fn source_version(&self, qualified_name: &str) -> u64 {
-        self.source_versions
-            .get(qualified_name)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn set_class_text(&mut self, qualified_name: &str, text: String) {
-        self.source_overrides
-            .insert(qualified_name.to_owned(), text);
-        let version = self
-            .source_versions
-            .entry(qualified_name.to_owned())
-            .or_default();
-        *version = version.saturating_add(1);
-    }
-
-    fn resolve_candidate_scenes(
-        &self,
-        qualified_name: &str,
-        source: &str,
-    ) -> Result<(CoreIconScene, CoreDiagramScene), String> {
-        let package = PackageLoader
-            .load(&self.path)
-            .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
-        let mut registry = LibraryRegistry::default();
-        add_bundled_msl(&mut registry);
-        registry.index_package(&package);
-        registry.register_package(&package);
-        let (mut class, _) = registry
-            .resolve_class(qualified_name)
-            .ok_or_else(|| format!("class `{qualified_name}` was not found"))?;
-        let parsed = parse(source, &class.source_file)
-            .map_err(|error| format!("candidate source does not parse: {error}"))?;
-        let parsed_class = parsed
-            .classes
-            .first()
-            .ok_or_else(|| "candidate source contains no class".to_owned())?;
-        class.source_range = SourceRange::new(0, source.len());
-        class.children = parsed_class.children.clone();
-        let icon = IconResolver::new(&mut registry).resolve(&class, source);
-        let diagram = resolve_diagram(&class, source, &mut registry);
-        Ok((icon, diagram))
-    }
-
-    fn ui_summary(&self, selected_class: Option<&str>) -> UiDocument {
-        let selected_class = selected_class.map(str::to_owned);
-        let (source_name, source) = selected_class
-            .as_deref()
-            .and_then(|class_name| self.class_source(class_name))
-            .unwrap_or_default();
-        let icon_graphics = selected_class
-            .as_deref()
-            .and_then(|class_name| self.icon(class_name))
-            .map_or(0, |scene| scene.graphics.len());
-        let (
-            diagram_background,
-            diagram_components,
-            diagram_own_components,
-            diagram_inherited_components,
-            diagram_connectors,
-            diagram_unresolved_components,
-            diagram_unresolved_bases,
-            diagram_connections,
-        ) = selected_class
-            .as_ref()
-            .and_then(|class_name| self.diagram(class_name))
-            .map_or((0, 0, 0, 0, 0, 0, 0, 0), |scene| {
-                let stats = scene.debug_stats();
-                (
-                    scene.background_graphics.len(),
-                    scene.components.len(),
-                    stats.own_components,
-                    stats.inherited_components,
-                    stats.connector_components,
-                    stats.unresolved_components,
-                    stats.unresolved_bases,
-                    scene.connections.len(),
-                )
-            });
-        UiDocument {
-            package_name: self.package_name.clone(),
-            class_names: self.class_names.clone(),
-            tree: build_tree(&self.package_name, &self.class_names),
-            selected_class,
-            icon_graphics,
-            diagram_background,
-            diagram_components,
-            diagram_own_components,
-            diagram_inherited_components,
-            diagram_connectors,
-            diagram_unresolved_components,
-            diagram_unresolved_bases,
-            diagram_connections,
-            source_name,
-            source_lines: source.lines().map(str::to_owned).collect(),
-        }
-    }
-
-    fn title(&self, fps: Option<(f32, f32)>) -> String {
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Modelica document");
-        let performance = fps
-            .map(|(fps, worst_ms)| format!(" | {:.1} FPS | worst {:.1} ms", fps, worst_ms))
-            .unwrap_or_default();
-        format!(
-            "modelica-wgpu | {} | {} | {} classes | drag edit · Ctrl+drag pan",
-            self.package_name,
-            file_name,
-            self.class_names.len(),
-        ) + &performance
-    }
-}
-
-fn collect_class_names(package: &PackageNode, output: &mut Vec<String>) {
-    output.extend(
-        package
-            .classes
-            .iter()
-            .map(|class| class.qualified_name.clone()),
-    );
-    for child in &package.children {
-        collect_class_names(child, output);
-    }
-}
-
-fn collect_class_sources(package: &PackageNode, output: &mut Vec<ClassSource>) {
-    for class in &package.classes {
-        collect_class_source(class, output);
-    }
-    for child in &package.children {
-        collect_class_sources(child, output);
-    }
-}
-
-fn collect_class_source(class: &Class, output: &mut Vec<ClassSource>) {
-    output.push(ClassSource {
-        qualified_name: class.qualified_name.clone(),
-        source_file: class.source_file.clone(),
-        source_range: class.source_range,
-    });
-    for child in &class.children {
-        collect_class_source(child, output);
-    }
-}
-
-fn build_tree(package_name: &str, class_names: &[String]) -> TreeNode {
-    let mut root = TreeNode {
-        name: package_name
-            .rsplit('.')
-            .next()
-            .unwrap_or(package_name)
-            .to_owned(),
-        qualified_name: package_name.to_owned(),
-        class_name: None,
-        children: Vec::new(),
-    };
-    for class_name in class_names {
-        let segments = class_name.split('.').collect::<Vec<_>>();
-        let root_segments = package_name.split('.').count();
-        if segments.len() <= root_segments || !class_name.starts_with(package_name) {
-            continue;
-        }
-        let mut node = &mut root;
-        for segment in &segments[root_segments..] {
-            let qualified_name = format!("{}.{}", node.qualified_name, segment);
-            let index = node
-                .children
-                .iter()
-                .position(|child| child.qualified_name == qualified_name);
-            let index = index.unwrap_or_else(|| {
-                node.children.push(TreeNode {
-                    name: (*segment).to_owned(),
-                    qualified_name: qualified_name.clone(),
-                    class_name: None,
-                    children: Vec::new(),
-                });
-                node.children.len() - 1
-            });
-            node = &mut node.children[index];
-        }
-        node.class_name = Some(class_name.clone());
-    }
-    root
-}
-
-fn add_bundled_msl(registry: &mut LibraryRegistry) {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../resources/modelica/msl-4.1.0/Modelica");
-    if root.is_dir() {
-        registry.add(Library {
-            root,
-            name: Some("Modelica Standard Library".into()),
-            version: Some("4.1.0".into()),
-            kind: LibraryKind::Builtin,
-            read_only: true,
-        });
-    }
-}
-
-fn install_ui_fonts(ctx: &egui::Context) {
-    let medium_candidates = [
-        r"C:\Windows\Fonts\Inter-Medium.ttf",
-        r"C:\Windows\Fonts\NotoSans-Medium.ttf",
-        "/usr/share/fonts/inter/Inter-Medium.ttf",
-        "/usr/share/fonts/truetype/inter/Inter-Medium.ttf",
-        "/usr/share/fonts/opentype/inter/Inter-Medium.otf",
-        "/usr/share/fonts/noto/NotoSans-Medium.ttf",
-    ];
-    let semibold_candidates = [
-        r"C:\Windows\Fonts\Inter-SemiBold.ttf",
-        r"C:\Windows\Fonts\NotoSans-SemiBold.ttf",
-        "/usr/share/fonts/inter/Inter-SemiBold.ttf",
-        "/usr/share/fonts/truetype/inter/Inter-SemiBold.ttf",
-        "/usr/share/fonts/opentype/inter/Inter-SemiBold.otf",
-        "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
-    ];
-    // Keep CJK UI text legible on all supported desktops. The environment
-    // override is useful for portable builds that ship their own font file.
-    let cjk_override = std::env::var("MODELICA_VIEWER_CJK_FONT").ok();
-    let cjk_candidates = [
-        cjk_override.as_deref().unwrap_or(""),
-        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
-        "/usr/share/fonts/sarasa-gothic/Sarasa-Regular.ttc",
-        "/usr/share/fonts/sarasa-gothic/Sarasa-SemiBold.ttc",
-        "/usr/share/fonts/sarasa-gothic/Sarasa-Bold.ttc",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\msyhbd.ttc",
-        r"C:\Windows\Fonts\YuGothM.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/local/share/fonts/NotoSansCJK-Regular.ttc",
-    ];
-    let symbol_candidates = [
-        r"C:\Windows\Fonts\seguisym.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols-Medium.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-    ];
-    let medium = medium_candidates
-        .iter()
-        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
-    let medium_path = medium.as_ref().map(|(path, _)| *path);
-    let semibold = semibold_candidates
-        .iter()
-        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
-    let semibold_path = semibold.as_ref().map(|(path, _)| *path);
-    let cjk = cjk_candidates
-        .iter()
-        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
-    let cjk_path = cjk.as_ref().map(|(path, _)| *path);
-    let symbols = symbol_candidates
-        .iter()
-        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
-    let symbols_path = symbols.as_ref().map(|(path, _)| *path);
-
-    let mut fonts = FontDefinitions::default();
-    let default_proportional = fonts
-        .families
-        .get(&FontFamily::Proportional)
-        .cloned()
-        .unwrap_or_default();
-    let default_monospace = fonts
-        .families
-        .get(&FontFamily::Monospace)
-        .cloned()
-        .unwrap_or_default();
-    let medium_key = if let Some((_, bytes)) = medium {
-        fonts
-            .font_data
-            .insert(UI_FONT_MEDIUM.to_owned(), FontData::from_owned(bytes));
-        UI_FONT_MEDIUM.to_owned()
-    } else {
-        eprintln!("modelica-wgpu: no medium UI font found; using egui default font");
-        default_proportional
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "Hack".to_owned())
-    };
-    let semibold_key = if let Some((_, bytes)) = semibold {
-        fonts
-            .font_data
-            .insert(UI_FONT_SEMIBOLD.to_owned(), FontData::from_owned(bytes));
-        UI_FONT_SEMIBOLD.to_owned()
-    } else {
-        // The medium font may also be unavailable on a clean Windows install.
-        // Reuse the resolved key instead of referring to a missing named font
-        // family, otherwise egui panics when the first semibold label is laid
-        // out.
-        medium_key.clone()
-    };
-    let cjk_key = cjk.map(|(_, bytes)| {
-        let key = "modelica-cjk".to_owned();
-        fonts
-            .font_data
-            .insert(key.clone(), FontData::from_owned(bytes));
-        key
-    });
-    let symbols_key = symbols.map(|(_, bytes)| {
-        let key = UI_FONT_SYMBOLS.to_owned();
-        fonts
-            .font_data
-            .insert(key.clone(), FontData::from_owned(bytes));
-        key
-    });
-
-    let mut ui_fallback = vec![medium_key.clone()];
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        ui_fallback.push(cjk_key.clone());
-    }
-    if let Some(symbols_key) = symbols_key.as_ref() {
-        ui_fallback.push(symbols_key.clone());
-    }
-    ui_fallback.extend(default_proportional.clone());
-    fonts
-        .families
-        .insert(FontFamily::Name(UI_FONT_MEDIUM.into()), ui_fallback.clone());
-    let mut semibold_fallback = vec![semibold_key, medium_key.clone()];
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        semibold_fallback.push(cjk_key.clone());
-    }
-    if let Some(symbols_key) = symbols_key.as_ref() {
-        semibold_fallback.push(symbols_key.clone());
-    }
-    semibold_fallback.extend(default_proportional);
-    fonts
-        .families
-        .insert(FontFamily::Name(UI_FONT_SEMIBOLD.into()), semibold_fallback);
-    let mut mono_fallback = default_monospace;
-    mono_fallback.insert(0, medium_key.clone());
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        mono_fallback.insert(1, cjk_key.clone());
-    }
-    fonts
-        .families
-        .insert(FontFamily::Name(UI_FONT_MONO.into()), mono_fallback);
-    fonts.families.insert(FontFamily::Proportional, ui_fallback);
-    ctx.set_fonts(fonts);
-    if let Some(path) = medium_path {
-        eprintln!("modelica-wgpu: installed medium UI font from {path}");
-    }
-    if let Some(path) = semibold_path {
-        eprintln!("modelica-wgpu: installed semibold UI font from {path}");
-    }
-    if let Some(path) = cjk_path {
-        eprintln!("modelica-wgpu: installed CJK fallback font from {path}");
-    } else {
-        eprintln!("modelica-wgpu: no CJK font found; Chinese glyphs may be missing");
-    }
-    if let Some(path) = symbols_path {
-        eprintln!("modelica-wgpu: installed symbols fallback font from {path}");
-    }
-}
-
-fn ui_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(UI_FONT_MEDIUM.into()))
-}
-
-fn ui_semibold_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(UI_FONT_SEMIBOLD.into()))
-}
-
-fn ui_mono_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(UI_FONT_MONO.into()))
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-enum FillMode {
-    Solid = 0,
-    HorizontalCylinder = 1,
-    VerticalCylinder = 2,
-    Sphere = 3,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum DiagramRenderLayer {
-    Background,
-    Component,
-    Connection,
-    Connector,
-    Overlay,
-}
-
-impl DiagramRenderLayer {
-    const COUNT: usize = 5;
-
-    fn index(self) -> usize {
-        match self {
-            Self::Background => 0,
-            Self::Component => 1,
-            Self::Connection => 2,
-            Self::Connector => 3,
-            Self::Overlay => 4,
-        }
-    }
-}
-
-const DIAGRAM_RENDER_LAYERS: [DiagramRenderLayer; 4] = [
-    DiagramRenderLayer::Background,
-    DiagramRenderLayer::Component,
-    DiagramRenderLayer::Connection,
-    DiagramRenderLayer::Connector,
-];
-const ICON_RENDER_LAYERS: [DiagramRenderLayer; 1] = [DiagramRenderLayer::Component];
-
-struct Geometry {
-    vertices: Vec<Vertex>,
-    indices: Vec<u16>,
-    style: StyleUniform,
-    layer: DiagramRenderLayer,
-    edit_key: Option<String>,
-    connection: Option<ConnectionGeometry>,
-    component: Option<ComponentGeometry>,
-}
-
-#[derive(Clone)]
-struct ConnectionGeometry {
-    line: LineGraphic,
-    transform: Transform2D,
-}
-
-#[derive(Clone, Copy)]
-struct ComponentGeometry {
-    transform: Transform2D,
-}
-
-struct GpuGeometry {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
-    style_bind_group: wgpu::BindGroup,
-    base_vertices: Vec<Vertex>,
-    vertex_capacity: usize,
-    index_capacity: usize,
-    layer: DiagramRenderLayer,
-    edit_key: Option<String>,
-    connection: Option<ConnectionGeometry>,
-    component: Option<ComponentGeometry>,
-}
-
-struct GpuIconScene {
-    geometries: Vec<GpuGeometry>,
-    layer_indices: [Vec<usize>; DiagramRenderLayer::COUNT],
-    bounds: Option<SceneBounds>,
-}
-
-impl GpuIconScene {
-    fn preview_translation(&self, queue: &wgpu::Queue, edit_key: &str, translation: [f32; 2]) {
-        for geometry in &self.geometries {
-            if geometry.edit_key.as_deref() != Some(edit_key) {
-                continue;
-            }
-            let vertices = geometry
-                .base_vertices
-                .iter()
-                .map(|vertex| Vertex {
-                    position: [
-                        vertex.position[0] + translation[0],
-                        vertex.position[1] + translation[1],
-                    ],
-                    ..*vertex
-                })
-                .collect::<Vec<_>>();
-            queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        }
-    }
-
-    fn commit_translation(
-        &mut self,
-        queue: &wgpu::Queue,
-        edit_key: &str,
-        translation: [f32; 2],
-        component_transform: Option<Transform2D>,
-    ) {
-        for geometry in &mut self.geometries {
-            if geometry.edit_key.as_deref() != Some(edit_key) {
-                continue;
-            }
-            let vertices = geometry
-                .base_vertices
-                .iter()
-                .map(|vertex| Vertex {
-                    position: [
-                        vertex.position[0] + translation[0],
-                        vertex.position[1] + translation[1],
-                    ],
-                    ..*vertex
-                })
-                .collect::<Vec<_>>();
-            queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-            geometry.base_vertices = vertices;
-            if let (Some(component), Some(transform)) =
-                (&mut geometry.component, component_transform)
-            {
-                component.transform = transform;
-            }
-        }
-    }
-
-    fn preview_component_resize(
-        &self,
-        queue: &wgpu::Queue,
-        component_id: &str,
-        new_transform: Transform2D,
-    ) {
-        for geometry in &self.geometries {
-            if geometry.edit_key.as_deref() != Some(component_id) {
-                continue;
-            }
-            let Some(component) = geometry.component else {
-                continue;
-            };
-            let vertices = geometry
-                .base_vertices
-                .iter()
-                .map(|vertex| {
-                    let local = inverse_transform_point(
-                        CorePoint {
-                            x: vertex.position[0],
-                            y: vertex.position[1],
-                        },
-                        component.transform,
-                    );
-                    let resized = apply_transform_point(local, new_transform);
-                    Vertex {
-                        position: [resized.x, resized.y],
-                        ..*vertex
-                    }
-                })
-                .collect::<Vec<_>>();
-            queue.write_buffer(&geometry.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        }
-    }
-
-    fn update_connection_points(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        connection_id: &str,
-        points: &[CorePoint],
-    ) {
-        for geometry in &mut self.geometries {
-            if geometry.edit_key.as_deref() != Some(connection_id) {
-                continue;
-            }
-            let Some(connection) = geometry.connection.clone() else {
-                continue;
-            };
-            let mut line = connection.line;
-            line.points = points.to_vec();
-            let Some(updated) = line_geometry(&line, connection.transform)
-                .into_iter()
-                .next()
-            else {
-                continue;
-            };
-
-            if updated.vertices.len() > geometry.vertex_capacity
-                || updated.indices.len() > geometry.index_capacity
-            {
-                let vertex_capacity = geometry
-                    .vertex_capacity
-                    .max(updated.vertices.len())
-                    .saturating_mul(2)
-                    .max(updated.vertices.len());
-                let index_capacity = geometry
-                    .index_capacity
-                    .max(updated.indices.len())
-                    .saturating_mul(2)
-                    .max(updated.indices.len());
-                let mut vertices = vec![
-                    Vertex {
-                        position: [0.0; 2],
-                        local: [0.0; 2],
-                    };
-                    vertex_capacity
-                ];
-                vertices[..updated.vertices.len()].copy_from_slice(&updated.vertices);
-                let mut indices = vec![0_u16; index_capacity];
-                indices[..updated.indices.len()].copy_from_slice(&updated.indices);
-                geometry.vertex_buffer =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("diagram connection preview vertices"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    });
-                geometry.index_buffer =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("diagram connection preview indices"),
-                        contents: bytemuck::cast_slice(&indices),
-                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                    });
-                geometry.vertex_capacity = vertex_capacity;
-                geometry.index_capacity = index_capacity;
-            } else {
-                queue.write_buffer(
-                    &geometry.vertex_buffer,
-                    0,
-                    bytemuck::cast_slice(&updated.vertices),
-                );
-                queue.write_buffer(
-                    &geometry.index_buffer,
-                    0,
-                    bytemuck::cast_slice(&updated.indices),
-                );
-            }
-            geometry.index_count = updated.indices.len() as u32;
-            geometry.base_vertices = updated.vertices;
-            if let Some(connection) = &mut geometry.connection {
-                connection.line.points = points.to_vec();
-            }
-        }
-    }
-
-    fn preview_connection_points(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        connection_id: &str,
-        points: &[CorePoint],
-    ) {
-        self.update_connection_points(device, queue, connection_id, points);
-    }
-
-    fn commit_connection_points(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        connection_id: &str,
-        points: &[CorePoint],
-    ) {
-        self.update_connection_points(device, queue, connection_id, points);
-    }
-}
-
-const CONNECTION_PREVIEW_EXTRA_SEGMENTS: usize = 4;
-const MIN_CONNECTION_PREVIEW_SEGMENTS: usize = 8;
-
-fn connection_preview_segment_capacity(segment_count: usize) -> usize {
-    segment_count
-        .saturating_add(CONNECTION_PREVIEW_EXTRA_SEGMENTS)
-        .max(MIN_CONNECTION_PREVIEW_SEGMENTS)
-}
-
-fn connection_preview_indices(segment_capacity: usize) -> Vec<u16> {
-    (0..segment_capacity)
-        .flat_map(|segment| {
-            let base = (segment * 4) as u16;
-            [base, base + 1, base + 2, base, base + 2, base + 3]
-        })
-        .collect()
-}
-
-/// Persistent variable-topology line mesh used while a connection is being
-/// dragged. Endpoint routing can add bridge segments, so the mesh reserves
-/// spare quad slots at drag start and only updates the active vertex prefix.
-struct ConnectionPreviewMesh {
-    connection_id: String,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    active_segment_count: usize,
-    segment_capacity: usize,
-    style_bind_group: wgpu::BindGroup,
-    vertices: Vec<Vertex>,
-    line_origin: CorePoint,
-    line_rotation: f32,
-    line_thickness: f32,
-    transform: Transform2D,
-}
-
-impl ConnectionPreviewMesh {
-    fn new(
-        device: &wgpu::Device,
-        style_layout: &wgpu::BindGroupLayout,
-        connection_id: String,
-        line: &LineGraphic,
-        transform: Transform2D,
-    ) -> Self {
-        let segment_count = line.points.len().saturating_sub(1);
-        let segment_capacity = connection_preview_segment_capacity(segment_count);
-        let initial_vertices = preview_connection_vertices(
-            &line.points,
-            line.origin,
-            line.rotation,
-            line.thickness,
-            transform,
-        );
-        let mut vertices = vec![
-            Vertex {
-                position: [0.0; 2],
-                local: [0.0; 2],
-            };
-            segment_capacity * 4
-        ];
-        vertices[..initial_vertices.len()].copy_from_slice(&initial_vertices);
-        let indices = connection_preview_indices(segment_capacity);
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("connection drag preview vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("connection drag preview indices"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let style = StyleUniform {
-            color: color_rgba(line.color),
-            edge_color: color_rgba(line.color),
-            gradient: [0.0; 4],
-            mode: FillMode::Solid as u32,
-            _padding: [0; 7],
-        };
-        let style_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("connection drag preview style"),
-            contents: bytemuck::bytes_of(&style),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let style_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("connection drag preview style bind group"),
-            layout: style_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: style_buffer.as_entire_binding(),
-            }],
-        });
-        Self {
-            connection_id,
-            vertex_buffer,
-            index_buffer,
-            active_segment_count: segment_count,
-            segment_capacity,
-            style_bind_group,
-            vertices,
-            line_origin: line.origin,
-            line_rotation: line.rotation,
-            line_thickness: line.thickness,
-            transform,
-        }
-    }
-
-    fn update(&mut self, queue: &wgpu::Queue, points: &[CorePoint]) -> bool {
-        if !self.can_update(points) {
-            return false;
-        }
-        let segment_count = points.len().saturating_sub(1);
-        update_preview_connection_vertices(
-            &mut self.vertices[..segment_count * 4],
-            points,
-            self.line_origin,
-            self.line_rotation,
-            self.line_thickness,
-            self.transform,
-        );
-        self.active_segment_count = segment_count;
-        if segment_count > 0 {
-            queue.write_buffer(
-                &self.vertex_buffer,
-                0,
-                bytemuck::cast_slice(&self.vertices[..segment_count * 4]),
-            );
-        }
-        true
-    }
-
-    fn can_update(&self, points: &[CorePoint]) -> bool {
-        valid_interactive_connection_route(points)
-            && points.len().saturating_sub(1) <= self.segment_capacity
-    }
-}
-
-/// Transient connection meshes shown while a diagram component is being
+            let start = content.find(marker).unmponent is being
 /// dragged. The static diagram scene is left untouched until MouseUp commits
 /// the source edit.
 struct ComponentConnectionPreviewSet {
@@ -2233,7 +421,11 @@ impl ComponentConnectionPreviewSet {
                 // valid fallback route can be rejected simply because the
                 // old two-point capacity is too small.
                 let mut line = raw_line.clone();
-                line.points = snapshot.base_route_points.clone();
+                line.points = if valid_interactive_connection_route(&snapshot.base_route_points) {
+                    snapshot.base_route_points.clone()
+                } else {
+                    component_drag_preview_route(snapshot, CorePoint { x: 0.0, y: 0.0 })
+                };
                 Some(ConnectionPreviewMesh::new(
                     device,
                     style_layout,
@@ -4339,12 +2531,6 @@ impl App {
         let Some(scene) = document.diagram(&class_name) else {
             return;
         };
-        if let Err(error) =
-            component_connection_drag_preflight(scene, &component_name, &class_name, &source_before)
-        {
-            self.load_error = Some(format!("Component resize rejected: {error}"));
-            return;
-        }
         let connected_connections =
             connection_drag_snapshots(scene, &component_name, &class_name, &source_before);
         self.pointer_interaction = PointerInteraction::ResizeDiagramComponent {
@@ -4725,46 +2911,10 @@ impl App {
                 } => connected_connections
                     .iter()
                     .map(|snapshot| {
-                        let route = connection_route_for_component_translation(
-                            &snapshot.base_route_points,
-                            snapshot.original_line_origin,
-                            snapshot.original_line_rotation,
-                            snapshot.original_endpoint_points,
-                            snapshot.moved_first_endpoint,
-                            snapshot.moved_last_endpoint,
-                            delta,
-                        );
-                        let points = if valid_interactive_connection_route(&route) {
-                            route
-                        } else {
-                            let local_delta = world_delta_to_line_local(
-                                snapshot.original_line_origin,
-                                snapshot.original_line_rotation,
-                                delta,
-                            );
-                            manhattan_component_translation_route(
-                                &snapshot.base_route_points,
-                                if snapshot.moved_first_endpoint {
-                                    translated_point(
-                                        snapshot.original_endpoint_points.0,
-                                        local_delta,
-                                    )
-                                } else {
-                                    snapshot.original_endpoint_points.0
-                                },
-                                if snapshot.moved_last_endpoint {
-                                    translated_point(
-                                        snapshot.original_endpoint_points.1,
-                                        local_delta,
-                                    )
-                                } else {
-                                    snapshot.original_endpoint_points.1
-                                },
-                                snapshot.moved_first_endpoint,
-                                snapshot.moved_last_endpoint,
-                            )
-                        };
-                        (snapshot.connection_id.clone(), points)
+                        (
+                            snapshot.connection_id.clone(),
+                            component_drag_preview_route(snapshot, delta),
+                        )
                     })
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
@@ -5040,10 +3190,16 @@ impl App {
                                 else {
                                     continue;
                                 };
-                                let Ok(preview_points) = reanchor_connection_points(
+                                let raw_points = connection
+                                    .line
+                                    .as_ref()
+                                    .map(|line| line.points.clone())
+                                    .filter(|points| !points.is_empty())
+                                    .unwrap_or_else(|| snapshot.base_route_points.clone());
+                                let Ok((preview_points, _)) = resolved_connection_display_route(
                                     &preview_scene,
                                     connection,
-                                    &snapshot.base_route_points,
+                                    &raw_points,
                                 ) else {
                                     continue;
                                 };
@@ -5630,6 +3786,7 @@ impl App {
             .document
             .as_ref()
             .and_then(|document| document.diagram(&class_name))
+            .cloned()
         else {
             trace_component_edit(
                 "rejected",
@@ -5661,7 +3818,6 @@ impl App {
             &component_name,
             format_args!("target={after_origin:?}"),
         );
-        let mut source_edits = Vec::with_capacity(connected_connections.len() + 1);
         let component_edit =
             match component_origin_edit(&source_before, &component_name, after_origin) {
                 Ok(edit) => edit,
@@ -5683,143 +3839,48 @@ impl App {
             &component_name,
             format_args!("range={}..{}", component_edit.start, component_edit.end),
         );
-        source_edits.push(component_edit.clone());
-        let mut connection_edits = Vec::with_capacity(connected_connections.len());
-        for snapshot in &connected_connections {
-            let Some(connection) = current_scene
-                .connections
-                .iter()
-                .find(|connection| connection.key == snapshot.connection_key)
-            else {
-                trace_component_edit(
-                    "connection-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!("key={:?}", snapshot.connection_key),
-                );
-                continue;
-            };
-            if let Err(error) =
-                connection_source_editable_in_class(connection, &class_name, &source_before)
-            {
-                trace_component_edit(
-                    "connection-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!("key={:?} not editable: {error}", snapshot.connection_key),
-                );
-                continue;
-            }
-            if !snapshot.preview_route_valid
-                || !valid_interactive_connection_route(&snapshot.preview_points)
-            {
-                trace_component_edit(
-                    "connection-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} preview route unavailable",
-                        snapshot.connection_key
-                    ),
-                );
-                continue;
-            };
-            let after_points = snapshot.preview_points.clone();
-            let edit = match connection_points_edit_for_key(
-                &source_before,
-                current_scene,
-                &snapshot.connection_key,
-                &after_points,
-            ) {
-                Ok(edit) => edit,
+        let mut candidate =
+            match apply_validated_source_edit(&source_before, component_edit, version) {
+                Ok(candidate) => candidate,
                 Err(error) => {
                     trace_component_edit(
-                        "connection-source-edit-failed",
+                        "source-transaction-failed",
                         &component_id,
                         &component_name,
-                        format_args!("key={:?} error={error}", snapshot.connection_key),
+                        &error,
                     );
-                    continue;
+                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                    self.rollback_component_preview(&component_id, &connected_connections);
+                    return;
                 }
             };
-            trace_component_edit(
-                "connection-source-edit-ok",
-                &component_id,
-                &component_name,
-                format_args!(
-                    "key={:?} points={:?} range={}..{}",
-                    snapshot.connection_key, after_points, edit.start, edit.end
-                ),
-            );
-            source_edits.push(edit);
-            connection_edits.push(ConnectionLineEdit {
-                connection_key: snapshot.connection_key.clone(),
-                before_points: snapshot.source_line_points.clone(),
-                after_points,
-                line_origin: snapshot.original_line_origin,
-            });
-        }
-        let candidate = match apply_validated_source_edits(&source_before, source_edits, version) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                trace_component_edit(
-                    "source-transaction-connections-failed",
-                    &component_id,
-                    &component_name,
-                    &error,
-                );
-                // A malformed or stale connection edit must not make the
-                // authoritative component move fail. Retry the transaction
-                // with only the component placement edit.
-                connection_edits.clear();
-                match apply_validated_source_edit(&source_before, component_edit.clone(), version) {
-                    Ok(candidate) => {
-                        trace_component_edit(
-                            "source-transaction-component-only-ok",
-                            &component_id,
-                            &component_name,
-                            format_args!("ignored connection error: {error}"),
-                        );
-                        candidate
-                    }
-                    Err(component_error) => {
-                        trace_component_edit(
-                            "source-transaction-failed",
-                            &component_id,
-                            &component_name,
-                            &component_error,
-                        );
-                        self.load_error = Some(format!("Diagram edit rejected: {component_error}"));
-                        self.rollback_component_preview(&component_id, &connected_connections);
-                        return;
-                    }
-                }
-            }
-        };
         trace_component_edit(
-            "source-transaction-ok",
+            "component-source-transaction-ok",
             &component_id,
             &component_name,
             format_args!("bytes={}", candidate.len()),
         );
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
-            document
-                .resolve_candidate_scenes(&class_name, &candidate)
-                .ok()
-        }) {
-            Some(scenes) => scenes,
-            None => {
-                trace_component_edit(
-                    "candidate-resolve-failed",
-                    &component_id,
-                    &component_name,
-                    "candidate scenes unavailable",
-                );
-                self.load_error = Some("Diagram edit could not resolve candidate source".into());
-                self.rollback_component_preview(&component_id, &connected_connections);
-                return;
-            }
-        };
+        let mut connection_edits = Vec::with_capacity(connected_connections.len());
+        let (mut resolved_icon, mut resolved_diagram) =
+            match self.document.as_ref().and_then(|document| {
+                document
+                    .resolve_candidate_scenes(&class_name, &candidate)
+                    .ok()
+            }) {
+                Some(scenes) => scenes,
+                None => {
+                    trace_component_edit(
+                        "candidate-resolve-failed",
+                        &component_id,
+                        &component_name,
+                        "candidate scenes unavailable",
+                    );
+                    self.load_error =
+                        Some("Diagram edit could not resolve candidate source".into());
+                    self.rollback_component_preview(&component_id, &connected_connections);
+                    return;
+                }
+            };
         trace_component_edit(
             "candidate-resolve-ok",
             &component_id,
@@ -5862,79 +3923,283 @@ impl App {
             &component_name,
             format_args!("resolved={canonical_after_origin:?}"),
         );
-        for edit in &mut connection_edits {
+        // The component placement is authoritative. It was applied first so
+        // every route below uses semantic anchors at the new placement.
+        // Persist each editable connection independently: an inherited,
+        // malformed, or stale Line must not roll the component back.
+        for snapshot in &connected_connections {
             let Some(connection) = resolved_diagram
                 .connections
                 .iter()
-                .find(|connection| connection.key == edit.connection_key)
+                .find(|connection| connection.key == snapshot.connection_key)
             else {
                 trace_component_edit(
-                    "connection-validation-failed",
+                    "connection-source-edit-skipped",
                     &component_id,
                     &component_name,
                     format_args!(
-                        "key={:?} connection missing after resolve",
-                        edit.connection_key
+                        "key={:?} missing after component resolve",
+                        snapshot.connection_key
                     ),
                 );
-                self.load_error = Some("Diagram edit lost a connection".into());
-                self.rollback_component_preview(&component_id, &connected_connections);
-                return;
+                continue;
             };
-            if connection
-                .line
-                .as_ref()
-                .is_none_or(|line| !point_nearly_equal(line.origin, edit.line_origin))
-            {
+            let raw_points = valid_interactive_connection_route(&snapshot.preview_points)
+                .then(|| snapshot.preview_points.clone())
+                .or_else(|| {
+                    connection
+                        .line
+                        .as_ref()
+                        .map(|line| line.points.clone())
+                        .filter(|points| !points.is_empty())
+                })
+                .unwrap_or_else(|| snapshot.base_route_points.clone());
+            let Ok((route, _fallback)) =
+                resolved_connection_display_route(&resolved_diagram, connection, &raw_points)
+            else {
                 trace_component_edit(
-                    "connection-validation-failed",
+                    "connection-source-edit-skipped",
                     &component_id,
                     &component_name,
-                    format_args!("key={:?} line origin mismatch", edit.connection_key),
+                    format_args!(
+                        "key={:?} route unavailable; visual route will be best effort",
+                        snapshot.connection_key
+                    ),
                 );
-                self.load_error = Some("Diagram edit failed: connection points mismatch".into());
-                self.rollback_component_preview(&component_id, &connected_connections);
-                return;
+                continue;
+            };
+            if !snapshot.source_editable {
+                trace_component_edit(
+                    "connection-source-read-only",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} reason={:?}; visual route will still be committed",
+                        snapshot.connection_key, snapshot.source_edit_error
+                    ),
+                );
+                continue;
             }
+            if let Err(error) =
+                connection_source_editable_in_class(connection, &class_name, &candidate)
+            {
+                trace_component_edit(
+                    "connection-source-edit-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} error={error}; visual route retained",
+                        snapshot.connection_key
+                    ),
+                );
+                continue;
+            }
+            let Some(line) = connection.line.as_ref() else {
+                trace_component_edit(
+                    "connection-source-edit-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} has no Line; visual route retained",
+                        snapshot.connection_key
+                    ),
+                );
+                continue;
+            };
+            if points_nearly_equal(&line.points, &route) {
+                continue;
+            }
+            let edit = match connection_points_edit_for_key(
+                &candidate,
+                &resolved_diagram,
+                &snapshot.connection_key,
+                &route,
+            ) {
+                Ok(edit) => edit,
+                Err(error) => {
+                    trace_component_edit(
+                        "connection-source-edit-skipped",
+                        &component_id,
+                        &component_name,
+                        format_args!(
+                            "key={:?} error={error}; visual route retained",
+                            snapshot.connection_key
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let next_candidate = match apply_validated_source_edit(&candidate, edit, version) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    trace_component_edit(
+                        "connection-source-edit-skipped",
+                        &component_id,
+                        &component_name,
+                        format_args!(
+                            "key={:?} error={error}; visual route retained",
+                            snapshot.connection_key
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let Some((next_icon, next_diagram)) = self.document.as_ref().and_then(|document| {
+                document
+                    .resolve_candidate_scenes(&class_name, &next_candidate)
+                    .ok()
+            }) else {
+                trace_component_edit(
+                    "connection-source-edit-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} candidate resolve failed; visual route retained",
+                        snapshot.connection_key
+                    ),
+                );
+                continue;
+            };
+            let Some(next_connection) = next_diagram
+                .connections
+                .iter()
+                .find(|connection| connection.key == snapshot.connection_key)
+            else {
+                trace_component_edit(
+                    "connection-source-edit-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} candidate connection missing; visual route retained",
+                        snapshot.connection_key
+                    ),
+                );
+                continue;
+            };
             if let Some(reason) =
-                connection_invariant_failure(&resolved_diagram, connection, &edit.after_points)
+                connection_invariant_failure(&next_diagram, next_connection, &route)
             {
                 trace_component_edit(
-                    "connection-validation-failed",
+                    "connection-source-edit-skipped",
                     &component_id,
                     &component_name,
-                    format_args!("key={:?} reason={reason}", edit.connection_key),
+                    format_args!(
+                        "key={:?} reason={reason}; visual route retained",
+                        snapshot.connection_key
+                    ),
                 );
-                self.load_error = Some(format!("Diagram edit failed: {reason}"));
-                self.rollback_component_preview(&component_id, &connected_connections);
-                return;
+                continue;
             }
-            let line = connection
+            let line_origin = next_connection
                 .line
                 .as_ref()
-                .expect("connection invariant check requires a line");
-            edit.after_points = line.points.clone();
-            edit.line_origin = line.origin;
+                .map_or(snapshot.original_line_origin, |line| line.origin);
             trace_component_edit(
-                "connection-validation-ok",
+                "connection-source-edit-ok",
                 &component_id,
                 &component_name,
                 format_args!(
-                    "key={:?} points={:?}",
-                    edit.connection_key, edit.after_points
+                    "key={:?} points={route:?} range={:?}",
+                    snapshot.connection_key, next_connection.line_source_range
                 ),
             );
+            candidate = next_candidate;
+            resolved_icon = next_icon;
+            resolved_diagram = next_diagram;
+            connection_edits.push(ConnectionLineEdit {
+                connection_key: snapshot.connection_key.clone(),
+                before_points: snapshot.source_line_points.clone(),
+                after_points: route,
+                line_origin,
+            });
         }
-        let gpu_connection_commits = connection_edits
-            .iter()
-            .filter_map(|edit| {
-                resolved_diagram
-                    .connections
-                    .iter()
-                    .find(|connection| connection.key == edit.connection_key)
-                    .map(|connection| (connection.id.clone(), edit.after_points.clone()))
-            })
-            .collect::<Vec<_>>();
+
+        // Build the GPU commit from every touching connection, not from the
+        // source-edit history. Read-only and source-skipped Lines must move
+        // visually in the same frame as the component.
+        let mut visual_connection_commits = Vec::with_capacity(connected_connections.len());
+        for snapshot in &connected_connections {
+            let Some(connection) = resolved_diagram
+                .connections
+                .iter()
+                .find(|connection| connection.key == snapshot.connection_key)
+            else {
+                trace_component_edit(
+                    "connection-visual-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} missing after final resolve",
+                        snapshot.connection_key
+                    ),
+                );
+                continue;
+            };
+            let raw_points = valid_interactive_connection_route(&snapshot.preview_points)
+                .then(|| snapshot.preview_points.clone())
+                .or_else(|| {
+                    connection
+                        .line
+                        .as_ref()
+                        .map(|line| line.points.clone())
+                        .filter(|points| !points.is_empty())
+                })
+                .unwrap_or_else(|| snapshot.base_route_points.clone());
+            let semantic_endpoint = strict_connection_points(&resolved_diagram, connection).ok();
+            let (route, fallback) =
+                match resolved_connection_display_route(&resolved_diagram, connection, &raw_points)
+                {
+                    Ok(route) => route,
+                    Err(error) => {
+                        trace_component_edit(
+                            "connection-visual-skipped",
+                            &component_id,
+                            &component_name,
+                            format_args!("key={:?} error={error}", snapshot.connection_key),
+                        );
+                        continue;
+                    }
+                };
+            let old_endpoint = raw_points
+                .first()
+                .zip(raw_points.last())
+                .map(|(first, last)| (*first, *last));
+            let committed_endpoint = route
+                .first()
+                .zip(route.last())
+                .map(|(first, last)| (*first, *last));
+            trace_connection_reanchor(
+                &component_id,
+                snapshot,
+                old_endpoint,
+                semantic_endpoint,
+                committed_endpoint,
+                fallback,
+            );
+            if let Some(edit) = connection_edits
+                .iter_mut()
+                .find(|edit| edit.connection_key == snapshot.connection_key)
+            {
+                edit.after_points = route.clone();
+                if let Some(line) = connection.line.as_ref() {
+                    edit.line_origin = line.origin;
+                }
+                if let Some(reason) =
+                    connection_invariant_failure(&resolved_diagram, connection, &route)
+                {
+                    trace_component_edit(
+                        "connection-source-validation-warning",
+                        &component_id,
+                        &component_name,
+                        format_args!(
+                            "key={:?} reason={reason}; visual route still committed",
+                            snapshot.connection_key
+                        ),
+                    );
+                }
+            }
+            visual_connection_commits.push((connection.id.clone(), route));
+        }
         let component_transform = {
             let Some(document) = self.document.as_mut() else {
                 self.rollback_component_preview(&component_id, &connected_connections);
@@ -5977,7 +4242,7 @@ impl App {
             [canonical_delta.x, -canonical_delta.y],
             component_transform,
         );
-        for (connection_id, points) in gpu_connection_commits {
+        for (connection_id, points) in visual_connection_commits {
             self.diagram_scene.commit_connection_points(
                 &self.device,
                 &self.queue,
@@ -6380,6 +4645,18 @@ impl App {
                 self.rebuild_selected_scenes();
                 return;
             };
+            if !snapshot.source_editable {
+                trace_component_edit(
+                    "connection-source-read-only",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} reason={:?}; resize visual route is canonicalized after resolve",
+                        snapshot.connection_key, snapshot.source_edit_error
+                    ),
+                );
+                continue;
+            }
             let after_points = match reanchor_connection_points(
                 &reanchored_scene,
                 connection,
@@ -8880,8 +7157,82 @@ fn canonical_connection_points(
     let Some(line) = connection.line.as_ref() else {
         return Vec::new();
     };
-    reanchor_connection_points(scene, connection, &line.points)
-        .unwrap_or_else(|_| line.points.clone())
+    let (points, _) = resolved_connection_display_route(scene, connection, &line.points)
+        .unwrap_or_else(|_| (line.points.clone(), ConnectionRouteFallback::Source));
+    points
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionRouteFallback {
+    SemanticReanchor,
+    Manhattan,
+    Source,
+}
+
+fn resolved_connection_display_route(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    raw_points: &[CorePoint],
+) -> Result<(Vec<CorePoint>, ConnectionRouteFallback), String> {
+    let (lhs, rhs) = strict_connection_points(scene, connection)
+        .map_err(|error| format!("unable to resolve connector anchors: {error:?}"))?;
+    let base_points = if valid_interactive_connection_route(raw_points) {
+        raw_points.to_vec()
+    } else {
+        vec![lhs, rhs]
+    };
+
+    if let Ok(reanchored) = reanchor_connection_points(scene, connection, &base_points) {
+        let canonical = canonicalize_orthogonal_points(&reanchored);
+        if valid_interactive_connection_route(&canonical)
+            && displayed_connection_points_match_invariant(scene, connection, &canonical)
+        {
+            return Ok((canonical, ConnectionRouteFallback::SemanticReanchor));
+        }
+    }
+
+    let moved_first_endpoint = raw_points
+        .first()
+        .is_some_and(|point| distance_between(*point, lhs) > ORTHOGONAL_EPSILON);
+    let moved_last_endpoint = raw_points
+        .last()
+        .is_some_and(|point| distance_between(*point, rhs) > ORTHOGONAL_EPSILON);
+    let fallback = canonicalize_orthogonal_points(&manhattan_component_translation_route(
+        &base_points,
+        lhs,
+        rhs,
+        moved_first_endpoint,
+        moved_last_endpoint,
+    ));
+    if valid_interactive_connection_route(&fallback)
+        && displayed_connection_points_match_invariant(scene, connection, &fallback)
+    {
+        return Ok((fallback, ConnectionRouteFallback::Manhattan));
+    }
+
+    Err("unable to construct an orthogonal route anchored to both connectors".to_owned())
+}
+
+fn trace_connection_reanchor(
+    component_id: &str,
+    snapshot: &ConnectionDragSnapshot,
+    old_endpoint: Option<(CorePoint, CorePoint)>,
+    semantic_endpoint: Option<(CorePoint, CorePoint)>,
+    committed_endpoint: Option<(CorePoint, CorePoint)>,
+    fallback: ConnectionRouteFallback,
+) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_DRAG").is_none()
+        && std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_EDIT").is_none()
+        && std::env::var_os("MODELICA_WGPU_TRACE_CONNECTION_EDIT").is_none()
+    {
+        return;
+    }
+    eprintln!(
+        "[CONNECTION REANCHOR] component_id={component_id} connection_key={:?} source_editable={} old_endpoint={old_endpoint:?} new_semantic_endpoint={semantic_endpoint:?} committed_display_endpoint={committed_endpoint:?} route_fallback={fallback:?} source_edit_error={:?}",
+        snapshot.connection_key,
+        snapshot.source_editable,
+        snapshot.source_edit_error,
+    );
 }
 
 fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
@@ -10459,6 +8810,22 @@ fn valid_interactive_connection_route(points: &[CorePoint]) -> bool {
     is_orthogonal_polyline(points)
 }
 
+fn displayed_connection_points_match_invariant(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    displayed_points: &[CorePoint],
+) -> bool {
+    let Ok((semantic_first, semantic_last)) = strict_connection_points(scene, connection) else {
+        return false;
+    };
+    displayed_points
+        .first()
+        .zip(displayed_points.last())
+        .is_some_and(|(first, last)| {
+            point_nearly_equal(*first, semantic_first) && point_nearly_equal(*last, semantic_last)
+        })
+}
+
 fn connection_points_match_invariants(
     scene: &CoreDiagramScene,
     connection: &modelica_core::scene::DiagramConnection,
@@ -10529,71 +8896,81 @@ fn connection_drag_snapshots(
             {
                 return None;
             }
-            if let Err(error) = connection_source_editable_in_class(connection, class_name, source)
+            let source_edit_error =
+                connection_source_editable_in_class(connection, class_name, source)
+                    .err()
+                    .inspect(|error| {
+                        trace_component_connection_state(component_name, connection, error)
+                    });
+            let source_editable = source_edit_error.is_none();
+            let line = connection.line.as_ref();
+            let source_line_points = line.map_or_else(Vec::new, |line| line.points.clone());
+            let original_line_origin =
+                line.map_or(CorePoint { x: 0.0, y: 0.0 }, |line| line.origin);
+            let original_line_rotation = line.map_or(0.0, |line| line.rotation);
+            let resolved_endpoints = resolve_connection_endpoints(scene, connection).ok();
+            let original_endpoint_points = strict_connection_points(scene, connection)
+                .ok()
+                .or_else(|| {
+                    line.and_then(|line| {
+                        line.points
+                            .first()
+                            .zip(line.points.last())
+                            .map(|(first, last)| (*first, *last))
+                    })
+                })
+                .unwrap_or((CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 0.0, y: 0.0 }));
+            let base_route_points = line
+                .map(|_| canonical_connection_points(scene, connection))
+                .filter(|points| valid_interactive_connection_route(points))
+                .or_else(|| {
+                    line.map(|line| line.points.clone())
+                        .filter(|points| valid_interactive_connection_route(points))
+                })
+                .or_else(|| {
+                    valid_interactive_connection_route(&[
+                        original_endpoint_points.0,
+                        original_endpoint_points.1,
+                    ])
+                    .then(|| vec![original_endpoint_points.0, original_endpoint_points.1])
+                })
+                .unwrap_or_default();
+            if base_route_points.is_empty() {
+                trace_component_connection_state(
+                    component_name,
+                    connection,
+                    "connection has no initial display route; semantic tracking retained",
+                );
+            }
+            let (moved_first_endpoint, moved_last_endpoint) = match resolved_endpoints
+                .as_ref()
+                .map(|endpoints| endpoints.point_order)
             {
-                trace_component_connection_skip(component_name, connection, &error);
-                return None;
-            }
-            let line = connection.line.as_ref()?;
-            if line.points.len() < 2 {
-                trace_component_connection_skip(
-                    component_name,
-                    connection,
-                    "Line annotation has fewer than two points",
-                );
-                return None;
-            }
-            let base_route_points = canonical_connection_points(scene, connection);
-            if !valid_interactive_connection_route(&base_route_points) {
-                trace_component_connection_skip(
-                    component_name,
-                    connection,
-                    "connection has no valid interactive route",
-                );
-                return None;
-            }
-            let original_endpoint_points = match strict_connection_points(scene, connection) {
-                Ok(points) => points,
-                Err(error) => {
-                    trace_component_connection_skip(
-                        component_name,
-                        connection,
-                        format_args!("connection points unresolved: {error:?}"),
-                    );
-                    return None;
-                }
-            };
-            let endpoints = match resolve_connection_endpoints(scene, connection) {
-                Ok(endpoints) => endpoints,
-                Err(error) => {
-                    trace_component_connection_skip(
-                        component_name,
-                        connection,
-                        format_args!("connector endpoints unresolved: {error:?}"),
-                    );
-                    return None;
-                }
-            };
-            let (moved_first_endpoint, moved_last_endpoint) = match endpoints.point_order {
-                ConnectionPointOrder::LhsToRhs => (
+                Some(ConnectionPointOrder::LhsToRhs) => (
                     connection.lhs.component_name == component_name,
                     connection.rhs.component_name == component_name,
                 ),
-                ConnectionPointOrder::RhsToLhs => (
+                Some(ConnectionPointOrder::RhsToLhs) => (
                     connection.rhs.component_name == component_name,
                     connection.lhs.component_name == component_name,
+                ),
+                None => (
+                    connection.lhs.component_name == component_name,
+                    connection.rhs.component_name == component_name,
                 ),
             };
             Some(ConnectionDragSnapshot {
                 connection_id: connection.id.clone(),
                 connection_key: connection.key.clone(),
-                source_line_points: line.points.clone(),
+                source_editable,
+                source_edit_error,
+                source_line_points,
                 base_route_points: base_route_points.clone(),
-                original_line_origin: line.origin,
-                original_line_rotation: line.rotation,
+                original_line_origin,
+                original_line_rotation,
                 original_endpoint_points,
-                preview_points: base_route_points,
-                preview_route_valid: true,
+                preview_points: base_route_points.clone(),
+                preview_route_valid: valid_interactive_connection_route(&base_route_points),
                 moved_first_endpoint,
                 moved_last_endpoint,
             })
@@ -10601,7 +8978,7 @@ fn connection_drag_snapshots(
         .collect()
 }
 
-fn trace_component_connection_skip(
+fn trace_component_connection_state(
     component_name: &str,
     connection: &modelica_core::scene::DiagramConnection,
     reason: impl std::fmt::Display,
@@ -10610,7 +8987,7 @@ fn trace_component_connection_skip(
         || std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_EDIT").is_some()
     {
         eprintln!(
-            "[COMPONENT DRAG] component={component_name} connection_id={} skipped={reason}",
+            "[COMPONENT DRAG] component={component_name} connection_id={} source_edit_unavailable={reason}",
             connection.id
         );
     }
@@ -10717,6 +9094,57 @@ fn connection_route_for_component_translation(
         );
     }
     points
+}
+
+fn component_drag_preview_route(
+    snapshot: &ConnectionDragSnapshot,
+    world_delta: CorePoint,
+) -> Vec<CorePoint> {
+    let base_route = if snapshot.base_route_points.len() >= 2 {
+        &snapshot.base_route_points
+    } else {
+        &snapshot.source_line_points
+    };
+    let route = connection_route_for_component_translation(
+        base_route,
+        snapshot.original_line_origin,
+        snapshot.original_line_rotation,
+        snapshot.original_endpoint_points,
+        snapshot.moved_first_endpoint,
+        snapshot.moved_last_endpoint,
+        world_delta,
+    );
+    if valid_interactive_connection_route(&route) {
+        return route;
+    }
+
+    let local_delta = world_delta_to_line_local(
+        snapshot.original_line_origin,
+        snapshot.original_line_rotation,
+        world_delta,
+    );
+    let lhs = if snapshot.moved_first_endpoint {
+        translated_point(snapshot.original_endpoint_points.0, local_delta)
+    } else {
+        snapshot.original_endpoint_points.0
+    };
+    let rhs = if snapshot.moved_last_endpoint {
+        translated_point(snapshot.original_endpoint_points.1, local_delta)
+    } else {
+        snapshot.original_endpoint_points.1
+    };
+    let fallback = manhattan_component_translation_route(
+        base_route,
+        lhs,
+        rhs,
+        snapshot.moved_first_endpoint,
+        snapshot.moved_last_endpoint,
+    );
+    if valid_interactive_connection_route(&fallback) {
+        fallback
+    } else {
+        route
+    }
 }
 
 fn translated_point(point: CorePoint, delta: CorePoint) -> CorePoint {
@@ -13907,6 +12335,101 @@ mod tests {
             ]
         );
         assert!(is_orthogonal_polyline(&moved_rhs));
+    }
+
+    #[test]
+    fn resolved_display_route_reanchors_read_only_connection_after_component_move() {
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let mut moved_scene = scene.clone();
+        moved_scene.components[0].origin = CorePoint { x: 20.0, y: 30.0 };
+        let (route, fallback) = resolved_connection_display_route(
+            &moved_scene,
+            &connection,
+            &[CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        )
+        .expect("semantic anchors should produce a display route");
+        assert_eq!(fallback, ConnectionRouteFallback::SemanticReanchor);
+        assert_eq!(
+            route,
+            vec![
+                CorePoint { x: 20.0, y: 30.0 },
+                CorePoint { x: 100.0, y: 30.0 },
+                CorePoint { x: 100.0, y: 0.0 },
+            ]
+        );
+        assert!(displayed_connection_points_match_invariant(
+            &moved_scene,
+            &connection,
+            &route,
+        ));
+    }
+
+    #[test]
+    fn component_drag_preview_reanchors_read_only_connection_with_empty_base_route() {
+        let snapshot = ConnectionDragSnapshot {
+            connection_id: "connection:read-only".to_owned(),
+            connection_key: ConnectionKey::new(
+                "Base",
+                ConnectorRef {
+                    component_name: "moved".to_owned(),
+                    connector_path: String::new(),
+                },
+                ConnectorRef {
+                    component_name: "other".to_owned(),
+                    connector_path: String::new(),
+                },
+                0,
+            ),
+            source_editable: false,
+            source_edit_error: Some("inherited".to_owned()),
+            source_line_points: Vec::new(),
+            base_route_points: Vec::new(),
+            original_line_origin: CorePoint { x: 0.0, y: 0.0 },
+            original_line_rotation: 0.0,
+            original_endpoint_points: (
+                CorePoint { x: 0.0, y: 0.0 },
+                CorePoint { x: 100.0, y: 0.0 },
+            ),
+            preview_points: Vec::new(),
+            preview_route_valid: false,
+            moved_first_endpoint: true,
+            moved_last_endpoint: false,
+        };
+        let route = component_drag_preview_route(&snapshot, CorePoint { x: 20.0, y: 30.0 });
+        assert_eq!(
+            route,
+            vec![
+                CorePoint { x: 20.0, y: 30.0 },
+                CorePoint { x: 20.0, y: 0.0 },
+                CorePoint { x: 100.0, y: 0.0 },
+            ]
+        );
+        assert!(valid_interactive_connection_route(&route));
+    }
+
+    #[test]
+    fn component_drag_snapshots_retain_connections_without_source_edits() {
+        let (mut scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let mut inherited = connection;
+        inherited.id = "connection:inherited".to_owned();
+        inherited.key = ConnectionKey::new("Base", inherited.lhs.clone(), inherited.rhs.clone(), 1);
+        scene.connections.push(inherited);
+
+        let snapshots = connection_drag_snapshots(&scene, "a", "Test", "");
+
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().all(|snapshot| !snapshot.source_editable));
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.preview_route_valid));
     }
 
     #[test]
