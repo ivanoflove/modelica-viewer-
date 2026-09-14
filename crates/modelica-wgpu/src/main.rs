@@ -64,6 +64,7 @@ const CONNECTION_SNAP_ENTER_PIXELS: f32 = 8.0;
 const CONNECTION_SNAP_EXIT_PIXELS: f32 = 12.0;
 const CONNECTION_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const PORT_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
+const COMPONENT_DRAG_PORT_HIT_PIXELS: f32 = 4.0;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -1161,6 +1162,7 @@ struct ConnectionDragSnapshot {
     original_line_rotation: f32,
     original_endpoint_points: (CorePoint, CorePoint),
     preview_points: Vec<CorePoint>,
+    preview_route_valid: bool,
     moved_first_endpoint: bool,
     moved_last_endpoint: bool,
 }
@@ -2220,16 +2222,23 @@ impl ComponentConnectionPreviewSet {
         let previews = snapshots
             .iter()
             .filter_map(|snapshot| {
-                let line = scene
+                let raw_line = scene
                     .connections
                     .iter()
                     .find(|connection| connection.key == snapshot.connection_key)
                     .and_then(|connection| connection.line.as_ref())?;
+                // The displayed route may contain a semantic reanchor elbow
+                // that is not present in the serialized source line. Size
+                // the transient mesh for that canonical route, otherwise a
+                // valid fallback route can be rejected simply because the
+                // old two-point capacity is too small.
+                let mut line = raw_line.clone();
+                line.points = snapshot.base_route_points.clone();
                 Some(ConnectionPreviewMesh::new(
                     device,
                     style_layout,
                     snapshot.connection_id.clone(),
-                    line,
+                    &line,
                     Transform2D {
                         scale_y: -1.0,
                         ..Transform2D::identity()
@@ -2251,15 +2260,6 @@ impl ComponentConnectionPreviewSet {
             .iter_mut()
             .find(|preview| preview.connection_id == connection_id)
             .is_some_and(|preview| preview.update(queue, points))
-    }
-
-    fn can_update_all(&self, routes: &[(String, Vec<CorePoint>)]) -> bool {
-        routes.iter().all(|(connection_id, points)| {
-            self.previews
-                .iter()
-                .find(|preview| preview.connection_id == *connection_id)
-                .is_some_and(|preview| preview.can_update(points))
-        })
     }
 }
 
@@ -4267,10 +4267,15 @@ impl App {
             return None;
         }
         // Placement covers the component's transparent area, including its
-        // ports. Let the strict semantic port hit keep ownership of the
-        // actual blue point so selected components remain connectable.
+        // ports. Only the small active semantic port radius keeps ownership
+        // of the actual blue point so selected components remain draggable
+        // in the whitespace around dense FluidPort groups.
         if self
-            .hit_test_diagram_port_for_component(pointer_model, tolerance, &component.id)
+            .hit_test_diagram_port_for_component(
+                pointer_model,
+                component_drag_port_tolerance(self.zoom),
+                &component.id,
+            )
             .is_some()
         {
             return None;
@@ -4340,7 +4345,8 @@ impl App {
             self.load_error = Some(format!("Component resize rejected: {error}"));
             return;
         }
-        let connected_connections = connection_drag_snapshots(scene, &component_name);
+        let connected_connections =
+            connection_drag_snapshots(scene, &component_name, &class_name, &source_before);
         self.pointer_interaction = PointerInteraction::ResizeDiagramComponent {
             button: MouseButton::Left,
             component_id: component.id.clone(),
@@ -4360,6 +4366,7 @@ impl App {
         };
         let pointer_model = self.screen_to_model(self.cursor);
         let tolerance = 8.0 / self.zoom.max(MIN_ZOOM);
+        let port_tolerance = component_drag_port_tolerance(self.zoom);
         match self.main_view {
             MainView::Icon => {
                 let Some(document) = self.document.as_ref() else {
@@ -4442,10 +4449,19 @@ impl App {
                         &class_name,
                         &source_before,
                     ) {
-                        self.load_error = Some(format!("Component drag rejected: {error}"));
-                        return;
+                        trace_component_edit(
+                            "preflight-warning",
+                            &component_id,
+                            &component_name,
+                            &error,
+                        );
                     }
-                    let connected_connections = connection_drag_snapshots(scene, &component_name);
+                    let connected_connections = connection_drag_snapshots(
+                        scene,
+                        &component_name,
+                        &class_name,
+                        &source_before,
+                    );
                     let component_connection_previews =
                         document.diagram(&class_name).map(|scene| {
                             ComponentConnectionPreviewSet::new(
@@ -4469,7 +4485,8 @@ impl App {
                     };
                     return;
                 }
-                if let Some(port) = self.hit_test_selected_component_port(pointer_model, tolerance)
+                if let Some(port) =
+                    self.hit_test_selected_component_port(pointer_model, port_tolerance)
                 {
                     let source = self
                         .diagram_anchor(&port)
@@ -4484,7 +4501,7 @@ impl App {
                     }
                     return;
                 }
-                if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
+                if let Some(port) = self.hit_test_diagram_port(pointer_model, port_tolerance) {
                     let source = self
                         .diagram_anchor(&port)
                         .filter(|anchor| anchor.editable)
@@ -4526,10 +4543,15 @@ impl App {
                     &class_name,
                     &source_before,
                 ) {
-                    self.load_error = Some(format!("Component drag rejected: {error}"));
-                    return;
+                    trace_component_edit(
+                        "preflight-warning",
+                        &component_id,
+                        &component_name,
+                        &error,
+                    );
                 }
-                let connected_connections = connection_drag_snapshots(scene, &component_name);
+                let connected_connections =
+                    connection_drag_snapshots(scene, &component_name, &class_name, &source_before);
                 let component_connection_previews = document.diagram(&class_name).map(|scene| {
                     ComponentConnectionPreviewSet::new(
                         &self.device,
@@ -4748,42 +4770,19 @@ impl App {
                 _ => Vec::new(),
             };
             let route_elapsed = route_started.elapsed();
-            let routes_accepted = if preview_routes.is_empty() {
-                true
-            } else {
-                self.component_connection_previews
-                    .as_ref()
-                    .is_some_and(|previews| previews.can_update_all(&preview_routes))
-            };
-            if !routes_accepted {
-                if let PointerInteraction::MoveDiagramComponent {
-                    connected_connections,
-                    ..
-                } = &self.pointer_interaction
-                {
-                    for (snapshot, (_connection_id, points)) in
-                        connected_connections.iter().zip(&preview_routes)
-                    {
-                        let reason = if !valid_interactive_connection_route(points) {
-                            "invalid route"
-                        } else {
-                            "preview mesh rejected route"
-                        };
-                        trace_component_drag_issue(
-                            &component_id,
-                            &snapshot.connection_key,
-                            reason,
-                            snapshot,
-                            points,
-                        );
-                    }
-                }
-                return true;
-            }
+            // The component is authoritative during a drag. Each connection
+            // preview is best effort and must not be allowed to freeze the
+            // component when its mesh is missing, full, or otherwise unable
+            // to accept this particular route.
+            let mut preview_mesh_results = Vec::with_capacity(preview_routes.len());
             if let Some(previews) = self.component_connection_previews.as_mut() {
                 for (connection_id, points) in &preview_routes {
-                    debug_assert!(previews.update(&self.queue, connection_id, points));
+                    let updated = valid_interactive_connection_route(points)
+                        && previews.update(&self.queue, connection_id, points);
+                    preview_mesh_results.push(updated);
                 }
+            } else {
+                preview_mesh_results.resize(preview_routes.len(), false);
             }
             let preview_started = Instant::now();
             self.diagram_scene
@@ -4800,8 +4799,26 @@ impl App {
                     y: original_origin.y + delta.y,
                 };
                 *preview_delta = delta;
-                for (snapshot, (_, points)) in connected_connections.iter_mut().zip(&preview_routes)
+                for ((snapshot, (_, points)), mesh_updated) in connected_connections
+                    .iter_mut()
+                    .zip(&preview_routes)
+                    .zip(&preview_mesh_results)
                 {
+                    snapshot.preview_route_valid = valid_interactive_connection_route(points);
+                    if !*mesh_updated {
+                        let reason = if snapshot.preview_route_valid {
+                            "preview mesh rejected route"
+                        } else {
+                            "invalid route after Manhattan fallback"
+                        };
+                        trace_component_drag_issue(
+                            &component_id,
+                            &snapshot.connection_key,
+                            reason,
+                            snapshot,
+                            points,
+                        );
+                    }
                     snapshot.preview_points = points.clone();
                 }
             }
@@ -5666,23 +5683,46 @@ impl App {
             &component_name,
             format_args!("range={}..{}", component_edit.start, component_edit.end),
         );
-        source_edits.push(component_edit);
+        source_edits.push(component_edit.clone());
         let mut connection_edits = Vec::with_capacity(connected_connections.len());
         for snapshot in &connected_connections {
-            let Some(_) = current_scene
+            let Some(connection) = current_scene
                 .connections
                 .iter()
                 .find(|connection| connection.key == snapshot.connection_key)
             else {
                 trace_component_edit(
-                    "connection-lookup-failed",
+                    "connection-skipped",
                     &component_id,
                     &component_name,
                     format_args!("key={:?}", snapshot.connection_key),
                 );
-                self.load_error = Some("Diagram edit lost a connection".into());
-                self.rollback_component_preview(&component_id, &connected_connections);
-                return;
+                continue;
+            };
+            if let Err(error) =
+                connection_source_editable_in_class(connection, &class_name, &source_before)
+            {
+                trace_component_edit(
+                    "connection-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!("key={:?} not editable: {error}", snapshot.connection_key),
+                );
+                continue;
+            }
+            if !snapshot.preview_route_valid
+                || !valid_interactive_connection_route(&snapshot.preview_points)
+            {
+                trace_component_edit(
+                    "connection-skipped",
+                    &component_id,
+                    &component_name,
+                    format_args!(
+                        "key={:?} preview route unavailable",
+                        snapshot.connection_key
+                    ),
+                );
+                continue;
             };
             let after_points = snapshot.preview_points.clone();
             let edit = match connection_points_edit_for_key(
@@ -5699,9 +5739,7 @@ impl App {
                         &component_name,
                         format_args!("key={:?} error={error}", snapshot.connection_key),
                     );
-                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
-                    self.rollback_component_preview(&component_id, &connected_connections);
-                    return;
+                    continue;
                 }
             };
             trace_component_edit(
@@ -5725,14 +5763,37 @@ impl App {
             Ok(candidate) => candidate,
             Err(error) => {
                 trace_component_edit(
-                    "source-transaction-failed",
+                    "source-transaction-connections-failed",
                     &component_id,
                     &component_name,
                     &error,
                 );
-                self.load_error = Some(format!("Diagram edit rejected: {error}"));
-                self.rollback_component_preview(&component_id, &connected_connections);
-                return;
+                // A malformed or stale connection edit must not make the
+                // authoritative component move fail. Retry the transaction
+                // with only the component placement edit.
+                connection_edits.clear();
+                match apply_validated_source_edit(&source_before, component_edit.clone(), version) {
+                    Ok(candidate) => {
+                        trace_component_edit(
+                            "source-transaction-component-only-ok",
+                            &component_id,
+                            &component_name,
+                            format_args!("ignored connection error: {error}"),
+                        );
+                        candidate
+                    }
+                    Err(component_error) => {
+                        trace_component_edit(
+                            "source-transaction-failed",
+                            &component_id,
+                            &component_name,
+                            &component_error,
+                        );
+                        self.load_error = Some(format!("Diagram edit rejected: {component_error}"));
+                        self.rollback_component_preview(&component_id, &connected_connections);
+                        return;
+                    }
+                }
             }
         };
         trace_component_edit(
@@ -9691,6 +9752,10 @@ fn connector_anchor_active_hit_distance(
     (distance <= tolerance.max(0.0)).then_some(distance)
 }
 
+fn component_drag_port_tolerance(zoom: f32) -> f32 {
+    COMPONENT_DRAG_PORT_HIT_PIXELS / zoom.max(MIN_ZOOM)
+}
+
 fn compare_connector_anchors_stably(
     left: &ConnectorAnchor,
     right: &ConnectorAnchor,
@@ -10452,6 +10517,8 @@ fn connection_invariant_failure_with_constraint(
 fn connection_drag_snapshots(
     scene: &CoreDiagramScene,
     component_name: &str,
+    class_name: &str,
+    source: &str,
 ) -> Vec<ConnectionDragSnapshot> {
     scene
         .connections
@@ -10462,37 +10529,59 @@ fn connection_drag_snapshots(
             {
                 return None;
             }
+            if let Err(error) = connection_source_editable_in_class(connection, class_name, source)
+            {
+                trace_component_connection_skip(component_name, connection, &error);
+                return None;
+            }
             let line = connection.line.as_ref()?;
             if line.points.len() < 2 {
+                trace_component_connection_skip(
+                    component_name,
+                    connection,
+                    "Line annotation has fewer than two points",
+                );
                 return None;
             }
             let base_route_points = canonical_connection_points(scene, connection);
-            let (Some(base_first), Some(base_last)) =
-                (base_route_points.first(), base_route_points.last())
-            else {
+            if !valid_interactive_connection_route(&base_route_points) {
+                trace_component_connection_skip(
+                    component_name,
+                    connection,
+                    "connection has no valid interactive route",
+                );
                 return None;
-            };
-            let (original_endpoint_points, moved_first_endpoint, moved_last_endpoint) = match (
-                strict_connection_points(scene, connection),
-                resolve_connection_endpoints(scene, connection),
-            ) {
-                (Ok(points), Ok(endpoints)) => {
-                    let (first, last) = match endpoints.point_order {
-                        ConnectionPointOrder::LhsToRhs => (
-                            connection.lhs.component_name == component_name,
-                            connection.rhs.component_name == component_name,
-                        ),
-                        ConnectionPointOrder::RhsToLhs => (
-                            connection.rhs.component_name == component_name,
-                            connection.lhs.component_name == component_name,
-                        ),
-                    };
-                    (points, first, last)
+            }
+            let original_endpoint_points = match strict_connection_points(scene, connection) {
+                Ok(points) => points,
+                Err(error) => {
+                    trace_component_connection_skip(
+                        component_name,
+                        connection,
+                        format_args!("connection points unresolved: {error:?}"),
+                    );
+                    return None;
                 }
-                _ => (
-                    (*base_first, *base_last),
+            };
+            let endpoints = match resolve_connection_endpoints(scene, connection) {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    trace_component_connection_skip(
+                        component_name,
+                        connection,
+                        format_args!("connector endpoints unresolved: {error:?}"),
+                    );
+                    return None;
+                }
+            };
+            let (moved_first_endpoint, moved_last_endpoint) = match endpoints.point_order {
+                ConnectionPointOrder::LhsToRhs => (
                     connection.lhs.component_name == component_name,
                     connection.rhs.component_name == component_name,
+                ),
+                ConnectionPointOrder::RhsToLhs => (
+                    connection.rhs.component_name == component_name,
+                    connection.lhs.component_name == component_name,
                 ),
             };
             Some(ConnectionDragSnapshot {
@@ -10504,11 +10593,27 @@ fn connection_drag_snapshots(
                 original_line_rotation: line.rotation,
                 original_endpoint_points,
                 preview_points: base_route_points,
+                preview_route_valid: true,
                 moved_first_endpoint,
                 moved_last_endpoint,
             })
         })
         .collect()
+}
+
+fn trace_component_connection_skip(
+    component_name: &str,
+    connection: &modelica_core::scene::DiagramConnection,
+    reason: impl std::fmt::Display,
+) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_DRAG").is_some()
+        || std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_EDIT").is_some()
+    {
+        eprintln!(
+            "[COMPONENT DRAG] component={component_name} connection_id={} skipped={reason}",
+            connection.id
+        );
+    }
 }
 
 fn component_connection_drag_preflight(
@@ -13085,7 +13190,7 @@ mod tests {
     }
 
     #[test]
-    fn port_active_hit_region_uses_semantic_center_not_visual_bounds() {
+    fn component_drag_port_region_is_small_and_uses_semantic_center() {
         let anchor = ConnectorAnchor {
             key: PortKey::new("component", "port"),
             connector_ref: ConnectorRef {
@@ -13104,10 +13209,20 @@ mod tests {
             editable: true,
         };
 
-        assert!(
-            connector_anchor_active_hit_distance(&anchor, CorePoint { x: 7.0, y: 0.0 }, 8.0,)
-                .is_some()
-        );
+        let tolerance = component_drag_port_tolerance(1.0);
+        assert_eq!(tolerance, 4.0);
+        assert!(connector_anchor_active_hit_distance(
+            &anchor,
+            CorePoint { x: 2.0, y: 0.0 },
+            tolerance
+        )
+        .is_some());
+        assert!(connector_anchor_active_hit_distance(
+            &anchor,
+            CorePoint { x: 6.0, y: 0.0 },
+            tolerance
+        )
+        .is_none());
         assert!(
             connector_anchor_active_hit_distance(&anchor, CorePoint { x: 20.0, y: 0.0 }, 8.0,)
                 .is_none()
