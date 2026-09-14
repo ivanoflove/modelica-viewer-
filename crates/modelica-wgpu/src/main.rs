@@ -3818,8 +3818,7 @@ impl App {
             .query(pointer_model, tolerance);
         let spatial_query_us = query_started.elapsed().as_secs_f64() * 1_000_000.0;
         let precise_started = Instant::now();
-        let mut placement_fallback = None;
-        let mut placement_candidate_count = 0;
+        let mut placement_fallback: Option<(f32, f32, (String, String, CorePoint))> = None;
         let result = candidates.component_indices.iter().rev().find_map(|index| {
             let item = self.diagram_hit_cache.components.get(*index)?;
             if !item.bounds.contains(pointer_model, tolerance) {
@@ -3829,16 +3828,48 @@ impl App {
             if !component.editable || !component.visible {
                 return None;
             }
-            placement_candidate_count += 1;
             let graphic_hit = diagram_component_contains_point(component, pointer_model, tolerance);
             let body_hit = point_in_component_placement_extent(component, pointer_model, tolerance);
             if !graphic_hit {
                 if body_hit {
-                    placement_fallback = Some((
-                        component.id.clone(),
-                        component.name.clone(),
-                        component.origin,
-                    ));
+                    let extent = component
+                        .placement_extent
+                        .unwrap_or_else(default_component_extent);
+                    let area =
+                        (extent.p2.x - extent.p1.x).abs() * (extent.p2.y - extent.p1.y).abs();
+                    let center = apply_transform_point(
+                        CorePoint {
+                            x: (extent.p1.x + extent.p2.x) * 0.5,
+                            y: (extent.p1.y + extent.p2.y) * 0.5,
+                        },
+                        Transform2D {
+                            translation: component.origin,
+                            rotation: component.rotation,
+                            scale_x: 1.0,
+                            scale_y: 1.0,
+                        },
+                    );
+                    let distance = distance_between(center, pointer_model);
+                    let candidate = (
+                        area,
+                        distance,
+                        (
+                            component.id.clone(),
+                            component.name.clone(),
+                            component.origin,
+                        ),
+                    );
+                    let replace =
+                        placement_fallback
+                            .as_ref()
+                            .is_none_or(|(best_area, best_distance, _)| {
+                                area < *best_area
+                                    || ((area - *best_area).abs() <= DIAGRAM_GEOMETRY_EPSILON
+                                        && distance < *best_distance)
+                            });
+                    if replace {
+                        placement_fallback = Some(candidate);
+                    }
                 }
                 return None;
             }
@@ -3848,11 +3879,7 @@ impl App {
                 component.origin,
             ))
         });
-        let result = result.or_else(|| {
-            (placement_candidate_count == 1)
-                .then_some(placement_fallback)
-                .flatten()
-        });
+        let result = result.or_else(|| placement_fallback.map(|(_, _, component)| component));
         if std::env::var_os("MODELICA_WGPU_PROFILE_HIT_TEST").is_some() {
             eprintln!(
                 "hit-test component: spatial_query_us={:.1} component_candidates={} precise_test_us={:.1} total_mouse_down_us={:.1}",
@@ -4193,6 +4220,15 @@ impl App {
         if !component.editable || !component.visible {
             return None;
         }
+        // Placement covers the component's transparent area, including its
+        // ports. Let the strict semantic port hit keep ownership of the
+        // actual blue point so selected components remain connectable.
+        if self
+            .hit_test_diagram_port(pointer_model, tolerance)
+            .is_some()
+        {
+            return None;
+        }
         point_in_component_placement_extent(component, pointer_model, tolerance).then(|| {
             (
                 component.id.clone(),
@@ -4318,20 +4354,6 @@ impl App {
                     self.begin_component_resize(component_name, handle);
                     return;
                 }
-                if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
-                    let source = self
-                        .diagram_anchor(&port)
-                        .filter(|anchor| anchor.editable)
-                        .cloned();
-                    self.set_diagram_selection(DiagramSelection::Port(port.clone()));
-                    self.hovered_port = Some(port);
-                    if let Some(source) = source {
-                        self.begin_connection_creation(&source);
-                    } else {
-                        self.pointer_interaction = PointerInteraction::None;
-                    }
-                    return;
-                }
                 if let Some((component_id, component_name, original_origin)) =
                     self.hit_test_selected_component_body(pointer_model, tolerance)
                 {
@@ -4363,6 +4385,20 @@ impl App {
                         connected_connections,
                         source_before,
                     };
+                    return;
+                }
+                if let Some(port) = self.hit_test_diagram_port(pointer_model, tolerance) {
+                    let source = self
+                        .diagram_anchor(&port)
+                        .filter(|anchor| anchor.editable)
+                        .cloned();
+                    self.set_diagram_selection(DiagramSelection::Port(port.clone()));
+                    self.hovered_port = Some(port);
+                    if let Some(source) = source {
+                        self.begin_connection_creation(&source);
+                    } else {
+                        self.pointer_interaction = PointerInteraction::None;
+                    }
                     return;
                 }
                 let Some((component_id, component_name, original_origin)) =
