@@ -1058,6 +1058,7 @@ impl CancelE2EProfile {
             micros(frame.queue_submit),
             micros(frame.present),
             micros(frame.frame_total),
+            micros(first_frame),
             micros(end_to_end),
             redraw.redraw_count,
         );
