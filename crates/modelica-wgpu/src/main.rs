@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, Layout, Margin,
-    Pos2, RichText, Rounding, Sense, Stroke, Vec2,
+    Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
 };
 use egui_wgpu::ScreenDescriptor;
 use lyon::{
@@ -36,8 +36,8 @@ use modelica_core::{
     apply_source_transaction,
     lexer::{tokenize, Token, TokenKind},
     parse, parse_component_declaration, resolve_diagram, Class, ClassKind, IconResolver, Library,
-    LibraryKind, LibraryRegistry, ModelicaFile, PackageLoader, PackageNode, SourceEdit,
-    SourceRange, SourceTransaction,
+    LibraryKind, LibraryRegistry, ModelicaFile, PackageLoader, PackageMember, PackageNode,
+    SourceEdit, SourceRange, SourceTransaction,
 };
 use modelica_render::{
     canonicalize_orthogonal_points, connector_anchor_hit_distance, connector_anchors,
@@ -407,6 +407,7 @@ mod save_tests {
             path: path.clone(),
             package_name: "SaveTest".to_owned(),
             class_names: Vec::new(),
+            model_tree: TreeNode::default(),
             diagnostics: 0,
             icons: Vec::new(),
             diagrams: Vec::new(),
@@ -524,6 +525,7 @@ mod save_tests {
             path: path.clone(),
             package_name: "Noop".to_owned(),
             class_names: Vec::new(),
+            model_tree: TreeNode::default(),
             diagnostics: 0,
             icons: Vec::new(),
             diagrams: Vec::new(),
@@ -1692,6 +1694,7 @@ struct LoadedDocument {
     path: PathBuf,
     package_name: String,
     class_names: Vec<String>,
+    model_tree: TreeNode,
     diagnostics: usize,
     icons: Vec<(String, CoreIconScene)>,
     diagrams: Vec<(String, CoreDiagramScene)>,
@@ -1711,11 +1714,13 @@ struct ClassSource {
     source_range: SourceRange,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct TreeNode {
     name: String,
     qualified_name: String,
     class_name: Option<String>,
+    kind: Option<ClassKind>,
+    description: Option<String>,
     children: Vec<TreeNode>,
 }
 
@@ -1746,7 +1751,7 @@ impl LoadedDocument {
             .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
         let mut class_names = Vec::new();
         collect_class_names(&package, &mut class_names);
-        class_names.sort();
+        let model_tree = build_model_tree(&package);
         let mut class_sources = Vec::new();
         collect_class_sources(&package, &mut class_sources);
         let mut registry = LibraryRegistry::default();
@@ -1799,6 +1804,7 @@ impl LoadedDocument {
             path: path.to_owned(),
             package_name: package.qualified_name,
             class_names,
+            model_tree,
             diagnostics: package.diagnostics.len(),
             icons,
             diagrams,
@@ -1955,7 +1961,7 @@ impl LoadedDocument {
         UiDocument {
             package_name: self.package_name.clone(),
             class_names: self.class_names.clone(),
-            tree: build_tree(&self.package_name, &self.class_names),
+            tree: self.model_tree.clone(),
             selected_class,
             icon_graphics,
             diagram_background,
@@ -1990,23 +1996,33 @@ impl LoadedDocument {
 }
 
 fn collect_class_names(package: &PackageNode, output: &mut Vec<String>) {
-    output.extend(
-        package
-            .classes
-            .iter()
-            .map(|class| class.qualified_name.clone()),
-    );
-    for child in &package.children {
-        collect_class_names(child, output);
+    output.push(package.qualified_name.clone());
+    for member in &package.ordered_members {
+        match member {
+            PackageMember::Package(child) => collect_class_names(child, output),
+            PackageMember::Class(class) => collect_class_names_from_class(class, output),
+        }
+    }
+}
+
+fn collect_class_names_from_class(class: &Class, output: &mut Vec<String>) {
+    output.push(class.qualified_name.clone());
+    for child in &class.children {
+        collect_class_names_from_class(child, output);
     }
 }
 
 fn collect_class_sources(package: &PackageNode, output: &mut Vec<ClassSource>) {
-    for class in &package.classes {
-        collect_class_source(class, output);
-    }
-    for child in &package.children {
-        collect_class_sources(child, output);
+    output.push(ClassSource {
+        qualified_name: package.qualified_name.clone(),
+        source_file: package.source_file.clone(),
+        source_range: package.source_range.unwrap_or(SourceRange::new(0, 0)),
+    });
+    for member in &package.ordered_members {
+        match member {
+            PackageMember::Package(child) => collect_class_sources(child, output),
+            PackageMember::Class(class) => collect_class_source(class, output),
+        }
     }
 }
 
@@ -2021,44 +2037,37 @@ fn collect_class_source(class: &Class, output: &mut Vec<ClassSource>) {
     }
 }
 
-fn build_tree(package_name: &str, class_names: &[String]) -> TreeNode {
-    let mut root = TreeNode {
-        name: package_name
-            .rsplit('.')
-            .next()
-            .unwrap_or(package_name)
-            .to_owned(),
-        qualified_name: package_name.to_owned(),
-        class_name: None,
-        children: Vec::new(),
-    };
-    for class_name in class_names {
-        let segments = class_name.split('.').collect::<Vec<_>>();
-        let root_segments = package_name.split('.').count();
-        if segments.len() <= root_segments || !class_name.starts_with(package_name) {
-            continue;
-        }
-        let mut node = &mut root;
-        for segment in &segments[root_segments..] {
-            let qualified_name = format!("{}.{}", node.qualified_name, segment);
-            let index = node
+fn build_model_tree(package: &PackageNode) -> TreeNode {
+    TreeNode {
+        name: package.name.clone(),
+        qualified_name: package.qualified_name.clone(),
+        class_name: Some(package.qualified_name.clone()),
+        kind: Some(ClassKind::Package),
+        description: package.description.clone(),
+        children: package
+            .ordered_members
+            .iter()
+            .map(build_model_tree_member)
+            .collect(),
+    }
+}
+
+fn build_model_tree_member(member: &PackageMember) -> TreeNode {
+    match member {
+        PackageMember::Package(package) => build_model_tree(package),
+        PackageMember::Class(class) => TreeNode {
+            name: class.name.clone(),
+            qualified_name: class.qualified_name.clone(),
+            class_name: Some(class.qualified_name.clone()),
+            kind: Some(class.kind),
+            description: class.description.clone(),
+            children: class
                 .children
                 .iter()
-                .position(|child| child.qualified_name == qualified_name);
-            let index = index.unwrap_or_else(|| {
-                node.children.push(TreeNode {
-                    name: (*segment).to_owned(),
-                    qualified_name: qualified_name.clone(),
-                    class_name: None,
-                    children: Vec::new(),
-                });
-                node.children.len() - 1
-            });
-            node = &mut node.children[index];
-        }
-        node.class_name = Some(class_name.clone());
+                .map(|child| build_model_tree_member(&PackageMember::Class(child.clone())))
+                .collect(),
+        },
     }
-    root
 }
 
 fn add_bundled_msl(registry: &mut LibraryRegistry) {
@@ -7800,11 +7809,7 @@ impl App {
         self.refresh_ui_document();
         self.expanded_nodes.clear();
         if let Some(doc) = self.document.as_ref() {
-            expand_top_level(
-                &mut self.expanded_nodes,
-                &doc.package_name,
-                &doc.class_names,
-            );
+            expand_top_level(&mut self.expanded_nodes, &doc.model_tree);
         }
         self.canvas_rect = None;
         self.pointer_interaction = PointerInteraction::None;
@@ -7941,10 +7946,7 @@ impl App {
         if expand_all_requested {
             if let Some(document) = &self.document {
                 expanded_nodes.clear();
-                collect_expandable_paths(
-                    &build_tree(&document.package_name, &document.class_names),
-                    &mut expanded_nodes,
-                );
+                collect_expandable_paths(&document.model_tree, &mut expanded_nodes);
             }
         } else if collapse_all_requested {
             expanded_nodes.clear();
@@ -8983,15 +8985,28 @@ fn glass_frame() -> Frame {
         .inner_margin(Margin::same(10.0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
     marker: &str,
+    icon: &str,
     label: &str,
+    identity: &str,
+    description: Option<&str>,
     selected: bool,
     indent: f32,
-) -> egui::Response {
+) -> (egui::Response, egui::Response) {
     let row_width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(Vec2::new(row_width, 29.0), Sense::click());
+    let marker_rect = Rect::from_min_size(
+        Pos2::new(rect.left() + indent * 12.0, rect.top()),
+        Vec2::new(24.0, rect.height()),
+    );
+    let marker_response = ui.interact(
+        marker_rect,
+        ui.id().with(("tree-toggle", identity)),
+        Sense::click(),
+    );
     let fill = if selected {
         theme_accent_soft(28)
     } else if response.hovered() {
@@ -9000,10 +9015,21 @@ fn tree_row(
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    let text_position = Pos2::new(rect.left() + indent * 12.0 + 30.0, rect.center().y);
     ui.painter().text(
         Pos2::new(rect.left() + indent * 12.0 + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
-        format!("{marker}  {label}"),
+        marker,
+        ui_font(12.0),
+        theme_text_tertiary(),
+    );
+    ui.painter().text(
+        text_position,
+        Align2::LEFT_CENTER,
+        format!(
+            "{icon}  {label}{}",
+            description.map_or_else(String::new, |value| format!("  — {value}"))
+        ),
         if selected {
             ui_semibold_font(13.0)
         } else {
@@ -9015,7 +9041,7 @@ fn tree_row(
             theme_text_secondary()
         },
     );
-    response
+    (response, marker_response)
 }
 
 fn document_tree(
@@ -9052,16 +9078,28 @@ fn render_tree_node(
     } else {
         "□"
     };
+    let icon = tree_node_icon(node.kind);
     let selected = selected_class.is_some() && node.class_name.as_deref() == selected_class;
-    let response = tree_row(ui, marker, &node.name, selected, depth as f32);
-    if response.clicked() {
+    let (response, marker_response) = tree_row(
+        ui,
+        marker,
+        icon,
+        &node.name,
+        &node.qualified_name,
+        node.description.as_deref(),
+        selected,
+        depth as f32,
+    );
+    if marker_response.clicked() {
         if has_children {
             if expanded {
                 expanded_nodes.remove(&node.qualified_name);
             } else {
                 expanded_nodes.insert(node.qualified_name.clone());
             }
-        } else if let Some(class_name) = &node.class_name {
+        }
+    } else if response.clicked() {
+        if let Some(class_name) = &node.class_name {
             *clicked = Some(class_name.clone());
         }
     }
@@ -9089,8 +9127,7 @@ fn collect_expandable_paths(node: &TreeNode, output: &mut HashSet<String>) {
     }
 }
 
-fn expand_top_level(expanded: &mut HashSet<String>, package_name: &str, class_names: &[String]) {
-    let root = build_tree(package_name, class_names);
+fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
     if !root.children.is_empty() {
         expanded.insert(root.qualified_name.clone());
     }
@@ -12604,6 +12641,21 @@ fn apply_validated_source_edits(
     Ok(apply_validated_source_edits_with_parsed(source, edits, version)?.source)
 }
 
+fn tree_node_icon(kind: Option<ClassKind>) -> &'static str {
+    match kind {
+        Some(ClassKind::Package) => "▱",
+        Some(ClassKind::Model) => "◇",
+        Some(ClassKind::Block) => "■",
+        Some(ClassKind::Connector | ClassKind::ExpandableConnector) => "●",
+        Some(ClassKind::Record | ClassKind::OperatorRecord) => "▤",
+        Some(ClassKind::Function | ClassKind::OperatorFunction) => "ƒ",
+        Some(ClassKind::Type) => "T",
+        Some(ClassKind::Operator) => "◈",
+        Some(ClassKind::Class) => "◆",
+        None => "·",
+    }
+}
+
 fn apply_validated_source_edits_with_parsed(
     source: &str,
     edits: Vec<SourceEdit>,
@@ -12668,7 +12720,7 @@ fn main() {
     );
     let mut app = pollster::block_on(App::new(window.clone(), document));
     if let Some(doc) = app.document.as_ref() {
-        expand_top_level(&mut app.expanded_nodes, &doc.package_name, &doc.class_names);
+        expand_top_level(&mut app.expanded_nodes, &doc.model_tree);
     }
     app.update_title(None);
     window.request_redraw();
@@ -15689,5 +15741,50 @@ mod tests {
         assert!(snapshots
             .iter()
             .all(|snapshot| snapshot.connection_key.lhs.component_name == "a"));
+    }
+
+    #[test]
+    fn model_tree_comes_from_ordered_ast_members_and_retains_kinds() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../modelica-core/tests/fixtures/IEH_CPP.mo");
+        let package = PackageLoader.load(fixture).expect("load IEH_CPP fixture");
+        let tree = build_model_tree(&package);
+        assert_eq!(tree.kind, Some(ClassKind::Package));
+        assert_eq!(tree.name, "IEH_CPP");
+        assert_eq!(
+            tree.description.as_deref(),
+            Some("远宽综合能源库 (pure C++ thermopack-cxx backend)")
+        );
+        assert_eq!(
+            tree.children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "ThermoMedium",
+                "Interfaces",
+                "FluidUnits",
+                "Converter",
+                "FMU"
+            ]
+        );
+        assert_eq!(tree.children[0].kind, Some(ClassKind::Package));
+        assert_eq!(
+            tree.children[0]
+                .children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Types", "Functions", "MediumWorld", "Units", "Examples"]
+        );
+        assert_eq!(tree.children[0].children[2].kind, Some(ClassKind::Model));
+        assert_eq!(
+            tree.children[1].children[0].children[0].kind,
+            Some(ClassKind::Connector)
+        );
+        assert_eq!(
+            tree.children[3].description.as_deref(),
+            Some("能源转换设备库")
+        );
     }
 }
