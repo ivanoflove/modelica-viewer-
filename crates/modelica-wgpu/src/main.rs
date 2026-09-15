@@ -36,8 +36,8 @@ use modelica_core::{
     apply_source_transaction,
     lexer::{tokenize, Token, TokenKind},
     parse, parse_component_declaration, resolve_diagram, Class, ClassKind, IconResolver, Library,
-    LibraryKind, LibraryRegistry, PackageLoader, PackageNode, SourceEdit, SourceRange,
-    SourceTransaction,
+    LibraryKind, LibraryRegistry, ModelicaFile, PackageLoader, PackageNode, SourceEdit,
+    SourceRange, SourceTransaction,
 };
 use modelica_render::{
     canonicalize_orthogonal_points, connector_anchor_hit_distance, connector_anchors,
@@ -755,6 +755,7 @@ fn trace_component_drag_issue(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn trace_cancel_profile(
     interaction: &str,
     connections: usize,
@@ -920,7 +921,7 @@ impl DeselectProfile {
             frame_total: frame.frame_total,
             end_to_end,
         });
-        if self.samples.len() >= 20 && self.samples.len() % 20 == 0 {
+        if self.samples.len() >= 20 && self.samples.len().is_multiple_of(20) {
             self.report_summary();
         }
     }
@@ -1073,7 +1074,7 @@ impl CancelE2EProfile {
             queue_submit: frame.queue_submit,
             present: frame.present,
         });
-        if self.samples.len() >= 20 && self.samples.len() % 20 == 0 {
+        if self.samples.len() >= 20 && self.samples.len().is_multiple_of(20) {
             self.report_summary();
         }
     }
@@ -1118,9 +1119,9 @@ impl CancelE2EProfile {
             };
             let summarize = |select: fn(&CancelE2ESample) -> Duration| {
                 (
-                    percentile(group.iter().map(|sample| select(*sample)).collect(), 0.50),
-                    percentile(group.iter().map(|sample| select(*sample)).collect(), 0.95),
-                    percentile(group.iter().map(|sample| select(*sample)).collect(), 1.0),
+                    percentile(group.iter().map(|sample| select(sample)).collect(), 0.50),
+                    percentile(group.iter().map(|sample| select(sample)).collect(), 0.95),
+                    percentile(group.iter().map(|sample| select(sample)).collect(), 1.0),
                 )
             };
             let (cancel_p50, cancel_p95, cancel_worst) = summarize(|sample| sample.cancel_cpu);
@@ -1884,6 +1885,17 @@ impl LoadedDocument {
         qualified_name: &str,
         source: &str,
     ) -> Result<(CoreIconScene, CoreDiagramScene), String> {
+        let parsed = parse(source, "<candidate>")
+            .map_err(|error| format!("candidate source does not parse: {error}"))?;
+        self.resolve_candidate_scenes_from_parsed(qualified_name, source, &parsed)
+    }
+
+    fn resolve_candidate_scenes_from_parsed(
+        &self,
+        qualified_name: &str,
+        source: &str,
+        parsed: &ModelicaFile,
+    ) -> Result<(CoreIconScene, CoreDiagramScene), String> {
         let package = PackageLoader
             .load(&self.path)
             .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
@@ -1894,8 +1906,6 @@ impl LoadedDocument {
         let (mut class, _) = registry
             .resolve_class(qualified_name)
             .ok_or_else(|| format!("class `{qualified_name}` was not found"))?;
-        let parsed = parse(source, &class.source_file)
-            .map_err(|error| format!("candidate source does not parse: {error}"))?;
         let parsed_class = parsed
             .classes
             .first()
@@ -3665,6 +3675,95 @@ struct EditCommitProfile {
     hit_index_update: Duration,
 }
 
+fn trace_interaction_latency(phase: &str, started: Instant) {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_COMPONENT_COMMIT").is_some()
+        || std::env::var_os("MODELICA_WGPU_PROFILE_CANCEL").is_some()
+        || std::env::var_os("MODELICA_WGPU_PROFILE_DESELECT").is_some()
+    {
+        eprintln!(
+            "[INTERACTION LATENCY] phase={phase} total_us={:.1}",
+            started.elapsed().as_secs_f64() * 1_000_000.0
+        );
+    }
+}
+
+struct ComponentCommitProfile {
+    enabled: bool,
+    started: Instant,
+    connections: usize,
+    component_edit_build: Duration,
+    connection_edit_build: Duration,
+    transaction_apply: Duration,
+    parse: Duration,
+    scene_resolve: Duration,
+    validation: Duration,
+    gpu_component_commit: Duration,
+    gpu_connections_commit: Duration,
+    hit_cache: Duration,
+    ui_refresh: Duration,
+    parse_count: u64,
+    resolve_count: u64,
+}
+
+impl ComponentCommitProfile {
+    fn new(connections: usize) -> Self {
+        Self {
+            enabled: std::env::var_os("MODELICA_WGPU_PROFILE_COMPONENT_COMMIT").is_some(),
+            started: Instant::now(),
+            connections,
+            component_edit_build: Duration::ZERO,
+            connection_edit_build: Duration::ZERO,
+            transaction_apply: Duration::ZERO,
+            parse: Duration::ZERO,
+            scene_resolve: Duration::ZERO,
+            validation: Duration::ZERO,
+            gpu_component_commit: Duration::ZERO,
+            gpu_connections_commit: Duration::ZERO,
+            hit_cache: Duration::ZERO,
+            ui_refresh: Duration::ZERO,
+            parse_count: 0,
+            resolve_count: 0,
+        }
+    }
+
+    fn micros(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1_000_000.0
+    }
+}
+
+impl Drop for ComponentCommitProfile {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "[COMPONENT COMMIT] connections={} total_us={:.1} component_edit_build_us={:.1} connection_edit_build_us={:.1} transaction_apply_us={:.1} parse_us={:.1} scene_resolve_us={:.1} validation_us={:.1} gpu_component_commit_us={:.1} gpu_connections_commit_us={:.1} hit_cache_us={:.1} ui_refresh_us={:.1} parse_count={} resolve_count={}",
+            self.connections,
+            Self::micros(self.started.elapsed()),
+            Self::micros(self.component_edit_build),
+            Self::micros(self.connection_edit_build),
+            Self::micros(self.transaction_apply),
+            Self::micros(self.parse),
+            Self::micros(self.scene_resolve),
+            Self::micros(self.validation),
+            Self::micros(self.gpu_component_commit),
+            Self::micros(self.gpu_connections_commit),
+            Self::micros(self.hit_cache),
+            Self::micros(self.ui_refresh),
+            self.parse_count,
+            self.resolve_count,
+        );
+        trace_interaction_latency("component_commit", self.started);
+    }
+}
+
+struct ValidatedSourceCandidate {
+    source: String,
+    parsed: ModelicaFile,
+    transaction_apply: Duration,
+    parse: Duration,
+}
+
 impl EditCommitProfile {
     fn new() -> Self {
         Self {
@@ -5203,6 +5302,7 @@ impl App {
             .record(pending, redraw, frame, finished_at);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn begin_cancel_profile(
         &mut self,
         interaction: &'static str,
@@ -5866,6 +5966,7 @@ impl App {
         let gpu_upload = rollback_component + rollback_connections;
         let cancel_completed_at = Instant::now();
         let cancel_cpu = cancel_completed_at.saturating_duration_since(total_started);
+        trace_interaction_latency("drag_cancel", total_started);
         self.begin_cancel_profile(
             interaction_name,
             connection_count,
@@ -5907,6 +6008,9 @@ impl App {
         let hover_changed = self.hovered_port.take().is_some();
         let hover_update = hover_started.elapsed();
         let changed = selection_changed || hover_changed;
+        if changed {
+            trace_interaction_latency("deselect", total_started);
+        }
         if changed && self.deselect_profile.enabled {
             let completed_at = Instant::now();
             self.begin_deselect_profile(
@@ -6396,30 +6500,25 @@ impl App {
         source_before: String,
         connected_connections: Vec<ConnectionDragSnapshot>,
     ) {
-        let delta = CorePoint {
-            x: after_origin.x - before_origin.x,
-            y: after_origin.y - before_origin.y,
-        };
+        let mut profile = ComponentCommitProfile::new(connected_connections.len());
         trace_component_edit(
             "commit-begin",
             &component_id,
             &component_name,
             format_args!(
-                "before={before_origin:?} after={after_origin:?} delta={delta:?} connections={}",
+                "before={before_origin:?} after={after_origin:?} connections={}",
                 connected_connections.len()
             ),
         );
+        let delta = CorePoint {
+            x: after_origin.x - before_origin.x,
+            y: after_origin.y - before_origin.y,
+        };
         if delta_is_zero(delta) {
-            trace_component_edit("noop", &component_id, &component_name, "zero delta");
             return;
         }
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
-            trace_component_edit(
-                "rejected",
-                &component_id,
-                &component_name,
-                "no selected class",
-            );
+            self.load_error = Some("Diagram edit has no selected class".into());
             let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
@@ -6428,12 +6527,7 @@ impl App {
             .as_ref()
             .map(|document| document.source_version(&class_name))
         else {
-            trace_component_edit(
-                "rejected",
-                &component_id,
-                &component_name,
-                "no source version",
-            );
+            self.load_error = Some("Diagram edit has no source version".into());
             let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
@@ -6443,232 +6537,65 @@ impl App {
             .and_then(|document| document.diagram(&class_name))
             .cloned()
         else {
-            trace_component_edit(
-                "rejected",
-                &component_id,
-                &component_name,
-                "no diagram scene",
-            );
+            self.load_error = Some("Diagram edit has no selected Diagram".into());
             let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
-        let Some(_) = current_scene
+        if !current_scene
             .components
             .iter()
-            .find(|component| component.id == component_id)
-        else {
-            trace_component_edit(
-                "rejected",
-                &component_id,
-                &component_name,
-                "component id not found in current scene",
-            );
-            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-            let _ = self.rollback_component_preview(&component_id, &connected_connections);
-            return;
-        };
-        trace_component_edit(
-            "component-origin-edit",
-            &component_id,
-            &component_name,
-            format_args!("target={after_origin:?}"),
-        );
-        let component_edit =
-            match component_origin_edit(&source_before, &component_name, after_origin) {
-                Ok(edit) => edit,
-                Err(error) => {
-                    trace_component_edit(
-                        "component-origin-edit-failed",
-                        &component_id,
-                        &component_name,
-                        &error,
-                    );
-                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
-                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                    return;
-                }
-            };
-        trace_component_edit(
-            "component-origin-edit-ok",
-            &component_id,
-            &component_name,
-            format_args!("range={}..{}", component_edit.start, component_edit.end),
-        );
-        let mut candidate =
-            match apply_validated_source_edit(&source_before, component_edit, version) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    trace_component_edit(
-                        "source-transaction-failed",
-                        &component_id,
-                        &component_name,
-                        &error,
-                    );
-                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
-                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                    return;
-                }
-            };
-        trace_component_edit(
-            "component-source-transaction-ok",
-            &component_id,
-            &component_name,
-            format_args!("bytes={}", candidate.len()),
-        );
-        let mut connection_edits = Vec::with_capacity(connected_connections.len());
-        let (mut resolved_icon, mut resolved_diagram) =
-            match self.document.as_ref().and_then(|document| {
-                document
-                    .resolve_candidate_scenes(&class_name, &candidate)
-                    .ok()
-            }) {
-                Some(scenes) => scenes,
-                None => {
-                    trace_component_edit(
-                        "candidate-resolve-failed",
-                        &component_id,
-                        &component_name,
-                        "candidate scenes unavailable",
-                    );
-                    self.load_error =
-                        Some("Diagram edit could not resolve candidate source".into());
-                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                    return;
-                }
-            };
-        trace_component_edit(
-            "candidate-resolve-ok",
-            &component_id,
-            &component_name,
-            "candidate scenes resolved",
-        );
-        let Some(resolved_component) = resolved_diagram
-            .components
-            .iter()
-            .find(|component| component.id == component_id)
-        else {
-            trace_component_edit(
-                "component-validation-failed",
-                &component_id,
-                &component_name,
-                "component id not found after resolve",
-            );
-            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-            let _ = self.rollback_component_preview(&component_id, &connected_connections);
-            return;
-        };
-        if !point_nearly_equal(resolved_component.origin, after_origin) {
-            trace_component_edit(
-                "component-validation-failed",
-                &component_id,
-                &component_name,
-                format_args!(
-                    "expected={after_origin:?} resolved={:?}",
-                    resolved_component.origin
-                ),
-            );
+            .any(|component| component.id == component_id)
+        {
             self.load_error = Some("Diagram edit failed: component origin mismatch".into());
             let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         }
-        let canonical_after_origin = resolved_component.origin;
-        trace_component_edit(
-            "component-validation-ok",
-            &component_id,
-            &component_name,
-            format_args!("resolved={canonical_after_origin:?}"),
-        );
-        // The component placement is authoritative. It was applied first so
-        // every route below uses semantic anchors at the new placement.
-        // Persist each editable connection independently: an inherited,
-        // malformed, or stale Line must not roll the component back.
+
+        let component_edit_started = Instant::now();
+        let component_edit =
+            match component_origin_edit(&source_before, &component_name, after_origin) {
+                Ok(edit) => edit,
+                Err(error) => {
+                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                    return;
+                }
+            };
+        profile.component_edit_build = component_edit_started.elapsed();
+
+        // All connection ranges and expected text come from the same source and
+        // scene snapshot. Do not resolve a candidate while building this list.
+        let connection_edit_started = Instant::now();
+        let mut connection_source_edits = Vec::with_capacity(connected_connections.len());
         for snapshot in &connected_connections {
-            let Some(connection) = resolved_diagram
+            if !snapshot.source_editable
+                || !snapshot.preview_route_valid
+                || !valid_interactive_connection_route(&snapshot.preview_points)
+            {
+                continue;
+            }
+            let Some(connection) = current_scene
                 .connections
                 .iter()
                 .find(|connection| connection.key == snapshot.connection_key)
             else {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} missing after component resolve",
-                        snapshot.connection_key
-                    ),
-                );
                 continue;
             };
-            let raw_points = valid_interactive_connection_route(&snapshot.preview_points)
-                .then(|| snapshot.preview_points.clone())
-                .or_else(|| {
-                    connection
-                        .line
-                        .as_ref()
-                        .map(|line| line.points.clone())
-                        .filter(|points| !points.is_empty())
-                })
-                .unwrap_or_else(|| snapshot.base_route_points.clone());
-            let Ok((route, _fallback)) =
-                resolved_connection_display_route(&resolved_diagram, connection, &raw_points)
-            else {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} route unavailable; visual route will be best effort",
-                        snapshot.connection_key
-                    ),
-                );
-                continue;
-            };
-            if !snapshot.source_editable {
-                trace_component_edit(
-                    "connection-source-read-only",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} reason={:?}; visual route will still be committed",
-                        snapshot.connection_key, snapshot.source_edit_error
-                    ),
-                );
-                continue;
-            }
-            if let Err(error) =
-                connection_source_editable_in_class(connection, &class_name, &candidate)
+            if connection_source_editable_in_class(connection, &class_name, &source_before).is_err()
             {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} error={error}; visual route retained",
-                        snapshot.connection_key
-                    ),
-                );
                 continue;
             }
             let Some(line) = connection.line.as_ref() else {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} has no Line; visual route retained",
-                        snapshot.connection_key
-                    ),
-                );
                 continue;
             };
-            if points_nearly_equal(&line.points, &route) {
+            if points_nearly_equal(&line.points, &snapshot.preview_points) {
                 continue;
             }
             let edit = match connection_points_edit_for_key(
-                &candidate,
-                &resolved_diagram,
+                &source_before,
+                &current_scene,
                 &snapshot.connection_key,
-                &route,
+                &snapshot.preview_points,
             ) {
                 Ok(edit) => edit,
                 Err(error) => {
@@ -6676,102 +6603,167 @@ impl App {
                         "connection-source-edit-skipped",
                         &component_id,
                         &component_name,
-                        format_args!(
-                            "key={:?} error={error}; visual route retained",
-                            snapshot.connection_key
-                        ),
+                        format_args!("key={:?} error={error}", snapshot.connection_key),
                     );
                     continue;
                 }
             };
-            let next_candidate = match apply_validated_source_edit(&candidate, edit, version) {
-                Ok(candidate) => candidate,
+            connection_source_edits.push((
+                ConnectionLineEdit {
+                    connection_key: snapshot.connection_key.clone(),
+                    before_points: snapshot.source_line_points.clone(),
+                    after_points: snapshot.preview_points.clone(),
+                    line_origin: line.origin,
+                },
+                edit,
+            ));
+        }
+        profile.connection_edit_build = connection_edit_started.elapsed();
+
+        // A failed connection invariant is the only reason to retry. The
+        // normal path is exactly one transaction, one parse and one resolve;
+        // retrying without the invalid connection keeps failures rare and
+        // bounded instead of reverting to one resolve per connection.
+        let mut excluded_connections = HashSet::new();
+        let mut accepted = None;
+        for attempt in 0..2 {
+            let mut source_edits = Vec::with_capacity(1 + connection_source_edits.len());
+            source_edits.push(component_edit.clone());
+            let mut attempt_connection_edits = Vec::with_capacity(connection_source_edits.len());
+            for (connection_edit, source_edit) in &connection_source_edits {
+                if excluded_connections.contains(&connection_edit.connection_key) {
+                    continue;
+                }
+                source_edits.push(source_edit.clone());
+                attempt_connection_edits.push(connection_edit.clone());
+            }
+
+            let validated_started = Instant::now();
+            let validated = match apply_validated_source_edits_with_parsed(
+                &source_before,
+                source_edits,
+                version,
+            ) {
+                Ok(validated) => validated,
                 Err(error) => {
+                    profile.transaction_apply += validated_started.elapsed();
+                    self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                    let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                    return;
+                }
+            };
+            profile.transaction_apply += validated.transaction_apply;
+            profile.parse += validated.parse;
+            profile.parse_count += 1;
+            let candidate = validated.source;
+            let resolve_started = Instant::now();
+            profile.resolve_count += 1;
+            let scenes = self.document.as_ref().and_then(|document| {
+                document
+                    .resolve_candidate_scenes_from_parsed(
+                        &class_name,
+                        &candidate,
+                        &validated.parsed,
+                    )
+                    .ok()
+            });
+            profile.scene_resolve += resolve_started.elapsed();
+            let Some((resolved_icon, resolved_diagram)) = scenes else {
+                self.load_error = Some("Diagram edit could not resolve candidate source".into());
+                let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                return;
+            };
+
+            let validation_started = Instant::now();
+            let Some(resolved_component) = resolved_diagram
+                .components
+                .iter()
+                .find(|component| component.id == component_id)
+            else {
+                profile.validation += validation_started.elapsed();
+                self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+                let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                return;
+            };
+            if !point_nearly_equal(resolved_component.origin, after_origin) {
+                profile.validation += validation_started.elapsed();
+                self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+                let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                return;
+            }
+            let invalid_connections = attempt_connection_edits
+                .iter()
+                .filter_map(|edit| {
+                    let connection = resolved_diagram
+                        .connections
+                        .iter()
+                        .find(|connection| connection.key == edit.connection_key);
+                    match connection {
+                        Some(connection) => connection_invariant_failure(
+                            &resolved_diagram,
+                            connection,
+                            &edit.after_points,
+                        )
+                        .map(|reason| (edit.connection_key.clone(), reason)),
+                        None => Some((
+                            edit.connection_key.clone(),
+                            "connection identity is no longer present",
+                        )),
+                    }
+                })
+                .collect::<Vec<_>>();
+            profile.validation += validation_started.elapsed();
+            if invalid_connections.is_empty() {
+                accepted = Some((
+                    candidate,
+                    resolved_icon,
+                    resolved_diagram,
+                    attempt_connection_edits,
+                ));
+                break;
+            }
+            if attempt == 0 {
+                for (key, reason) in invalid_connections {
+                    excluded_connections.insert(key.clone());
                     trace_component_edit(
-                        "connection-source-edit-skipped",
+                        "connection-source-edit-retry",
                         &component_id,
                         &component_name,
-                        format_args!(
-                            "key={:?} error={error}; visual route retained",
-                            snapshot.connection_key
-                        ),
+                        format_args!("key={key:?} reason={reason}"),
                     );
-                    continue;
                 }
-            };
-            let Some((next_icon, next_diagram)) = self.document.as_ref().and_then(|document| {
-                document
-                    .resolve_candidate_scenes(&class_name, &next_candidate)
-                    .ok()
-            }) else {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} candidate resolve failed; visual route retained",
-                        snapshot.connection_key
-                    ),
-                );
-                continue;
-            };
-            let Some(next_connection) = next_diagram
-                .connections
-                .iter()
-                .find(|connection| connection.key == snapshot.connection_key)
-            else {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} candidate connection missing; visual route retained",
-                        snapshot.connection_key
-                    ),
-                );
-                continue;
-            };
-            if let Some(reason) =
-                connection_invariant_failure(&next_diagram, next_connection, &route)
-            {
-                trace_component_edit(
-                    "connection-source-edit-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} reason={reason}; visual route retained",
-                        snapshot.connection_key
-                    ),
-                );
-                continue;
+            } else {
+                self.load_error = Some("Diagram edit failed: connection invariant mismatch".into());
+                let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                return;
             }
-            let line_origin = next_connection
-                .line
-                .as_ref()
-                .map_or(snapshot.original_line_origin, |line| line.origin);
-            trace_component_edit(
-                "connection-source-edit-ok",
-                &component_id,
-                &component_name,
-                format_args!(
-                    "key={:?} points={route:?} range={:?}",
-                    snapshot.connection_key, next_connection.line_source_range
-                ),
-            );
-            candidate = next_candidate;
-            resolved_icon = next_icon;
-            resolved_diagram = next_diagram;
-            connection_edits.push(ConnectionLineEdit {
-                connection_key: snapshot.connection_key.clone(),
-                before_points: snapshot.source_line_points.clone(),
-                after_points: route,
-                line_origin,
-            });
         }
 
-        // Build the GPU commit from every touching connection, not from the
-        // source-edit history. Read-only and source-skipped Lines must move
-        // visually in the same frame as the component.
+        let Some((candidate, resolved_icon, resolved_diagram, connection_edits)) = accepted else {
+            self.load_error = Some("Diagram edit rejected: no candidate".into());
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
+            return;
+        };
+        let canonical_after_origin = resolved_diagram
+            .components
+            .iter()
+            .find(|component| component.id == component_id)
+            .map_or(after_origin, |component| component.origin);
+        let mut connection_edits = connection_edits;
+        for edit in &mut connection_edits {
+            if let Some(line) = resolved_diagram
+                .connections
+                .iter()
+                .find(|connection| connection.key == edit.connection_key)
+                .and_then(|connection| connection.line.as_ref())
+            {
+                // History must contain the points that the batch transaction
+                // actually persisted, not a display fallback route.
+                edit.after_points = line.points.clone();
+                edit.line_origin = line.origin;
+            }
+        }
+
         let mut visual_connection_commits = Vec::with_capacity(connected_connections.len());
         for snapshot in &connected_connections {
             let Some(connection) = resolved_diagram
@@ -6779,82 +6771,34 @@ impl App {
                 .iter()
                 .find(|connection| connection.key == snapshot.connection_key)
             else {
-                trace_component_edit(
-                    "connection-visual-skipped",
-                    &component_id,
-                    &component_name,
-                    format_args!(
-                        "key={:?} missing after final resolve",
-                        snapshot.connection_key
-                    ),
-                );
                 continue;
             };
             let raw_points = valid_interactive_connection_route(&snapshot.preview_points)
                 .then(|| snapshot.preview_points.clone())
-                .or_else(|| {
-                    connection
-                        .line
-                        .as_ref()
-                        .map(|line| line.points.clone())
-                        .filter(|points| !points.is_empty())
-                })
+                .or_else(|| connection.line.as_ref().map(|line| line.points.clone()))
+                .filter(|points| !points.is_empty())
                 .unwrap_or_else(|| snapshot.base_route_points.clone());
-            let semantic_endpoint = strict_connection_points(&resolved_diagram, connection).ok();
-            let (route, fallback) =
-                match resolved_connection_display_route(&resolved_diagram, connection, &raw_points)
-                {
-                    Ok(route) => route,
-                    Err(error) => {
-                        trace_component_edit(
-                            "connection-visual-skipped",
-                            &component_id,
-                            &component_name,
-                            format_args!("key={:?} error={error}", snapshot.connection_key),
-                        );
-                        continue;
-                    }
-                };
-            let old_endpoint = raw_points
-                .first()
-                .zip(raw_points.last())
-                .map(|(first, last)| (*first, *last));
-            let committed_endpoint = route
-                .first()
-                .zip(route.last())
-                .map(|(first, last)| (*first, *last));
-            trace_connection_reanchor(
-                &component_id,
-                snapshot,
-                old_endpoint,
-                semantic_endpoint,
-                committed_endpoint,
-                fallback,
-            );
-            if let Some(edit) = connection_edits
-                .iter_mut()
-                .find(|edit| edit.connection_key == snapshot.connection_key)
+            if let Ok((route, fallback)) =
+                resolved_connection_display_route(&resolved_diagram, connection, &raw_points)
             {
-                edit.after_points = route.clone();
-                if let Some(line) = connection.line.as_ref() {
-                    edit.line_origin = line.origin;
-                }
-                if let Some(reason) =
-                    connection_invariant_failure(&resolved_diagram, connection, &route)
-                {
-                    trace_component_edit(
-                        "connection-source-validation-warning",
-                        &component_id,
-                        &component_name,
-                        format_args!(
-                            "key={:?} reason={reason}; visual route still committed",
-                            snapshot.connection_key
-                        ),
-                    );
-                }
+                trace_connection_reanchor(
+                    &component_id,
+                    snapshot,
+                    raw_points
+                        .first()
+                        .zip(raw_points.last())
+                        .map(|(first, last)| (*first, *last)),
+                    strict_connection_points(&resolved_diagram, connection).ok(),
+                    route
+                        .first()
+                        .zip(route.last())
+                        .map(|(first, last)| (*first, *last)),
+                    fallback,
+                );
+                visual_connection_commits.push((connection.id.clone(), route));
             }
-            visual_connection_commits.push((connection.id.clone(), route));
         }
+
         let component_transform = {
             let Some(document) = self.document.as_mut() else {
                 let _ = self.rollback_component_preview(&component_id, &connected_connections);
@@ -6887,16 +6831,18 @@ impl App {
                     })
                 })
         };
-        let canonical_delta = CorePoint {
-            x: canonical_after_origin.x - before_origin.x,
-            y: canonical_after_origin.y - before_origin.y,
-        };
+        let gpu_component_started = Instant::now();
         self.diagram_scene.commit_translation(
             &self.queue,
             &component_id,
-            [canonical_delta.x, -canonical_delta.y],
+            [
+                canonical_after_origin.x - before_origin.x,
+                -(canonical_after_origin.y - before_origin.y),
+            ],
             component_transform,
         );
+        profile.gpu_component_commit = gpu_component_started.elapsed();
+        let gpu_connections_started = Instant::now();
         for (connection_id, points) in visual_connection_commits {
             self.diagram_scene.commit_connection_points(
                 &self.device,
@@ -6905,11 +6851,13 @@ impl App {
                 &points,
             );
         }
+        profile.gpu_connections_commit = gpu_connections_started.elapsed();
+        let source_connection_edit_count = connection_edits.len();
         trace_component_edit(
-            "gpu-commit-ok",
+            "commit-ok",
             &component_id,
             &component_name,
-            format_args!("delta={canonical_delta:?}"),
+            format_args!("delta={delta:?} source_connection_edits={source_connection_edit_count}"),
         );
         self.history.push(EditCommand::MoveDiagramComponent {
             class_name,
@@ -6922,9 +6870,13 @@ impl App {
         });
         self.redo_history.clear();
         self.load_error = None;
+        let hit_cache_started = Instant::now();
         self.diagram_hit_cache =
             build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
+        profile.hit_cache = hit_cache_started.elapsed();
+        let ui_refresh_started = Instant::now();
         self.refresh_ui_document();
+        profile.ui_refresh = ui_refresh_started.elapsed();
     }
 
     fn commit_diagram_connection_move(
@@ -12649,15 +12601,32 @@ fn apply_validated_source_edits(
     edits: Vec<SourceEdit>,
     version: u64,
 ) -> Result<String, String> {
+    Ok(apply_validated_source_edits_with_parsed(source, edits, version)?.source)
+}
+
+fn apply_validated_source_edits_with_parsed(
+    source: &str,
+    edits: Vec<SourceEdit>,
+    version: u64,
+) -> Result<ValidatedSourceCandidate, String> {
     let transaction = SourceTransaction {
         edits,
         source_version: Some(version),
     };
+    let transaction_started = Instant::now();
     let candidate = apply_source_transaction(source, &transaction, Some(version))
         .map_err(|error| error.to_string())?;
-    parse(&candidate, "<candidate>")
+    let transaction_apply = transaction_started.elapsed();
+    let parse_started = Instant::now();
+    let parsed = parse(&candidate, "<candidate>")
         .map_err(|error| format!("candidate source does not parse: {error}"))?;
-    Ok(candidate)
+    let parse = parse_started.elapsed();
+    Ok(ValidatedSourceCandidate {
+        source: candidate,
+        parsed,
+        transaction_apply,
+        parse,
+    })
 }
 
 fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
@@ -15722,4 +15691,3 @@ mod tests {
             .all(|snapshot| snapshot.connection_key.lhs.component_name == "a"));
     }
 }
-

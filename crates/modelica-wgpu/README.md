@@ -57,6 +57,14 @@ MODELICA_WGPU_PROFILE_DESELECT=1 cargo run -p modelica-wgpu --release <package.m
 
 它输出 `[DESELECT PROFILE]`，拆分 selection state、hover、overlay、egui、tessellation、scene encode、submit、present、整帧和端到端耗时；`[DESELECT REDRAW]` 记录请求重绘次数与实际重绘次数。达到 20 个样本后输出 p50/p95/worst 汇总。建议在同一个 Diagram 上完成至少 100 次“选中组件后点击空白取消选中”循环，再与连接预览取消分别比较。
 
+组件移动 MouseUp 提交路径可单独 profile：
+
+```text
+MODELICA_WGPU_PROFILE_COMPONENT_COMMIT=1 cargo run -p modelica-wgpu --release <package.mo>
+```
+
+每次提交输出 `[COMPONENT COMMIT]`，包括批量 transaction、parse、scene resolve、validation、GPU、hit-cache 和 UI 刷新耗时，以及 `parse_count` / `resolve_count`。正常多连接提交应为 `parse_count=1 resolve_count=1`；只有连接 invariant 校验失败时才会进行一次有限重试并剔除无效连接编辑。`[INTERACTION LATENCY]` 同时区分 `drag_cancel`、`component_commit` 和 `deselect`。
+
 ## 外观与字体（与 Electron 客户端一致）
 
 - 主题 / 强调色与 Electron 版同一套 token（surface、text、border、accent），默认跟随系统、强调色 Violet。
