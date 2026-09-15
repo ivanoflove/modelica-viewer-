@@ -65,6 +65,10 @@ const CONNECTION_SNAP_EXIT_PIXELS: f32 = 12.0;
 const CONNECTION_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const PORT_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const COMPONENT_DRAG_PORT_HIT_PIXELS: f32 = 4.0;
+// A transformed icon line can otherwise become a sub-pixel stroke when a
+// component's icon coordinate system is fitted into its Placement extent.
+// Keep the annotation's relative widths, but retain a readable minimum.
+const MIN_VISIBLE_MODEL_STROKE_WIDTH: f32 = 0.3;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -2319,6 +2323,24 @@ struct ComponentGeometry {
     transform: Transform2D,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelTextAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Debug)]
+struct ModelTextOverlayItem {
+    text: String,
+    corners: [CorePoint; 4],
+    color: [u8; 3],
+    font_size: f32,
+    scale: f32,
+    alignment: ModelTextAlignment,
+    bold: bool,
+}
+
 struct GpuGeometry {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -3135,7 +3157,7 @@ fn update_preview_connection_vertices(
     thickness: f32,
     transform: Transform2D,
 ) {
-    let half_width = (thickness.max(0.1) * transform_scale(transform)) * 0.5;
+    let half_width = model_stroke_width(thickness, transform) * 0.5;
     let (vertex_chunks, remainder) = vertices.as_chunks_mut::<4>();
     debug_assert!(remainder.is_empty());
     for (segment, vertex_chunk) in points.windows(2).zip(vertex_chunks) {
@@ -4098,7 +4120,10 @@ impl App {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // All Modelica geometry is emitted with alpha=1.0. Keep
+                    // the opaque path as a replace operation so sRGB colors
+                    // are not routed through an unnecessary alpha blend.
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -7877,6 +7902,16 @@ impl App {
             DiagramSelection::Port(key) => self.diagram_anchor(key),
             _ => None,
         };
+        let icon_text_items = collect_model_text_overlay_items(
+            self.document.as_ref(),
+            selected_class.as_deref(),
+            MainView::Icon,
+        );
+        let diagram_text_items = collect_model_text_overlay_items(
+            self.document.as_ref(),
+            selected_class.as_deref(),
+            MainView::Diagram,
+        );
         let overlay_update = overlay_update_started.elapsed();
         let zoom = self.zoom;
         let pan = self.pan;
@@ -7903,6 +7938,29 @@ impl App {
                 load_error.as_deref(),
                 document_loading,
             );
+            if main_view == MainView::Icon {
+                draw_model_text_overlay(
+                    ctx,
+                    icon_clip_rect,
+                    &icon_text_items,
+                    zoom,
+                    pan,
+                    viewport,
+                    pixels_per_point,
+                    false,
+                );
+            } else if main_view == MainView::Diagram {
+                draw_model_text_overlay(
+                    ctx,
+                    icon_clip_rect,
+                    &diagram_text_items,
+                    zoom,
+                    pan,
+                    viewport,
+                    pixels_per_point,
+                    true,
+                );
+            }
             if main_view == MainView::Diagram {
                 draw_diagram_selection_overlay(
                     ctx,
@@ -9554,6 +9612,203 @@ fn draw_diagram_selection_overlay(
     }
 }
 
+fn collect_model_text_overlay_items(
+    document: Option<&LoadedDocument>,
+    selected_class: Option<&str>,
+    main_view: MainView,
+) -> Vec<ModelTextOverlayItem> {
+    let Some(document) = document else {
+        return Vec::new();
+    };
+    let Some(class_name) = selected_class else {
+        return Vec::new();
+    };
+    let display_class_name = class_name.rsplit('.').next().unwrap_or(class_name);
+    let mut items = Vec::new();
+
+    match main_view {
+        MainView::Source => {}
+        MainView::Icon => {
+            let Some(scene) = document.icon(class_name) else {
+                return items;
+            };
+            for resolved in &scene.graphics {
+                if let CoreGraphic::Text(text) = &resolved.graphic {
+                    items.push(model_text_overlay_item(
+                        text,
+                        resolved.transform,
+                        display_class_name,
+                        display_class_name,
+                    ));
+                }
+            }
+        }
+        MainView::Diagram => {
+            let Some(scene) = document.diagram(class_name) else {
+                return items;
+            };
+            for graphic in &scene.background_graphics {
+                if let CoreGraphic::Text(text) = graphic {
+                    items.push(model_text_overlay_item(
+                        text,
+                        Transform2D::identity(),
+                        display_class_name,
+                        display_class_name,
+                    ));
+                }
+            }
+            for component in &scene.components {
+                if !component.visible {
+                    continue;
+                }
+                let Some(layer) = component.diagram_layer() else {
+                    continue;
+                };
+                let placement = diagram_placement_transform(layer, component);
+                let component_class_name = component
+                    .resolved_type_qualified_name
+                    .as_deref()
+                    .and_then(|name| name.rsplit('.').next())
+                    .unwrap_or(component.type_name.as_str());
+                for resolved in &layer.graphics {
+                    if let CoreGraphic::Text(text) = &resolved.graphic {
+                        items.push(model_text_overlay_item(
+                            text,
+                            compose_transform(placement, resolved.transform),
+                            &component.name,
+                            component_class_name,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    items
+}
+
+fn model_text_overlay_item(
+    text: &modelica_core::scene::TextGraphic,
+    transform: Transform2D,
+    instance_name: &str,
+    class_name: &str,
+) -> ModelTextOverlayItem {
+    let extent = text.extent;
+    let local_corners = [
+        extent.p1,
+        CorePoint {
+            x: extent.p2.x,
+            y: extent.p1.y,
+        },
+        extent.p2,
+        CorePoint {
+            x: extent.p1.x,
+            y: extent.p2.y,
+        },
+    ];
+    let corners = local_corners.map(|point| {
+        let [x, y] = transform_graphic_point(point, text.origin, text.rotation, transform);
+        CorePoint { x, y }
+    });
+    ModelTextOverlayItem {
+        text: expand_model_text(&text.text, instance_name, class_name),
+        corners,
+        color: text.color,
+        font_size: text.font_size.unwrap_or(10.0),
+        scale: transform_scale(transform),
+        alignment: model_text_alignment(text.horizontal_alignment.as_deref()),
+        bold: text.text_style.iter().any(|style| style.contains("Bold")),
+    }
+}
+
+fn expand_model_text(template: &str, instance_name: &str, class_name: &str) -> String {
+    let escaped_percent = '\u{0}';
+    template
+        .replace("%%", &escaped_percent.to_string())
+        .replace("%name", instance_name)
+        .replace("%class", class_name)
+        .replace(escaped_percent, "%")
+}
+
+fn model_text_alignment(value: Option<&str>) -> ModelTextAlignment {
+    match value {
+        Some(value) if value.contains("Left") => ModelTextAlignment::Left,
+        Some(value) if value.contains("Right") => ModelTextAlignment::Right,
+        _ => ModelTextAlignment::Center,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_model_text_overlay(
+    ctx: &egui::Context,
+    canvas_rect: Option<egui::Rect>,
+    items: &[ModelTextOverlayItem],
+    zoom: f32,
+    pan: [f32; 2],
+    viewport: [u32; 2],
+    pixels_per_point: f32,
+    diagram: bool,
+) {
+    let Some(canvas_rect) = canvas_rect else {
+        return;
+    };
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("modelica-model-text"),
+        ))
+        .with_clip_rect(canvas_rect);
+    let to_screen = |point: CorePoint| {
+        Pos2::new(
+            (viewport[0] as f32 * 0.5 + pan[0] + point.x * zoom) / pixels_per_point,
+            (viewport[1] as f32 * 0.5
+                + pan[1]
+                + if diagram {
+                    -point.y * zoom
+                } else {
+                    point.y * zoom
+                })
+                / pixels_per_point,
+        )
+    };
+
+    for item in items {
+        if item.text.is_empty() {
+            continue;
+        }
+        let screen_corners = item.corners.map(to_screen);
+        let min_x = screen_corners
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = screen_corners
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let center_y = screen_corners.iter().map(|point| point.y).sum::<f32>() / 4.0;
+        let (position, align) = match item.alignment {
+            ModelTextAlignment::Left => (Pos2::new(min_x, center_y), Align2::LEFT_CENTER),
+            ModelTextAlignment::Center => (
+                Pos2::new((min_x + max_x) * 0.5, center_y),
+                Align2::CENTER_CENTER,
+            ),
+            ModelTextAlignment::Right => (Pos2::new(max_x, center_y), Align2::RIGHT_CENTER),
+        };
+        let font_size = (item.font_size * item.scale * zoom).clamp(7.0, 24.0);
+        let font = if item.bold {
+            ui_semibold_font(font_size)
+        } else {
+            ui_font(font_size)
+        };
+        painter.text(
+            position,
+            align,
+            &item.text,
+            font,
+            Color32::from_rgb(item.color[0], item.color[1], item.color[2]),
+        );
+    }
+}
+
 fn build_scene(
     device: &wgpu::Device,
     style_layout: &wgpu::BindGroupLayout,
@@ -10294,7 +10549,7 @@ fn line_geometry(line: &LineGraphic, transform: Transform2D) -> Vec<Geometry> {
     vec![stroke_geometry(
         &polyline_path(&points),
         |_| [0.0, 0.0],
-        line.thickness.max(0.1) * transform_scale(transform),
+        model_stroke_width(line.thickness, transform),
         color_rgba(line.color),
     )]
 }
@@ -10376,7 +10631,7 @@ fn ellipse_geometry(ellipse: &EllipseGraphic, transform: Transform2D) -> Vec<Geo
         geometry.push(stroke_geometry(
             &polyline_path(&points),
             |_| [0.0, 0.0],
-            ellipse.line_thickness.unwrap_or(0.25).max(0.1) * transform_scale(transform),
+            model_stroke_width(ellipse.line_thickness.unwrap_or(0.25), transform),
             color_rgba(ellipse.line_color),
         ));
     }
@@ -10408,7 +10663,7 @@ fn closed_shape_geometry(
         geometry.push(stroke_geometry(
             &polyline_path(points),
             |_| [0.0, 0.0],
-            line_thickness.unwrap_or(0.25).max(0.1) * transform_scale(transform),
+            model_stroke_width(line_thickness.unwrap_or(0.25), transform),
             color_rgba(line_color),
         ));
     }
@@ -10437,6 +10692,10 @@ fn transform_graphic_point(
 
 fn transform_scale(transform: Transform2D) -> f32 {
     ((transform.scale_x.abs() + transform.scale_y.abs()) * 0.5).max(0.01)
+}
+
+fn model_stroke_width(annotation_width: f32, transform: Transform2D) -> f32 {
+    (annotation_width.max(0.1) * transform_scale(transform)).max(MIN_VISIBLE_MODEL_STROKE_WIDTH)
 }
 
 fn ellipse_points(ellipse: &EllipseGraphic, transform: Transform2D) -> Vec<[f32; 2]> {
@@ -14812,6 +15071,53 @@ end BoundarySig;
     }
 
     #[test]
+    fn modelica_strokes_keep_annotation_ratios_with_a_visible_floor() {
+        let identity = Transform2D::identity();
+        assert_eq!(model_stroke_width(0.25, identity), 0.3);
+        assert_eq!(model_stroke_width(1.0, identity), 1.0);
+        assert_eq!(
+            model_stroke_width(
+                0.5,
+                Transform2D {
+                    scale_x: 0.1,
+                    scale_y: 0.1,
+                    ..identity
+                },
+            ),
+            MIN_VISIBLE_MODEL_STROKE_WIDTH
+        );
+    }
+
+    #[test]
+    fn model_text_macros_and_annotation_color_are_preserved() {
+        assert_eq!(
+            expand_model_text("%%name %name (%class)", "sink", "BoundarySig"),
+            "%name sink (BoundarySig)"
+        );
+        let text = modelica_core::scene::TextGraphic {
+            origin: CorePoint { x: 0.0, y: 0.0 },
+            rotation: 0.0,
+            extent: modelica_core::scene::Extent {
+                p1: CorePoint { x: -10.0, y: -5.0 },
+                p2: CorePoint { x: 10.0, y: 5.0 },
+            },
+            text: "sink".to_owned(),
+            color: [0, 0, 127],
+            fill_color: None,
+            fill_pattern: None,
+            font_size: Some(12.0),
+            font_name: None,
+            horizontal_alignment: Some("TextAlignment.Left".to_owned()),
+            text_style: vec!["TextStyle.Bold".to_owned()],
+        };
+        let item = model_text_overlay_item(&text, Transform2D::identity(), "sink", "BoundarySig");
+        assert_eq!(item.text, "sink");
+        assert_eq!(item.color, [0, 0, 127]);
+        assert_eq!(item.alignment, ModelTextAlignment::Left);
+        assert!(item.bold);
+    }
+
+    #[test]
     fn diagram_layers_draw_connectors_after_opaque_components() {
         let coordinate_system = modelica_core::scene::CoordinateSystem::default();
         let icon_for = |owner: &str, graphic: CoreGraphic| {
@@ -15097,12 +15403,15 @@ end BoundarySig;
             let expected_min_x = if name == "port_a" { -104.0 } else { 96.0 };
             let expected_max_x = if name == "port_a" { -96.0 } else { 104.0 };
             // Stroke tessellation expands the filled extent by roughly half
-            // the transformed line width, so bounds are checked with a small
+            // the transformed line width, so bounds are checked with a
             // renderer tolerance rather than against the raw placement box.
-            assert!((min[0] - expected_min_x).abs() < 0.1);
-            assert!((max[0] - expected_max_x).abs() < 0.1);
-            assert!((min[1] + 4.0).abs() < 0.1);
-            assert!((max[1] - 4.0).abs() < 0.1);
+            // The visible stroke floor intentionally makes tiny fitted icons
+            // expand slightly more than their pre-floor geometry.
+            let geometry_tolerance = MIN_VISIBLE_MODEL_STROKE_WIDTH + 0.05;
+            assert!((min[0] - expected_min_x).abs() < geometry_tolerance);
+            assert!((max[0] - expected_max_x).abs() < geometry_tolerance);
+            assert!((min[1] + 4.0).abs() < geometry_tolerance);
+            assert!((max[1] - 4.0).abs() < geometry_tolerance);
         }
     }
 

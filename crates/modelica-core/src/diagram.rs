@@ -240,6 +240,7 @@ impl<'a> DiagramResolver<'a> {
                     self.registry,
                     &component_class,
                     &component_source,
+                    &component.name,
                 );
                 component.resolved_icon = Some(Box::new(icon));
                 if matches!(
@@ -299,8 +300,13 @@ impl<'a> DiagramResolver<'a> {
 struct IconResolverAdapter;
 
 impl IconResolverAdapter {
-    fn resolve(registry: &mut LibraryRegistry, class: &Class, source: &str) -> IconScene {
-        crate::IconResolver::new(registry).resolve(class, source)
+    fn resolve(
+        registry: &mut LibraryRegistry,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+    ) -> IconScene {
+        crate::IconResolver::new(registry).resolve_for_instance(class, source, instance_name)
     }
 }
 
@@ -887,6 +893,45 @@ end Top;
                 .all(|component| component.resolved_icon.is_some())
         );
         assert!(scene.content_bounds.is_some());
+    }
+
+    #[test]
+    fn diagram_component_icons_expand_name_for_each_instance() {
+        let source = r#"
+model Unit
+  annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%name")}));
+end Unit;
+
+model Top
+  Unit left annotation(Placement(transformation(extent={{-80,-10},{-60,10}})));
+  Unit right annotation(Placement(transformation(extent={{60,-10},{80,10}})));
+end Top;
+"#;
+        let file = parse(source, "DiagramText.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("DiagramText.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[1], source, &mut registry);
+
+        for (name, component) in [
+            ("left", &scene.components[0]),
+            ("right", &scene.components[1]),
+        ] {
+            let text = component
+                .resolved_icon
+                .as_ref()
+                .and_then(|icon| {
+                    icon.graphics
+                        .iter()
+                        .find_map(|graphic| match &graphic.graphic {
+                            crate::scene::Graphic::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                })
+                .expect("component label");
+            assert_eq!(text, name);
+        }
     }
 
     #[test]

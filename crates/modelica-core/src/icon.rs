@@ -21,8 +21,23 @@ impl<'a> IconResolver<'a> {
     }
 
     pub fn resolve(&mut self, class: &Class, source: &str) -> IconScene {
+        self.resolve_for_instance(class, source, &class.name)
+    }
+
+    /// Resolve an Icon for a concrete component instance.
+    ///
+    /// Diagram components reuse their class Icon, but Modelica text macros
+    /// such as `%name` refer to the placed instance rather than the class
+    /// declaration. Keep the class-based API above for standalone previews
+    /// and expose the instance-aware path to the Diagram resolver.
+    pub fn resolve_for_instance(
+        &mut self,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+    ) -> IconScene {
         let mut visiting = Vec::new();
-        self.resolve_inner(class, source, &mut visiting, &class.name)
+        self.resolve_inner(class, source, &mut visiting, instance_name)
     }
 
     fn resolve_inner(
@@ -901,6 +916,21 @@ end Parent;
             .collect::<Vec<_>>();
         assert!(texts.contains(&"Parent/42"));
         assert!(texts.contains(&"leftPin/Pin"));
+
+        let instance_scene = IconResolver::new(&mut registry).resolve_for_instance(
+            &file.classes[0],
+            source,
+            "input_1",
+        );
+        let instance_text = instance_scene
+            .graphics
+            .iter()
+            .find_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .expect("instance text");
+        assert_eq!(instance_text, "input_1/Pin");
         assert_eq!(
             scene
                 .graphics
