@@ -9851,16 +9851,63 @@ fn canonical_connection_points(
     let Some(line) = connection.line.as_ref() else {
         return Vec::new();
     };
-    let (points, _) = resolved_connection_display_route(scene, connection, &line.points)
-        .unwrap_or_else(|_| (line.points.clone(), ConnectionRouteFallback::Source));
-    points
+    match resolved_connection_display_route(scene, connection, &line.points) {
+        Ok((points, _)) => points,
+        Err(_) => match strict_connection_points(scene, connection) {
+            Ok((first, last)) => {
+                let points = semantic_endpoint_route(first, last, &line.points);
+                if valid_interactive_connection_route(&points) {
+                    points
+                } else {
+                    line.points.clone()
+                }
+            }
+            Err(_) => line.points.clone(),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectionRouteFallback {
     SemanticReanchor,
+    SemanticEndpoint,
     Manhattan,
-    Source,
+}
+
+/// Construct the smallest valid orthogonal route between semantic endpoints.
+///
+/// This is deliberately independent of the source annotation.  A source
+/// `Line.points` array may be stale after a component/connector placement has
+/// changed, but a displayed route must still meet the resolved connector
+/// anchors.  Keep the source route's first segment orientation when it is
+/// usable so the fallback does not needlessly flip an existing corner.
+fn semantic_endpoint_route(
+    first: CorePoint,
+    last: CorePoint,
+    base_points: &[CorePoint],
+) -> Vec<CorePoint> {
+    if (first.x - last.x).abs() <= ORTHOGONAL_EPSILON
+        || (first.y - last.y).abs() <= ORTHOGONAL_EPSILON
+    {
+        return vec![first, last];
+    }
+
+    let horizontal_first = base_points
+        .first()
+        .zip(base_points.get(1))
+        .is_some_and(|(start, next)| (start.y - next.y).abs() <= ORTHOGONAL_EPSILON);
+    let elbow = if horizontal_first {
+        CorePoint {
+            x: last.x,
+            y: first.y,
+        }
+    } else {
+        CorePoint {
+            x: first.x,
+            y: last.y,
+        }
+    };
+    vec![first, elbow, last]
 }
 
 fn resolved_connection_display_route(
@@ -9902,6 +9949,19 @@ fn resolved_connection_display_route(
         && displayed_connection_points_match_invariant(scene, connection, &fallback)
     {
         return Ok((fallback, ConnectionRouteFallback::Manhattan));
+    }
+
+    // The route-preserving and translation fallbacks can both reject a
+    // malformed source polyline (for example, after a connector placement
+    // changed the endpoint axes).  Semantic anchors are still authoritative;
+    // never let a display path fall back to the stale source endpoints when
+    // they resolved successfully.
+    let endpoint_fallback =
+        canonicalize_orthogonal_points(&semantic_endpoint_route(lhs, rhs, raw_points));
+    if valid_interactive_connection_route(&endpoint_fallback)
+        && displayed_connection_points_match_invariant(scene, connection, &endpoint_fallback)
+    {
+        return Ok((endpoint_fallback, ConnectionRouteFallback::SemanticEndpoint));
     }
 
     Err("unable to construct an orthogonal route anchored to both connectors".to_owned())
@@ -14336,6 +14396,88 @@ mod tests {
                 .points,
             points
         );
+    }
+
+    #[test]
+    fn semantic_endpoint_route_keeps_stale_signal_line_anchored() {
+        let source = r#"
+connector RealInput = input Real annotation(
+  Icon(graphics={Polygon(points={{-100,100},{100,0},{-100,-100}})}),
+  Diagram(graphics={Polygon(points={{0,50},{100,0},{0,-50},{0,50}})})
+);
+connector RealOutput = output Real annotation(
+  Icon(graphics={Polygon(points={{-100,100},{100,0},{-100,-100}})}),
+  Diagram(graphics={Polygon(points={{-100,50},{0,0},{-100,-50}})})
+);
+model BoundarySig
+  RealInput p_in annotation(Placement(transformation(extent={{-110,-10},{-90,10}})));
+  RealOutput p_out annotation(Placement(transformation(extent={{90,-10},{110,10}})));
+equation
+  connect(p_in, p_out) annotation(Line(points={{-30.2,28.4},{30.2,28.4}}));
+end BoundarySig;
+"#;
+        let file = parse(source, "BoundarySig.mo").expect("parse signal fixture");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("BoundarySig.mo", source)
+            .expect("register signal fixture");
+        let class = file
+            .classes
+            .iter()
+            .find(|class| class.name == "BoundarySig")
+            .expect("BoundarySig class");
+        let scene = resolve_diagram(class, source, &mut registry);
+        let connection = scene.connections.first().expect("signal connection");
+
+        let (semantic_first, semantic_last) =
+            strict_connection_points(&scene, connection).expect("signal connector anchors");
+        let points = canonical_connection_points(&scene, connection);
+        assert_eq!(
+            (semantic_first, semantic_last),
+            (
+                CorePoint { x: -100.0, y: 0.0 },
+                CorePoint { x: 100.0, y: 0.0 }
+            )
+        );
+        assert_eq!(
+            points,
+            vec![
+                CorePoint { x: -100.0, y: 0.0 },
+                CorePoint { x: 100.0, y: 0.0 },
+            ]
+        );
+
+        let geometry = core_diagram_geometry(&scene)
+            .into_iter()
+            .find(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .expect("signal connection geometry");
+        assert_eq!(
+            geometry
+                .connection
+                .expect("connection metadata")
+                .line
+                .points,
+            points
+        );
+    }
+
+    #[test]
+    fn semantic_endpoint_route_repairs_unusable_source_polyline() {
+        let first = CorePoint { x: -40.0, y: 12.0 };
+        let last = CorePoint { x: 60.0, y: -18.0 };
+        let route = semantic_endpoint_route(
+            first,
+            last,
+            &[
+                CorePoint { x: -30.0, y: 4.0 },
+                CorePoint { x: 10.0, y: 25.0 },
+                CorePoint { x: 50.0, y: -2.0 },
+            ],
+        );
+
+        assert_eq!(route.first(), Some(&first));
+        assert_eq!(route.last(), Some(&last));
+        assert!(valid_interactive_connection_route(&route));
     }
 
     #[test]
