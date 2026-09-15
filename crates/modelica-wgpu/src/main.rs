@@ -70,6 +70,13 @@ const FIT_SCENE_FILL: f32 = 0.86;
 const CONNECTION_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const PORT_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const COMPONENT_DRAG_PORT_HIT_PIXELS: f32 = 4.0;
+// Modelica source coordinates are serialized as decimals, so small endpoint
+// differences are expected. A larger drift means the source route belongs to
+// an older placement and its interior points must not be trusted for display.
+const ROUTE_REPAIR_ENDPOINT_DRIFT_UNITS: f32 = 2.0;
+// Keep ordinary routed detours, but reject a source route whose length is more
+// than four times the direct Manhattan distance between the current anchors.
+const ROUTE_REPAIR_MAX_DETOUR_RATIO: f32 = 4.0;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -2328,6 +2335,27 @@ struct ComponentGeometry {
 enum StrokeKind {
     Connection,
     Icon,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaleRouteReason {
+    InvalidSourceRoute,
+    EndpointDrift,
+    ExcessiveDetour,
+    ReanchorInvalid,
+    ReanchorEndpointMismatch,
+}
+
+impl StaleRouteReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InvalidSourceRoute => "invalid_source_route",
+            Self::EndpointDrift => "endpoint_drift",
+            Self::ExcessiveDetour => "excessive_detour",
+            Self::ReanchorInvalid => "reanchor_invalid",
+            Self::ReanchorEndpointMismatch => "reanchor_endpoint_mismatch",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10313,17 +10341,20 @@ fn canonical_connection_points(
     };
     match resolved_connection_display_route(scene, connection, &line.points) {
         Ok((points, _)) => points,
-        Err(_) => match strict_connection_points(scene, connection) {
-            Ok((first, last)) => {
-                let points = semantic_endpoint_route(first, last, &line.points);
+        Err(_) => {
+            // A connection without resolvable semantic endpoints can still be
+            // a fixed/external line, so preserve its source route in that
+            // case. Once endpoints resolve, never silently display stale raw
+            // geometry.
+            if let Ok((first, last)) = strict_connection_points(scene, connection) {
+                let points = canonical_orthogonal_route(first, last, &line.points);
                 if valid_interactive_connection_route(&points) {
-                    points
-                } else {
-                    line.points.clone()
+                    return points;
                 }
+                return Vec::new();
             }
-            Err(_) => line.points.clone(),
-        },
+            line.points.clone()
+        }
     }
 }
 
@@ -10332,6 +10363,7 @@ enum ConnectionRouteFallback {
     SemanticReanchor,
     SemanticEndpoint,
     Manhattan,
+    CanonicalOrthogonal,
 }
 
 /// Construct the smallest valid orthogonal route between semantic endpoints.
@@ -10352,10 +10384,11 @@ fn semantic_endpoint_route(
         return vec![first, last];
     }
 
-    let horizontal_first = base_points
-        .first()
-        .zip(base_points.get(1))
-        .is_some_and(|(start, next)| (start.y - next.y).abs() <= ORTHOGONAL_EPSILON);
+    let horizontal_first = match base_points.first().zip(base_points.get(1)) {
+        Some((start, next)) if (start.y - next.y).abs() <= ORTHOGONAL_EPSILON => true,
+        Some((start, next)) if (start.x - next.x).abs() <= ORTHOGONAL_EPSILON => false,
+        _ => (last.x - first.x).abs() >= (last.y - first.y).abs(),
+    };
     let elbow = if horizontal_first {
         CorePoint {
             x: last.x,
@@ -10368,6 +10401,107 @@ fn semantic_endpoint_route(
         }
     };
     vec![first, elbow, last]
+}
+
+fn canonical_orthogonal_route(
+    first: CorePoint,
+    last: CorePoint,
+    route_hint: &[CorePoint],
+) -> Vec<CorePoint> {
+    if (first.x - last.x).abs() <= ORTHOGONAL_EPSILON
+        || (first.y - last.y).abs() <= ORTHOGONAL_EPSILON
+    {
+        return vec![first, last];
+    }
+
+    let source_horizontal = match route_hint.first().zip(route_hint.get(1)) {
+        Some((start, next)) if (start.y - next.y).abs() <= ORTHOGONAL_EPSILON => true,
+        Some((start, next)) if (start.x - next.x).abs() <= ORTHOGONAL_EPSILON => false,
+        _ => (last.x - first.x).abs() >= (last.y - first.y).abs(),
+    };
+    let first_moved = route_hint
+        .first()
+        .is_some_and(|point| distance_between(*point, first) > ORTHOGONAL_EPSILON);
+    let last_moved = route_hint
+        .last()
+        .is_some_and(|point| distance_between(*point, last) > ORTHOGONAL_EPSILON);
+
+    if first_moved == last_moved {
+        return semantic_endpoint_route(first, last, route_hint);
+    }
+
+    // Preserve the side of a two-ended route that did not move. This is the
+    // same stable choice used by interactive re-anchoring, and avoids a
+    // visible corner flip when a stale source route is repaired on startup.
+    let horizontal_first = match (first_moved, last_moved) {
+        (false, true) => !source_horizontal,
+        (true, false) => source_horizontal,
+        _ => source_horizontal,
+    };
+    let elbow = if horizontal_first {
+        CorePoint {
+            x: last.x,
+            y: first.y,
+        }
+    } else {
+        CorePoint {
+            x: first.x,
+            y: last.y,
+        }
+    };
+    vec![first, elbow, last]
+}
+
+fn stale_route_reason(
+    raw_points: &[CorePoint],
+    semantic_first: CorePoint,
+    semantic_last: CorePoint,
+) -> Option<StaleRouteReason> {
+    if !valid_interactive_connection_route(raw_points) {
+        return Some(StaleRouteReason::InvalidSourceRoute);
+    }
+    let first_drift = distance_between(raw_points[0], semantic_first);
+    let last_drift = distance_between(
+        *raw_points.last().expect("valid route has a last point"),
+        semantic_last,
+    );
+    if first_drift > ROUTE_REPAIR_ENDPOINT_DRIFT_UNITS
+        || last_drift > ROUTE_REPAIR_ENDPOINT_DRIFT_UNITS
+    {
+        return Some(StaleRouteReason::EndpointDrift);
+    }
+
+    if raw_points.len() > 2 {
+        let direct_manhattan =
+            (semantic_first.x - semantic_last.x).abs() + (semantic_first.y - semantic_last.y).abs();
+        let route_length = raw_points
+            .windows(2)
+            .map(|pair| distance_between(pair[0], pair[1]))
+            .sum::<f32>();
+        let allowed_route_length = direct_manhattan * ROUTE_REPAIR_MAX_DETOUR_RATIO;
+        if route_length > allowed_route_length.max(ROUTE_REPAIR_ENDPOINT_DRIFT_UNITS) {
+            return Some(StaleRouteReason::ExcessiveDetour);
+        }
+    }
+
+    None
+}
+
+fn trace_route_repair(
+    connection: &modelica_core::scene::DiagramConnection,
+    raw_points: &[CorePoint],
+    semantic_first: CorePoint,
+    semantic_last: CorePoint,
+    reason: StaleRouteReason,
+) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_ROUTE_REPAIR").is_none() {
+        return;
+    }
+    eprintln!(
+        "[ROUTE REPAIR] connection={} raw_points={raw_points:?} semantic_start={semantic_first:?} semantic_end={semantic_last:?} stale_reason={} fallback=canonical_orthogonal",
+        connection.id,
+        reason.label(),
+    );
 }
 
 fn resolved_connection_display_route(
@@ -10383,13 +10517,36 @@ fn resolved_connection_display_route(
         vec![lhs, rhs]
     };
 
-    if let Ok(reanchored) = reanchor_connection_points(scene, connection, &base_points) {
-        let canonical = canonicalize_orthogonal_points(&reanchored);
-        if valid_interactive_connection_route(&canonical)
-            && displayed_connection_points_match_invariant(scene, connection, &canonical)
-        {
-            return Ok((canonical, ConnectionRouteFallback::SemanticReanchor));
+    let mut stale_reason = stale_route_reason(raw_points, lhs, rhs);
+    if stale_reason.is_none() {
+        match reanchor_connection_points(scene, connection, &base_points) {
+            Ok(reanchored) => {
+                let canonical = canonicalize_orthogonal_points(&reanchored);
+                if valid_interactive_connection_route(&canonical)
+                    && displayed_connection_points_match_invariant(scene, connection, &canonical)
+                {
+                    return Ok((canonical, ConnectionRouteFallback::SemanticReanchor));
+                }
+                stale_reason = Some(if valid_interactive_connection_route(&canonical) {
+                    StaleRouteReason::ReanchorEndpointMismatch
+                } else {
+                    StaleRouteReason::ReanchorInvalid
+                });
+            }
+            Err(_) => stale_reason = Some(StaleRouteReason::ReanchorInvalid),
         }
+    }
+
+    if let Some(reason) = stale_reason {
+        let fallback =
+            canonicalize_orthogonal_points(&canonical_orthogonal_route(lhs, rhs, raw_points));
+        if valid_interactive_connection_route(&fallback)
+            && displayed_connection_points_match_invariant(scene, connection, &fallback)
+        {
+            trace_route_repair(connection, raw_points, lhs, rhs, reason);
+            return Ok((fallback, ConnectionRouteFallback::CanonicalOrthogonal));
+        }
+        return Err("unable to construct a canonical orthogonal display route".to_owned());
     }
 
     let moved_first_endpoint = raw_points
@@ -10417,7 +10574,7 @@ fn resolved_connection_display_route(
     // never let a display path fall back to the stale source endpoints when
     // they resolved successfully.
     let endpoint_fallback =
-        canonicalize_orthogonal_points(&semantic_endpoint_route(lhs, rhs, raw_points));
+        canonicalize_orthogonal_points(&canonical_orthogonal_route(lhs, rhs, raw_points));
     if valid_interactive_connection_route(&endpoint_fallback)
         && displayed_connection_points_match_invariant(scene, connection, &endpoint_fallback)
     {
@@ -14917,6 +15074,50 @@ mod tests {
     }
 
     #[test]
+    fn initial_render_repairs_stale_route_without_mutating_source() {
+        let raw_points = vec![
+            CorePoint { x: 0.0, y: 40.0 },
+            CorePoint { x: 0.0, y: 400.0 },
+            CorePoint { x: 100.0, y: 400.0 },
+            CorePoint { x: 100.0, y: 40.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 40.0 },
+            CorePoint { x: 100.0, y: 40.0 },
+            raw_points.clone(),
+        );
+
+        let (route, fallback) = resolved_connection_display_route(&scene, &connection, &raw_points)
+            .expect("stale route should be repaired for initial display");
+        assert_eq!(fallback, ConnectionRouteFallback::CanonicalOrthogonal);
+        assert_eq!(
+            route,
+            vec![
+                CorePoint { x: 0.0, y: 40.0 },
+                CorePoint { x: 100.0, y: 40.0 },
+            ]
+        );
+        assert!(valid_interactive_connection_route(&route));
+        assert_eq!(
+            connection.line.as_ref().expect("source line").points,
+            raw_points
+        );
+
+        let connection_geometry = core_diagram_geometry(&scene)
+            .into_iter()
+            .find(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .expect("initial connection geometry");
+        assert_eq!(
+            connection_geometry
+                .connection
+                .expect("connection metadata")
+                .line
+                .points,
+            route
+        );
+    }
+
+    #[test]
     fn semantic_endpoint_route_keeps_stale_signal_line_anchored() {
         let source = r#"
 connector RealInput = input Real annotation(
@@ -15845,7 +16046,7 @@ end BoundarySig;
             &[CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
         )
         .expect("semantic anchors should produce a display route");
-        assert_eq!(fallback, ConnectionRouteFallback::SemanticReanchor);
+        assert_eq!(fallback, ConnectionRouteFallback::CanonicalOrthogonal);
         assert_eq!(
             route,
             vec![
