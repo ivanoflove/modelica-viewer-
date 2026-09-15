@@ -49,6 +49,14 @@ MODELICA_WGPU_PROFILE_CANCEL=1 cargo run -p modelica-wgpu --release <package.mo>
 
 日志中的 `[CANCEL PROFILE]` 会拆分瞬态回滚、受影响连接、预览清理、选择更新和 GPU 写入；取消路径不会触发完整 Diagram 解析或命中缓存重建。
 
+纯取消选中路径可使用独立 profiler，避免与拖动/连接预览取消混在一起：
+
+```text
+MODELICA_WGPU_PROFILE_DESELECT=1 cargo run -p modelica-wgpu --release <package.mo>
+```
+
+它输出 `[DESELECT PROFILE]`，拆分 selection state、hover、overlay、egui、tessellation、scene encode、submit、present、整帧和端到端耗时；`[DESELECT REDRAW]` 记录请求重绘次数与实际重绘次数。达到 20 个样本后输出 p50/p95/worst 汇总。建议在同一个 Diagram 上完成至少 100 次“选中组件后点击空白取消选中”循环，再与连接预览取消分别比较。
+
 ## 外观与字体（与 Electron 客户端一致）
 
 - 主题 / 强调色与 Electron 版同一套 token（surface、text、border、accent），默认跟随系统、强调色 Violet。
@@ -66,3 +74,4 @@ MODELICA_WGPU_PROFILE_CANCEL=1 cargo run -p modelica-wgpu --release <package.mo>
 5. 对比截图检查渐变是否连续、边缘是否由 MSAA 平滑
 
 通过这组验收后，再把场景缓存、输入模型和完整 UI 迁移到该渲染后端。
+

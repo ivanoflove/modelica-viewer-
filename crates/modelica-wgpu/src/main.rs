@@ -798,6 +798,172 @@ struct PendingCancelProfile {
     redraw_count: u32,
 }
 
+#[derive(Clone, Debug)]
+struct DeselectSelectionMetadata {
+    selected_kind: &'static str,
+    selected_component_id: Option<String>,
+    selected_component_graphic_count: usize,
+    selected_component_port_count: usize,
+}
+
+#[derive(Debug)]
+struct PendingDeselectProfile {
+    generation: u64,
+    started: Instant,
+    selection_completed_at: Instant,
+    selection_state: Duration,
+    hover_update: Duration,
+    selected_kind: &'static str,
+    selected_component_id: Option<String>,
+    selected_component_graphic_count: usize,
+    selected_component_port_count: usize,
+    first_redraw_at: Option<Instant>,
+    request_count: u32,
+    redraw_count: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeselectRedrawTiming {
+    generation: u64,
+    first_redraw_at: Instant,
+    request_count: u32,
+    redraw_count: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeselectFrameTiming {
+    overlay_update: Duration,
+    ui_build: Duration,
+    egui_tessellation: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
+    present: Duration,
+    frame_total: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeselectSample {
+    selection_state: Duration,
+    overlay_update: Duration,
+    hover_update: Duration,
+    ui_build: Duration,
+    egui_tessellation: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
+    present: Duration,
+    frame_total: Duration,
+    end_to_end: Duration,
+}
+
+struct DeselectProfile {
+    enabled: bool,
+    samples: Vec<DeselectSample>,
+}
+
+impl DeselectProfile {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("MODELICA_WGPU_PROFILE_DESELECT").is_some(),
+            samples: Vec::with_capacity(128),
+        }
+    }
+
+    fn record(
+        &mut self,
+        pending: PendingDeselectProfile,
+        redraw: DeselectRedrawTiming,
+        frame: DeselectFrameTiming,
+        finished_at: Instant,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let micros = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
+        let redraw_wait = redraw
+            .first_redraw_at
+            .saturating_duration_since(pending.selection_completed_at);
+        let end_to_end = finished_at.saturating_duration_since(pending.started);
+        eprintln!(
+            "[DESELECT REDRAW] generation={} request_count={} redraw_count={}",
+            redraw.generation, redraw.request_count, redraw.redraw_count,
+        );
+        eprintln!(
+            "[DESELECT PROFILE] generation={} selected_kind={} selected_component_id={} selected_component_graphic_count={} selected_component_port_count={} selection_state_us={:.1} overlay_update_us={:.1} hover_update_us={:.1} ui_build_us={:.1} egui_tessellation_us={:.1} scene_encode_us={:.1} queue_submit_us={:.1} present_us={:.1} frame_total_us={:.1} end_to_end_us={:.1} redraw_wait_us={:.1} request_count={} redraw_count={}",
+            pending.generation,
+            pending.selected_kind,
+            pending.selected_component_id.as_deref().unwrap_or("-"),
+            pending.selected_component_graphic_count,
+            pending.selected_component_port_count,
+            micros(pending.selection_state),
+            micros(frame.overlay_update),
+            micros(pending.hover_update),
+            micros(frame.ui_build),
+            micros(frame.egui_tessellation),
+            micros(frame.scene_encode),
+            micros(frame.queue_submit),
+            micros(frame.present),
+            micros(frame.frame_total),
+            micros(end_to_end),
+            micros(redraw_wait),
+            redraw.request_count,
+            redraw.redraw_count,
+        );
+        self.samples.push(DeselectSample {
+            selection_state: pending.selection_state,
+            overlay_update: frame.overlay_update,
+            hover_update: pending.hover_update,
+            ui_build: frame.ui_build,
+            egui_tessellation: frame.egui_tessellation,
+            scene_encode: frame.scene_encode,
+            queue_submit: frame.queue_submit,
+            present: frame.present,
+            frame_total: frame.frame_total,
+            end_to_end,
+        });
+        if self.samples.len() >= 20 && self.samples.len() % 20 == 0 {
+            self.report_summary();
+        }
+    }
+
+    fn report_summary(&self) {
+        let percentile = |mut values: Vec<Duration>, percent: f32| {
+            values.sort_unstable();
+            let index = ((values.len().saturating_sub(1)) as f32 * percent).round() as usize;
+            values.get(index).copied().unwrap_or_default()
+        };
+        let summarize = |select: fn(&DeselectSample) -> Duration| {
+            (
+                percentile(self.samples.iter().map(select).collect(), 0.50),
+                percentile(self.samples.iter().map(select).collect(), 0.95),
+                percentile(self.samples.iter().map(select).collect(), 1.0),
+            )
+        };
+        let micros = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
+        let format_triplet = |triplet: (Duration, Duration, Duration)| {
+            format!(
+                "{:.1}/{:.1}/{:.1}",
+                micros(triplet.0),
+                micros(triplet.1),
+                micros(triplet.2),
+            )
+        };
+        eprintln!(
+            "[DESELECT SUMMARY] samples={} selection_state_us={} overlay_update_us={} hover_update_us={} ui_build_us={} egui_tessellation_us={} scene_encode_us={} queue_submit_us={} present_us={} frame_total_us={} end_to_end_us={} (p50/p95/worst)",
+            self.samples.len(),
+            format_triplet(summarize(|sample| sample.selection_state)),
+            format_triplet(summarize(|sample| sample.overlay_update)),
+            format_triplet(summarize(|sample| sample.hover_update)),
+            format_triplet(summarize(|sample| sample.ui_build)),
+            format_triplet(summarize(|sample| sample.egui_tessellation)),
+            format_triplet(summarize(|sample| sample.scene_encode)),
+            format_triplet(summarize(|sample| sample.queue_submit)),
+            format_triplet(summarize(|sample| sample.present)),
+            format_triplet(summarize(|sample| sample.frame_total)),
+            format_triplet(summarize(|sample| sample.end_to_end)),
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CancelRedrawTiming {
     generation: u64,
@@ -3586,6 +3752,9 @@ struct App {
     cancel_generation: u64,
     pending_cancel_profile: Option<PendingCancelProfile>,
     cancel_e2e_profile: CancelE2EProfile,
+    deselect_generation: u64,
+    pending_deselect_profile: Option<PendingDeselectProfile>,
+    deselect_profile: DeselectProfile,
     drag_profile: DragProfile,
     connection_creation_profile: ConnectionCreationProfile,
     history: Vec<EditCommand>,
@@ -3922,6 +4091,9 @@ impl App {
             cancel_generation: 0,
             pending_cancel_profile: None,
             cancel_e2e_profile: CancelE2EProfile::new(),
+            deselect_generation: 0,
+            pending_deselect_profile: None,
+            deselect_profile: DeselectProfile::new(),
             drag_profile: DragProfile::new(),
             connection_creation_profile: ConnectionCreationProfile::new(),
             history: Vec::new(),
@@ -4884,6 +5056,147 @@ impl App {
         !matches!(self.pointer_interaction, PointerInteraction::None)
     }
 
+    fn request_redraw(&mut self) {
+        if let Some(profile) = self.pending_deselect_profile.as_mut() {
+            profile.request_count = profile.request_count.saturating_add(1);
+        }
+        self.window.request_redraw();
+    }
+
+    fn deselect_selection_metadata(&self) -> DeselectSelectionMetadata {
+        let mut metadata = match &self.diagram_selection {
+            DiagramSelection::None => DeselectSelectionMetadata {
+                selected_kind: "None",
+                selected_component_id: None,
+                selected_component_graphic_count: 0,
+                selected_component_port_count: 0,
+            },
+            DiagramSelection::Port(key) => DeselectSelectionMetadata {
+                selected_kind: "Port",
+                selected_component_id: Some(key.owner_component_id.clone()),
+                selected_component_graphic_count: 0,
+                selected_component_port_count: self
+                    .diagram_hit_cache
+                    .ports
+                    .iter()
+                    .filter(|anchor| anchor.owner_component_id == key.owner_component_id)
+                    .count(),
+            },
+            DiagramSelection::Component(_) => DeselectSelectionMetadata {
+                selected_kind: "Component",
+                selected_component_id: None,
+                selected_component_graphic_count: 0,
+                selected_component_port_count: 0,
+            },
+            DiagramSelection::Connection(_) => DeselectSelectionMetadata {
+                selected_kind: "Connection",
+                selected_component_id: None,
+                selected_component_graphic_count: 0,
+                selected_component_port_count: 0,
+            },
+        };
+
+        let component = match &self.diagram_selection {
+            DiagramSelection::Component(component_name) => self
+                .document
+                .as_ref()
+                .and_then(|document| {
+                    self.selected_class_name()
+                        .and_then(|class_name| document.diagram(class_name))
+                })
+                .and_then(|scene| {
+                    scene
+                        .components
+                        .iter()
+                        .find(|component| component.name == *component_name)
+                }),
+            DiagramSelection::Port(key) => self
+                .document
+                .as_ref()
+                .and_then(|document| {
+                    self.selected_class_name()
+                        .and_then(|class_name| document.diagram(class_name))
+                })
+                .and_then(|scene| {
+                    scene
+                        .components
+                        .iter()
+                        .find(|component| component.id == key.owner_component_id)
+                }),
+            _ => None,
+        };
+        if let Some(component) = component {
+            metadata.selected_component_id = Some(component.id.clone());
+            metadata.selected_component_graphic_count = component
+                .diagram_layer()
+                .map_or(0, |layer| layer.graphics.len());
+            metadata.selected_component_port_count = self
+                .diagram_hit_cache
+                .ports
+                .iter()
+                .filter(|anchor| anchor.owner_component_id == component.id)
+                .count();
+        }
+        metadata
+    }
+
+    fn begin_deselect_profile(
+        &mut self,
+        metadata: DeselectSelectionMetadata,
+        started: Instant,
+        selection_completed_at: Instant,
+        selection_state: Duration,
+        hover_update: Duration,
+    ) {
+        if !self.deselect_profile.enabled {
+            return;
+        }
+        self.deselect_generation = self.deselect_generation.wrapping_add(1);
+        self.pending_deselect_profile = Some(PendingDeselectProfile {
+            generation: self.deselect_generation,
+            started,
+            selection_completed_at,
+            selection_state,
+            hover_update,
+            selected_kind: metadata.selected_kind,
+            selected_component_id: metadata.selected_component_id,
+            selected_component_graphic_count: metadata.selected_component_graphic_count,
+            selected_component_port_count: metadata.selected_component_port_count,
+            first_redraw_at: None,
+            request_count: 0,
+            redraw_count: 0,
+        });
+    }
+
+    fn begin_deselect_redraw(&mut self) -> Option<DeselectRedrawTiming> {
+        let profile = self.pending_deselect_profile.as_mut()?;
+        let now = Instant::now();
+        profile.redraw_count = profile.redraw_count.saturating_add(1);
+        let first_redraw_at = *profile.first_redraw_at.get_or_insert(now);
+        Some(DeselectRedrawTiming {
+            generation: profile.generation,
+            first_redraw_at,
+            request_count: profile.request_count,
+            redraw_count: profile.redraw_count,
+        })
+    }
+
+    fn finish_deselect_profile(
+        &mut self,
+        redraw: DeselectRedrawTiming,
+        frame: DeselectFrameTiming,
+        finished_at: Instant,
+    ) {
+        let Some(pending) = self.pending_deselect_profile.take() else {
+            return;
+        };
+        if pending.generation != redraw.generation {
+            return;
+        }
+        self.deselect_profile
+            .record(pending, redraw, frame, finished_at);
+    }
+
     fn begin_cancel_profile(
         &mut self,
         interaction: &'static str,
@@ -5577,32 +5890,30 @@ impl App {
 
     fn clear_diagram_selection(&mut self) -> bool {
         let total_started = Instant::now();
+        let metadata = self
+            .deselect_profile
+            .enabled
+            .then(|| self.deselect_selection_metadata());
         let selection_started = Instant::now();
         let selection_changed = self.set_diagram_selection(DiagramSelection::None);
+        let selection_state = selection_started.elapsed();
+        let hover_started = Instant::now();
         let hover_changed = self.hovered_port.take().is_some();
+        let hover_update = hover_started.elapsed();
         let changed = selection_changed || hover_changed;
-        if changed {
+        if changed && self.deselect_profile.enabled {
             let completed_at = Instant::now();
-            self.begin_cancel_profile(
-                "DeselectDiagram",
-                0,
-                PreviewResourceStats::default(),
-                Duration::ZERO,
+            self.begin_deselect_profile(
+                metadata.unwrap_or(DeselectSelectionMetadata {
+                    selected_kind: "None",
+                    selected_component_id: None,
+                    selected_component_graphic_count: 0,
+                    selected_component_port_count: 0,
+                }),
                 total_started,
                 completed_at,
-                completed_at.saturating_duration_since(total_started),
-            );
-            trace_cancel_profile(
-                "DeselectDiagram",
-                0,
-                completed_at.saturating_duration_since(total_started),
-                Duration::ZERO,
-                Duration::ZERO,
-                Duration::ZERO,
-                selection_started.elapsed(),
-                Duration::ZERO,
-                Duration::ZERO,
-                Duration::ZERO,
+                selection_state,
+                hover_update,
             );
         }
         changed
@@ -7497,7 +7808,7 @@ impl App {
         );
         self.load_error = None;
         self.loading_document = Some(std::thread::spawn(move || LoadedDocument::load(&path)));
-        self.window.request_redraw();
+        self.request_redraw();
     }
 
     fn poll_document_load(&mut self) {
@@ -7505,7 +7816,7 @@ impl App {
             return;
         };
         if !handle.is_finished() {
-            self.window.request_redraw();
+            self.request_redraw();
             return;
         }
         let handle = self
@@ -7517,7 +7828,7 @@ impl App {
             Ok(Err(error)) => self.load_error = Some(error),
             Err(_) => self.load_error = Some("Modelica document loading thread panicked".into()),
         }
-        self.window.request_redraw();
+        self.request_redraw();
     }
 
     /// Install a freshly parsed document into the viewer state and reset all
@@ -7556,6 +7867,7 @@ impl App {
     fn render(
         &mut self,
         cancel_redraw: Option<CancelRedrawTiming>,
+        deselect_redraw: Option<DeselectRedrawTiming>,
     ) -> Result<(), wgpu::SurfaceError> {
         self.poll_document_load();
         let document_loading = self.loading_document.is_some();
@@ -7582,6 +7894,7 @@ impl App {
         let mut icon_clip_rect = None;
         let mut expand_all_requested = false;
         let mut collapse_all_requested = false;
+        let overlay_update_started = Instant::now();
         let selected_connection_points = self.selected_connection_overlay_points();
         let selected_component_overlay = self.selected_component_overlay();
         let hovered_anchor = if self.connection_creation_active() {
@@ -7601,10 +7914,12 @@ impl App {
             DiagramSelection::Port(key) => self.diagram_anchor(key),
             _ => None,
         };
+        let overlay_update = overlay_update_started.elapsed();
         let zoom = self.zoom;
         let pan = self.pan;
         let viewport = [self.config.width, self.config.height];
         let pixels_per_point = self.window.scale_factor() as f32;
+        let ui_build_started = Instant::now();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_preview_ui(
                 ctx,
@@ -7640,6 +7955,7 @@ impl App {
                 );
             }
         });
+        let ui_build = ui_build_started.elapsed();
         if theme_mode != self.theme_mode || accent_theme != self.accent_theme {
             self.theme_mode = theme_mode;
             self.accent_theme = accent_theme;
@@ -7650,7 +7966,7 @@ impl App {
             }
             set_theme(is_dark, self.accent_theme);
             save_appearance(self.theme_mode, self.accent_theme);
-            self.window.request_redraw();
+            self.request_redraw();
         }
         let previous_main_view = self.main_view;
         self.main_view = main_view;
@@ -7677,19 +7993,19 @@ impl App {
         }
         self.expanded_nodes = expanded_nodes;
         if expand_all_requested || collapse_all_requested {
-            self.window.request_redraw();
+            self.request_redraw();
         }
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
         if fit_requested {
             self.fit_scene();
-            self.window.request_redraw();
+            self.request_redraw();
         }
 
         if view_changed {
             self.fit_scene();
-            self.window.request_redraw();
+            self.request_redraw();
         }
 
         if (open_requested || open_directory_requested) && !document_loading {
@@ -7745,7 +8061,7 @@ impl App {
                 build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
             self.fit_scene();
             self.update_title(None);
-            self.window.request_redraw();
+            self.request_redraw();
         }
 
         // Time the expensive stages of this frame so a freeze can be traced to
@@ -7768,7 +8084,8 @@ impl App {
         }
         let profile_enabled = self.drag_profile.enabled
             || self.connection_creation_profile.enabled
-            || self.cancel_e2e_profile.enabled;
+            || self.cancel_e2e_profile.enabled
+            || self.deselect_profile.enabled;
         let egui_tessellation_started = profile_enabled.then(Instant::now);
         let paint_jobs = self
             .egui_ctx
@@ -7964,6 +8281,21 @@ impl App {
                 cancel_redraw,
                 CancelFrameTiming {
                     ui: ui_done,
+                    egui_tessellation,
+                    scene_encode,
+                    queue_submit,
+                    present,
+                    frame_total: total,
+                },
+                finished_at,
+            );
+        }
+        if let Some(deselect_redraw) = deselect_redraw {
+            self.finish_deselect_profile(
+                deselect_redraw,
+                DeselectFrameTiming {
+                    overlay_update,
+                    ui_build,
                     egui_tessellation,
                     scene_encode,
                     queue_submit,
@@ -12377,17 +12709,18 @@ fn main() {
                         WindowEvent::CloseRequested => event_loop.exit(),
                         WindowEvent::Resized(size) => {
                             app.resize(size);
-                            app.window.request_redraw();
+                            app.request_redraw();
                         }
                         WindowEvent::RedrawRequested => {
                             let mut cancel_redraw = app.begin_cancel_redraw();
+                            let deselect_redraw = app.begin_deselect_redraw();
                             let flush_started = Instant::now();
                             app.flush_drag_preview();
                             if let Some(redraw) = cancel_redraw.as_mut() {
                                 redraw.flush_drag_preview = flush_started.elapsed();
                             }
                             app.process_pending_waypoint();
-                            match app.render(cancel_redraw) {
+                            match app.render(cancel_redraw, deselect_redraw) {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                                 app.resize(app.window.inner_size())
@@ -12401,7 +12734,7 @@ fn main() {
                         }
                         WindowEvent::ThemeChanged(_) => {
                             app.background_dirty = true;
-                            app.window.request_redraw();
+                            app.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. }
                             if event.state == ElementState::Pressed && !event.repeat =>
@@ -12451,7 +12784,7 @@ fn main() {
                                     _ => {}
                                 }
                             }
-                            app.window.request_redraw();
+                            app.request_redraw();
                         }
                         WindowEvent::CursorMoved { position, .. } => {
                             app.cursor = position;
@@ -12465,13 +12798,13 @@ fn main() {
                                 let request_redraw = app.pending_drag_position.is_none();
                                 app.pending_drag_position = Some((position, Instant::now()));
                                 if request_redraw {
-                                    app.window.request_redraw();
+                                    app.request_redraw();
                                 }
                             } else {
                                 let hover_changed = app.update_hovered_diagram_port();
                                 let drag_changed = app.update_model_drag_preview(position);
                                 if egui_consumed || hover_changed || drag_changed {
-                                    app.window.request_redraw();
+                                    app.request_redraw();
                                 }
                             }
                         }
@@ -12519,7 +12852,7 @@ fn main() {
                                     // consumed together by RedrawRequested.
                                     app.pending_waypoint = true;
                                     app.pending_waypoint_queued_at = Some(Instant::now());
-                                    app.window.request_redraw();
+                                    app.request_redraw();
                                 }
                             } else if app.canvas_event_allowed() {
                                 if button == MouseButton::Right {
@@ -12557,7 +12890,7 @@ fn main() {
                                 || selection_changed
                                 || interaction_changed
                             {
-                                app.window.request_redraw();
+                                app.request_redraw();
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. }
@@ -12573,7 +12906,7 @@ fn main() {
                                     }
                                 };
                                 app.zoom_at_cursor(amount);
-                                app.window.request_redraw();
+                                app.request_redraw();
                             }
                         _ => {}
                     }
@@ -15383,3 +15716,4 @@ mod tests {
             .all(|snapshot| snapshot.connection_key.lhs.component_name == "a"));
     }
 }
+
