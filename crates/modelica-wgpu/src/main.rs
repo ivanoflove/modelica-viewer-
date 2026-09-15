@@ -5193,6 +5193,11 @@ impl App {
         if pending.generation != redraw.generation {
             return;
         }
+        let redraw = DeselectRedrawTiming {
+            request_count: pending.request_count,
+            redraw_count: pending.redraw_count,
+            ..redraw
+        };
         self.deselect_profile
             .record(pending, redraw, frame, finished_at);
     }
