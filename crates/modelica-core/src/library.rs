@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Class, ClassLocation, ModelicaFile, SourceRange};
+use crate::ast::{Class, ClassKind, ClassLocation, ModelicaFile, SourceRange};
 use crate::diagnostics::Diagnostic;
 use crate::parser::{parse, requalify_class_tree};
 
@@ -33,11 +33,51 @@ pub struct LibraryRegistry {
 pub struct PackageNode {
     pub name: String,
     pub qualified_name: String,
+    pub description: Option<String>,
     pub source_file: PathBuf,
     pub source_range: Option<SourceRange>,
+    /// Members in browser/source order. `children` and `classes` remain as
+    /// compatibility indexes for callers that only need one kind of member.
+    pub ordered_members: Vec<PackageMember>,
     pub children: Vec<PackageNode>,
     pub classes: Vec<Class>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackageMember {
+    Package(PackageNode),
+    Class(Class),
+}
+
+impl PackageMember {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Package(package) => &package.name,
+            Self::Class(class) => &class.name,
+        }
+    }
+
+    pub fn qualified_name(&self) -> &str {
+        match self {
+            Self::Package(package) => &package.qualified_name,
+            Self::Class(class) => &class.qualified_name,
+        }
+    }
+
+    pub fn as_package(&self) -> &PackageNode {
+        match self {
+            Self::Package(package) => package,
+            Self::Class(_) => panic!("package member is not a package"),
+        }
+    }
+
+    pub fn as_class(&self) -> &Class {
+        match self {
+            Self::Class(class) => class,
+            Self::Package(_) => panic!("package member is not a class"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -106,8 +146,15 @@ impl PackageLoader {
         Ok(PackageNode {
             name,
             qualified_name,
+            description: None,
             source_file: file.to_owned(),
             source_range: None,
+            ordered_members: parsed
+                .classes
+                .iter()
+                .cloned()
+                .map(PackageMember::Class)
+                .collect(),
             children: Vec::new(),
             classes: parsed.classes,
             diagnostics: Vec::new(),
@@ -148,53 +195,52 @@ impl PackageLoader {
                     .iter()
                     .find(|class| class.kind == crate::ast::ClassKind::Package)
             });
-        let (name, qualified_name, source_range, inline_children, mut inline_classes) =
-            if let Some(class) = package_class {
-                let qualified = parent.map_or_else(
-                    || {
-                        parsed.within.as_ref().map_or_else(
-                            || class.name.clone(),
-                            |within| format!("{within}.{}", class.name),
-                        )
-                    },
-                    |parent| format!("{parent}.{}", class.name),
-                );
-                let class = requalify_root_class(class.clone(), &qualified);
-                let mut packages = Vec::new();
-                let mut classes = Vec::new();
-                for child in class.children {
-                    if child.kind == crate::ast::ClassKind::Package {
-                        packages.push(package_from_class(
-                            child,
-                            package_file.clone(),
-                            Some(&qualified),
-                        ));
-                    } else {
-                        classes.push(child);
-                    }
-                }
-                (
-                    class.name,
-                    qualified,
-                    Some(class.source_range),
-                    packages,
-                    classes,
-                )
-            } else {
-                let name = directory_name.to_owned();
-                let qualified = parent.map_or_else(
-                    || {
-                        parsed
-                            .within
-                            .clone()
-                            .map_or_else(|| name.clone(), |within| format!("{within}.{name}"))
-                    },
-                    |parent| format!("{parent}.{name}"),
-                );
-                (name, qualified, None, Vec::new(), parsed.classes)
+        let (mut package, qualified_name) = if let Some(class) = package_class {
+            let qualified = parent.map_or_else(
+                || {
+                    parsed.within.as_ref().map_or_else(
+                        || class.name.clone(),
+                        |within| format!("{within}.{}", class.name),
+                    )
+                },
+                |parent| format!("{parent}.{}", class.name),
+            );
+            (
+                package_from_class(class.clone(), package_file.clone(), parent),
+                qualified,
+            )
+        } else {
+            let name = directory_name.to_owned();
+            let qualified = parent.map_or_else(
+                || {
+                    parsed
+                        .within
+                        .clone()
+                        .map_or_else(|| name.clone(), |within| format!("{within}.{name}"))
+                },
+                |parent| format!("{parent}.{name}"),
+            );
+            let mut package = PackageNode {
+                name,
+                qualified_name: qualified.clone(),
+                description: None,
+                source_file: package_file.clone(),
+                source_range: None,
+                ordered_members: parsed
+                    .classes
+                    .iter()
+                    .cloned()
+                    .map(PackageMember::Class)
+                    .collect(),
+                children: Vec::new(),
+                classes: parsed.classes,
+                diagnostics: Vec::new(),
             };
+            sync_legacy_members(&mut package);
+            (package, qualified)
+        };
 
-        let mut children = inline_children;
+        let mut external_members = Vec::new();
         let mut diagnostics = Vec::new();
         for entry in entries(directory, true) {
             if entry
@@ -205,7 +251,7 @@ impl PackageLoader {
             }
             if entry.is_dir() && entry.join("package.mo").is_file() {
                 match self.load_package_directory(&entry, Some(&qualified_name)) {
-                    Ok(child) => children.push(child),
+                    Ok(child) => external_members.push(PackageMember::Package(child)),
                     Err(error) => diagnostics.push(error),
                 }
             } else if entry.is_file()
@@ -215,28 +261,33 @@ impl PackageLoader {
                 && entry.file_name().is_some_and(|name| name != "package.mo")
             {
                 match parse_file(&entry) {
-                    Ok(file) => inline_classes.extend(file.classes.into_iter().map(|class| {
-                        if file.within.is_some() {
+                    Ok(file) => external_members.extend(file.classes.into_iter().map(|class| {
+                        let class = if file.within.is_some() {
                             class
                         } else {
                             requalify_class_tree(class, Some(&qualified_name))
+                        };
+                        if class.kind == ClassKind::Package {
+                            PackageMember::Package(package_from_class(
+                                class,
+                                entry.clone(),
+                                Some(&qualified_name),
+                            ))
+                        } else {
+                            PackageMember::Class(class)
                         }
                     })),
                     Err(error) => diagnostics.push(error),
                 }
             }
         }
-        children.sort_by(|left, right| left.name.cmp(&right.name));
-        inline_classes.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(PackageNode {
-            name,
-            qualified_name,
-            source_file: package_file,
-            source_range,
-            children,
-            classes: inline_classes,
-            diagnostics,
-        })
+        let mut members = package.ordered_members;
+        members.extend(external_members);
+        let package_order = read_package_order(directory);
+        package.ordered_members = merge_package_members(members, package_order, &mut diagnostics);
+        package.diagnostics.extend(diagnostics);
+        sync_legacy_members(&mut package);
+        Ok(package)
     }
 }
 
@@ -276,28 +327,113 @@ fn package_from_class(class: Class, source_file: PathBuf, parent: Option<&str>) 
         |parent| format!("{parent}.{}", class.name),
     );
     let class = requalify_root_class(class, &qualified);
+    let description = class.description.clone();
     let mut children = Vec::new();
     let mut classes = Vec::new();
+    let mut ordered_members = Vec::new();
     for child in class.children {
-        if child.kind == crate::ast::ClassKind::Package {
-            children.push(package_from_class(
-                child,
-                source_file.clone(),
-                Some(&qualified),
-            ));
+        if child.kind == ClassKind::Package {
+            let package = package_from_class(child, source_file.clone(), Some(&qualified));
+            children.push(package.clone());
+            ordered_members.push(PackageMember::Package(package));
         } else {
-            classes.push(child);
+            classes.push(child.clone());
+            ordered_members.push(PackageMember::Class(child));
         }
     }
     PackageNode {
         name: class.name,
         qualified_name: qualified,
+        description,
         source_file,
         source_range: Some(class.source_range),
+        ordered_members,
         children,
         classes,
         diagnostics: Vec::new(),
     }
+}
+
+fn sync_legacy_members(package: &mut PackageNode) {
+    package.children = package
+        .ordered_members
+        .iter()
+        .filter_map(|member| match member {
+            PackageMember::Package(child) => Some(child.clone()),
+            PackageMember::Class(_) => None,
+        })
+        .collect();
+    package.classes = package
+        .ordered_members
+        .iter()
+        .filter_map(|member| match member {
+            PackageMember::Package(_) => None,
+            PackageMember::Class(class) => Some(class.clone()),
+        })
+        .collect();
+}
+
+fn read_package_order(directory: &Path) -> Option<Vec<String>> {
+    let source = fs::read_to_string(directory.join("package.order")).ok()?;
+    let names = source
+        .lines()
+        .filter_map(|line| {
+            let line = line.split("//").next().unwrap_or_default().trim();
+            (!line.is_empty()).then(|| line.to_owned())
+        })
+        .collect::<Vec<_>>();
+    Some(names)
+}
+
+fn merge_package_members(
+    members: Vec<PackageMember>,
+    package_order: Option<Vec<String>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<PackageMember> {
+    let mut unique = Vec::new();
+    for member in members {
+        if unique
+            .iter()
+            .any(|candidate: &PackageMember| candidate.name() == member.name())
+        {
+            diagnostics.push(Diagnostic::warning(
+                "DUPLICATE_PACKAGE_MEMBER",
+                format!(
+                    "duplicate package member `{}`; keeping the first declaration",
+                    member.name()
+                ),
+            ));
+        } else {
+            unique.push(member);
+        }
+    }
+    let Some(order) = package_order else {
+        return unique;
+    };
+    let mut remaining = unique;
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for name in order {
+        if let Some(index) = remaining.iter().position(|member| member.name() == name) {
+            ordered.push(remaining.remove(index));
+        } else {
+            diagnostics.push(Diagnostic::warning(
+                "PACKAGE_ORDER_MISSING_MEMBER",
+                format!("package.order refers to missing member `{name}`"),
+            ));
+        }
+    }
+    remaining.sort_by(|left, right| left.name().cmp(right.name()));
+    if !remaining.is_empty() {
+        diagnostics.push(Diagnostic::warning(
+            "PACKAGE_ORDER_UNLISTED_MEMBER",
+            format!(
+                "{} package member(s) were not listed in package.order; using stable name order",
+                remaining.len()
+            ),
+        ));
+    }
+    ordered.extend(remaining);
+    ordered
 }
 
 fn requalify_root_class(mut class: Class, qualified_name: &str) -> Class {
@@ -346,11 +482,11 @@ impl LibraryRegistry {
         if let Ok(source) = fs::read_to_string(&package.source_file) {
             let _ = self.register_source(package.source_file.clone(), source);
         }
-        for class in &package.classes {
-            self.register_class_source(class);
-        }
-        for child in &package.children {
-            self.register_package(child);
+        for member in &package.ordered_members {
+            match member {
+                PackageMember::Package(child) => self.register_package(child),
+                PackageMember::Class(class) => self.register_class_source(class),
+            }
         }
     }
 
@@ -395,11 +531,11 @@ impl LibraryRegistry {
             source_file: package.source_file.clone(),
             source_range: package.source_range.unwrap_or(SourceRange::new(0, 0)),
         });
-        for class in &package.classes {
-            self.index_class_location(class);
-        }
-        for child in &package.children {
-            self.index_package(child);
+        for member in &package.ordered_members {
+            match member {
+                PackageMember::Package(child) => self.index_package(child),
+                PackageMember::Class(class) => self.index_class_location(class),
+            }
         }
     }
 
@@ -474,7 +610,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{LibraryRegistry, PackageLoader};
+    use super::{LibraryRegistry, PackageLoader, PackageMember};
 
     fn fixture_root() -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -568,5 +704,142 @@ mod tests {
         assert_eq!(package.qualified_name, "Demo");
         assert_eq!(package.classes[0].qualified_name, "Demo.Thing");
         fs::remove_file(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn preserves_mixed_package_and_class_order_for_standalone_sources() {
+        let root = std::env::temp_dir().join("modelica-core-ordered-standalone-test.mo");
+        fs::write(
+            &root,
+            r#"package P "root"
+              model M "model" end M;
+              package Q "package" connector C "connector" end C; end Q;
+              function F "function" end F;
+              record R "record" end R;
+              type T = Real "type";
+            end P;"#,
+        )
+        .expect("write fixture");
+        let package = PackageLoader.load(&root).expect("load fixture");
+        assert_eq!(package.description.as_deref(), Some("root"));
+        assert_eq!(
+            package
+                .ordered_members
+                .iter()
+                .map(PackageMember::name)
+                .collect::<Vec<_>>(),
+            ["M", "Q", "F", "R", "T"]
+        );
+        assert_eq!(
+            package.ordered_members[0].as_class().kind,
+            crate::ast::ClassKind::Model
+        );
+        assert_eq!(
+            package.ordered_members[1]
+                .as_package()
+                .description
+                .as_deref(),
+            Some("package")
+        );
+        fs::remove_file(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn applies_package_order_to_directory_members() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("modelica-core-package-order-{nonce}"));
+        fs::create_dir_all(&root).expect("create fixture");
+        fs::write(root.join("package.mo"), "package P end P;").expect("write package");
+        fs::write(root.join("A.mo"), "model A end A;").expect("write A");
+        fs::write(root.join("B.mo"), "model B end B;").expect("write B");
+        fs::write(root.join("package.order"), "B\nA\n").expect("write package.order");
+        let package = PackageLoader.load(&root).expect("load fixture");
+        assert_eq!(
+            package
+                .ordered_members
+                .iter()
+                .map(PackageMember::name)
+                .collect::<Vec<_>>(),
+            ["B", "A"]
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn ieh_cpp_fixture_builds_the_source_ordered_browser_tree() {
+        let fixture =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/IEH_CPP.mo");
+        let package = PackageLoader.load(fixture).expect("load IEH_CPP fixture");
+        assert_eq!(package.name, "IEH_CPP");
+        assert_eq!(
+            package.description.as_deref(),
+            Some("远宽综合能源库 (pure C++ thermopack-cxx backend)")
+        );
+        assert_eq!(
+            package
+                .ordered_members
+                .iter()
+                .map(PackageMember::name)
+                .collect::<Vec<_>>(),
+            [
+                "ThermoMedium",
+                "Interfaces",
+                "FluidUnits",
+                "Converter",
+                "FMU"
+            ]
+        );
+        let thermo = package.ordered_members[0].as_package();
+        assert_eq!(
+            thermo.description.as_deref(),
+            Some("Thermodynamic medium package — inner/outer Thermopack CPA/Cubic integration")
+        );
+        assert_eq!(
+            thermo
+                .ordered_members
+                .iter()
+                .map(PackageMember::name)
+                .collect::<Vec<_>>(),
+            ["Types", "Functions", "MediumWorld", "Units", "Examples"]
+        );
+        assert_eq!(
+            thermo.ordered_members[0].as_package().ordered_members[0]
+                .as_class()
+                .kind,
+            crate::ast::ClassKind::Record
+        );
+        let interfaces = package.ordered_members[1].as_package();
+        assert_eq!(
+            interfaces.ordered_members[0]
+                .as_package()
+                .ordered_members
+                .iter()
+                .map(PackageMember::name)
+                .collect::<Vec<_>>(),
+            ["FluidPort", "FluidPortIN", "FluidPortOUT"]
+        );
+        assert_eq!(
+            interfaces.ordered_members[0].as_package().ordered_members[0]
+                .as_class()
+                .kind,
+            crate::ast::ClassKind::Connector
+        );
+        assert_eq!(
+            package.ordered_members[3]
+                .as_package()
+                .description
+                .as_deref(),
+            Some("能源转换设备库")
+        );
+        assert_eq!(
+            package.ordered_members[4]
+                .as_package()
+                .description
+                .as_deref(),
+            Some("test")
+        );
     }
 }

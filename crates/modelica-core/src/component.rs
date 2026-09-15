@@ -5,6 +5,10 @@ use crate::lexer::{Token, TokenKind};
 pub struct ComponentDeclaration {
     pub declared_type_name: String,
     pub instance_name: String,
+    /// Array dimensions written after the component instance, for example
+    /// `ports[3]` or `ports[nPorts]`. Expressions are kept as source-like
+    /// strings because their values may depend on Modelica parameters.
+    pub dimensions: Vec<String>,
 }
 
 const DECLARATION_PREFIXES: &[&str] = &[
@@ -44,12 +48,12 @@ const NON_COMPONENT_HEADS: &[&str] = &[
     "when",
 ];
 
-/// Parse only the declaration head (`Type instanceName`).
+/// Parse the declaration head (`Type instanceName[dimensions]`).
 ///
 /// Prefixes are accepted only before the type. Once the first complete
 /// qualified type and instance name are found, the function returns
-/// immediately; modifiers, dimensions, and annotations cannot replace the
-/// declaration with a shorter suffix of the qualified type.
+/// immediately; modifiers and annotations cannot replace the declaration
+/// with a shorter suffix of the qualified type.
 pub fn parse_component_declaration(tokens: &[Token]) -> Option<ComponentDeclaration> {
     let significant = tokens
         .iter()
@@ -116,10 +120,19 @@ pub fn parse_component_declaration(tokens: &[Token]) -> Option<ComponentDeclarat
     if !is_name_token(instance) || DECLARATION_PREFIXES.contains(&instance.text.as_str()) {
         return None;
     }
+    index += 1;
+    let mut dimensions = Vec::new();
+    while significant
+        .get(index)
+        .is_some_and(|token| token.text == "[")
+    {
+        dimensions.push(parse_bracket_dimension(&significant, &mut index)?);
+    }
 
     Some(ComponentDeclaration {
         declared_type_name,
         instance_name: instance.text.clone(),
+        dimensions,
     })
 }
 
@@ -145,14 +158,46 @@ fn skip_braced_dimension(tokens: &[&Token], index: &mut usize) -> Option<()> {
     None
 }
 
+fn parse_bracket_dimension(tokens: &[&Token], index: &mut usize) -> Option<String> {
+    if tokens.get(*index)?.text != "[" {
+        return None;
+    }
+    *index += 1;
+    let start = *index;
+    let mut depth = 1;
+    while let Some(token) = tokens.get(*index) {
+        match token.text.as_str() {
+            "[" => depth += 1,
+            "]" => {
+                depth -= 1;
+                if depth == 0 {
+                    let value = tokens[start..*index]
+                        .iter()
+                        .map(|token| token.text.as_str())
+                        .collect::<String>();
+                    *index += 1;
+                    return Some(value);
+                }
+            }
+            _ => {}
+        }
+        *index += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_component_declaration;
     use crate::lexer::tokenize;
 
-    fn parse(value: &str) -> (String, String) {
+    fn parse(value: &str) -> (String, String, Vec<String>) {
         let declaration = parse_component_declaration(&tokenize(value)).expect("declaration");
-        (declaration.declared_type_name, declaration.instance_name)
+        (
+            declaration.declared_type_name,
+            declaration.instance_name,
+            declaration.dimensions,
+        )
     }
 
     #[test]
@@ -161,14 +206,16 @@ mod tests {
             parse("Interfaces.FluidInterfaces.FluidPortIN port"),
             (
                 "Interfaces.FluidInterfaces.FluidPortIN".into(),
-                "port".into()
+                "port".into(),
+                vec![]
             )
         );
         assert_eq!(
             parse("Modelica.Fluid.Interfaces.FluidPort_a port_a"),
             (
                 "Modelica.Fluid.Interfaces.FluidPort_a".into(),
-                "port_a".into()
+                "port_a".into(),
+                vec![]
             )
         );
     }
@@ -177,7 +224,27 @@ mod tests {
     fn skips_prefixes_but_stops_before_modifiers() {
         assert_eq!(
             parse("replaceable flow Interfaces.FluidPort port constrainedby Base"),
-            ("Interfaces.FluidPort".into(), "port".into())
+            ("Interfaces.FluidPort".into(), "port".into(), vec![])
+        );
+    }
+
+    #[test]
+    fn preserves_array_dimensions_after_component_name() {
+        assert_eq!(
+            parse("Modelica.Fluid.Interfaces.FluidPorts_a ports[3]"),
+            (
+                "Modelica.Fluid.Interfaces.FluidPorts_a".into(),
+                "ports".into(),
+                vec!["3".into()]
+            )
+        );
+        assert_eq!(
+            parse("FluidPorts_a ports[nPorts]"),
+            ("FluidPorts_a".into(), "ports".into(), vec!["nPorts".into()])
+        );
+        assert_eq!(
+            parse("FluidPorts_a ports[n,m]"),
+            ("FluidPorts_a".into(), "ports".into(), vec!["n,m".into()])
         );
     }
 }

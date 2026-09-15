@@ -21,8 +21,23 @@ impl<'a> IconResolver<'a> {
     }
 
     pub fn resolve(&mut self, class: &Class, source: &str) -> IconScene {
+        self.resolve_for_instance(class, source, &class.name)
+    }
+
+    /// Resolve an Icon for a concrete component instance.
+    ///
+    /// Diagram components reuse their class Icon, but Modelica text macros
+    /// such as `%name` refer to the placed instance rather than the class
+    /// declaration. Keep the class-based API above for standalone previews
+    /// and expose the instance-aware path to the Diagram resolver.
+    pub fn resolve_for_instance(
+        &mut self,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+    ) -> IconScene {
         let mut visiting = Vec::new();
-        self.resolve_inner(class, source, &mut visiting, &class.name)
+        self.resolve_inner(class, source, &mut visiting, instance_name)
     }
 
     fn resolve_inner(
@@ -191,6 +206,7 @@ impl<'a> IconResolver<'a> {
                     qualified_name: graphic.owner.qualified_name,
                     kind: GraphicOwnerKind::Connector,
                     instance_name: Some(nested_instance_name),
+                    dimensions: component.dimensions.clone(),
                 };
                 graphic.transform = compose_transform(placement, graphic.transform);
                 graphic.editable = false;
@@ -230,6 +246,7 @@ fn stamp_own_graphics(scene: &mut IconScene, class: &Class) {
             qualified_name: class.qualified_name.clone(),
             kind: GraphicOwnerKind::Own,
             instance_name: None,
+            dimensions: Vec::new(),
         };
         graphic.transform = Transform2D::identity();
         graphic.editable = true;
@@ -256,6 +273,7 @@ struct PlacementTransform {
 struct ComponentPlacement {
     type_name: String,
     name: String,
+    dimensions: Vec<String>,
     visible: bool,
     icon_visible: Option<bool>,
     transformation: Option<PlacementTransform>,
@@ -306,6 +324,7 @@ fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacem
         result.push(ComponentPlacement {
             type_name: declaration.declared_type_name,
             name: declaration.instance_name,
+            dimensions: declaration.dimensions,
             visible: placement
                 .named("visible")
                 .and_then(parse_bool_value)
@@ -641,6 +660,7 @@ fn fallback_base_icon(base_name: &str) -> Option<IconScene> {
                 qualified_name: base_name.to_owned(),
                 kind: GraphicOwnerKind::Own,
                 instance_name: None,
+                dimensions: Vec::new(),
             },
             transform: Transform2D::identity(),
             editable: true,
@@ -896,6 +916,21 @@ end Parent;
             .collect::<Vec<_>>();
         assert!(texts.contains(&"Parent/42"));
         assert!(texts.contains(&"leftPin/Pin"));
+
+        let instance_scene = IconResolver::new(&mut registry).resolve_for_instance(
+            &file.classes[0],
+            source,
+            "input_1",
+        );
+        let instance_text = instance_scene
+            .graphics
+            .iter()
+            .find_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .expect("instance text");
+        assert_eq!(instance_text, "input_1/Pin");
         assert_eq!(
             scene
                 .graphics
@@ -947,6 +982,35 @@ end Parent;
         assert!(scene.graphics.iter().any(|graphic| {
             graphic.owner.kind == GraphicOwnerKind::Connector
                 && graphic.owner.instance_name.as_deref() == Some("bus.signal")
+        }));
+    }
+
+    #[test]
+    fn propagates_nested_connector_array_dimensions_to_public_graphics() {
+        let source = r#"
+connector Signal
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end Signal;
+
+model Parent
+  Signal ports[3] annotation(Placement(transformation(extent={{-20,-20},{20,20}})));
+end Parent;
+"#;
+        let file = parse(source, "NestedVectorConnectors.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("NestedVectorConnectors.mo", source)
+            .expect("index source");
+        let scene = IconResolver::new(&mut registry).resolve(&file.classes[1], source);
+        let connector_graphics = scene
+            .graphics
+            .iter()
+            .filter(|graphic| graphic.owner.kind == GraphicOwnerKind::Connector)
+            .collect::<Vec<_>>();
+        assert!(!connector_graphics.is_empty());
+        assert!(connector_graphics.iter().all(|graphic| {
+            graphic.owner.instance_name.as_deref() == Some("ports")
+                && graphic.owner.dimensions == vec!["3"]
         }));
     }
 
