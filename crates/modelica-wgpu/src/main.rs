@@ -62,13 +62,14 @@ const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
 const CONNECTION_SNAP_ENTER_PIXELS: f32 = 8.0;
 const CONNECTION_SNAP_EXIT_PIXELS: f32 = 12.0;
+const MIN_SCREEN_CONNECTION_STROKE_PX: f32 = 1.25;
+const MIN_SCREEN_ICON_STROKE_PX: f32 = 1.05;
+const MIN_SCREEN_MODEL_TEXT_PX: f32 = 10.5;
+const MIN_SCREEN_MODEL_NAME_TEXT_PX: f32 = 11.5;
+const FIT_SCENE_FILL: f32 = 0.86;
 const CONNECTION_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const PORT_HIT_DISTANCE_TIE_EPSILON: f32 = 1.0e-4;
 const COMPONENT_DRAG_PORT_HIT_PIXELS: f32 = 4.0;
-// A transformed icon line can otherwise become a sub-pixel stroke when a
-// component's icon coordinate system is fitted into its Placement extent.
-// Keep the annotation's relative widths, but retain a readable minimum.
-const MIN_VISIBLE_MODEL_STROKE_WIDTH: f32 = 0.3;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
@@ -2324,6 +2325,12 @@ struct ComponentGeometry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrokeKind {
+    Connection,
+    Icon,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelTextAlignment {
     Left,
     Center,
@@ -2339,6 +2346,7 @@ struct ModelTextOverlayItem {
     scale: f32,
     alignment: ModelTextAlignment,
     bold: bool,
+    minimum_screen_px: f32,
 }
 
 struct GpuGeometry {
@@ -2359,6 +2367,7 @@ struct GpuIconScene {
     geometries: Vec<GpuGeometry>,
     layer_indices: [Vec<usize>; DiagramRenderLayer::COUNT],
     bounds: Option<SceneBounds>,
+    stroke_zoom: f32,
 }
 
 impl GpuIconScene {
@@ -2465,10 +2474,14 @@ impl GpuIconScene {
             };
             let mut line = connection.line;
             line.points = points.to_vec();
-            let Some(updated) = line_geometry(&line, connection.transform)
-                .into_iter()
-                .next()
-            else {
+            let Some(updated) = line_geometry(
+                &line,
+                connection.transform,
+                self.stroke_zoom,
+                StrokeKind::Connection,
+            )
+            .into_iter()
+            .next() else {
                 continue;
             };
 
@@ -2583,6 +2596,8 @@ struct ConnectionPreviewMesh {
     line_rotation: f32,
     line_thickness: f32,
     transform: Transform2D,
+    stroke_zoom: f32,
+    points: Vec<CorePoint>,
 }
 
 impl ConnectionPreviewMesh {
@@ -2592,6 +2607,7 @@ impl ConnectionPreviewMesh {
         connection_id: String,
         line: &LineGraphic,
         transform: Transform2D,
+        stroke_zoom: f32,
     ) -> Self {
         let segment_count = line.points.len().saturating_sub(1);
         let segment_capacity = connection_preview_segment_capacity(segment_count);
@@ -2601,6 +2617,7 @@ impl ConnectionPreviewMesh {
             line.rotation,
             line.thickness,
             transform,
+            stroke_zoom,
         );
         let mut vertices = vec![
             Vertex {
@@ -2653,6 +2670,8 @@ impl ConnectionPreviewMesh {
             line_rotation: line.rotation,
             line_thickness: line.thickness,
             transform,
+            stroke_zoom,
+            points: line.points.clone(),
         }
     }
 
@@ -2668,7 +2687,9 @@ impl ConnectionPreviewMesh {
             self.line_rotation,
             self.line_thickness,
             self.transform,
+            self.stroke_zoom,
         );
+        self.points = points.to_vec();
         self.active_segment_count = segment_count;
         if segment_count > 0 {
             queue.write_buffer(
@@ -2678,6 +2699,31 @@ impl ConnectionPreviewMesh {
             );
         }
         true
+    }
+
+    fn set_zoom(&mut self, queue: &wgpu::Queue, stroke_zoom: f32) {
+        if (self.stroke_zoom - stroke_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        self.stroke_zoom = stroke_zoom;
+        let segment_count = self.points.len().saturating_sub(1);
+        if segment_count == 0 {
+            return;
+        }
+        update_preview_connection_vertices(
+            &mut self.vertices[..segment_count * 4],
+            &self.points,
+            self.line_origin,
+            self.line_rotation,
+            self.line_thickness,
+            self.transform,
+            self.stroke_zoom,
+        );
+        queue.write_buffer(
+            &self.vertex_buffer,
+            0,
+            bytemuck::cast_slice(&self.vertices[..segment_count * 4]),
+        );
     }
 
     fn can_update(&self, points: &[CorePoint]) -> bool {
@@ -2699,6 +2745,7 @@ impl ComponentConnectionPreviewSet {
         style_layout: &wgpu::BindGroupLayout,
         scene: &CoreDiagramScene,
         snapshots: &[ConnectionDragSnapshot],
+        stroke_zoom: f32,
     ) -> Self {
         let previews = snapshots
             .iter()
@@ -2728,6 +2775,7 @@ impl ComponentConnectionPreviewSet {
                         scale_y: -1.0,
                         ..Transform2D::identity()
                     },
+                    stroke_zoom,
                 ))
             })
             .collect();
@@ -2761,6 +2809,12 @@ impl ComponentConnectionPreviewSet {
             .find(|preview| preview.connection_id == connection_id)
             .is_some_and(|preview| preview.update(queue, points))
     }
+
+    fn set_zoom(&mut self, queue: &wgpu::Queue, stroke_zoom: f32) {
+        for preview in &mut self.previews {
+            preview.set_zoom(queue, stroke_zoom);
+        }
+    }
 }
 
 fn geometry_connection_is_in_preview_set(
@@ -2788,17 +2842,24 @@ struct ConnectionCreationPreview {
     frozen_segment_count: usize,
     dynamic_segment_count: usize,
     needs_full_upload: bool,
+    stroke_zoom: f32,
 }
 
 impl ConnectionCreationPreview {
-    fn new(device: &wgpu::Device, style_layout: &wgpu::BindGroupLayout) -> Self {
-        Self::with_capacity(device, style_layout, INITIAL_CONNECTION_CREATION_SEGMENTS)
+    fn new(device: &wgpu::Device, style_layout: &wgpu::BindGroupLayout, stroke_zoom: f32) -> Self {
+        Self::with_capacity(
+            device,
+            style_layout,
+            INITIAL_CONNECTION_CREATION_SEGMENTS,
+            stroke_zoom,
+        )
     }
 
     fn with_capacity(
         device: &wgpu::Device,
         style_layout: &wgpu::BindGroupLayout,
         segment_capacity: usize,
+        stroke_zoom: f32,
     ) -> Self {
         let vertices = vec![
             Vertex {
@@ -2853,6 +2914,7 @@ impl ConnectionCreationPreview {
             frozen_segment_count: 0,
             dynamic_segment_count: 0,
             needs_full_upload: true,
+            stroke_zoom,
         }
     }
 
@@ -2869,7 +2931,8 @@ impl ConnectionCreationPreview {
         while segment_capacity < required_segments {
             segment_capacity = segment_capacity.saturating_mul(2);
         }
-        let mut replacement = Self::with_capacity(device, style_layout, segment_capacity);
+        let mut replacement =
+            Self::with_capacity(device, style_layout, segment_capacity, self.stroke_zoom);
         replacement.active_segment_count = self.active_segment_count;
         replacement.frozen_segment_count = self.frozen_segment_count;
         replacement.dynamic_segment_count = self.dynamic_segment_count;
@@ -2947,9 +3010,41 @@ impl ConnectionCreationPreview {
                     scale_y: -1.0,
                     ..Transform2D::identity()
                 },
+                self.stroke_zoom,
             );
         }
         segment_count
+    }
+
+    fn set_zoom(&mut self, queue: &wgpu::Queue, points: &[CorePoint], stroke_zoom: f32) {
+        if (self.stroke_zoom - stroke_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        let segment_count = points.len().saturating_sub(1);
+        if segment_count > self.segment_capacity || segment_count != self.active_segment_count {
+            return;
+        }
+        self.stroke_zoom = stroke_zoom;
+        if segment_count == 0 {
+            return;
+        }
+        update_preview_connection_vertices(
+            &mut self.vertices[..segment_count * 4],
+            points,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            0.35,
+            Transform2D {
+                scale_y: -1.0,
+                ..Transform2D::identity()
+            },
+            self.stroke_zoom,
+        );
+        queue.write_buffer(
+            &self.vertex_buffer,
+            0,
+            bytemuck::cast_slice(&self.vertices[..segment_count * 4]),
+        );
     }
 
     fn upload_active_range(&mut self, queue: &wgpu::Queue, start_segment: usize) -> Duration {
@@ -3130,6 +3225,7 @@ fn preview_connection_vertices(
     rotation: f32,
     thickness: f32,
     transform: Transform2D,
+    stroke_zoom: f32,
 ) -> Vec<Vertex> {
     let mut vertices = vec![
         Vertex {
@@ -3145,6 +3241,7 @@ fn preview_connection_vertices(
         rotation,
         thickness,
         transform,
+        stroke_zoom,
     );
     vertices
 }
@@ -3156,8 +3253,10 @@ fn update_preview_connection_vertices(
     rotation: f32,
     thickness: f32,
     transform: Transform2D,
+    stroke_zoom: f32,
 ) {
-    let half_width = model_stroke_width(thickness, transform) * 0.5;
+    let half_width =
+        model_stroke_width(thickness, transform, stroke_zoom, StrokeKind::Connection) * 0.5;
     let (vertex_chunks, remainder) = vertices.as_chunks_mut::<4>();
     debug_assert!(remainder.is_empty());
     for (segment, vertex_chunk) in points.windows(2).zip(vertex_chunks) {
@@ -4146,8 +4245,20 @@ impl App {
             multiview: None,
         });
 
-        let scene = build_scene(&device, &style_layout, document.as_ref(), None);
-        let diagram_scene = build_diagram_scene(&device, &style_layout, document.as_ref(), None);
+        let scene = build_scene(
+            &device,
+            &style_layout,
+            document.as_ref(),
+            None,
+            INITIAL_ZOOM,
+        );
+        let diagram_scene = build_diagram_scene(
+            &device,
+            &style_layout,
+            document.as_ref(),
+            None,
+            INITIAL_ZOOM,
+        );
         let msaa_view = create_msaa_view(&device, &config);
         let egui_ctx = egui::Context::default();
         install_ui_fonts(&egui_ctx);
@@ -4681,6 +4792,7 @@ impl App {
                 scale_y: -1.0,
                 ..Transform2D::identity()
             },
+            self.zoom,
         ));
         self.set_diagram_selection(DiagramSelection::Connection(hit.connection_id.clone()));
         // A corner (inner polyline vertex) can be dragged freely. Prefer the
@@ -4773,6 +4885,7 @@ impl App {
         self.connection_creation_preview = Some(ConnectionCreationPreview::new(
             &self.device,
             &self.style_layout,
+            self.zoom,
         ));
         self.hovered_port = None;
     }
@@ -5067,6 +5180,7 @@ impl App {
                                 &self.style_layout,
                                 scene,
                                 &connected_connections,
+                                self.zoom,
                             )
                         });
                     self.component_connection_previews = component_connection_previews;
@@ -5156,6 +5270,7 @@ impl App {
                         &self.style_layout,
                         scene,
                         &connected_connections,
+                        self.zoom,
                     )
                 });
                 self.set_diagram_selection(DiagramSelection::Component(component_name.clone()));
@@ -5852,6 +5967,7 @@ impl App {
             &self.style_layout,
             self.document.as_ref(),
             self.selected_class.as_deref(),
+            self.zoom,
         );
         self.connection_preview = None;
         self.component_connection_previews = None;
@@ -5860,6 +5976,7 @@ impl App {
             &self.style_layout,
             self.document.as_ref(),
             self.selected_class.as_deref(),
+            self.zoom,
         );
         self.diagram_hit_cache =
             build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
@@ -7748,20 +7865,80 @@ impl App {
         let Some(bounds) = active_scene.bounds else {
             self.zoom = INITIAL_ZOOM;
             self.pan = [0.0, 0.0];
+            self.rebuild_scene_geometry_for_zoom();
             self.update_view_uniform();
             return;
         };
         let size = bounds.size();
         let target_x = self.config.width as f32 * 0.50;
         let target_y = self.config.height as f32 * 0.52;
-        let target_size = (self.config.width.min(self.config.height) as f32 * 0.68).max(120.0);
-        self.zoom = (target_size / size[0].max(size[1])).clamp(MIN_ZOOM, MAX_ZOOM);
+        let width = size[0].abs().max(f32::EPSILON);
+        let height = size[1].abs().max(f32::EPSILON);
+        let width_zoom = self.config.width as f32 * FIT_SCENE_FILL / width;
+        let height_zoom = self.config.height as f32 * FIT_SCENE_FILL / height;
+        self.zoom = width_zoom.min(height_zoom).clamp(MIN_ZOOM, MAX_ZOOM);
         let center = bounds.center();
         self.pan = [
             target_x - self.config.width as f32 * 0.5 - center[0] * self.zoom,
             target_y - self.config.height as f32 * 0.5 - center[1] * self.zoom,
         ];
+        self.rebuild_scene_geometry_for_zoom();
         self.update_view_uniform();
+    }
+
+    fn rebuild_scene_geometry_for_zoom(&mut self) {
+        let selected_class = self.selected_class.clone();
+        let document = self.document.as_ref();
+        match self.main_view {
+            MainView::Icon => {
+                self.scene = build_scene(
+                    &self.device,
+                    &self.style_layout,
+                    document,
+                    selected_class.as_deref(),
+                    self.zoom,
+                );
+            }
+            MainView::Diagram => {
+                self.diagram_scene = build_diagram_scene(
+                    &self.device,
+                    &self.style_layout,
+                    document,
+                    selected_class.as_deref(),
+                    self.zoom,
+                );
+            }
+            MainView::Source => return,
+        }
+        self.refresh_preview_geometry_for_zoom();
+    }
+
+    fn refresh_preview_geometry_for_zoom(&mut self) {
+        if let Some(preview) = self.connection_preview.as_mut() {
+            preview.set_zoom(&self.queue, self.zoom);
+        }
+        if let Some(previews) = self.component_connection_previews.as_mut() {
+            previews.set_zoom(&self.queue, self.zoom);
+        }
+        let creation_points = match &self.pointer_interaction {
+            PointerInteraction::CreateDiagramConnection(creation) => {
+                let mut points = Vec::with_capacity(creation.committed_points.len() + 2);
+                append_connection_creation_route_with_orientation(
+                    &creation.committed_points,
+                    creation.cursor_point,
+                    creation.tail_orientation,
+                    &mut points,
+                );
+                Some(points)
+            }
+            _ => None,
+        };
+        if let (Some(preview), Some(points)) = (
+            self.connection_creation_preview.as_mut(),
+            creation_points.as_deref(),
+        ) {
+            preview.set_zoom(&self.queue, points, self.zoom);
+        }
     }
 
     fn zoom_at_cursor(&mut self, wheel_delta: f32) {
@@ -7785,6 +7962,7 @@ impl App {
         let world_after = [world_before[0] * self.zoom, world_before[1] * self.zoom];
         self.pan[0] += cursor[0] - center[0] - self.pan[0] - world_after[0];
         self.pan[1] += cursor[1] - center[1] - self.pan[1] - world_after[1];
+        self.rebuild_scene_geometry_for_zoom();
         self.update_view_uniform();
     }
 
@@ -7826,9 +8004,20 @@ impl App {
     /// Install a freshly parsed document into the viewer state and reset all
     /// per-class editing/selection state for the new library.
     fn adopt_loaded_document(&mut self, document: LoadedDocument) {
-        self.scene = build_scene(&self.device, &self.style_layout, Some(&document), None);
-        self.diagram_scene =
-            build_diagram_scene(&self.device, &self.style_layout, Some(&document), None);
+        self.scene = build_scene(
+            &self.device,
+            &self.style_layout,
+            Some(&document),
+            None,
+            self.zoom,
+        );
+        self.diagram_scene = build_diagram_scene(
+            &self.device,
+            &self.style_layout,
+            Some(&document),
+            None,
+            self.zoom,
+        );
         self.document = Some(document);
         self.selected_class = None;
         self.refresh_ui_document();
@@ -8049,6 +8238,7 @@ impl App {
                     &self.style_layout,
                     self.document.as_ref(),
                     Some(&class_name),
+                    self.zoom,
                 );
             } else {
                 self.scene = build_scene(
@@ -8056,6 +8246,7 @@ impl App {
                     &self.style_layout,
                     self.document.as_ref(),
                     None,
+                    self.zoom,
                 );
             }
             self.diagram_scene = build_diagram_scene(
@@ -8063,6 +8254,7 @@ impl App {
                 &self.style_layout,
                 self.document.as_ref(),
                 Some(&class_name),
+                self.zoom,
             );
             self.selected_class = Some(class_name);
             self.refresh_ui_document();
@@ -9717,6 +9909,11 @@ fn model_text_overlay_item(
         scale: transform_scale(transform),
         alignment: model_text_alignment(text.horizontal_alignment.as_deref()),
         bold: text.text_style.iter().any(|style| style.contains("Bold")),
+        minimum_screen_px: if text.text.contains("%name") {
+            MIN_SCREEN_MODEL_NAME_TEXT_PX
+        } else {
+            MIN_SCREEN_MODEL_TEXT_PX
+        },
     }
 }
 
@@ -9793,7 +9990,9 @@ fn draw_model_text_overlay(
             ),
             ModelTextAlignment::Right => (Pos2::new(max_x, center_y), Align2::RIGHT_CENTER),
         };
-        let font_size = (item.font_size * item.scale * zoom).clamp(7.0, 24.0);
+        let font_size = (item.font_size * item.scale * zoom)
+            .max(item.minimum_screen_px / pixels_per_point)
+            .min(28.0);
         let font = if item.bold {
             ui_semibold_font(font_size)
         } else {
@@ -9814,12 +10013,13 @@ fn build_scene(
     style_layout: &wgpu::BindGroupLayout,
     document: Option<&LoadedDocument>,
     selected_class: Option<&str>,
+    stroke_zoom: f32,
 ) -> GpuIconScene {
     let geometries = document
         .and_then(|document| selected_class.and_then(|name| document.icon(name)))
-        .map(core_icon_geometry)
+        .map(|scene| core_icon_geometry_at_zoom(scene, stroke_zoom))
         .unwrap_or_default();
-    gpu_scene_from_geometries(device, style_layout, geometries, "icon")
+    gpu_scene_from_geometries(device, style_layout, geometries, "icon", stroke_zoom)
 }
 
 fn build_diagram_scene(
@@ -9827,10 +10027,13 @@ fn build_diagram_scene(
     style_layout: &wgpu::BindGroupLayout,
     document: Option<&LoadedDocument>,
     selected_class: Option<&str>,
+    stroke_zoom: f32,
 ) -> GpuIconScene {
     let diagram =
         document.and_then(|document| selected_class.and_then(|name| document.diagram(name)));
-    let geometries = diagram.map(core_diagram_geometry).unwrap_or_default();
+    let geometries = diagram
+        .map(|scene| core_diagram_geometry_at_zoom(scene, stroke_zoom))
+        .unwrap_or_default();
     if std::env::var_os("MODELICA_WGPU_DEBUG_DIAGRAM").is_some() {
         if let Some(scene) = diagram {
             log_diagram_geometry_diagnostics(scene, &geometries);
@@ -9838,7 +10041,7 @@ fn build_diagram_scene(
             eprintln!("diagram diagnostic: no selected DiagramScene");
         }
     }
-    gpu_scene_from_geometries(device, style_layout, geometries, "diagram")
+    gpu_scene_from_geometries(device, style_layout, geometries, "diagram", stroke_zoom)
 }
 
 fn build_diagram_hit_cache(
@@ -9991,6 +10194,7 @@ fn gpu_scene_from_geometries(
     style_layout: &wgpu::BindGroupLayout,
     geometries: Vec<Geometry>,
     label: &str,
+    stroke_zoom: f32,
 ) -> GpuIconScene {
     let geometries = geometries
         .into_iter()
@@ -10067,6 +10271,7 @@ fn gpu_scene_from_geometries(
         geometries: gpu_geometries,
         layer_indices,
         bounds,
+        stroke_zoom,
     }
 }
 
@@ -10077,13 +10282,13 @@ fn connection_mesh_buffer_capacity(vertex_count: usize, index_count: usize) -> (
     )
 }
 
-fn core_icon_geometry(scene: &CoreIconScene) -> Vec<Geometry> {
+fn core_icon_geometry_at_zoom(scene: &CoreIconScene, stroke_zoom: f32) -> Vec<Geometry> {
     scene
         .graphics
         .iter()
         .flat_map(|resolved| {
             let edit_key = resolved.editable.then(|| resolved.id.0.clone());
-            core_graphic_geometry(resolved)
+            core_graphic_geometry_at_zoom(resolved, stroke_zoom)
                 .into_iter()
                 .map(move |mut geometry| {
                     geometry.edit_key = edit_key.clone();
@@ -10244,7 +10449,12 @@ fn trace_connection_reanchor(
     );
 }
 
+#[cfg(test)]
 fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
+    core_diagram_geometry_at_zoom(scene, INITIAL_ZOOM)
+}
+
+fn core_diagram_geometry_at_zoom(scene: &CoreDiagramScene, stroke_zoom: f32) -> Vec<Geometry> {
     let diagram_flip = Transform2D {
         scale_y: -1.0,
         ..Transform2D::identity()
@@ -10252,7 +10462,7 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
     let mut geometries = scene
         .background_graphics
         .iter()
-        .flat_map(|graphic| core_graphic_geometry_from_graphic(graphic, diagram_flip))
+        .flat_map(|graphic| core_graphic_geometry_from_graphic(graphic, diagram_flip, stroke_zoom))
         .map(|mut geometry| {
             geometry.layer = DiagramRenderLayer::Background;
             geometry
@@ -10262,8 +10472,15 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
         if let Some(line) = &connection.line {
             let mut display_line = line.clone();
             display_line.points = canonical_connection_points(scene, connection);
-            geometries.extend(line_geometry(&display_line, diagram_flip).into_iter().map(
-                |mut geometry| {
+            geometries.extend(
+                line_geometry(
+                    &display_line,
+                    diagram_flip,
+                    stroke_zoom,
+                    StrokeKind::Connection,
+                )
+                .into_iter()
+                .map(|mut geometry| {
                     geometry.layer = DiagramRenderLayer::Connection;
                     geometry.edit_key = Some(connection.id.clone());
                     geometry.connection = Some(ConnectionGeometry {
@@ -10271,8 +10488,8 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
                         transform: diagram_flip,
                     });
                     geometry
-                },
-            ));
+                }),
+            );
         }
     }
     for component in &scene.components {
@@ -10296,7 +10513,7 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
             let graphic_transform = compose_transform(placement, resolved.transform);
             let transform = compose_transform(diagram_flip, graphic_transform);
             geometries.extend(
-                core_graphic_geometry_from_graphic(&resolved.graphic, transform)
+                core_graphic_geometry_from_graphic(&resolved.graphic, transform, stroke_zoom)
                     .into_iter()
                     .map(|mut geometry| {
                         geometry.layer = layer;
@@ -10315,19 +10532,20 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
     geometries
 }
 
-fn core_graphic_geometry(resolved: &ResolvedGraphic) -> Vec<Geometry> {
-    core_graphic_geometry_from_graphic(&resolved.graphic, resolved.transform)
+fn core_graphic_geometry_at_zoom(resolved: &ResolvedGraphic, stroke_zoom: f32) -> Vec<Geometry> {
+    core_graphic_geometry_from_graphic(&resolved.graphic, resolved.transform, stroke_zoom)
 }
 
 fn core_graphic_geometry_from_graphic(
     graphic: &CoreGraphic,
     transform: Transform2D,
+    stroke_zoom: f32,
 ) -> Vec<Geometry> {
     match graphic {
-        CoreGraphic::Line(line) => line_geometry(line, transform),
-        CoreGraphic::Polygon(polygon) => polygon_geometry(polygon, transform),
-        CoreGraphic::Rectangle(rectangle) => rectangle_geometry(rectangle, transform),
-        CoreGraphic::Ellipse(ellipse) => ellipse_geometry(ellipse, transform),
+        CoreGraphic::Line(line) => line_geometry(line, transform, stroke_zoom, StrokeKind::Icon),
+        CoreGraphic::Polygon(polygon) => polygon_geometry(polygon, transform, stroke_zoom),
+        CoreGraphic::Rectangle(rectangle) => rectangle_geometry(rectangle, transform, stroke_zoom),
+        CoreGraphic::Ellipse(ellipse) => ellipse_geometry(ellipse, transform, stroke_zoom),
         CoreGraphic::Text(_) | CoreGraphic::Bitmap(_) => Vec::new(),
     }
 }
@@ -10537,7 +10755,12 @@ fn nonzero_scale(scale: f32) -> f32 {
     }
 }
 
-fn line_geometry(line: &LineGraphic, transform: Transform2D) -> Vec<Geometry> {
+fn line_geometry(
+    line: &LineGraphic,
+    transform: Transform2D,
+    stroke_zoom: f32,
+    kind: StrokeKind,
+) -> Vec<Geometry> {
     let points = line
         .points
         .iter()
@@ -10549,12 +10772,16 @@ fn line_geometry(line: &LineGraphic, transform: Transform2D) -> Vec<Geometry> {
     vec![stroke_geometry(
         &polyline_path(&points),
         |_| [0.0, 0.0],
-        model_stroke_width(line.thickness, transform),
+        model_stroke_width(line.thickness, transform, stroke_zoom, kind),
         color_rgba(line.color),
     )]
 }
 
-fn polygon_geometry(polygon: &PolygonGraphic, transform: Transform2D) -> Vec<Geometry> {
+fn polygon_geometry(
+    polygon: &PolygonGraphic,
+    transform: Transform2D,
+    stroke_zoom: f32,
+) -> Vec<Geometry> {
     let points = polygon
         .points
         .iter()
@@ -10571,10 +10798,15 @@ fn polygon_geometry(polygon: &PolygonGraphic, transform: Transform2D) -> Vec<Geo
             .or(Some("LinePattern.Solid")),
         polygon.line_thickness,
         transform,
+        stroke_zoom,
     )
 }
 
-fn rectangle_geometry(rectangle: &RectangleGraphic, transform: Transform2D) -> Vec<Geometry> {
+fn rectangle_geometry(
+    rectangle: &RectangleGraphic,
+    transform: Transform2D,
+    stroke_zoom: f32,
+) -> Vec<Geometry> {
     let extent = rectangle.extent;
     let points = [
         extent.p1,
@@ -10602,10 +10834,15 @@ fn rectangle_geometry(rectangle: &RectangleGraphic, transform: Transform2D) -> V
             .or(Some("LinePattern.Solid")),
         rectangle.line_thickness,
         transform,
+        stroke_zoom,
     )
 }
 
-fn ellipse_geometry(ellipse: &EllipseGraphic, transform: Transform2D) -> Vec<Geometry> {
+fn ellipse_geometry(
+    ellipse: &EllipseGraphic,
+    transform: Transform2D,
+    stroke_zoom: f32,
+) -> Vec<Geometry> {
     let points = ellipse_points(ellipse, transform);
     let mut geometry = Vec::new();
     if !fill_pattern_is_none(ellipse.fill_pattern.as_deref()) && points.len() >= 3 {
@@ -10631,13 +10868,19 @@ fn ellipse_geometry(ellipse: &EllipseGraphic, transform: Transform2D) -> Vec<Geo
         geometry.push(stroke_geometry(
             &polyline_path(&points),
             |_| [0.0, 0.0],
-            model_stroke_width(ellipse.line_thickness.unwrap_or(0.25), transform),
+            model_stroke_width(
+                ellipse.line_thickness.unwrap_or(0.25),
+                transform,
+                stroke_zoom,
+                StrokeKind::Icon,
+            ),
             color_rgba(ellipse.line_color),
         ));
     }
     geometry
 }
 
+#[allow(clippy::too_many_arguments)]
 fn closed_shape_geometry(
     points: &[[f32; 2]],
     fill_color: [u8; 3],
@@ -10646,6 +10889,7 @@ fn closed_shape_geometry(
     line_pattern: Option<&str>,
     line_thickness: Option<f32>,
     transform: Transform2D,
+    stroke_zoom: f32,
 ) -> Vec<Geometry> {
     if points.len() < 3 {
         return Vec::new();
@@ -10663,7 +10907,12 @@ fn closed_shape_geometry(
         geometry.push(stroke_geometry(
             &polyline_path(points),
             |_| [0.0, 0.0],
-            model_stroke_width(line_thickness.unwrap_or(0.25), transform),
+            model_stroke_width(
+                line_thickness.unwrap_or(0.25),
+                transform,
+                stroke_zoom,
+                StrokeKind::Icon,
+            ),
             color_rgba(line_color),
         ));
     }
@@ -10694,8 +10943,18 @@ fn transform_scale(transform: Transform2D) -> f32 {
     ((transform.scale_x.abs() + transform.scale_y.abs()) * 0.5).max(0.01)
 }
 
-fn model_stroke_width(annotation_width: f32, transform: Transform2D) -> f32 {
-    (annotation_width.max(0.1) * transform_scale(transform)).max(MIN_VISIBLE_MODEL_STROKE_WIDTH)
+fn model_stroke_width(
+    annotation_width: f32,
+    transform: Transform2D,
+    stroke_zoom: f32,
+    kind: StrokeKind,
+) -> f32 {
+    let transformed_width = annotation_width.max(0.1) * transform_scale(transform);
+    let minimum_screen_width = match kind {
+        StrokeKind::Connection => MIN_SCREEN_CONNECTION_STROKE_PX,
+        StrokeKind::Icon => MIN_SCREEN_ICON_STROKE_PX,
+    };
+    transformed_width.max(minimum_screen_width / stroke_zoom.max(MIN_ZOOM))
 }
 
 fn ellipse_points(ellipse: &EllipseGraphic, transform: Transform2D) -> Vec<[f32; 2]> {
@@ -14831,7 +15090,7 @@ end BoundarySig;
             start_angle: None,
             end_angle: None,
         };
-        let geometry = ellipse_geometry(&ellipse, Transform2D::identity());
+        let geometry = ellipse_geometry(&ellipse, Transform2D::identity(), INITIAL_ZOOM);
         assert_eq!(geometry.len(), 2);
         assert!(geometry[1].indices.len() >= 3);
     }
@@ -14883,9 +15142,10 @@ end BoundarySig;
             smooth: None,
         };
 
-        let rectangle_geometry = rectangle_geometry(&rectangle, Transform2D::identity());
-        let ellipse_geometry = ellipse_geometry(&ellipse, Transform2D::identity());
-        let polygon_geometry = polygon_geometry(&polygon, Transform2D::identity());
+        let rectangle_geometry =
+            rectangle_geometry(&rectangle, Transform2D::identity(), INITIAL_ZOOM);
+        let ellipse_geometry = ellipse_geometry(&ellipse, Transform2D::identity(), INITIAL_ZOOM);
+        let polygon_geometry = polygon_geometry(&polygon, Transform2D::identity(), INITIAL_ZOOM);
         assert_eq!(
             rectangle_geometry.len(),
             1,
@@ -14923,7 +15183,7 @@ end BoundarySig;
             radius: None,
         };
 
-        let geometry = rectangle_geometry(&rectangle, Transform2D::identity());
+        let geometry = rectangle_geometry(&rectangle, Transform2D::identity(), INITIAL_ZOOM);
         assert_eq!(geometry.len(), 2);
         assert!(geometry.iter().all(|item| item.indices.len() >= 3));
     }
@@ -15071,21 +15331,27 @@ end BoundarySig;
     }
 
     #[test]
-    fn modelica_strokes_keep_annotation_ratios_with_a_visible_floor() {
+    fn modelica_strokes_keep_annotation_ratios_with_a_screen_floor() {
         let identity = Transform2D::identity();
-        assert_eq!(model_stroke_width(0.25, identity), 0.3);
-        assert_eq!(model_stroke_width(1.0, identity), 1.0);
+        let icon_width = model_stroke_width(0.25, identity, 1.0, StrokeKind::Icon);
+        assert!((icon_width - MIN_SCREEN_ICON_STROKE_PX).abs() < 0.0001);
         assert_eq!(
-            model_stroke_width(
-                0.5,
-                Transform2D {
-                    scale_x: 0.1,
-                    scale_y: 0.1,
-                    ..identity
-                },
-            ),
-            MIN_VISIBLE_MODEL_STROKE_WIDTH
+            model_stroke_width(2.0, identity, 1.0, StrokeKind::Icon),
+            2.0
         );
+        let zoomed_out_width = model_stroke_width(
+            0.5,
+            Transform2D {
+                scale_x: 0.1,
+                scale_y: 0.1,
+                ..identity
+            },
+            0.5,
+            StrokeKind::Icon,
+        );
+        assert!((zoomed_out_width * 0.5 - MIN_SCREEN_ICON_STROKE_PX).abs() < 0.0001);
+        let connection_width = model_stroke_width(0.25, identity, 1.0, StrokeKind::Connection);
+        assert!((connection_width - MIN_SCREEN_CONNECTION_STROKE_PX).abs() < 0.0001);
     }
 
     #[test]
@@ -15115,6 +15381,18 @@ end BoundarySig;
         assert_eq!(item.color, [0, 0, 127]);
         assert_eq!(item.alignment, ModelTextAlignment::Left);
         assert!(item.bold);
+        assert_eq!(item.minimum_screen_px, MIN_SCREEN_MODEL_TEXT_PX);
+
+        let name_item = model_text_overlay_item(
+            &modelica_core::scene::TextGraphic {
+                text: "%name".to_owned(),
+                ..text
+            },
+            Transform2D::identity(),
+            "sink",
+            "BoundarySig",
+        );
+        assert_eq!(name_item.minimum_screen_px, MIN_SCREEN_MODEL_NAME_TEXT_PX);
     }
 
     #[test]
@@ -15407,7 +15685,7 @@ end BoundarySig;
             // renderer tolerance rather than against the raw placement box.
             // The visible stroke floor intentionally makes tiny fitted icons
             // expand slightly more than their pre-floor geometry.
-            let geometry_tolerance = MIN_VISIBLE_MODEL_STROKE_WIDTH + 0.05;
+            let geometry_tolerance = MIN_SCREEN_ICON_STROKE_PX / INITIAL_ZOOM + 0.1;
             assert!((min[0] - expected_min_x).abs() < geometry_tolerance);
             assert!((max[0] - expected_max_x).abs() < geometry_tolerance);
             assert!((min[1] + 4.0).abs() < geometry_tolerance);
@@ -15868,6 +16146,7 @@ end BoundarySig;
             0.0,
             1.0,
             Transform2D::identity(),
+            INITIAL_ZOOM,
         );
         let capacity = vertices.len();
         let moved = vec![
@@ -15882,6 +16161,7 @@ end BoundarySig;
             0.0,
             1.0,
             Transform2D::identity(),
+            INITIAL_ZOOM,
         );
         assert_eq!(vertices.len(), capacity);
         assert_eq!(capacity, (initial.len() - 1) * 4);
