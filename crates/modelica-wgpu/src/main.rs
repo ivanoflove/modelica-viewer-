@@ -9800,6 +9800,7 @@ fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
                 .max_height(scroll_height)
                 .max_width(scroll_width)
                 .auto_shrink([false, false])
+                .drag_to_scroll(false)
                 .show_rows(
                     ui,
                     SOURCE_ROW_HEIGHT,
@@ -9872,6 +9873,22 @@ fn trace_source_scroll(
         document.selected_class.as_deref().unwrap_or("<none>"),
         output.state.offset,
         output.content_size.y,
+    );
+}
+
+fn trace_source_wheel(
+    source_view: bool,
+    delta_y: f32,
+    egui_consumed: bool,
+    egui_repaint: bool,
+    redraw_requested: bool,
+    owner: WheelOwner,
+) {
+    if !source_view || std::env::var_os("MODELICA_WGPU_TRACE_SOURCE_SCROLL").is_none() {
+        return;
+    }
+    eprintln!(
+        "[SOURCE WHEEL] delta_y={delta_y:.3} egui_consumed={egui_consumed} egui_repaint={egui_repaint} redraw_requested={redraw_requested} owner={owner:?}"
     );
 }
 
@@ -11999,6 +12016,28 @@ fn should_zoom_canvas(
     canvas_event_allowed_for(main_view, pointer_over_canvas) && control_pressed
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WheelOwner {
+    Egui,
+    CanvasZoom,
+    None,
+}
+
+fn wheel_owner(
+    main_view: MainView,
+    egui_consumed: bool,
+    pointer_over_canvas: bool,
+    control_pressed: bool,
+) -> WheelOwner {
+    if egui_consumed {
+        WheelOwner::Egui
+    } else if should_zoom_canvas(main_view, pointer_over_canvas, control_pressed) {
+        WheelOwner::CanvasZoom
+    } else {
+        WheelOwner::None
+    }
+}
+
 fn delta_is_zero(delta: CorePoint) -> bool {
     delta.x.abs() <= f32::EPSILON && delta.y.abs() <= f32::EPSILON
 }
@@ -14046,6 +14085,15 @@ fn main() {
                 Event::WindowEvent { window_id, event } if window_id == app.window.id() => {
                     let egui_response = app.egui_state.on_window_event(&app.window, &event);
                     let egui_consumed = egui_response.consumed;
+                    let egui_repaint = egui_response.repaint;
+                    let egui_repaint_requested = egui_repaint
+                        && !matches!(&event, WindowEvent::RedrawRequested)
+                        // Interactive drag input is coalesced by pending_drag_position;
+                        // avoid turning every CursorMoved event into another frame request.
+                        && !app.interactive_drag_active();
+                    if egui_repaint_requested {
+                        app.request_redraw();
+                    }
                     match event {
                         WindowEvent::CloseRequested => event_loop.exit(),
                         WindowEvent::Resized(size) => {
@@ -14234,21 +14282,32 @@ fn main() {
                                 app.request_redraw();
                             }
                         }
-                        WindowEvent::MouseWheel { delta, .. }
-                            if should_zoom_canvas(
+                        WindowEvent::MouseWheel { delta, .. } => {
+                            let owner = wheel_owner(
                                 app.main_view,
+                                egui_consumed,
                                 app.pointer_over_canvas(),
                                 app.modifiers.control_key(),
-                            ) => {
-                                let amount = match delta {
-                                    MouseScrollDelta::LineDelta(_, y) => y,
-                                    MouseScrollDelta::PixelDelta(position) => {
-                                        position.y as f32 / 80.0
-                                    }
-                                };
+                            );
+                            let amount = match delta {
+                                MouseScrollDelta::LineDelta(_, y) => y,
+                                MouseScrollDelta::PixelDelta(position) => {
+                                    position.y as f32 / 80.0
+                                }
+                            };
+                            if owner == WheelOwner::CanvasZoom {
                                 app.zoom_at_cursor(amount);
                                 app.request_redraw();
                             }
+                            trace_source_wheel(
+                                matches!(app.main_view, MainView::Source),
+                                amount,
+                                egui_consumed,
+                                egui_repaint,
+                                egui_repaint_requested,
+                                owner,
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -14545,6 +14604,34 @@ mod tests {
         assert!(!should_zoom_canvas(MainView::Icon, true, false));
         assert!(should_zoom_canvas(MainView::Icon, true, true));
         assert!(!should_zoom_canvas(MainView::Source, true, true));
+    }
+
+    #[test]
+    fn wheel_owner_prioritizes_egui_over_canvas_zoom() {
+        assert_eq!(
+            wheel_owner(MainView::Source, true, true, true),
+            WheelOwner::Egui
+        );
+        assert_eq!(
+            wheel_owner(MainView::Diagram, true, true, true),
+            WheelOwner::Egui
+        );
+        assert_eq!(
+            wheel_owner(MainView::Source, false, true, true),
+            WheelOwner::None
+        );
+        assert_eq!(
+            wheel_owner(MainView::Diagram, false, true, true),
+            WheelOwner::CanvasZoom
+        );
+        assert_eq!(
+            wheel_owner(MainView::Icon, false, false, true),
+            WheelOwner::None
+        );
+        assert_eq!(
+            wheel_owner(MainView::Diagram, false, true, false),
+            WheelOwner::None
+        );
     }
 
     #[test]
