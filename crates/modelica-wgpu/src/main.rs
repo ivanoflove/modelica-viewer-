@@ -1,10 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -422,8 +423,10 @@ mod save_tests {
             class_names: Vec::new(),
             model_tree: TreeNode::default(),
             diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
+            registry: RefCell::new(LibraryRegistry::default()),
+            icon_cache: HashMap::new(),
+            diagram_cache: HashMap::new(),
+            scene_resolution_stats: RefCell::new(SceneResolutionStats::default()),
             class_sources,
             source_overrides,
             saved_class_text,
@@ -540,8 +543,10 @@ mod save_tests {
             class_names: Vec::new(),
             model_tree: TreeNode::default(),
             diagnostics: 0,
-            icons: Vec::new(),
-            diagrams: Vec::new(),
+            registry: RefCell::new(LibraryRegistry::default()),
+            icon_cache: HashMap::new(),
+            diagram_cache: HashMap::new(),
+            scene_resolution_stats: RefCell::new(SceneResolutionStats::default()),
             class_sources: Vec::new(),
             source_overrides: HashMap::new(),
             saved_class_text: HashMap::new(),
@@ -1702,15 +1707,16 @@ impl MainView {
     }
 }
 
-#[derive(Clone, Debug)]
 struct LoadedDocument {
     path: PathBuf,
     package_name: String,
     class_names: Vec<String>,
     model_tree: TreeNode,
     diagnostics: usize,
-    icons: Vec<(String, CoreIconScene)>,
-    diagrams: Vec<(String, CoreDiagramScene)>,
+    registry: RefCell<LibraryRegistry>,
+    icon_cache: HashMap<String, OnceLock<Option<CoreIconScene>>>,
+    diagram_cache: HashMap<String, OnceLock<Option<CoreDiagramScene>>>,
+    scene_resolution_stats: RefCell<SceneResolutionStats>,
     class_sources: Vec<ClassSource>,
     source_overrides: HashMap<String, String>,
     // Text the parser saw when the document was loaded (or what we last wrote
@@ -1718,6 +1724,24 @@ struct LoadedDocument {
     // applies an edit, so an externally modified file is never overwritten.
     saved_class_text: HashMap<String, String>,
     source_versions: HashMap<String, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SceneResolutionStats {
+    icon_resolve_count: u64,
+    icon_resolve_time: Duration,
+    diagram_resolve_count: u64,
+    diagram_resolve_time: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LibraryLoadStats {
+    package_load_time: Duration,
+    tree_build_time: Duration,
+    registry_build_time: Duration,
+    total_time: Duration,
+    file_count: usize,
+    class_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1758,39 +1782,30 @@ struct UiDocument {
 
 impl LoadedDocument {
     fn load(path: &FsPath) -> Result<Self, String> {
-        fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let load_started = Instant::now();
+        let package_started = Instant::now();
         let package = PackageLoader
             .load(path)
             .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
+        let package_load_time = package_started.elapsed();
         let mut class_names = Vec::new();
         collect_class_names(&package, &mut class_names);
+        let tree_started = Instant::now();
         let model_tree = build_model_tree(&package);
+        let tree_build_time = tree_started.elapsed();
         let mut class_sources = Vec::new();
         collect_class_sources(&package, &mut class_sources);
+        let registry_started = Instant::now();
         let mut registry = LibraryRegistry::default();
         add_bundled_msl(&mut registry);
         registry.index_package(&package);
         registry.register_package(&package);
-        let icons = class_names
+        let registry_build_time = registry_started.elapsed();
+        let file_count = class_sources
             .iter()
-            .filter_map(|qualified_name| {
-                let (class, source) = registry.resolve_class(qualified_name)?;
-                Some((
-                    qualified_name.clone(),
-                    IconResolver::new(&mut registry).resolve(&class, &source),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let diagrams = class_names
-            .iter()
-            .filter_map(|qualified_name| {
-                let (class, source) = registry.resolve_class(qualified_name)?;
-                Some((
-                    qualified_name.clone(),
-                    resolve_diagram(&class, &source, &mut registry),
-                ))
-            })
-            .collect::<Vec<_>>();
+            .map(|class| class.source_file.clone())
+            .collect::<HashSet<_>>()
+            .len();
         // Snapshot the original text of every class once, so later disk saves
         // can verify the on-disk slice still matches before applying edits.
         let mut saved_class_text = HashMap::new();
@@ -1813,47 +1828,115 @@ impl LoadedDocument {
                 saved_class_text.insert(class.qualified_name.clone(), slice.to_owned());
             }
         }
-        Ok(Self {
+        let icon_cache = class_names
+            .iter()
+            .cloned()
+            .map(|class_name| (class_name, OnceLock::new()))
+            .collect();
+        let diagram_cache = class_names
+            .iter()
+            .cloned()
+            .map(|class_name| (class_name, OnceLock::new()))
+            .collect();
+        let load_stats = LibraryLoadStats {
+            package_load_time,
+            tree_build_time,
+            registry_build_time,
+            total_time: load_started.elapsed(),
+            file_count,
+            class_count: class_names.len(),
+        };
+        let document = Self {
             path: path.to_owned(),
             package_name: package.qualified_name,
             class_names,
             model_tree,
             diagnostics: package.diagnostics.len(),
-            icons,
-            diagrams,
+            registry: RefCell::new(registry),
+            icon_cache,
+            diagram_cache,
+            scene_resolution_stats: RefCell::new(SceneResolutionStats::default()),
             class_sources,
             source_overrides: HashMap::new(),
             saved_class_text,
             source_versions: HashMap::new(),
-        })
+        };
+        trace_library_load(&load_stats);
+        Ok(document)
     }
 
     fn icon(&self, class_name: &str) -> Option<&CoreIconScene> {
-        self.icons
-            .iter()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+        let cache = self.icon_cache.get(class_name)?;
+        cache
+            .get_or_init(|| self.resolve_icon_scene(class_name))
+            .as_ref()
     }
 
     fn diagram(&self, class_name: &str) -> Option<&CoreDiagramScene> {
-        self.diagrams
-            .iter()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+        let cache = self.diagram_cache.get(class_name)?;
+        cache
+            .get_or_init(|| self.resolve_diagram_scene(class_name))
+            .as_ref()
     }
 
-    fn icon_mut(&mut self, class_name: &str) -> Option<&mut CoreIconScene> {
-        self.icons
-            .iter_mut()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+    fn replace_icon(&mut self, class_name: &str, scene: CoreIconScene) {
+        let Some(cache) = self.icon_cache.get_mut(class_name) else {
+            return;
+        };
+        *cache = OnceLock::new();
+        let _ = cache.set(Some(scene));
     }
 
-    fn diagram_mut(&mut self, class_name: &str) -> Option<&mut CoreDiagramScene> {
-        self.diagrams
-            .iter_mut()
-            .find(|(candidate, _)| candidate == class_name)
-            .map(|(_, scene)| scene)
+    fn replace_diagram(&mut self, class_name: &str, scene: CoreDiagramScene) {
+        let Some(cache) = self.diagram_cache.get_mut(class_name) else {
+            return;
+        };
+        *cache = OnceLock::new();
+        let _ = cache.set(Some(scene));
+    }
+
+    fn icon_cache_hit(&self, class_name: &str) -> bool {
+        self.icon_cache
+            .get(class_name)
+            .is_some_and(|cache| cache.get().is_some())
+    }
+
+    fn diagram_cache_hit(&self, class_name: &str) -> bool {
+        self.diagram_cache
+            .get(class_name)
+            .is_some_and(|cache| cache.get().is_some())
+    }
+
+    fn scene_resolution_stats(&self) -> SceneResolutionStats {
+        *self.scene_resolution_stats.borrow()
+    }
+
+    fn resolve_icon_scene(&self, class_name: &str) -> Option<CoreIconScene> {
+        let started = Instant::now();
+        let result = {
+            let mut registry = self.registry.borrow_mut();
+            registry
+                .resolve_class(class_name)
+                .map(|(class, source)| IconResolver::new(&mut registry).resolve(&class, &source))
+        };
+        let mut stats = self.scene_resolution_stats.borrow_mut();
+        stats.icon_resolve_count = stats.icon_resolve_count.saturating_add(1);
+        stats.icon_resolve_time += started.elapsed();
+        result
+    }
+
+    fn resolve_diagram_scene(&self, class_name: &str) -> Option<CoreDiagramScene> {
+        let started = Instant::now();
+        let result = {
+            let mut registry = self.registry.borrow_mut();
+            registry
+                .resolve_class(class_name)
+                .map(|(class, source)| resolve_diagram(&class, &source, &mut registry))
+        };
+        let mut stats = self.scene_resolution_stats.borrow_mut();
+        stats.diagram_resolve_count = stats.diagram_resolve_count.saturating_add(1);
+        stats.diagram_resolve_time += started.elapsed();
+        result
     }
 
     fn class_source(&self, qualified_name: &str) -> Option<(String, String)> {
@@ -1892,11 +1975,56 @@ impl LoadedDocument {
     fn set_class_text(&mut self, qualified_name: &str, text: String) {
         self.source_overrides
             .insert(qualified_name.to_owned(), text);
+        self.invalidate_scene_caches();
+        self.refresh_registry_source(qualified_name);
         let version = self
             .source_versions
             .entry(qualified_name.to_owned())
             .or_default();
         *version = version.saturating_add(1);
+    }
+
+    fn invalidate_scene_caches(&mut self) {
+        for cache in self.icon_cache.values_mut() {
+            *cache = OnceLock::new();
+        }
+        for cache in self.diagram_cache.values_mut() {
+            *cache = OnceLock::new();
+        }
+    }
+
+    fn refresh_registry_source(&mut self, qualified_name: &str) {
+        let Some(source_file) = self
+            .class_sources
+            .iter()
+            .find(|class| class.qualified_name == qualified_name)
+            .map(|class| class.source_file.clone())
+        else {
+            return;
+        };
+        let Ok(mut source) = fs::read_to_string(&source_file) else {
+            return;
+        };
+        let mut edits = self
+            .class_sources
+            .iter()
+            .filter(|class| class.source_file == source_file)
+            .filter_map(|class| {
+                self.source_overrides
+                    .get(&class.qualified_name)
+                    .map(|updated| (class.source_range, updated.clone()))
+            })
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|left| std::cmp::Reverse(left.0.start));
+        for (range, updated) in edits {
+            if range.end <= source.len() && range.start <= range.end {
+                source.replace_range(range.start..range.end, &updated);
+            }
+        }
+        let _ = self
+            .registry
+            .borrow_mut()
+            .register_source(source_file, source);
     }
 
     fn resolve_candidate_scenes(
@@ -1915,13 +2043,7 @@ impl LoadedDocument {
         source: &str,
         parsed: &ModelicaFile,
     ) -> Result<(CoreIconScene, CoreDiagramScene), String> {
-        let package = PackageLoader
-            .load(&self.path)
-            .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
-        let mut registry = LibraryRegistry::default();
-        add_bundled_msl(&mut registry);
-        registry.index_package(&package);
-        registry.register_package(&package);
+        let mut registry = self.registry.borrow_mut();
         let (mut class, _) = registry
             .resolve_class(qualified_name)
             .ok_or_else(|| format!("class `{qualified_name}` was not found"))?;
@@ -2006,6 +2128,50 @@ impl LoadedDocument {
             self.class_names.len(),
         ) + &performance
     }
+}
+
+fn trace_library_load(stats: &LibraryLoadStats) {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_LIBRARY_LOAD").is_none() {
+        return;
+    }
+    eprintln!(
+        "[LIBRARY LOAD] files={} classes={} package_load_us={:.1} tree_build_us={:.1} registry_build_us={:.1} icon_resolve_count=0 icon_resolve_us=0.0 diagram_resolve_count=0 diagram_resolve_us=0.0 total_us={:.1}",
+        stats.file_count,
+        stats.class_count,
+        stats.package_load_time.as_secs_f64() * 1_000_000.0,
+        stats.tree_build_time.as_secs_f64() * 1_000_000.0,
+        stats.registry_build_time.as_secs_f64() * 1_000_000.0,
+        stats.total_time.as_secs_f64() * 1_000_000.0,
+    );
+}
+
+fn trace_class_open(
+    class_name: &str,
+    icon_cache_hit: bool,
+    diagram_cache_hit: bool,
+    before: SceneResolutionStats,
+    after: SceneResolutionStats,
+    gpu_scene_build_time: Duration,
+    total_time: Duration,
+) {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_LIBRARY_LOAD").is_none()
+        && std::env::var_os("MODELICA_WGPU_PROFILE_CLASS_OPEN").is_none()
+    {
+        return;
+    }
+    let icon_resolve_time = after
+        .icon_resolve_time
+        .saturating_sub(before.icon_resolve_time);
+    let diagram_resolve_time = after
+        .diagram_resolve_time
+        .saturating_sub(before.diagram_resolve_time);
+    eprintln!(
+        "[CLASS OPEN] class={class_name} icon_cache_hit={icon_cache_hit} diagram_cache_hit={diagram_cache_hit} icon_resolve_us={:.1} diagram_resolve_us={:.1} gpu_scene_build_us={:.1} total_us={:.1}",
+        icon_resolve_time.as_secs_f64() * 1_000_000.0,
+        diagram_resolve_time.as_secs_f64() * 1_000_000.0,
+        gpu_scene_build_time.as_secs_f64() * 1_000_000.0,
+        total_time.as_secs_f64() * 1_000_000.0,
+    );
 }
 
 fn collect_class_names(package: &PackageNode, output: &mut Vec<String>) {
@@ -6645,12 +6811,8 @@ impl App {
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.replace_icon(&class_name, resolved_icon);
+        document.replace_diagram(&class_name, resolved_diagram);
         self.history.push(EditCommand::CreateDiagramConnection {
             class_name,
             connection_key,
@@ -6721,12 +6883,8 @@ impl App {
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.replace_icon(&class_name, resolved_icon);
+        document.replace_diagram(&class_name, resolved_diagram);
         self.history.push(EditCommand::MoveIconGraphic {
             class_name,
             graphic_id,
@@ -7054,12 +7212,8 @@ impl App {
                 return;
             };
             document.set_class_text(&class_name, candidate.clone());
-            if let Some(scene) = document.icon_mut(&class_name) {
-                *scene = resolved_icon;
-            }
-            if let Some(scene) = document.diagram_mut(&class_name) {
-                *scene = resolved_diagram;
-            }
+            document.replace_icon(&class_name, resolved_icon);
+            document.replace_diagram(&class_name, resolved_diagram);
             document
                 .diagram(&class_name)
                 .and_then(|scene| {
@@ -7395,12 +7549,8 @@ impl App {
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.replace_icon(&class_name, resolved_icon);
+        document.replace_diagram(&class_name, resolved_diagram);
         if profile.enabled {
             profile.document_update = document_started.elapsed();
         }
@@ -7609,12 +7759,8 @@ impl App {
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
-        if let Some(scene) = document.icon_mut(&class_name) {
-            *scene = resolved_icon;
-        }
-        if let Some(scene) = document.diagram_mut(&class_name) {
-            *scene = resolved_diagram;
-        }
+        document.replace_icon(&class_name, resolved_icon);
+        document.replace_diagram(&class_name, resolved_diagram);
         self.history.push(EditCommand::ResizeDiagramComponent {
             class_name,
             component_id,
@@ -7661,12 +7807,8 @@ impl App {
                     return;
                 };
                 document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.replace_icon(class_name, resolved_icon);
+                document.replace_diagram(class_name, resolved_diagram);
             }
             EditCommand::MoveDiagramComponent {
                 class_name,
@@ -7722,12 +7864,8 @@ impl App {
                     return;
                 };
                 document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.replace_icon(class_name, resolved_icon);
+                document.replace_diagram(class_name, resolved_diagram);
             }
             EditCommand::MoveDiagramConnection {
                 class_name,
@@ -7783,12 +7921,8 @@ impl App {
                     return;
                 };
                 document.set_class_text(class_name, candidate);
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.replace_icon(class_name, resolved_icon);
+                document.replace_diagram(class_name, resolved_diagram);
             }
             EditCommand::CreateDiagramConnection {
                 class_name,
@@ -7815,12 +7949,8 @@ impl App {
                     return;
                 };
                 document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.replace_icon(class_name, resolved_icon);
+                document.replace_diagram(class_name, resolved_diagram);
             }
             EditCommand::ResizeDiagramComponent {
                 class_name,
@@ -7876,12 +8006,8 @@ impl App {
                     return;
                 };
                 document.set_class_text(class_name, source.clone());
-                if let Some(scene) = document.icon_mut(class_name) {
-                    *scene = resolved_icon;
-                }
-                if let Some(scene) = document.diagram_mut(class_name) {
-                    *scene = resolved_diagram;
-                }
+                document.replace_icon(class_name, resolved_icon);
+                document.replace_diagram(class_name, resolved_diagram);
             }
         }
         self.load_error = None;
@@ -8331,9 +8457,22 @@ impl App {
         }
 
         if let Some(class_name) = class_clicked {
+            let class_open_started = Instant::now();
+            let (icon_cache_hit, diagram_cache_hit, before_resolution) = self
+                .document
+                .as_ref()
+                .map(|document| {
+                    (
+                        document.icon_cache_hit(&class_name),
+                        document.diagram_cache_hit(&class_name),
+                        document.scene_resolution_stats(),
+                    )
+                })
+                .unwrap_or((false, false, SceneResolutionStats::default()));
             let has_visual = self.document.as_ref().is_some_and(|document| {
                 document.icon(&class_name).is_some() || document.diagram(&class_name).is_some()
             });
+            let gpu_scene_build_started = Instant::now();
             if has_visual {
                 self.scene = build_scene(
                     &self.device,
@@ -8357,6 +8496,22 @@ impl App {
                 self.document.as_ref(),
                 Some(&class_name),
                 self.zoom,
+            );
+            let gpu_scene_build_time = gpu_scene_build_started.elapsed();
+            let after_resolution = self
+                .document
+                .as_ref()
+                .map_or_else(SceneResolutionStats::default, |document| {
+                    document.scene_resolution_stats()
+                });
+            trace_class_open(
+                &class_name,
+                icon_cache_hit,
+                diagram_cache_hit,
+                before_resolution,
+                after_resolution,
+                gpu_scene_build_time,
+                class_open_started.elapsed(),
             );
             self.selected_class = Some(class_name);
             self.refresh_ui_document();
@@ -14046,6 +14201,54 @@ mod tests {
         assert!(!canvas_event_allowed_for(MainView::Icon, false));
         assert!(canvas_event_allowed_for(MainView::Icon, true));
         assert!(canvas_event_allowed_for(MainView::Diagram, true));
+    }
+
+    #[test]
+    fn loaded_document_resolves_scenes_lazily_and_reuses_cached_results() {
+        let directory = std::env::temp_dir().join(format!(
+            "modelica-wgpu-lazy-load-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("LazyLibrary.mo");
+        fs::write(&path, "model A\nend A;\nmodel B\nend B;\n").expect("write test library");
+
+        let mut document = LoadedDocument::load(&path).expect("load test library");
+        let initial = document.scene_resolution_stats();
+        assert_eq!(initial.icon_resolve_count, 0);
+        assert_eq!(initial.diagram_resolve_count, 0);
+        assert!(document.class_names.iter().any(|name| name == "A"));
+        assert!(document.class_names.iter().any(|name| name == "B"));
+        assert!(!document.icon_cache_hit("A"));
+        assert!(!document.diagram_cache_hit("A"));
+
+        assert!(document.icon("A").is_some());
+        assert!(document.diagram("A").is_some());
+        let after_first_open = document.scene_resolution_stats();
+        assert_eq!(after_first_open.icon_resolve_count, 1);
+        assert_eq!(after_first_open.diagram_resolve_count, 1);
+        assert!(document.icon_cache_hit("A"));
+        assert!(document.diagram_cache_hit("A"));
+
+        assert!(document.icon("A").is_some());
+        assert!(document.diagram("A").is_some());
+        assert_eq!(document.scene_resolution_stats(), after_first_open);
+
+        assert!(document.icon("B").is_some());
+        assert!(document.diagram("B").is_some());
+        let after_second_class = document.scene_resolution_stats();
+        assert_eq!(after_second_class.icon_resolve_count, 2);
+        assert_eq!(after_second_class.diagram_resolve_count, 2);
+
+        document.set_class_text("A", "model A\nend A;\n".to_owned());
+        assert!(!document.icon_cache_hit("A"));
+        assert!(!document.diagram_cache_hit("A"));
+
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
