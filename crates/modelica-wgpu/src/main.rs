@@ -8901,17 +8901,17 @@ fn theme_text_primary() -> Color32 {
     if is_dark_theme() {
         theme_rgb(241, 241, 244) // --text-primary: #f1f1f4
     } else {
-        theme_rgb(32, 33, 40) // --text-primary: #202128
+        theme_rgb(31, 35, 40) // --text-primary: #1f2328
     }
 }
 
-// Light-theme UI text tokens: primary #20232B, secondary #505664,
-// muted #737A89, disabled #A1A6B2. These colors apply to UI chrome only.
+// Keep UI text roles opaque and separated enough to remain readable on the
+// light surface. These colors apply to UI chrome only, not Diagram graphics.
 fn theme_text_secondary() -> Color32 {
     if is_dark_theme() {
         theme_rgb(169, 171, 182) // --text-secondary: #a9abb6
     } else {
-        theme_rgb(112, 114, 125) // --text-secondary: #70727d
+        theme_rgb(95, 99, 104) // --text-secondary: #5f6368
     }
 }
 
@@ -8920,7 +8920,7 @@ fn theme_text_disabled() -> Color32 {
     if is_dark_theme() {
         theme_rgb(104, 108, 124)
     } else {
-        theme_rgb(161, 166, 178)
+        theme_rgb(150, 155, 163)
     }
 }
 
@@ -8928,7 +8928,71 @@ fn theme_text_tertiary() -> Color32 {
     if is_dark_theme() {
         theme_rgb(126, 128, 140) // --text-tertiary: #7e808c
     } else {
-        theme_rgb(151, 153, 164) // --text-tertiary: #9799a4
+        theme_rgb(122, 127, 135) // --text-tertiary: #7a7f87
+    }
+}
+
+fn theme_code_keyword() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(179, 164, 255)
+    } else {
+        theme_rgb(75, 59, 157)
+    }
+}
+
+fn theme_code_number() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(240, 177, 96)
+    } else {
+        theme_rgb(145, 76, 15)
+    }
+}
+
+fn theme_code_string() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(112, 210, 151)
+    } else {
+        theme_rgb(22, 115, 72)
+    }
+}
+
+fn theme_code_comment() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(157, 160, 173)
+    } else {
+        theme_rgb(103, 108, 115)
+    }
+}
+
+fn theme_code_punctuation() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(194, 196, 205)
+    } else {
+        theme_rgb(83, 89, 97)
+    }
+}
+
+fn theme_code_type() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(100, 198, 229)
+    } else {
+        theme_rgb(17, 105, 140)
+    }
+}
+
+fn theme_code_qualified() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(184, 166, 237)
+    } else {
+        theme_rgb(90, 64, 145)
+    }
+}
+
+fn theme_code_function() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(232, 153, 92)
+    } else {
+        theme_rgb(144, 74, 26)
     }
 }
 
@@ -9054,11 +9118,15 @@ fn configure_egui_style(ctx: &egui::Context) {
     visuals.panel_fill = Color32::TRANSPARENT;
     visuals.faint_bg_color = theme_surface_soft(72);
     visuals.extreme_bg_color = theme_surface();
-    visuals.code_bg_color = theme_surface_soft(170);
+    visuals.code_bg_color = if is_dark_theme() {
+        theme_surface_soft(210)
+    } else {
+        theme_rgb(248, 249, 252)
+    };
     visuals.warn_fg_color = theme_rgb(154, 116, 31);
     visuals.error_fg_color = theme_rgb(193, 72, 90);
     visuals.selection = egui::style::Selection {
-        bg_fill: theme_accent_soft(26),
+        bg_fill: theme_accent_soft(40),
         stroke: Stroke::new(1.0_f32, theme_accent()),
     };
 
@@ -9079,13 +9147,13 @@ fn configure_egui_style(ctx: &egui::Context) {
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
     visuals.widgets.inactive.bg_fill = theme_surface();
     visuals.widgets.inactive.weak_bg_fill = theme_surface_soft(185);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, theme_text_secondary());
-    visuals.widgets.hovered.bg_fill = theme_accent_soft(20);
-    visuals.widgets.hovered.weak_bg_fill = theme_accent_soft(16);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_accent_soft(90));
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
+    visuals.widgets.hovered.bg_fill = theme_accent_soft(28);
+    visuals.widgets.hovered.weak_bg_fill = theme_accent_soft(22);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_accent_soft(110));
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, theme_accent());
     visuals.widgets.active.bg_fill = theme_accent();
-    visuals.widgets.active.weak_bg_fill = theme_accent_soft(110);
+    visuals.widgets.active.weak_bg_fill = theme_accent_soft(130);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, theme_accent());
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.open = visuals.widgets.hovered;
@@ -9122,17 +9190,22 @@ fn draw_preview_ui(
     visuals.panel_fill = Color32::TRANSPARENT;
     visuals.faint_bg_color = theme_surface_soft(72);
     visuals.extreme_bg_color = theme_surface();
-    visuals.code_bg_color = theme_surface_soft(170);
+    visuals.code_bg_color = if is_dark_theme() {
+        theme_surface_soft(210)
+    } else {
+        theme_rgb(248, 249, 252)
+    };
     visuals.selection = egui::style::Selection {
-        bg_fill: theme_accent_soft(26),
+        bg_fill: theme_accent_soft(40),
         stroke: Stroke::new(1.0_f32, theme_accent()),
     };
-    visuals.widgets.hovered.bg_fill = theme_accent_soft(20);
-    visuals.widgets.hovered.weak_bg_fill = theme_accent_soft(16);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_accent_soft(90));
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
+    visuals.widgets.hovered.bg_fill = theme_accent_soft(28);
+    visuals.widgets.hovered.weak_bg_fill = theme_accent_soft(22);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_accent_soft(110));
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, theme_accent());
     visuals.widgets.active.bg_fill = theme_accent();
-    visuals.widgets.active.weak_bg_fill = theme_accent_soft(110);
+    visuals.widgets.active.weak_bg_fill = theme_accent_soft(130);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, theme_accent());
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.open = visuals.widgets.hovered;
@@ -9515,13 +9588,20 @@ fn tree_row(
         Sense::click(),
     );
     let fill = if selected {
-        theme_accent_soft(28)
+        theme_accent_soft(42)
     } else if response.hovered() {
-        theme_surface_raised(80)
+        theme_surface_raised(115)
     } else {
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            Rounding::same(4.0),
+            Stroke::new(1.0_f32, theme_accent_soft(125)),
+        );
+    }
     let text_position = Pos2::new(rect.left() + indent * 12.0 + 30.0, rect.center().y);
     ui.painter().text(
         Pos2::new(rect.left() + indent * 12.0 + 8.0, rect.center().y),
@@ -9530,24 +9610,41 @@ fn tree_row(
         ui_font(12.0),
         theme_text_tertiary(),
     );
-    ui.painter().text(
-        text_position,
-        Align2::LEFT_CENTER,
-        format!(
-            "{icon}  {label}{}",
-            description.map_or_else(String::new, |value| format!("  — {value}"))
-        ),
-        if selected {
-            ui_semibold_font(13.0)
-        } else {
-            ui_font(13.0)
-        },
-        if selected {
-            theme_accent()
-        } else {
-            theme_text_secondary()
-        },
+    let label_font = if selected {
+        ui_semibold_font(13.0)
+    } else {
+        ui_font(13.0)
+    };
+    let label_color = if selected {
+        theme_accent_strong()
+    } else {
+        theme_text_primary()
+    };
+    let label_galley =
+        ui.painter()
+            .layout_no_wrap(format!("{icon}  {label}"), label_font, label_color);
+    let label_position = Pos2::new(
+        text_position.x,
+        rect.center().y - label_galley.size().y * 0.5,
     );
+    ui.painter()
+        .galley(label_position, label_galley.clone(), label_color);
+    if let Some(description) = description {
+        let description_text = format!("  — {description}");
+        let description_font = ui_font(12.0);
+        let description_color = theme_text_secondary();
+        let description_galley =
+            ui.painter()
+                .layout_no_wrap(description_text, description_font, description_color);
+        ui.painter().galley(
+            Pos2::new(
+                label_position.x + label_galley.size().x + 3.0,
+                rect.center().y - description_galley.size().y * 0.5,
+            ),
+            description_galley,
+            description_color,
+        );
+    }
     (response, marker_response)
 }
 
@@ -9717,11 +9814,11 @@ fn modelica_layout_job(line: &str, class_names: &[String]) -> LayoutJob {
     let tokens = tokenize(line);
     for (index, token) in tokens.iter().enumerate() {
         let color = match token.kind {
-            TokenKind::Keyword => theme_accent_strong(),
-            TokenKind::Number => theme_rgb(185, 105, 35),
-            TokenKind::String => theme_rgb(44, 133, 91),
-            TokenKind::Comment => theme_text_tertiary(),
-            TokenKind::Punctuation => theme_text_secondary(),
+            TokenKind::Keyword => theme_code_keyword(),
+            TokenKind::Number => theme_code_number(),
+            TokenKind::String => theme_code_string(),
+            TokenKind::Comment => theme_code_comment(),
+            TokenKind::Punctuation => theme_code_punctuation(),
             TokenKind::Identifier => identifier_color(&tokens, index, class_names),
             TokenKind::Unknown | TokenKind::Whitespace => theme_text_primary(),
         };
@@ -9745,15 +9842,15 @@ fn identifier_color(tokens: &[Token], index: usize, class_names: &[String]) -> C
             .iter()
             .any(|name| name == &token.text || name.rsplit('.').next() == Some(token.text.as_str()))
     {
-        return theme_rgb(37, 126, 158);
+        return theme_code_type();
     }
 
     if adjacent_punctuation(tokens, index, ".") {
-        return theme_rgb(100, 82, 164);
+        return theme_code_qualified();
     }
 
     if next_non_trivia(tokens, index).is_some_and(|next| next.text == "(") {
-        return theme_rgb(157, 91, 36);
+        return theme_code_function();
     }
 
     theme_text_primary()
