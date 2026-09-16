@@ -2378,6 +2378,18 @@ struct ModelTextOverlayItem {
     minimum_screen_px: f32,
 }
 
+/// Placement inputs for a component while a diagram edit is still only a
+/// preview. Keeping these values together lets the GPU geometry and the text
+/// overlay use the same effective component transform during move and resize
+/// interactions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ComponentPreviewPlacement {
+    origin: CorePoint,
+    rotation: f32,
+    extent: modelica_core::scene::Extent,
+    delta: CorePoint,
+}
+
 struct GpuGeometry {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -4945,6 +4957,61 @@ impl App {
         Some(connection_world_points(raw_line, points))
     }
 
+    fn component_preview_placement(
+        &self,
+        component: &CoreComponentInstance,
+    ) -> Option<ComponentPreviewPlacement> {
+        match &self.pointer_interaction {
+            PointerInteraction::MoveDiagramComponent {
+                component_id,
+                preview_origin,
+                ..
+            } if component_id == &component.id => Some(ComponentPreviewPlacement {
+                origin: *preview_origin,
+                rotation: component.rotation,
+                extent: component
+                    .placement_extent
+                    .unwrap_or_else(default_component_extent),
+                delta: CorePoint {
+                    x: preview_origin.x - component.origin.x,
+                    y: preview_origin.y - component.origin.y,
+                },
+            }),
+            PointerInteraction::ResizeDiagramComponent {
+                component_id,
+                original_component,
+                preview_extent,
+                ..
+            } if component_id == &component.id => Some(ComponentPreviewPlacement {
+                origin: original_component.origin,
+                rotation: original_component.rotation,
+                extent: *preview_extent,
+                delta: CorePoint { x: 0.0, y: 0.0 },
+            }),
+            _ => None,
+        }
+    }
+
+    fn active_diagram_component_preview(&self) -> Option<(&str, ComponentPreviewPlacement)> {
+        let component_id = match &self.pointer_interaction {
+            PointerInteraction::MoveDiagramComponent { component_id, .. }
+            | PointerInteraction::ResizeDiagramComponent { component_id, .. } => {
+                component_id.as_str()
+            }
+            _ => return None,
+        };
+        let class_name = self.selected_class_name()?;
+        let component = self
+            .document
+            .as_ref()?
+            .diagram(class_name)?
+            .components
+            .iter()
+            .find(|component| component.id == component_id)?;
+        self.component_preview_placement(component)
+            .map(|preview| (component_id, preview))
+    }
+
     fn selected_component_overlay(&self) -> Option<ComponentSelectionOverlay> {
         let component_name = match &self.diagram_selection {
             DiagramSelection::Component(component_name) => component_name,
@@ -4958,20 +5025,18 @@ impl App {
             .components
             .iter()
             .find(|component| component.name == *component_name)?;
-        let origin = match &self.pointer_interaction {
-            PointerInteraction::MoveDiagramComponent {
-                component_name: active_name,
-                preview_origin,
-                ..
-            } if active_name == component_name => *preview_origin,
-            _ => component.origin,
-        };
+        let preview = self.component_preview_placement(component);
         Some(ComponentSelectionOverlay {
-            origin,
-            extent: component
-                .placement_extent
-                .unwrap_or(default_component_extent()),
-            rotation: component.rotation,
+            origin: preview.map_or(component.origin, |preview| preview.origin),
+            extent: preview.map_or_else(
+                || {
+                    component
+                        .placement_extent
+                        .unwrap_or_else(default_component_extent)
+                },
+                |preview| preview.extent,
+            ),
+            rotation: preview.map_or(component.rotation, |preview| preview.rotation),
         })
     }
 
@@ -5918,11 +5983,15 @@ impl App {
                 let Some(icon) = original_component.diagram_layer() else {
                     return false;
                 };
-                let placement = diagram_placement_transform_for_extent(
+                let placement = effective_component_transform(
                     icon,
-                    original_component.origin,
-                    original_component.rotation,
-                    preview_extent,
+                    &original_component,
+                    Some(ComponentPreviewPlacement {
+                        origin: original_component.origin,
+                        rotation: original_component.rotation,
+                        extent: preview_extent,
+                        delta: CorePoint { x: 0.0, y: 0.0 },
+                    }),
                 );
                 self.diagram_scene.preview_component_resize(
                     &self.queue,
@@ -8120,15 +8189,19 @@ impl App {
             DiagramSelection::Port(key) => self.diagram_anchor(key),
             _ => None,
         };
+        let diagram_component_preview = self.active_diagram_component_preview();
+        trace_component_preview(diagram_component_preview);
         let icon_text_items = collect_model_text_overlay_items(
             self.document.as_ref(),
             selected_class.as_deref(),
             MainView::Icon,
+            None,
         );
         let diagram_text_items = collect_model_text_overlay_items(
             self.document.as_ref(),
             selected_class.as_deref(),
             MainView::Diagram,
+            diagram_component_preview,
         );
         let overlay_update = overlay_update_started.elapsed();
         let zoom = self.zoom;
@@ -9837,6 +9910,7 @@ fn collect_model_text_overlay_items(
     document: Option<&LoadedDocument>,
     selected_class: Option<&str>,
     main_view: MainView,
+    diagram_component_preview: Option<(&str, ComponentPreviewPlacement)>,
 ) -> Vec<ModelTextOverlayItem> {
     let Some(document) = document else {
         return Vec::new();
@@ -9885,7 +9959,10 @@ fn collect_model_text_overlay_items(
                 let Some(layer) = component.diagram_layer() else {
                     continue;
                 };
-                let placement = diagram_placement_transform(layer, component);
+                let preview = diagram_component_preview
+                    .filter(|(component_id, _)| *component_id == component.id.as_str())
+                    .map(|(_, preview)| preview);
+                let placement = effective_component_transform(layer, component, preview);
                 let component_class_name = component
                     .resolved_type_qualified_name
                     .as_deref()
@@ -9944,6 +10021,26 @@ fn model_text_overlay_item(
             MIN_SCREEN_MODEL_TEXT_PX
         },
     }
+}
+
+fn trace_component_preview(preview: Option<(&str, ComponentPreviewPlacement)>) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_COMPONENT_PREVIEW").is_none() {
+        return;
+    }
+    let Some((component_id, preview)) = preview else {
+        return;
+    };
+    eprintln!(
+        "[COMPONENT PREVIEW] component={component_id} delta=({:.3},{:.3}) geometry_delta=({:.3},{:.3}) text_delta=({:.3},{:.3}) port_delta=({:.3},{:.3})",
+        preview.delta.x,
+        preview.delta.y,
+        preview.delta.x,
+        -preview.delta.y,
+        preview.delta.x,
+        preview.delta.y,
+        preview.delta.x,
+        preview.delta.y,
+    );
 }
 
 fn expand_model_text(template: &str, instance_name: &str, class_name: &str) -> String {
@@ -10868,17 +10965,23 @@ fn diagram_placement_transform(
     icon: &CoreIconScene,
     component: &CoreComponentInstance,
 ) -> Transform2D {
-    diagram_placement_transform_for_extent(
-        icon,
-        component.origin,
-        component.rotation,
-        component
+    effective_component_transform(icon, component, None)
+}
+
+fn effective_component_transform(
+    icon: &CoreIconScene,
+    component: &CoreComponentInstance,
+    preview: Option<ComponentPreviewPlacement>,
+) -> Transform2D {
+    let preview = preview.unwrap_or(ComponentPreviewPlacement {
+        origin: component.origin,
+        rotation: component.rotation,
+        extent: component
             .placement_extent
-            .unwrap_or(modelica_core::scene::Extent {
-                p1: CorePoint { x: -10.0, y: -10.0 },
-                p2: CorePoint { x: 10.0, y: 10.0 },
-            }),
-    )
+            .unwrap_or_else(default_component_extent),
+        delta: CorePoint { x: 0.0, y: 0.0 },
+    });
+    diagram_placement_transform_for_extent(icon, preview.origin, preview.rotation, preview.extent)
 }
 
 fn diagram_placement_transform_for_extent(
@@ -15835,6 +15938,129 @@ end BoundarySig;
             "BoundarySig",
         );
         assert_eq!(name_item.minimum_screen_px, MIN_SCREEN_MODEL_NAME_TEXT_PX);
+    }
+
+    #[test]
+    fn diagram_text_preview_uses_the_same_move_transform_as_component_geometry() {
+        let coordinate_system = modelica_core::scene::CoordinateSystem::default();
+        let icon = CoreIconScene {
+            owner_qualified_name: Some("Test.Component".to_owned()),
+            coordinate_system,
+            graphics: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let component = CoreComponentInstance {
+            id: "component-id".to_owned(),
+            name: "cpa".to_owned(),
+            source_owner: "Test".to_owned(),
+            type_name: "Component".to_owned(),
+            dimensions: Vec::new(),
+            resolved_type_qualified_name: Some("Test.Component".to_owned()),
+            class_kind: Some(ClassKind::Model),
+            origin: CorePoint { x: 50.0, y: -20.0 },
+            rotation: 90.0,
+            placement_extent: Some(modelica_core::scene::Extent {
+                p1: CorePoint { x: 10.0, y: 10.0 },
+                p2: CorePoint { x: -10.0, y: -10.0 },
+            }),
+            visible: true,
+            editable: true,
+            resolved_icon: Some(Box::new(icon.clone())),
+            resolved_diagram: None,
+        };
+        let text = modelica_core::scene::TextGraphic {
+            origin: CorePoint { x: 4.0, y: -3.0 },
+            rotation: 15.0,
+            extent: modelica_core::scene::Extent {
+                p1: CorePoint { x: -30.0, y: -5.0 },
+                p2: CorePoint { x: 30.0, y: 5.0 },
+            },
+            text: "%name".to_owned(),
+            color: [0, 0, 0],
+            fill_color: None,
+            fill_pattern: None,
+            font_size: Some(12.0),
+            font_name: None,
+            horizontal_alignment: None,
+            text_style: Vec::new(),
+        };
+        let moved_preview = ComponentPreviewPlacement {
+            origin: CorePoint { x: 70.0, y: -10.0 },
+            rotation: component.rotation,
+            extent: component
+                .placement_extent
+                .unwrap_or_else(default_component_extent),
+            delta: CorePoint { x: 20.0, y: 10.0 },
+        };
+        let base_transform = compose_transform(
+            effective_component_transform(&icon, &component, None),
+            Transform2D::identity(),
+        );
+        let moved_transform = compose_transform(
+            effective_component_transform(&icon, &component, Some(moved_preview)),
+            Transform2D::identity(),
+        );
+        let base_item = model_text_overlay_item(&text, base_transform, "cpa", "Component");
+        let moved_item = model_text_overlay_item(&text, moved_transform, "cpa", "Component");
+
+        assert_eq!(moved_item.text, base_item.text);
+        assert_eq!(moved_item.scale, base_item.scale);
+        for (base, moved) in base_item.corners.iter().zip(moved_item.corners) {
+            assert!((moved.x - base.x - 20.0).abs() < 0.0001);
+            assert!((moved.y - base.y - 10.0).abs() < 0.0001);
+        }
+
+        let resized_preview = ComponentPreviewPlacement {
+            origin: component.origin,
+            rotation: component.rotation,
+            extent: modelica_core::scene::Extent {
+                p1: CorePoint { x: 20.0, y: 20.0 },
+                p2: CorePoint { x: -20.0, y: -20.0 },
+            },
+            delta: CorePoint { x: 0.0, y: 0.0 },
+        };
+        let resized_item = model_text_overlay_item(
+            &text,
+            effective_component_transform(&icon, &component, Some(resized_preview)),
+            "cpa",
+            "Component",
+        );
+        assert!(resized_item.scale > base_item.scale);
+    }
+
+    #[test]
+    fn diagram_text_preview_preserves_parameter_text_during_component_move() {
+        let text = modelica_core::scene::TextGraphic {
+            origin: CorePoint { x: 0.0, y: 0.0 },
+            rotation: 0.0,
+            extent: modelica_core::scene::Extent {
+                p1: CorePoint { x: -20.0, y: -4.0 },
+                p2: CorePoint { x: 20.0, y: 4.0 },
+            },
+            text: "H2,O2,H2O,N2".to_owned(),
+            color: [0, 0, 0],
+            fill_color: None,
+            fill_pattern: None,
+            font_size: Some(10.0),
+            font_name: None,
+            horizontal_alignment: None,
+            text_style: Vec::new(),
+        };
+        let base = model_text_overlay_item(&text, Transform2D::identity(), "cpa", "Component");
+        let moved = model_text_overlay_item(
+            &text,
+            Transform2D {
+                translation: CorePoint { x: 20.0, y: 10.0 },
+                ..Transform2D::identity()
+            },
+            "cpa",
+            "Component",
+        );
+        assert_eq!(moved.text, "H2,O2,H2O,N2");
+        for (base, moved) in base.corners.iter().zip(moved.corners) {
+            assert!((moved.x - base.x - 20.0).abs() < 0.0001);
+            assert!((moved.y - base.y - 10.0).abs() < 0.0001);
+        }
     }
 
     #[test]
