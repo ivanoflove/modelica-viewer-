@@ -64,6 +64,7 @@ const CONNECTION_SNAP_ENTER_PIXELS: f32 = 8.0;
 const CONNECTION_SNAP_EXIT_PIXELS: f32 = 12.0;
 const MIN_SCREEN_CONNECTION_STROKE_PX: f32 = 1.25;
 const MIN_SCREEN_ICON_STROKE_PX: f32 = 1.05;
+const CONNECTION_ENDPOINT_OVERDRAW_PX: f32 = 3.0;
 const MIN_SCREEN_MODEL_TEXT_PX: f32 = 10.5;
 const MIN_SCREEN_MODEL_NAME_TEXT_PX: f32 = 11.5;
 const FIT_SCENE_FILL: f32 = 0.86;
@@ -2282,8 +2283,8 @@ enum FillMode {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum DiagramRenderLayer {
     Background,
-    Component,
     Connection,
+    Component,
     Connector,
     Overlay,
 }
@@ -2294,8 +2295,8 @@ impl DiagramRenderLayer {
     fn index(self) -> usize {
         match self {
             Self::Background => 0,
-            Self::Component => 1,
-            Self::Connection => 2,
+            Self::Connection => 1,
+            Self::Component => 2,
             Self::Connector => 3,
             Self::Overlay => 4,
         }
@@ -2304,8 +2305,8 @@ impl DiagramRenderLayer {
 
 const DIAGRAM_RENDER_LAYERS: [DiagramRenderLayer; 4] = [
     DiagramRenderLayer::Background,
-    DiagramRenderLayer::Component,
     DiagramRenderLayer::Connection,
+    DiagramRenderLayer::Component,
     DiagramRenderLayer::Connector,
 ];
 const ICON_RENDER_LAYERS: [DiagramRenderLayer; 1] = [DiagramRenderLayer::Component];
@@ -10611,6 +10612,160 @@ fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
     core_diagram_geometry_at_zoom(scene, INITIAL_ZOOM)
 }
 
+/// Add a small display-only overlap between a connection stroke and each
+/// connector graphic. The returned points remain in Line-local coordinates;
+/// semantic anchors, hit testing, snapping, and source edits continue to use
+/// the unmodified route passed into this function.
+fn display_connection_points(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    semantic_points: &[CorePoint],
+    stroke_zoom: f32,
+) -> Vec<CorePoint> {
+    let Some(line) = connection.line.as_ref() else {
+        return semantic_points.to_vec();
+    };
+    if semantic_points.len() < 2 {
+        return semantic_points.to_vec();
+    }
+    let Ok(endpoints) = resolve_connection_endpoints(scene, connection) else {
+        return semantic_points.to_vec();
+    };
+    let (first_anchor, last_anchor) = match endpoints.point_order {
+        ConnectionPointOrder::LhsToRhs => (&endpoints.lhs, &endpoints.rhs),
+        ConnectionPointOrder::RhsToLhs => (&endpoints.rhs, &endpoints.lhs),
+    };
+    let max_overdraw = CONNECTION_ENDPOINT_OVERDRAW_PX / stroke_zoom.max(MIN_ZOOM);
+    let mut display_points = semantic_points.to_vec();
+    if let Some(point) =
+        display_connection_endpoint(line, &display_points, 0, first_anchor, max_overdraw)
+    {
+        display_points[0] = point;
+    }
+    let last_index = display_points.len() - 1;
+    if let Some(point) =
+        display_connection_endpoint(line, &display_points, last_index, last_anchor, max_overdraw)
+    {
+        display_points[last_index] = point;
+    }
+    if valid_interactive_connection_route(&display_points) {
+        display_points
+    } else {
+        semantic_points.to_vec()
+    }
+}
+
+fn display_connection_endpoint(
+    line: &LineGraphic,
+    points: &[CorePoint],
+    endpoint_index: usize,
+    anchor: &ConnectorAnchor,
+    max_overdraw: f32,
+) -> Option<CorePoint> {
+    let bounds = anchor.visual_bounds?;
+    let endpoint = line_local_to_world(line, *points.get(endpoint_index)?);
+    let neighbor_index = if endpoint_index == 0 {
+        1
+    } else {
+        points.len().checked_sub(2)?
+    };
+    let neighbor = line_local_to_world(line, *points.get(neighbor_index)?);
+    let target = endpoint_overdraw_target(endpoint, neighbor, bounds, max_overdraw)?;
+    Some(world_to_line_local(line, target))
+}
+
+/// Return a point a few pixels inside an axis-aligned connector visual bound.
+/// The ray pointing away from the route is preferred; the opposite ray is a
+/// fallback for glyphs whose semantic origin is at their tip or outer rim.
+fn endpoint_overdraw_target(
+    endpoint: CorePoint,
+    route_neighbor: CorePoint,
+    bounds: modelica_render::Bounds,
+    max_overdraw: f32,
+) -> Option<CorePoint> {
+    let route_delta = CorePoint {
+        x: route_neighbor.x - endpoint.x,
+        y: route_neighbor.y - endpoint.y,
+    };
+    let route_length = route_delta.x.hypot(route_delta.y);
+    if route_length <= ORTHOGONAL_EPSILON {
+        return None;
+    }
+    let route_direction = CorePoint {
+        x: route_delta.x / route_length,
+        y: route_delta.y / route_length,
+    };
+    let directions = [
+        CorePoint {
+            x: -route_direction.x,
+            y: -route_direction.y,
+        },
+        route_direction,
+    ];
+    let min_x = bounds.x.min(bounds.x + bounds.width);
+    let max_x = bounds.x.max(bounds.x + bounds.width);
+    let min_y = bounds.y.min(bounds.y + bounds.height);
+    let max_y = bounds.y.max(bounds.y + bounds.height);
+    for direction in directions {
+        let Some((entry, exit)) =
+            ray_bounds_interval(endpoint, direction, min_x, max_x, min_y, max_y)
+        else {
+            continue;
+        };
+        let entry = entry.max(0.0);
+        if exit <= entry + ORTHOGONAL_EPSILON {
+            continue;
+        }
+        let distance = if entry <= ORTHOGONAL_EPSILON {
+            max_overdraw.min(exit)
+        } else if entry <= max_overdraw {
+            entry + max_overdraw.min(exit - entry)
+        } else {
+            continue;
+        };
+        if distance > ORTHOGONAL_EPSILON {
+            return Some(CorePoint {
+                x: endpoint.x + direction.x * distance,
+                y: endpoint.y + direction.y * distance,
+            });
+        }
+    }
+    None
+}
+
+fn ray_bounds_interval(
+    origin: CorePoint,
+    direction: CorePoint,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+) -> Option<(f32, f32)> {
+    let mut entry = f32::NEG_INFINITY;
+    let mut exit = f32::INFINITY;
+    for (axis_origin, axis_direction, axis_min, axis_max) in [
+        (origin.x, direction.x, min_x, max_x),
+        (origin.y, direction.y, min_y, max_y),
+    ] {
+        if axis_direction.abs() <= ORTHOGONAL_EPSILON {
+            if axis_origin < axis_min - ORTHOGONAL_EPSILON
+                || axis_origin > axis_max + ORTHOGONAL_EPSILON
+            {
+                return None;
+            }
+            continue;
+        }
+        let first = (axis_min - axis_origin) / axis_direction;
+        let second = (axis_max - axis_origin) / axis_direction;
+        entry = entry.max(first.min(second));
+        exit = exit.min(first.max(second));
+        if entry > exit + ORTHOGONAL_EPSILON {
+            return None;
+        }
+    }
+    Some((entry, exit))
+}
+
 fn core_diagram_geometry_at_zoom(scene: &CoreDiagramScene, stroke_zoom: f32) -> Vec<Geometry> {
     let diagram_flip = Transform2D {
         scale_y: -1.0,
@@ -10628,7 +10783,9 @@ fn core_diagram_geometry_at_zoom(scene: &CoreDiagramScene, stroke_zoom: f32) -> 
     for connection in &scene.connections {
         if let Some(line) = &connection.line {
             let mut display_line = line.clone();
-            display_line.points = canonical_connection_points(scene, connection);
+            let semantic_points = canonical_connection_points(scene, connection);
+            display_line.points =
+                display_connection_points(scene, connection, &semantic_points, stroke_zoom);
             geometries.extend(
                 line_geometry(
                     &display_line,
@@ -15118,6 +15275,74 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_overdraw_enters_directional_connector_bounds() {
+        let input_target = endpoint_overdraw_target(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            modelica_render::Bounds {
+                x: 0.0,
+                y: -50.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            3.0,
+        )
+        .expect("RealInput ray should enter its triangle bounds");
+        assert!(point_nearly_equal(
+            input_target,
+            CorePoint { x: 3.0, y: 0.0 }
+        ));
+
+        let output_target = endpoint_overdraw_target(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: -100.0, y: 0.0 },
+            modelica_render::Bounds {
+                x: -100.0,
+                y: -50.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            3.0,
+        )
+        .expect("RealOutput ray should enter its mirrored triangle bounds");
+        assert!(point_nearly_equal(
+            output_target,
+            CorePoint { x: -3.0, y: 0.0 }
+        ));
+
+        let top_target = endpoint_overdraw_target(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 0.0, y: 100.0 },
+            modelica_render::Bounds {
+                x: -50.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            3.0,
+        )
+        .expect("rotated connector ray should enter its top bounds");
+        assert!(point_nearly_equal(top_target, CorePoint { x: 0.0, y: 3.0 }));
+
+        let fluid_target = endpoint_overdraw_target(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            modelica_render::Bounds {
+                x: -20.0,
+                y: -20.0,
+                width: 40.0,
+                height: 40.0,
+            },
+            3.0,
+        )
+        .expect("FluidPort ray should stay inside its circular bounds");
+        assert!(point_nearly_equal(
+            fluid_target,
+            CorePoint { x: -3.0, y: 0.0 }
+        ));
+    }
+
+    #[test]
     fn semantic_endpoint_route_keeps_stale_signal_line_anchored() {
         let source = r#"
 connector RealInput = input Real annotation(
@@ -15151,6 +15376,7 @@ end BoundarySig;
         let (semantic_first, semantic_last) =
             strict_connection_points(&scene, connection).expect("signal connector anchors");
         let points = canonical_connection_points(&scene, connection);
+        let display_points = display_connection_points(&scene, connection, &points, INITIAL_ZOOM);
         assert_eq!(
             (semantic_first, semantic_last),
             (
@@ -15176,7 +15402,22 @@ end BoundarySig;
                 .expect("connection metadata")
                 .line
                 .points,
-            points
+            display_points
+        );
+        assert_ne!(display_points, points);
+        assert_eq!(
+            line_local_to_world(
+                connection.line.as_ref().expect("signal line"),
+                display_points[0],
+            ),
+            CorePoint { x: -99.0, y: 0.0 }
+        );
+        assert_eq!(
+            line_local_to_world(
+                connection.line.as_ref().expect("signal line"),
+                *display_points.last().expect("display endpoint"),
+            ),
+            CorePoint { x: 99.0, y: 0.0 }
         );
     }
 
@@ -15598,6 +15839,21 @@ end BoundarySig;
 
     #[test]
     fn diagram_layers_draw_connectors_after_opaque_components() {
+        let connection_layer = DIAGRAM_RENDER_LAYERS
+            .iter()
+            .position(|layer| *layer == DiagramRenderLayer::Connection)
+            .expect("connection render layer");
+        let component_layer = DIAGRAM_RENDER_LAYERS
+            .iter()
+            .position(|layer| *layer == DiagramRenderLayer::Component)
+            .expect("component render layer");
+        let connector_layer = DIAGRAM_RENDER_LAYERS
+            .iter()
+            .position(|layer| *layer == DiagramRenderLayer::Connector)
+            .expect("connector render layer");
+        assert!(connection_layer < component_layer);
+        assert!(component_layer < connector_layer);
+
         let coordinate_system = modelica_core::scene::CoordinateSystem::default();
         let icon_for = |owner: &str, graphic: CoreGraphic| {
             Box::new(CoreIconScene {
