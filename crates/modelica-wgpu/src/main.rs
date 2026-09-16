@@ -9548,11 +9548,14 @@ fn draw_preview_ui(
                     });
                 });
                 ui.separator();
-                match *main_view {
-                    MainView::Source => source_preview(ui, document),
-                    MainView::Icon => icon_preview(ui, document, icon_clip_rect),
-                    MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
-                }
+                let content_size = ui.available_size();
+                ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
+                    match *main_view {
+                        MainView::Source => source_preview(ui, document),
+                        MainView::Icon => icon_preview(ui, document, icon_clip_rect),
+                        MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
+                    }
+                });
             });
         });
 }
@@ -9742,6 +9745,9 @@ fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
     }
 }
 
+const SOURCE_ROW_HEIGHT: f32 = 20.0;
+const SOURCE_HEADER_HEIGHT: f32 = 24.0;
+
 fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
     let frame = Frame::none()
         .fill(theme_surface())
@@ -9749,51 +9755,74 @@ fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
         .inner_margin(Margin::same(16.0));
     frame.show(ui, |ui| {
         if let Some(document) = document {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(if document.source_name.is_empty() {
-                        "No class selected"
-                    } else {
-                        document.source_name.as_str()
-                    })
-                    .size(13.0)
-                    .strong(),
-                );
-                ui.label(
-                    RichText::new(if document.source_name.is_empty() {
-                        "click a model in the library"
-                    } else {
-                        "read-only source"
-                    })
-                    .size(11.0)
-                    .color(if document.source_name.is_empty() {
-                        theme_text_tertiary()
-                    } else {
-                        theme_live()
-                    }),
-                );
-            });
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), SOURCE_HEADER_HEIGHT),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.label(
+                        RichText::new(if document.source_name.is_empty() {
+                            "No class selected"
+                        } else {
+                            document.source_name.as_str()
+                        })
+                        .size(13.0)
+                        .font(ui_semibold_font(13.0))
+                        .color(theme_text_primary()),
+                    );
+                    ui.label(
+                        RichText::new(if document.source_name.is_empty() {
+                            "click a model in the library"
+                        } else {
+                            "read-only source"
+                        })
+                        .size(11.0)
+                        .color(if document.source_name.is_empty() {
+                            theme_text_secondary()
+                        } else {
+                            theme_live()
+                        }),
+                    );
+                },
+            );
         }
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         if let Some(document) = document {
-            egui::ScrollArea::vertical()
+            let scroll_height = ui.available_height().max(0.0);
+            let scroll_width = ui.available_width().max(0.0);
+            let scroll_delta = ui.input(|input| input.raw_scroll_delta);
+            let pointer_position = ui.ctx().pointer_latest_pos();
+            let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
+            let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
+            let offset_before = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+                .map_or(Vec2::ZERO, |state| state.offset);
+            let scroll_output = egui::ScrollArea::both()
+                .id_source(scroll_id_source)
+                .max_height(scroll_height)
+                .max_width(scroll_width)
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for (number, line) in document.source_lines.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{:>4}", number + 1))
-                                    .monospace()
-                                    .size(13.0)
-                                    .color(theme_text_tertiary()),
+                .show_rows(
+                    ui,
+                    SOURCE_ROW_HEIGHT,
+                    document.source_lines.len(),
+                    |ui, row_range| {
+                        for row in row_range {
+                            render_source_line(
+                                ui,
+                                row,
+                                &document.source_lines[row],
+                                &document.class_names,
                             );
-                            ui.add(
-                                egui::Label::new(modelica_layout_job(line, &document.class_names))
-                                    .selectable(false),
-                            );
-                        });
-                    }
-                });
+                        }
+                    },
+                );
+            trace_source_scroll(
+                document,
+                scroll_delta,
+                pointer_position,
+                offset_before,
+                &scroll_output,
+                scroll_height,
+            );
             if document.source_lines.is_empty() {
                 ui.add_space(32.0);
                 ui.vertical_centered(|ui| {
@@ -9806,6 +9835,44 @@ fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
             }
         }
     });
+}
+
+fn render_source_line(ui: &mut egui::Ui, row: usize, line: &str, class_names: &[String]) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(SOURCE_ROW_HEIGHT);
+        ui.label(
+            RichText::new(format!("{:>4}", row + 1))
+                .monospace()
+                .size(13.0)
+                .color(theme_text_tertiary()),
+        );
+        ui.add(
+            egui::Label::new(modelica_layout_job(line, class_names))
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .selectable(false),
+        );
+    });
+}
+
+fn trace_source_scroll(
+    document: &UiDocument,
+    scroll_delta: Vec2,
+    pointer_position: Option<Pos2>,
+    offset_before: Vec2,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+    viewport_height: f32,
+) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_SOURCE_SCROLL").is_none() || scroll_delta == Vec2::ZERO
+    {
+        return;
+    }
+    let hovered = pointer_position.is_some_and(|position| output.inner_rect.contains(position));
+    eprintln!(
+        "[SOURCE SCROLL] class={} hovered={hovered} wheel_delta={scroll_delta:?} offset_before={offset_before:?} offset_after={:?} viewport_height={viewport_height:.1} content_height={:.1}",
+        document.selected_class.as_deref().unwrap_or("<none>"),
+        output.state.offset,
+        output.content_size.y,
+    );
 }
 
 fn modelica_layout_job(line: &str, class_names: &[String]) -> LayoutJob {
