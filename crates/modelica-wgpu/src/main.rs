@@ -18133,6 +18133,121 @@ end BoundarySig;
     }
 
     #[test]
+    fn failed_stale_source_range_preserves_source_and_history() {
+        let source = "model A\nend A;";
+        let original_source = source.to_owned();
+        let history = [sample_create_command()];
+        let redo_history = [sample_create_command()];
+        let result = apply_validated_source_edits(
+            source,
+            vec![SourceEdit {
+                start: 6,
+                end: 7,
+                expected_text: Some("Old".to_owned()),
+                replacement: "New".to_owned(),
+            }],
+            0,
+        );
+
+        let error = result.expect_err("stale source ranges must fail before applying");
+        assert!(error.contains("stale source range"));
+        assert_eq!(source, original_source);
+        assert_eq!(history.len(), 1);
+        assert_eq!(redo_history.len(), 1);
+    }
+
+    #[test]
+    fn failed_candidate_parse_preserves_source_and_history() {
+        let source = "model A\nend A;";
+        let original_source = source.to_owned();
+        let history = [sample_create_command()];
+        let redo_history = [sample_create_command()];
+        let result = apply_validated_source_edits(
+            source,
+            vec![SourceEdit {
+                start: 0,
+                end: 5,
+                expected_text: Some("model".to_owned()),
+                replacement: "model A\n  \"unterminated".to_owned(),
+            }],
+            0,
+        );
+
+        let error = result.expect_err("an unparsable candidate must fail before applying");
+        assert!(error.contains("candidate source does not parse"));
+        assert_eq!(source, original_source);
+        assert_eq!(history.len(), 1);
+        assert_eq!(redo_history.len(), 1);
+    }
+
+    #[test]
+    fn failed_inherited_connection_preflight_preserves_scene_and_history() {
+        let (scene, mut connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        connection.key.owner_class = "Base".to_owned();
+        let original_origin = scene.components[0].origin;
+        let original_points = scene.connections[0]
+            .line
+            .as_ref()
+            .expect("test line")
+            .points
+            .clone();
+        let history = [sample_create_command()];
+        let redo_history = [sample_create_command()];
+        let error =
+            connection_source_editable_in_class(&connection, "Child", "model Child\nend Child;")
+                .expect_err("inherited connections must be rejected");
+
+        assert!(error.contains("read-only"));
+        assert_eq!(scene.components[0].origin, original_origin);
+        assert_eq!(
+            scene.connections[0]
+                .line
+                .as_ref()
+                .expect("test line")
+                .points,
+            original_points
+        );
+        assert_eq!(history.len(), 1);
+        assert_eq!(redo_history.len(), 1);
+    }
+
+    #[test]
+    fn failed_connection_geometry_validation_preserves_scene_and_history() {
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let original_origin = scene.components[0].origin;
+        let original_points = connection.line.as_ref().expect("test line").points.clone();
+        let invalid_points = vec![
+            CorePoint { x: 20.0, y: 30.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+        let history = [sample_create_command()];
+        let redo_history = [sample_create_command()];
+        let error = connection_invariant_failure(&scene, &connection, &invalid_points)
+            .expect("diagonal geometry must fail validation");
+
+        assert_eq!(error, "connection points mismatch");
+        assert_eq!(scene.components[0].origin, original_origin);
+        assert_eq!(
+            scene.connections[0]
+                .line
+                .as_ref()
+                .expect("test line")
+                .points,
+            original_points
+        );
+        assert_eq!(history.len(), 1);
+        assert_eq!(redo_history.len(), 1);
+    }
+
+    #[test]
     fn component_translation_manhattan_fallback_keeps_invalid_preview_orthogonal() {
         let base_route = vec![
             CorePoint { x: 0.0, y: 0.0 },
