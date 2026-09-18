@@ -8403,13 +8403,28 @@ impl App {
             ));
             return;
         };
+        let Some((semantic_points, display_points)) =
+            connection_geometry_points(&resolved_diagram, connection, self.zoom)
+        else {
+            self.load_error = Some(connection_edit_diagnostic(
+                connection,
+                &class_name,
+                Some(endpoint_constraint),
+                "validation",
+                "unable to construct a display route from the resolved connection",
+            ));
+            return;
+        };
         trace_connection_edit(
             "validation-ok",
             &connection_key,
             endpoint_constraint,
-            format_args!("canonical_points={:?}", canonical_line.points),
+            format_args!(
+                "source_points={:?} semantic_points={semantic_points:?} display_points={display_points:?}",
+                canonical_line.points
+            ),
         );
-        let canonical_points = canonical_line.points.clone();
+        let source_points = canonical_line.points.clone();
         let connection_id = connection.id.clone();
         if profile.enabled {
             profile.semantic_validation = validation_started.elapsed();
@@ -8430,20 +8445,22 @@ impl App {
             &self.device,
             &self.queue,
             &connection_id,
-            &canonical_points,
+            &display_points,
         );
         trace_connection_edit(
             "gpu-commit-ok",
             &connection_key,
             endpoint_constraint,
-            format_args!("canonical_points={canonical_points:?}"),
+            format_args!("display_points={display_points:?}"),
         );
         if profile.enabled {
             profile.gpu_update = gpu_started.elapsed();
         }
         let hit_index_started = Instant::now();
+        let mut hit_line = canonical_line.clone();
+        hit_line.points = semantic_points;
         self.diagram_hit_cache
-            .update_connection(cache_connection_index, &canonical_line);
+            .update_connection(cache_connection_index, &hit_line);
         if profile.enabled {
             profile.hit_index_update = hit_index_started.elapsed();
         }
@@ -8454,7 +8471,7 @@ impl App {
                 class_name,
                 connection_key,
                 before_points,
-                after_points: canonical_points,
+                after_points: source_points,
                 endpoint_constraint,
             },
         );
@@ -11967,6 +11984,26 @@ fn trace_connection_reanchor(
     );
 }
 
+/// Resolve the two route forms needed after a committed connection change.
+///
+/// The semantic route is used by hit testing and interaction. The display
+/// route is the same route used by initial scene construction, including the
+/// display-only connector overdraw. Keeping both results together prevents a
+/// commit frame from showing different geometry than the next rebuild.
+fn connection_geometry_points(
+    scene: &CoreDiagramScene,
+    connection: &modelica_core::scene::DiagramConnection,
+    stroke_zoom: f32,
+) -> Option<(Vec<CorePoint>, Vec<CorePoint>)> {
+    connection.line.as_ref()?;
+    let semantic_points = canonical_connection_points(scene, connection);
+    (semantic_points.len() >= 2).then(|| {
+        let display_points =
+            display_connection_points(scene, connection, &semantic_points, stroke_zoom);
+        (semantic_points, display_points)
+    })
+}
+
 #[cfg(test)]
 fn core_diagram_geometry(scene: &CoreDiagramScene) -> Vec<Geometry> {
     core_diagram_geometry_at_zoom(scene, INITIAL_ZOOM)
@@ -12141,11 +12178,15 @@ fn core_diagram_geometry_at_zoom(scene: &CoreDiagramScene, stroke_zoom: f32) -> 
         })
         .collect::<Vec<_>>();
     for connection in &scene.connections {
-        if let Some(line) = &connection.line {
+        if let Some((_, display_points)) =
+            connection_geometry_points(scene, connection, stroke_zoom)
+        {
+            let line = connection
+                .line
+                .as_ref()
+                .expect("connection geometry has a line");
             let mut display_line = line.clone();
-            let semantic_points = canonical_connection_points(scene, connection);
-            display_line.points =
-                display_connection_points(scene, connection, &semantic_points, stroke_zoom);
+            display_line.points = display_points;
             geometries.extend(
                 line_geometry(
                     &display_line,
@@ -16911,6 +16952,44 @@ end Child;
             .expect("source line")
             .points
             == stale_points));
+    }
+
+    #[test]
+    fn committed_connection_geometry_matches_initial_rebuild_route() {
+        let raw_points = vec![
+            CorePoint {
+                x: -800.0,
+                y: 400.0,
+            },
+            CorePoint { x: 800.0, y: 400.0 },
+        ];
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 20.0 },
+            CorePoint { x: 100.0, y: -30.0 },
+            raw_points.clone(),
+        );
+        let (semantic_points, display_points) =
+            connection_geometry_points(&scene, &connection, INITIAL_ZOOM)
+                .expect("committed route must have display geometry");
+        let rebuilt_geometry = core_diagram_geometry(&scene)
+            .into_iter()
+            .find(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .expect("rebuilt connection geometry");
+
+        assert_eq!(
+            semantic_points,
+            canonical_connection_points(&scene, &connection)
+        );
+        assert_eq!(
+            rebuilt_geometry
+                .connection
+                .expect("connection metadata")
+                .line
+                .points,
+            display_points
+        );
+        assert_ne!(display_points, raw_points);
+        assert!(valid_interactive_connection_route(&semantic_points));
     }
 
     #[test]
