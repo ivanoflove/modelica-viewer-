@@ -864,6 +864,57 @@ mod save_tests {
     }
 
     #[test]
+    fn unsaved_state_follows_content_not_history() {
+        let directory = temp_directory("dirty-content");
+        let source = "model A\n  Real value;\nend A;\n";
+        let (mut document, path) = temp_document(
+            &directory,
+            "Dirty.mo",
+            source,
+            &[("A", source, "model A\n  Real changed;\nend A;\n")],
+        );
+
+        assert!(document.has_unsaved_changes());
+        assert!(document.title(None).contains("modelica-wgpu *"));
+        document.set_class_text("A", source.to_owned());
+        assert!(!document.has_unsaved_changes());
+        assert!(!document.title(None).contains("modelica-wgpu *"));
+        assert_eq!(save_edited_classes(&mut document).unwrap(), 0);
+
+        document.set_class_text("A", "model A\n  Real changed;\nend A;\n".to_owned());
+        assert!(document.has_unsaved_changes());
+        assert_eq!(save_edited_classes(&mut document).unwrap(), 1);
+        assert!(!document.has_unsaved_changes());
+        assert!(!document.title(None).contains("modelica-wgpu *"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "model A\n  Real changed;\nend A;\n"
+        );
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn discard_unsaved_changes_restores_saved_baseline() {
+        let directory = temp_directory("discard-dirty");
+        let source = "model A\n  Real value;\nend A;\n";
+        let (mut document, path) = temp_document(
+            &directory,
+            "Discard.mo",
+            source,
+            &[("A", source, "model A\n  Real changed;\nend A;\n")],
+        );
+
+        assert!(document.has_unsaved_changes());
+        document.discard_unsaved_changes();
+        assert!(!document.has_unsaved_changes());
+        assert_eq!(document.class_text("A").as_deref(), Some(source));
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn save_after_undo_and_redo_sequence_keeps_source_state_consistent() {
         let directory = temp_directory("save-undo-redo");
         let source = "model A\n  Real value;\nend A;\n";
@@ -1418,6 +1469,28 @@ enum MainView {
     Source,
     Icon,
     Diagram,
+}
+
+#[derive(Clone, Debug)]
+enum PendingDocumentAction {
+    Open(PathBuf),
+    Close,
+}
+
+impl PendingDocumentAction {
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Open(_) => "打开另一个文档",
+            Self::Close => "关闭窗口",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaveDecision {
+    Save,
+    Discard,
+    Cancel,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2566,6 +2639,7 @@ struct TreeNode {
 struct UiDocument {
     package_name: String,
     class_names: Vec<String>,
+    dirty: bool,
     tree: TreeNode,
     selected_class: Option<String>,
     icon_graphics: usize,
@@ -2773,6 +2847,23 @@ impl LoadedDocument {
             .unwrap_or_default()
     }
 
+    /// Return whether the in-memory document differs from the last successful
+    /// save. This deliberately compares edited class text with the saved
+    /// baseline instead of using history length: undo can legitimately return
+    /// the document to its saved content.
+    fn has_unsaved_changes(&self) -> bool {
+        self.source_overrides.iter().any(|(qualified_name, text)| {
+            self.saved_class_text
+                .get(qualified_name)
+                .is_none_or(|saved| saved != text)
+        })
+    }
+
+    fn discard_unsaved_changes(&mut self) {
+        self.source_overrides.clear();
+        self.invalidate_scene_caches();
+    }
+
     fn set_class_text(&mut self, qualified_name: &str, text: String) {
         let matches_saved_text = self
             .saved_class_text
@@ -2937,6 +3028,7 @@ impl LoadedDocument {
         UiDocument {
             package_name: self.package_name.clone(),
             class_names: self.class_names.clone(),
+            dirty: self.has_unsaved_changes(),
             tree: self.model_tree.clone(),
             selected_class,
             icon_graphics,
@@ -2963,7 +3055,8 @@ impl LoadedDocument {
             .map(|(fps, worst_ms)| format!(" | {:.1} FPS | worst {:.1} ms", fps, worst_ms))
             .unwrap_or_default();
         format!(
-            "modelica-wgpu | {} | {} | {} classes | drag edit · Ctrl+drag pan",
+            "modelica-wgpu{} | {} | {} | {} classes | drag edit · Ctrl+drag pan",
+            if self.has_unsaved_changes() { " *" } else { "" },
             self.package_name,
             file_name,
             self.class_names.len(),
@@ -5020,6 +5113,9 @@ struct App {
     document: Option<LoadedDocument>,
     loading_document: Option<JoinHandle<Result<LoadedDocument, String>>>,
     load_error: Option<String>,
+    status_message: Option<String>,
+    pending_document_action: Option<PendingDocumentAction>,
+    exit_requested: bool,
     selected_class: Option<String>,
     ui_document: Option<UiDocument>,
     expanded_nodes: HashSet<String>,
@@ -5374,6 +5470,9 @@ impl App {
             document,
             loading_document: None,
             load_error: None,
+            status_message: None,
+            pending_document_action: None,
+            exit_requested: false,
             selected_class: None,
             ui_document: None,
             expanded_nodes: HashSet::new(),
@@ -7686,6 +7785,7 @@ impl App {
             },
         );
         self.load_error = None;
+        self.status_message = None;
         self.rebuild_selected_scenes();
         self.set_diagram_selection(DiagramSelection::Connection(connection_id));
     }
@@ -7763,6 +7863,7 @@ impl App {
             },
         );
         self.load_error = None;
+        self.status_message = None;
         self.rebuild_selected_scenes();
     }
 
@@ -8077,6 +8178,7 @@ impl App {
             },
         );
         self.load_error = None;
+        self.status_message = None;
         let hit_cache_started = Instant::now();
         self.diagram_hit_cache =
             build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
@@ -8409,6 +8511,7 @@ impl App {
             },
         );
         self.load_error = None;
+        self.status_message = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8599,6 +8702,7 @@ impl App {
             },
         );
         self.load_error = None;
+        self.status_message = None;
         self.rebuild_selected_scenes();
     }
 
@@ -8872,6 +8976,7 @@ impl App {
             }
         }
         self.load_error = None;
+        self.status_message = None;
         self.rebuild_selected_scenes();
         Ok(())
     }
@@ -8907,10 +9012,102 @@ impl App {
     }
 
     fn persist_edits(&mut self) -> Result<usize, String> {
-        match self.document.as_mut() {
+        let result = match self.document.as_mut() {
             Some(document) => save_edited_classes(document),
             None => Err("no Modelica document is open".to_owned()),
+        };
+        self.refresh_ui_document();
+        self.update_title(None);
+        result
+    }
+
+    fn discard_unsaved_changes(&mut self) {
+        if let Some(document) = self.document.as_mut() {
+            document.discard_unsaved_changes();
         }
+        self.rebuild_selected_scenes();
+        self.update_title(None);
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(LoadedDocument::has_unsaved_changes)
+    }
+
+    fn request_document_open(&mut self, path: PathBuf) {
+        if self.loading_document.is_some() || self.pending_document_action.is_some() {
+            return;
+        }
+        if self.has_unsaved_changes() {
+            self.pending_document_action = Some(PendingDocumentAction::Open(path));
+            self.status_message = Some("当前文档有未保存修改".to_owned());
+            self.request_redraw();
+        } else {
+            self.begin_document_load(path);
+        }
+    }
+
+    fn request_window_close(&mut self) {
+        if self.pending_document_action.is_some() {
+            return;
+        }
+        if self.has_unsaved_changes() {
+            self.pending_document_action = Some(PendingDocumentAction::Close);
+            self.status_message = Some("关闭前需要处理未保存修改".to_owned());
+            self.request_redraw();
+        } else {
+            self.exit_requested = true;
+        }
+    }
+
+    fn execute_document_action(&mut self, action: PendingDocumentAction) {
+        match action {
+            PendingDocumentAction::Open(path) => self.begin_document_load(path),
+            PendingDocumentAction::Close => self.exit_requested = true,
+        }
+    }
+
+    fn handle_leave_decision(&mut self, decision: LeaveDecision) {
+        let Some(action) = self.pending_document_action.clone() else {
+            return;
+        };
+        match decision {
+            LeaveDecision::Cancel => {
+                self.pending_document_action = None;
+                self.status_message = Some("已取消离开操作".to_owned());
+            }
+            LeaveDecision::Discard => {
+                self.discard_unsaved_changes();
+                self.pending_document_action = None;
+                self.status_message = Some("已放弃本次未保存修改".to_owned());
+                self.execute_document_action(action);
+            }
+            LeaveDecision::Save => match self.persist_edits() {
+                Ok(saved) if !self.has_unsaved_changes() => {
+                    self.pending_document_action = None;
+                    self.status_message = Some(if saved == 0 {
+                        "没有待保存的修改".to_owned()
+                    } else {
+                        format!("保存成功：已写入 {saved} 个文件")
+                    });
+                    self.load_error = None;
+                    self.execute_document_action(action);
+                }
+                Ok(_) => {
+                    self.status_message = Some("保存部分成功：仍有修改未写入".to_owned());
+                }
+                Err(error) => {
+                    self.status_message = Some(if error.contains("save partially completed") {
+                        "保存部分成功：仍有修改未写入".to_owned()
+                    } else {
+                        "保存失败：当前修改已保留".to_owned()
+                    });
+                    self.load_error = Some(error);
+                }
+            },
+        }
+        self.request_redraw();
     }
 
     fn update_title(&self, fps: Option<(f32, f32)>) {
@@ -9069,7 +9266,7 @@ impl App {
     /// Install a freshly parsed document into the viewer state and reset all
     /// per-class editing/selection state for the new library.
     fn begin_document_load(&mut self, path: PathBuf) {
-        if self.loading_document.is_some() {
+        if self.loading_document.is_some() || self.has_unsaved_changes() {
             return;
         }
         eprintln!(
@@ -9077,6 +9274,7 @@ impl App {
             path.display()
         );
         self.load_error = None;
+        self.status_message = Some("正在加载新文档…".to_owned());
         self.loading_document = Some(std::thread::spawn(move || LoadedDocument::load(&path)));
         self.request_redraw();
     }
@@ -9094,9 +9292,22 @@ impl App {
             .take()
             .expect("document load handle still present");
         match handle.join() {
+            Ok(Ok(document)) if self.has_unsaved_changes() => {
+                self.status_message =
+                    Some("新文档加载期间当前文档发生了修改，已保留当前文档".to_owned());
+                self.load_error =
+                    Some("新文档未打开：当前文档在加载期间产生了未保存修改".to_owned());
+                drop(document);
+            }
             Ok(Ok(document)) => self.adopt_loaded_document(document),
-            Ok(Err(error)) => self.load_error = Some(error),
-            Err(_) => self.load_error = Some("Modelica document loading thread panicked".into()),
+            Ok(Err(error)) => {
+                self.status_message = Some("文档加载失败：当前文档已保留".to_owned());
+                self.load_error = Some(error);
+            }
+            Err(_) => {
+                self.status_message = Some("文档加载失败：当前文档已保留".to_owned());
+                self.load_error = Some("Modelica document loading thread panicked".into());
+            }
         }
         self.request_redraw();
     }
@@ -9139,6 +9350,7 @@ impl App {
         self.hovered_port = None;
         self.diagram_hit_cache = DiagramHitCache::default();
         self.load_error = None;
+        self.status_message = Some("文档加载完成".to_owned());
         self.update_title(None);
     }
 
@@ -9164,6 +9376,7 @@ impl App {
         let document_summary = self.ui_document.as_ref();
         let mut expanded_nodes = self.expanded_nodes.clone();
         let load_error = self.load_error.clone();
+        let status_message = self.status_message.clone();
         let mut open_requested = false;
         let mut open_directory_requested = false;
         let mut class_clicked = None;
@@ -9172,6 +9385,7 @@ impl App {
         let mut icon_clip_rect = None;
         let mut expand_all_requested = false;
         let mut collapse_all_requested = false;
+        let mut leave_decision = None;
         let overlay_update_started = Instant::now();
         let selected_connection_points = self.selected_connection_overlay_points();
         let selected_component_overlay = self.selected_component_overlay();
@@ -9230,7 +9444,10 @@ impl App {
                 &mut expand_all_requested,
                 &mut collapse_all_requested,
                 load_error.as_deref(),
+                status_message.as_deref(),
                 document_loading,
+                self.pending_document_action.as_ref(),
+                &mut leave_decision,
             );
             if main_view == MainView::Icon {
                 draw_model_text_overlay(
@@ -9310,6 +9527,10 @@ impl App {
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
+        if let Some(decision) = leave_decision {
+            self.handle_leave_decision(decision);
+        }
+
         if fit_requested {
             self.fit_scene();
             self.request_redraw();
@@ -9320,7 +9541,10 @@ impl App {
             self.request_redraw();
         }
 
-        if (open_requested || open_directory_requested) && !document_loading {
+        if (open_requested || open_directory_requested)
+            && !document_loading
+            && self.pending_document_action.is_none()
+        {
             let picked = if open_directory_requested {
                 FileDialog::new().pick_folder()
             } else {
@@ -9329,7 +9553,7 @@ impl App {
                     .pick_file()
             };
             if let Some(path) = picked {
-                self.begin_document_load(path);
+                self.request_document_open(path);
             }
         }
 
@@ -10056,7 +10280,10 @@ fn draw_preview_ui(
     expand_all_requested: &mut bool,
     collapse_all_requested: &mut bool,
     load_error: Option<&str>,
+    status_message: Option<&str>,
     document_loading: bool,
+    pending_document_action: Option<&PendingDocumentAction>,
+    leave_decision: &mut Option<LeaveDecision>,
 ) {
     // Keep the global Electron-aligned spacing and widget treatment intact;
     // only update the palette when the user changes light/dark or accent.
@@ -10134,6 +10361,29 @@ fn draw_preview_ui(
                         .font(ui_mono_font(10.0))
                         .color(theme_text_tertiary()),
                     );
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(if document.dirty {
+                            "● 未保存"
+                        } else {
+                            "✓ 已保存"
+                        })
+                        .size(10.0)
+                        .font(ui_semibold_font(10.0))
+                        .color(if document.dirty {
+                            theme_rgb(190, 116, 31)
+                        } else {
+                            theme_live()
+                        }),
+                    );
+                }
+                if let Some(status) = status_message {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(status)
+                            .size(10.0)
+                            .color(theme_text_secondary()),
+                    );
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button(
@@ -10180,7 +10430,13 @@ fn draw_preview_ui(
                     .fill(theme_surface_soft(210))
                     .stroke(Stroke::new(1.0_f32, theme_border(26)))
                     .rounding(Rounding::same(8.0));
-                    if ui.add_enabled(!document_loading, open_library).clicked() {
+                    if ui
+                        .add_enabled(
+                            !document_loading && pending_document_action.is_none(),
+                            open_library,
+                        )
+                        .clicked()
+                    {
                         *open_directory_requested = true;
                     }
                     let open_file = egui::Button::new(
@@ -10192,7 +10448,13 @@ fn draw_preview_ui(
                     .fill(theme_accent())
                     .stroke(Stroke::new(1.0_f32, theme_accent()))
                     .rounding(Rounding::same(8.0));
-                    if ui.add_enabled(!document_loading, open_file).clicked() {
+                    if ui
+                        .add_enabled(
+                            !document_loading && pending_document_action.is_none(),
+                            open_file,
+                        )
+                        .clicked()
+                    {
                         *open_requested = true;
                     }
                 });
@@ -10299,7 +10561,7 @@ fn draw_preview_ui(
             } else if let Some(error) = load_error {
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new(format!("Load failed: {error}"))
+                    RichText::new(format!("错误：{error}"))
                         .size(10.0)
                         .color(theme_rgb(190, 70, 70)),
                 );
@@ -10435,6 +10697,45 @@ fn draw_preview_ui(
                 });
             });
         });
+
+    if let Some(action) = pending_document_action {
+        let screen_rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("leave-prompt-blocker"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen_rect.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(rect, Rounding::ZERO, theme_rgba(12, 16, 24, 105));
+            });
+        egui::Window::new("未保存修改")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    RichText::new(format!(
+                        "当前文档有未保存修改。确定要{}吗？",
+                        action.description()
+                    ))
+                    .size(14.0)
+                    .color(theme_text_primary()),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保存并继续").clicked() {
+                        *leave_decision = Some(LeaveDecision::Save);
+                    }
+                    if ui.button("放弃修改").clicked() {
+                        *leave_decision = Some(LeaveDecision::Discard);
+                    }
+                    if ui.button("取消").clicked() {
+                        *leave_decision = Some(LeaveDecision::Cancel);
+                    }
+                });
+            });
+    }
 }
 
 fn glass_frame() -> Frame {
@@ -15047,6 +15348,7 @@ fn main() {
     if let Some(doc) = app.document.as_ref() {
         expand_top_level(&mut app.expanded_nodes, &doc.model_tree);
     }
+    app.refresh_ui_document();
     app.update_title(None);
     window.request_redraw();
 
@@ -15067,7 +15369,7 @@ fn main() {
                         app.request_redraw();
                     }
                     match event {
-                        WindowEvent::CloseRequested => event_loop.exit(),
+                        WindowEvent::CloseRequested => app.request_window_close(),
                         WindowEvent::Resized(size) => {
                             app.resize(size);
                             app.request_redraw();
@@ -15100,7 +15402,7 @@ fn main() {
                         WindowEvent::KeyboardInput { event, .. }
                             if event.state == ElementState::Pressed && !event.repeat =>
                         {
-                            if !egui_consumed {
+                            if !egui_consumed && app.pending_document_action.is_none() {
                                 match event.physical_key {
                                     PhysicalKey::Code(KeyCode::Escape)
                                         if app.pointer_interaction_active() =>
@@ -15129,15 +15431,27 @@ fn main() {
                                     {
                                         match app.persist_edits() {
                                             Ok(0) => {
+                                                app.status_message =
+                                                    Some("没有待保存的修改".to_owned());
                                                 eprintln!("modelica-wgpu: nothing to save");
                                             }
                                             Ok(saved) => {
+                                                app.status_message = Some(format!(
+                                                    "保存成功：已写入 {saved} 个文件"
+                                                ));
                                                 eprintln!(
                                                     "modelica-wgpu: saved {saved} edited file(s) to disk"
                                                 );
                                                 app.load_error = None;
                                             }
                                             Err(error) => {
+                                                app.status_message = Some(
+                                                    if error.contains("save partially completed") {
+                                                        "保存部分成功：仍有修改未写入".to_owned()
+                                                    } else {
+                                                        "保存失败：当前修改已保留".to_owned()
+                                                    },
+                                                );
                                                 app.load_error = Some(error);
                                             }
                                         }
@@ -15281,6 +15595,9 @@ fn main() {
                             );
                         }
                         _ => {}
+                    }
+                    if app.exit_requested {
+                        event_loop.exit();
                     }
                 }
                 Event::AboutToWait => {}
