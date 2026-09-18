@@ -307,17 +307,248 @@ fn write_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), Strin
     }
 }
 
-struct PendingSourceEdit {
-    start: usize,
-    end: usize,
-    updated: String,
-    qualified: String,
-}
-
 struct PendingFileSave {
     path: PathBuf,
     contents: String,
     class_sources: Vec<ClassSource>,
+}
+
+fn ranges_strictly_contain(outer: SourceRange, inner: SourceRange) -> bool {
+    outer.start <= inner.start
+        && inner.end <= outer.end
+        && (outer.start < inner.start || inner.end < outer.end)
+}
+
+fn nested_edit_conflict(parent: &str, child: &str, reason: impl Into<String>) -> String {
+    format!(
+        "cannot merge nested edits for {parent} and {child}: {}",
+        reason.into()
+    )
+}
+
+fn find_nested_class_range(source: &str, parent: &str, child: &str) -> Result<SourceRange, String> {
+    let relative = child.strip_prefix(&format!("{parent}."));
+    let Some(relative) = relative else {
+        return Err(nested_edit_conflict(
+            parent,
+            child,
+            "the child is not nested below the parent",
+        ));
+    };
+    let relative_parts = relative.split('.').collect::<Vec<_>>();
+    let parsed = parsed_class_sources(source, FsPath::new("<nested-edit>"))?;
+    let candidates = parsed
+        .into_iter()
+        .filter(|class| {
+            let parts = class.qualified_name.split('.').collect::<Vec<_>>();
+            parts.len() > relative_parts.len()
+                && parts[parts.len() - relative_parts.len()..] == relative_parts
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [class] => Ok(class.source_range),
+        [] => Err(nested_edit_conflict(
+            parent,
+            child,
+            "the child class could not be located in the parent override",
+        )),
+        _ => Err(nested_edit_conflict(
+            parent,
+            child,
+            "the child identity is ambiguous in the parent override",
+        )),
+    }
+}
+
+fn compose_dirty_class(
+    document: &LoadedDocument,
+    file_classes: &[ClassSource],
+    class: &ClassSource,
+) -> Result<String, String> {
+    let updated = document
+        .source_overrides
+        .get(&class.qualified_name)
+        .ok_or_else(|| {
+            format!(
+                "missing source override for {} while composing nested edits",
+                class.qualified_name
+            )
+        })?;
+    let dirty_children = file_classes
+        .iter()
+        .filter(|candidate| {
+            candidate.qualified_name != class.qualified_name
+                && document
+                    .source_overrides
+                    .contains_key(&candidate.qualified_name)
+                && ranges_strictly_contain(class.source_range, candidate.source_range)
+        })
+        .filter(|candidate| {
+            !file_classes.iter().any(|intermediate| {
+                intermediate.qualified_name != class.qualified_name
+                    && intermediate.qualified_name != candidate.qualified_name
+                    && document
+                        .source_overrides
+                        .contains_key(&intermediate.qualified_name)
+                    && ranges_strictly_contain(class.source_range, intermediate.source_range)
+                    && ranges_strictly_contain(intermediate.source_range, candidate.source_range)
+            })
+        })
+        .collect::<Vec<_>>();
+    if dirty_children.is_empty() {
+        return Ok(updated.clone());
+    }
+
+    let mut child_edits = Vec::new();
+    for child in dirty_children {
+        let child_range =
+            find_nested_class_range(updated, &class.qualified_name, &child.qualified_name)?;
+        let child_current = compose_dirty_class(document, file_classes, child)?;
+        let child_raw = document
+            .source_overrides
+            .get(&child.qualified_name)
+            .expect("dirty child override checked above");
+        let child_saved = document
+            .saved_class_text
+            .get(&child.qualified_name)
+            .ok_or_else(|| {
+                format!(
+                    "no baseline snapshot for nested class {}",
+                    child.qualified_name
+                )
+            })?;
+        let observed = updated
+            .get(child_range.start..child_range.end)
+            .ok_or_else(|| {
+                nested_edit_conflict(
+                    &class.qualified_name,
+                    &child.qualified_name,
+                    "the child range is not valid in the parent override",
+                )
+            })?;
+        if observed == child_current {
+            continue;
+        }
+        if observed != child_saved && observed != child_raw {
+            return Err(nested_edit_conflict(
+                &class.qualified_name,
+                &child.qualified_name,
+                "both overrides changed the child body differently",
+            ));
+        }
+        if observed != child_current {
+            child_edits.push((child_range, child_current));
+        }
+    }
+
+    let mut merged = updated.clone();
+    child_edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, replacement) in child_edits {
+        if merged.get(range.start..range.end).is_none() {
+            return Err(nested_edit_conflict(
+                &class.qualified_name,
+                "nested child",
+                "the merged child range is not valid",
+            ));
+        }
+        merged.replace_range(range.start..range.end, &replacement);
+    }
+    Ok(merged)
+}
+
+/// Compose the current in-memory view of one source file.
+///
+/// Dirty classes whose ranges are nested are merged from the deepest class
+/// outward. Only the outermost dirty class in a containment group becomes a
+/// file replacement, so the registry preview and the save candidate use the
+/// same source text.
+fn compose_current_file_source(
+    document: &LoadedDocument,
+    path: &FsPath,
+    disk_original: &str,
+) -> Result<String, String> {
+    let file_classes = document
+        .class_sources
+        .iter()
+        .filter(|class| class.source_file == path)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut dirty_classes = Vec::new();
+    for qualified_name in document.source_overrides.keys() {
+        let Some(class) = file_classes
+            .iter()
+            .find(|class| class.qualified_name == *qualified_name)
+        else {
+            continue;
+        };
+        let range = class.source_range;
+        if range.start > range.end
+            || range.end > disk_original.len()
+            || disk_original.get(range.start..range.end).is_none()
+        {
+            return Err(format!(
+                "stale source range at byte {} in {}; reload the library first",
+                range.start,
+                path.display()
+            ));
+        }
+        let expected = document
+            .saved_class_text
+            .get(qualified_name)
+            .ok_or_else(|| {
+                format!(
+                    "no baseline snapshot for {} in {}; reload the library first",
+                    qualified_name,
+                    path.display()
+                )
+            })?;
+        if &disk_original[range.start..range.end] != expected {
+            return Err(format!(
+                "{} changed on disk since it was loaded; reload before saving",
+                path.display()
+            ));
+        }
+        dirty_classes.push(class.clone());
+    }
+    if dirty_classes.is_empty() {
+        return Ok(disk_original.to_owned());
+    }
+
+    let roots = dirty_classes
+        .iter()
+        .filter(|class| {
+            !dirty_classes.iter().any(|candidate| {
+                candidate.qualified_name != class.qualified_name
+                    && ranges_strictly_contain(candidate.source_range, class.source_range)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut sorted_roots = roots.clone();
+    sorted_roots.sort_by_key(|class| class.source_range.start);
+    for pair in sorted_roots.windows(2) {
+        if pair[0].source_range.end > pair[1].source_range.start {
+            return Err(format!(
+                "overlapping source edits in {}: {} overlaps {}",
+                path.display(),
+                pair[0].qualified_name,
+                pair[1].qualified_name
+            ));
+        }
+    }
+
+    let mut edits = Vec::new();
+    for root in roots {
+        edits.push((
+            root.source_range,
+            compose_dirty_class(document, &file_classes, root)?,
+        ));
+    }
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut composed = disk_original.to_owned();
+    for (range, replacement) in edits {
+        composed.replace_range(range.start..range.end, &replacement);
+    }
+    Ok(composed)
 }
 
 /// Build and validate every file's save plan before writing any file.
@@ -331,85 +562,24 @@ fn build_save_plan(document: &LoadedDocument) -> Result<Vec<PendingFileSave>, St
     if document.source_overrides.is_empty() {
         return Ok(Vec::new());
     }
-    let mut by_file = std::collections::BTreeMap::<PathBuf, Vec<PendingSourceEdit>>::new();
-    for class in &document.class_sources {
-        let Some(updated) = document.source_overrides.get(&class.qualified_name) else {
-            continue;
-        };
-        let range = class.source_range;
-        if range.start > range.end {
-            return Err(format!(
-                "invalid source range {}:{} for {}",
-                range.start, range.end, class.qualified_name
-            ));
-        }
-        if range.start == range.end {
-            continue;
-        }
-        by_file
-            .entry(class.source_file.clone())
-            .or_default()
-            .push(PendingSourceEdit {
-                start: range.start,
-                end: range.end,
-                updated: updated.clone(),
-                qualified: class.qualified_name.clone(),
-            });
+    let mut by_file = std::collections::BTreeSet::new();
+    for qualified_name in document.source_overrides.keys() {
+        let class = document
+            .class_sources
+            .iter()
+            .find(|class| class.qualified_name == *qualified_name)
+            .ok_or_else(|| format!("no source location for edited class {qualified_name}"))?;
+        by_file.insert(class.source_file.clone());
     }
     let mut plan = Vec::with_capacity(by_file.len());
-    for (path, mut edits) in by_file {
+    for path in by_file {
         let disk_original =
             fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        edits.sort_by_key(|edit| edit.start);
-        for pair in edits.windows(2) {
-            let previous = &pair[0];
-            let current = &pair[1];
-            if current.start < previous.end {
-                return Err(format!(
-                    "overlapping source edits in {}: {} [{}..{}] overlaps {} [{}..{}]",
-                    path.display(),
-                    previous.qualified,
-                    previous.start,
-                    previous.end,
-                    current.qualified,
-                    current.start,
-                    current.end,
-                ));
-            }
-        }
-        for edit in &edits {
-            if edit.end > disk_original.len() || disk_original.get(edit.start..edit.end).is_none() {
-                return Err(format!(
-                    "stale source range at byte {} in {}; reload the library first",
-                    edit.start,
-                    path.display()
-                ));
-            }
-            let expected = document
-                .saved_class_text
-                .get(&edit.qualified)
-                .ok_or_else(|| {
-                    format!(
-                        "no baseline snapshot for {} in {}; reload the library first",
-                        edit.qualified,
-                        path.display()
-                    )
-                })?;
-            if &disk_original[edit.start..edit.end] != expected {
-                return Err(format!(
-                    "{} changed on disk since it was loaded; reload before saving",
-                    path.display()
-                ));
-            }
-        }
-        let mut disk = disk_original;
-        for edit in edits.iter().rev() {
-            disk.replace_range(edit.start..edit.end, &edit.updated);
-        }
-        let class_sources = parsed_class_sources(&disk, &path)?;
+        let contents = compose_current_file_source(document, &path, &disk_original)?;
+        let class_sources = parsed_class_sources(&contents, &path)?;
         plan.push(PendingFileSave {
             path,
-            contents: disk,
+            contents,
             class_sources,
         });
     }
@@ -510,6 +680,24 @@ mod save_tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    fn nested_document(label: &str) -> (LoadedDocument, PathBuf, String) {
+        let directory = temp_directory(label);
+        let path = directory.join("Nested.mo");
+        let source = "model Parent\n  Real parent_value;\n  model Child\n    Real child_value;\n    model Grandchild\n      Real grand_value;\n    end Grandchild;\n  end Child;\nend Parent;\n";
+        fs::write(&path, source).unwrap();
+        let document = LoadedDocument::load(&path).expect("load nested fixture");
+        (document, path, source.to_owned())
+    }
+
+    fn assert_candidate_contains(candidate: &str, snippets: &[&str]) {
+        for snippet in snippets {
+            assert!(
+                candidate.contains(snippet),
+                "candidate is missing {snippet:?}"
+            );
+        }
     }
 
     #[test]
@@ -858,10 +1046,10 @@ mod save_tests {
     }
 
     #[test]
-    fn save_rejects_overlapping_class_edits_before_writing() {
+    fn save_rejects_conflicting_nested_class_edits() {
         let directory = temp_directory("plan-overlap");
         let path = directory.join("Nested.mo");
-        let source = "model Parent\n  model Child\n  end Child;\nend Parent;\n";
+        let source = "model Parent\n  model Child\n    Real value;\n  end Child;\nend Parent;\n";
         fs::write(&path, source).unwrap();
         let parent_start = source.find("model Parent").unwrap();
         let parent_end = source.len();
@@ -869,6 +1057,8 @@ mod save_tests {
         let child_end = source.find("end Child;").unwrap() + "end Child;".len();
         let parent_text = source[parent_start..parent_end].to_owned();
         let child_text = source[child_start..child_end].to_owned();
+        let parent_override = parent_text.replace("Real value;", "Real parent_value;");
+        let child_override = child_text.replace("Real value;", "Real child_value;");
         let mut document = LoadedDocument {
             path: path.clone(),
             package_name: "OverlapTest".to_owned(),
@@ -892,14 +1082,8 @@ mod save_tests {
                 },
             ],
             source_overrides: HashMap::from([
-                (
-                    "Parent".to_owned(),
-                    parent_text.replace("Parent", "ParentRenamed"),
-                ),
-                (
-                    "Parent.Child".to_owned(),
-                    child_text.replace("Child", "ChildRenamed"),
-                ),
+                ("Parent".to_owned(), parent_override),
+                ("Parent.Child".to_owned(), child_override),
             ]),
             saved_class_text: HashMap::from([
                 ("Parent".to_owned(), parent_text),
@@ -908,9 +1092,10 @@ mod save_tests {
             source_versions: HashMap::new(),
         };
 
-        let error = save_edited_classes(&mut document).expect_err("overlap must be rejected");
+        let error =
+            save_edited_classes(&mut document).expect_err("nested conflict must be rejected");
         assert!(
-            error.contains("overlapping source edits"),
+            error.contains("cannot merge nested edits"),
             "unexpected error: {error}"
         );
         assert!(error.contains("Parent"), "parent name missing: {error}");
@@ -920,6 +1105,144 @@ mod save_tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn child_then_parent_preserves_both_nested_changes() {
+        let (mut document, path, _) = nested_document("nested-child-parent");
+        let child_base = document.class_text("Parent.Child").unwrap();
+        let parent_base = document.class_text("Parent").unwrap();
+        let child_changed = child_base.replace("Real child_value;", "Real child_changed;");
+        let parent_changed = parent_base.replace("Real parent_value;", "Real parent_changed;");
+
+        document.set_class_text("Parent.Child", child_changed);
+        document.set_class_text("Parent", parent_changed);
+        assert_eq!(
+            save_edited_classes(&mut document).expect("nested edits should save"),
+            1
+        );
+        let saved = fs::read_to_string(&path).unwrap();
+        assert_candidate_contains(&saved, &["Real parent_changed;", "Real child_changed;"]);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn parent_then_child_preserves_both_nested_changes() {
+        let (mut document, path, _) = nested_document("nested-parent-child");
+        let child_base = document.class_text("Parent.Child").unwrap();
+        let parent_base = document.class_text("Parent").unwrap();
+        let child_changed = child_base.replace("Real child_value;", "Real child_changed;");
+        let parent_changed = parent_base.replace("Real parent_value;", "Real parent_changed;");
+
+        document.set_class_text("Parent", parent_changed);
+        document.set_class_text("Parent.Child", child_changed);
+        let plan = build_save_plan(&document).expect("nested edits should merge");
+        assert_eq!(plan.len(), 1);
+        assert_candidate_contains(
+            &plan[0].contents,
+            &["Real parent_changed;", "Real child_changed;"],
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn non_conflicting_parent_and_child_edits_are_merged() {
+        let (mut document, path, _) = nested_document("nested-non-conflicting");
+        let child_base = document.class_text("Parent.Child").unwrap();
+        let parent_base = document.class_text("Parent").unwrap();
+        document.set_class_text(
+            "Parent",
+            parent_base.replace("Real parent_value;", "Real parent_changed;"),
+        );
+        document.set_class_text(
+            "Parent.Child",
+            child_base.replace("Real child_value;", "Real child_changed;"),
+        );
+        let candidate =
+            compose_current_file_source(&document, &path, &fs::read_to_string(&path).unwrap())
+                .expect("non-conflicting edits should merge");
+        assert_candidate_contains(&candidate, &["Real parent_changed;", "Real child_changed;"]);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn parent_already_containing_child_change_is_not_duplicated() {
+        let (mut document, path, _) = nested_document("nested-already-merged");
+        let child_base = document.class_text("Parent.Child").unwrap();
+        let parent_base = document.class_text("Parent").unwrap();
+        let child_changed = child_base.replace("Real child_value;", "Real child_changed;");
+        let parent_changed = parent_base
+            .replace("Real parent_value;", "Real parent_changed;")
+            .replace(&child_base, &child_changed);
+
+        document.set_class_text("Parent.Child", child_changed.clone());
+        document.set_class_text("Parent", parent_changed);
+        let candidate =
+            compose_current_file_source(&document, &path, &fs::read_to_string(&path).unwrap())
+                .expect("already merged child should be accepted");
+        assert_eq!(candidate.matches("Real child_changed;").count(), 1);
+        assert!(candidate.contains("Real parent_changed;"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn nested_registry_source_matches_save_candidate() {
+        let (mut document, path, _) = nested_document("nested-registry-candidate");
+        let child_base = document.class_text("Parent.Child").unwrap();
+        let parent_base = document.class_text("Parent").unwrap();
+        document.set_class_text(
+            "Parent.Child",
+            child_base.replace("Real child_value;", "Real child_changed;"),
+        );
+        document.set_class_text(
+            "Parent",
+            parent_base.replace("Real parent_value;", "Real parent_changed;"),
+        );
+        let disk = fs::read_to_string(&path).unwrap();
+        let candidate = build_save_plan(&document).expect("save candidate");
+        let registry = document
+            .registry
+            .borrow()
+            .source(&path)
+            .expect("composed source in registry")
+            .to_owned();
+        assert_eq!(candidate.len(), 1);
+        assert_eq!(candidate[0].contents, registry);
+        assert_eq!(
+            candidate[0].contents,
+            compose_current_file_source(&document, &path, &disk).unwrap()
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn three_level_nested_edits_merge_from_grandchild_outward() {
+        let (mut document, path, _) = nested_document("nested-three-level");
+        let grandchild_base = document.class_text("Parent.Child.Grandchild").unwrap();
+        let child_base = document.class_text("Parent.Child").unwrap();
+        let parent_base = document.class_text("Parent").unwrap();
+        document.set_class_text(
+            "Parent.Child.Grandchild",
+            grandchild_base.replace("Real grand_value;", "Real grand_changed;"),
+        );
+        document.set_class_text(
+            "Parent.Child",
+            child_base.replace("Real child_value;", "Real child_changed;"),
+        );
+        document.set_class_text(
+            "Parent",
+            parent_base.replace("Real parent_value;", "Real parent_changed;"),
+        );
+        let plan = build_save_plan(&document).expect("three-level edits should merge");
+        assert_candidate_contains(
+            &plan[0].contents,
+            &[
+                "Real parent_changed;",
+                "Real child_changed;",
+                "Real grand_changed;",
+            ],
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -2494,25 +2817,12 @@ impl LoadedDocument {
         else {
             return;
         };
-        let Ok(mut source) = fs::read_to_string(&source_file) else {
+        let Ok(source) = fs::read_to_string(&source_file) else {
             return;
         };
-        let mut edits = self
-            .class_sources
-            .iter()
-            .filter(|class| class.source_file == source_file)
-            .filter_map(|class| {
-                self.source_overrides
-                    .get(&class.qualified_name)
-                    .map(|updated| (class.source_range, updated.clone()))
-            })
-            .collect::<Vec<_>>();
-        edits.sort_by_key(|left| std::cmp::Reverse(left.0.start));
-        for (range, updated) in edits {
-            if range.end <= source.len() && range.start <= range.end {
-                source.replace_range(range.start..range.end, &updated);
-            }
-        }
+        let Ok(source) = compose_current_file_source(self, &source_file, &source) else {
+            return;
+        };
         let _ = self
             .registry
             .borrow_mut()
