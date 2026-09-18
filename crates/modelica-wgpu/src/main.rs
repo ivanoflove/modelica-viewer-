@@ -2639,6 +2639,8 @@ struct TreeNode {
 struct UiDocument {
     package_name: String,
     class_names: Vec<String>,
+    full_class_names: HashSet<String>,
+    short_class_names: HashSet<String>,
     dirty: bool,
     tree: TreeNode,
     selected_class: Option<String>,
@@ -2653,6 +2655,54 @@ struct UiDocument {
     diagram_connections: usize,
     source_name: String,
     source_lines: Vec<String>,
+    source_version: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceHighlightCacheKey {
+    selected_class: Option<String>,
+    source_version: u64,
+    dark_theme: bool,
+    accent_theme: AccentTheme,
+}
+
+#[derive(Default)]
+struct SourceHighlightCache {
+    key: Option<SourceHighlightCacheKey>,
+    lines: Vec<Option<LayoutJob>>,
+}
+
+impl SourceHighlightCache {
+    fn prepare(&mut self, document: &UiDocument) {
+        let key = SourceHighlightCacheKey {
+            selected_class: document.selected_class.clone(),
+            source_version: document.source_version,
+            dark_theme: is_dark_theme(),
+            accent_theme: active_accent(),
+        };
+        if self.key.as_ref() != Some(&key) || self.lines.len() != document.source_lines.len() {
+            self.key = Some(key);
+            self.lines = (0..document.source_lines.len()).map(|_| None).collect();
+        }
+    }
+
+    fn layout_job(&mut self, document: &UiDocument, row: usize) -> (LayoutJob, Duration) {
+        self.prepare(document);
+        if let Some(job) = self.lines.get(row).and_then(Option::as_ref) {
+            return (job.clone(), Duration::ZERO);
+        }
+        let started = Instant::now();
+        let job = modelica_layout_job(
+            &document.source_lines[row],
+            &document.full_class_names,
+            &document.short_class_names,
+        );
+        let elapsed = started.elapsed();
+        if let Some(cached) = self.lines.get_mut(row) {
+            *cached = Some(job.clone());
+        }
+        (job, elapsed)
+    }
 }
 
 impl LoadedDocument {
@@ -2992,6 +3042,16 @@ impl LoadedDocument {
 
     fn ui_summary(&self, selected_class: Option<&str>) -> UiDocument {
         let selected_class = selected_class.map(str::to_owned);
+        let source_version = selected_class
+            .as_deref()
+            .map_or(0, |class_name| self.source_version(class_name));
+        let full_class_names = self.class_names.iter().cloned().collect::<HashSet<_>>();
+        let short_class_names = self
+            .class_names
+            .iter()
+            .filter_map(|name| name.rsplit('.').next())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
         let (source_name, source) = selected_class
             .as_deref()
             .and_then(|class_name| self.class_source(class_name))
@@ -3028,6 +3088,8 @@ impl LoadedDocument {
         UiDocument {
             package_name: self.package_name.clone(),
             class_names: self.class_names.clone(),
+            full_class_names,
+            short_class_names,
             dirty: self.has_unsaved_changes(),
             tree: self.model_tree.clone(),
             selected_class,
@@ -3042,6 +3104,7 @@ impl LoadedDocument {
             diagram_connections,
             source_name,
             source_lines: source.lines().map(str::to_owned).collect(),
+            source_version,
         }
     }
 
@@ -5118,6 +5181,7 @@ struct App {
     exit_requested: bool,
     selected_class: Option<String>,
     ui_document: Option<UiDocument>,
+    source_highlight_cache: SourceHighlightCache,
     expanded_nodes: HashSet<String>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -5475,6 +5539,7 @@ impl App {
             exit_requested: false,
             selected_class: None,
             ui_document: None,
+            source_highlight_cache: SourceHighlightCache::default(),
             expanded_nodes: HashSet::new(),
             egui_ctx,
             egui_state,
@@ -9386,6 +9451,7 @@ impl App {
         let mut expand_all_requested = false;
         let mut collapse_all_requested = false;
         let mut leave_decision = None;
+        let mut source_highlight_cache = std::mem::take(&mut self.source_highlight_cache);
         let overlay_update_started = Instant::now();
         let selected_connection_points = self.selected_connection_overlay_points();
         let selected_component_overlay = self.selected_component_overlay();
@@ -9446,6 +9512,7 @@ impl App {
                 load_error.as_deref(),
                 status_message.as_deref(),
                 document_loading,
+                &mut source_highlight_cache,
                 self.pending_document_action.as_ref(),
                 &mut leave_decision,
             );
@@ -9487,6 +9554,7 @@ impl App {
                 );
             }
         });
+        self.source_highlight_cache = source_highlight_cache;
         let ui_build = ui_build_started.elapsed();
         if theme_mode != self.theme_mode || accent_theme != self.accent_theme {
             self.theme_mode = theme_mode;
@@ -10282,6 +10350,7 @@ fn draw_preview_ui(
     load_error: Option<&str>,
     status_message: Option<&str>,
     document_loading: bool,
+    source_highlight_cache: &mut SourceHighlightCache,
     pending_document_action: Option<&PendingDocumentAction>,
     leave_decision: &mut Option<LeaveDecision>,
 ) {
@@ -10690,7 +10759,7 @@ fn draw_preview_ui(
                 let content_size = ui.available_size();
                 ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
                     match *main_view {
-                        MainView::Source => source_preview(ui, document),
+                        MainView::Source => source_preview(ui, document, source_highlight_cache),
                         MainView::Icon => icon_preview(ui, document, icon_clip_rect),
                         MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
                     }
@@ -10926,7 +10995,11 @@ fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
 const SOURCE_ROW_HEIGHT: f32 = 20.0;
 const SOURCE_HEADER_HEIGHT: f32 = 24.0;
 
-fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
+fn source_preview(
+    ui: &mut egui::Ui,
+    document: Option<&UiDocument>,
+    source_highlight_cache: &mut SourceHighlightCache,
+) {
     let frame = Frame::none()
         .fill(theme_surface())
         .rounding(Rounding::same(8.0))
@@ -10985,12 +11058,8 @@ fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
                     document.source_lines.len(),
                     |ui, row_range| {
                         for row in row_range {
-                            render_source_line(
-                                ui,
-                                row,
-                                &document.source_lines[row],
-                                &document.class_names,
-                            );
+                            let (layout_job, _) = source_highlight_cache.layout_job(document, row);
+                            render_source_line(ui, row, layout_job);
                         }
                     },
                 );
@@ -11016,7 +11085,7 @@ fn source_preview(ui: &mut egui::Ui, document: Option<&UiDocument>) {
     });
 }
 
-fn render_source_line(ui: &mut egui::Ui, row: usize, line: &str, class_names: &[String]) {
+fn render_source_line(ui: &mut egui::Ui, row: usize, layout_job: LayoutJob) {
     ui.horizontal(|ui| {
         ui.set_min_height(SOURCE_ROW_HEIGHT);
         ui.label(
@@ -11026,7 +11095,7 @@ fn render_source_line(ui: &mut egui::Ui, row: usize, line: &str, class_names: &[
                 .color(theme_text_tertiary()),
         );
         ui.add(
-            egui::Label::new(modelica_layout_job(line, class_names))
+            egui::Label::new(layout_job)
                 .wrap_mode(egui::TextWrapMode::Extend)
                 .selectable(false),
         );
@@ -11070,7 +11139,11 @@ fn trace_source_wheel(
     );
 }
 
-fn modelica_layout_job(line: &str, class_names: &[String]) -> LayoutJob {
+fn modelica_layout_job(
+    line: &str,
+    full_class_names: &HashSet<String>,
+    short_class_names: &HashSet<String>,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     let font_id = ui_mono_font(12.0);
     let tokens = tokenize(line);
@@ -11081,7 +11154,9 @@ fn modelica_layout_job(line: &str, class_names: &[String]) -> LayoutJob {
             TokenKind::String => theme_code_string(),
             TokenKind::Comment => theme_code_comment(),
             TokenKind::Punctuation => theme_code_punctuation(),
-            TokenKind::Identifier => identifier_color(&tokens, index, class_names),
+            TokenKind::Identifier => {
+                identifier_color(&tokens, index, full_class_names, short_class_names)
+            }
             TokenKind::Unknown | TokenKind::Whitespace => theme_text_primary(),
         };
         job.append(
@@ -11097,12 +11172,16 @@ fn modelica_layout_job(line: &str, class_names: &[String]) -> LayoutJob {
     job
 }
 
-fn identifier_color(tokens: &[Token], index: usize, class_names: &[String]) -> Color32 {
+fn identifier_color(
+    tokens: &[Token],
+    index: usize,
+    full_class_names: &HashSet<String>,
+    short_class_names: &HashSet<String>,
+) -> Color32 {
     let token = &tokens[index];
     if is_builtin_type(&token.text)
-        || class_names
-            .iter()
-            .any(|name| name == &token.text || name.rsplit('.').next() == Some(token.text.as_str()))
+        || full_class_names.contains(&token.text)
+        || short_class_names.contains(&token.text)
     {
         return theme_code_type();
     }
