@@ -5245,6 +5245,7 @@ struct App {
     source_scroll_rect: Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: Option<SourcePerfFrame>,
+    source_frame_stats: SourceFrameStats,
     expanded_nodes: HashSet<String>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -5607,6 +5608,7 @@ impl App {
             source_scroll_rect: None,
             source_wheel_sample: None,
             source_perf_frame: None,
+            source_frame_stats: SourceFrameStats::default(),
             expanded_nodes: HashSet::new(),
             egui_ctx,
             egui_state,
@@ -9652,6 +9654,7 @@ impl App {
                 );
             }
         });
+        let egui_run = ui_build_started.elapsed();
         self.source_highlight_cache = source_highlight_cache;
         self.source_scroll_state = source_scroll_state;
         self.source_scroll_rect = source_scroll_rect;
@@ -9822,7 +9825,8 @@ impl App {
         let profile_enabled = self.drag_profile.enabled
             || self.connection_creation_profile.enabled
             || self.cancel_e2e_profile.enabled
-            || self.deselect_profile.enabled;
+            || self.deselect_profile.enabled
+            || std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some();
         let egui_tessellation_started = profile_enabled.then(Instant::now);
         let paint_jobs = self
             .egui_ctx
@@ -9844,10 +9848,15 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("modelica-wgpu encoder"),
             });
+        let texture_update_started = profile_enabled.then(Instant::now);
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, image_delta);
         }
+        let texture_update = texture_update_started
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let update_buffers_started = profile_enabled.then(Instant::now);
         let mut command_buffers = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -9855,6 +9864,9 @@ impl App {
             &paint_jobs,
             &screen_descriptor,
         );
+        let update_buffers = update_buffers_started
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("modelica-wgpu render pass"),
@@ -10088,12 +10100,30 @@ impl App {
             }
         }
 
-        if let Some(profile) = self.source_perf_frame.take() {
-            trace_source_perf(profile, total);
-        }
+        let source_frame_seen = if let Some(profile) = self.source_perf_frame.take() {
+            trace_source_frame(
+                profile,
+                SourceFrameTimings {
+                    egui_run,
+                    egui_tessellation,
+                    texture_update,
+                    update_buffers,
+                    scene_encode,
+                    queue_submit,
+                    present,
+                    frame_total: total,
+                },
+            );
+            self.source_frame_stats.record(total);
+            true
+        } else {
+            false
+        };
         self.source_wheel_sample = None;
         if self.main_view == MainView::Source && self.source_scroll_state.active {
             self.request_redraw();
+        } else if source_frame_seen {
+            self.source_frame_stats.finish_session();
         }
 
         if let Some((fps, worst_ms)) = self.stats.record(Instant::now()) {
@@ -11140,6 +11170,39 @@ struct SourcePerfFrame {
     highlight: Duration,
     wheel: Option<SourceWheelSample>,
     scroll_offset: f32,
+    cache_hits: usize,
+    cache_misses: usize,
+}
+
+#[derive(Default)]
+struct SourceFrameStats {
+    frame_times: Vec<Duration>,
+}
+
+impl SourceFrameStats {
+    fn record(&mut self, frame_time: Duration) {
+        self.frame_times.push(frame_time);
+    }
+
+    fn finish_session(&mut self) {
+        if self.frame_times.is_empty() {
+            return;
+        }
+        let mut values = self.frame_times.clone();
+        values.sort_unstable();
+        let percentile = |fraction: f64| {
+            let index = ((values.len() - 1) as f64 * fraction).round() as usize;
+            values[index].as_secs_f64() * 1000.0
+        };
+        eprintln!(
+            "[SOURCE FRAME SUMMARY] samples={} frame_ms_p50={:.2} frame_ms_p95={:.2} frame_ms_worst={:.2}",
+            values.len(),
+            percentile(0.50),
+            percentile(0.95),
+            percentile(1.0),
+        );
+        self.frame_times.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -11280,6 +11343,8 @@ fn source_preview(
             let pointer_position = ui.ctx().pointer_latest_pos();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             let source_content_width = source_highlight_cache.content_width(ui, document);
+            let cache_hits_before = source_highlight_cache.cache_hits;
+            let cache_misses_before = source_highlight_cache.cache_misses;
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
             let mut state_before =
                 egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
@@ -11365,6 +11430,12 @@ fn source_preview(
                     highlight: highlight_time,
                     wheel: source_wheel_sample,
                     scroll_offset: source_scroll_state.current_y,
+                    cache_hits: source_highlight_cache
+                        .cache_hits
+                        .saturating_sub(cache_hits_before),
+                    cache_misses: source_highlight_cache
+                        .cache_misses
+                        .saturating_sub(cache_misses_before),
                 });
             }
         }
@@ -11420,7 +11491,19 @@ fn trace_source_scroll(
     );
 }
 
-fn trace_source_perf(profile: SourcePerfFrame, frame: Duration) {
+#[derive(Clone, Copy, Debug)]
+struct SourceFrameTimings {
+    egui_run: Duration,
+    egui_tessellation: Duration,
+    texture_update: Duration,
+    update_buffers: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
+    present: Duration,
+    frame_total: Duration,
+}
+
+fn trace_source_frame(profile: SourcePerfFrame, timings: SourceFrameTimings) {
     if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_none() {
         return;
     }
@@ -11437,13 +11520,28 @@ fn trace_source_perf(profile: SourcePerfFrame, frame: Duration) {
     };
     let source_ui_us = profile.source_ui.as_secs_f64() * 1_000_000.0;
     let highlight_us = profile.highlight.as_secs_f64() * 1_000_000.0;
-    let layout_us = source_ui_us - highlight_us;
+    let cache_total = profile.cache_hits + profile.cache_misses;
+    let cache_hit_rate = if cache_total == 0 {
+        100.0
+    } else {
+        profile.cache_hits as f64 / cache_total as f64 * 100.0
+    };
     eprintln!(
-        "[SOURCE PERF] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} layout_us={layout_us:.1} frame_ms={:.2}",
+        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} egui_tessellation_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
         profile.rows,
         wheel_kind,
         profile.scroll_offset,
-        frame.as_secs_f64() * 1000.0,
+        timings.egui_run.as_secs_f64() * 1_000_000.0,
+        timings.egui_tessellation.as_secs_f64() * 1_000_000.0,
+        timings.update_buffers.as_secs_f64() * 1_000_000.0,
+        timings.texture_update.as_secs_f64() * 1_000_000.0,
+        timings.scene_encode.as_secs_f64() * 1_000_000.0,
+        timings.queue_submit.as_secs_f64() * 1_000_000.0,
+        timings.present.as_secs_f64() * 1_000_000.0,
+        timings.frame_total.as_secs_f64() * 1000.0,
+        1.0 / timings.frame_total.as_secs_f64().max(f64::EPSILON),
+        profile.cache_hits,
+        profile.cache_misses,
     );
 }
 
