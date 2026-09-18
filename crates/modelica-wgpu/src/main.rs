@@ -5182,6 +5182,10 @@ struct App {
     selected_class: Option<String>,
     ui_document: Option<UiDocument>,
     source_highlight_cache: SourceHighlightCache,
+    source_scroll_state: SourceScrollState,
+    source_scroll_rect: Option<egui::Rect>,
+    source_wheel_sample: Option<SourceWheelSample>,
+    source_perf_frame: Option<SourcePerfFrame>,
     expanded_nodes: HashSet<String>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -5540,6 +5544,10 @@ impl App {
             selected_class: None,
             ui_document: None,
             source_highlight_cache: SourceHighlightCache::default(),
+            source_scroll_state: SourceScrollState::new(),
+            source_scroll_rect: None,
+            source_wheel_sample: None,
+            source_perf_frame: None,
             expanded_nodes: HashSet::new(),
             egui_ctx,
             egui_state,
@@ -5593,6 +5601,28 @@ impl App {
             self.cursor.x as f32 / scale_factor,
             self.cursor.y as f32 / scale_factor,
         ))
+    }
+
+    fn pointer_over_source_scroll(&self) -> bool {
+        if self.main_view != MainView::Source {
+            return false;
+        }
+        let Some(rect) = self.source_scroll_rect else {
+            return false;
+        };
+        let scale_factor = self.window.scale_factor() as f32;
+        rect.contains(Pos2::new(
+            self.cursor.x as f32 / scale_factor,
+            self.cursor.y as f32 / scale_factor,
+        ))
+    }
+
+    fn enqueue_source_line_scroll(&mut self, delta_y: f32) {
+        self.source_scroll_state.enqueue_line_delta(delta_y);
+        self.source_wheel_sample = Some(SourceWheelSample {
+            kind: SourceWheelKind::LineDelta,
+            delta_y,
+        });
     }
 
     fn canvas_event_allowed(&self) -> bool {
@@ -9452,6 +9482,11 @@ impl App {
         let mut collapse_all_requested = false;
         let mut leave_decision = None;
         let mut source_highlight_cache = std::mem::take(&mut self.source_highlight_cache);
+        let mut source_scroll_state =
+            std::mem::replace(&mut self.source_scroll_state, SourceScrollState::new());
+        let mut source_scroll_rect = self.source_scroll_rect;
+        let source_wheel_sample = self.source_wheel_sample;
+        let mut source_perf_frame = None;
         let overlay_update_started = Instant::now();
         let selected_connection_points = self.selected_connection_overlay_points();
         let selected_component_overlay = self.selected_component_overlay();
@@ -9513,6 +9548,10 @@ impl App {
                 status_message.as_deref(),
                 document_loading,
                 &mut source_highlight_cache,
+                &mut source_scroll_state,
+                &mut source_scroll_rect,
+                source_wheel_sample,
+                &mut source_perf_frame,
                 self.pending_document_action.as_ref(),
                 &mut leave_decision,
             );
@@ -9555,6 +9594,9 @@ impl App {
             }
         });
         self.source_highlight_cache = source_highlight_cache;
+        self.source_scroll_state = source_scroll_state;
+        self.source_scroll_rect = source_scroll_rect;
+        self.source_perf_frame = source_perf_frame;
         let ui_build = ui_build_started.elapsed();
         if theme_mode != self.theme_mode || accent_theme != self.accent_theme {
             self.theme_mode = theme_mode;
@@ -9987,6 +10029,14 @@ impl App {
             }
         }
 
+        if let Some(profile) = self.source_perf_frame.take() {
+            trace_source_perf(profile, total);
+        }
+        self.source_wheel_sample = None;
+        if self.main_view == MainView::Source && self.source_scroll_state.active {
+            self.request_redraw();
+        }
+
         if let Some((fps, worst_ms)) = self.stats.record(Instant::now()) {
             self.update_title(Some((fps, worst_ms)));
         }
@@ -10351,6 +10401,10 @@ fn draw_preview_ui(
     status_message: Option<&str>,
     document_loading: bool,
     source_highlight_cache: &mut SourceHighlightCache,
+    source_scroll_state: &mut SourceScrollState,
+    source_scroll_rect: &mut Option<egui::Rect>,
+    source_wheel_sample: Option<SourceWheelSample>,
+    source_perf_frame: &mut Option<SourcePerfFrame>,
     pending_document_action: Option<&PendingDocumentAction>,
     leave_decision: &mut Option<LeaveDecision>,
 ) {
@@ -10759,7 +10813,15 @@ fn draw_preview_ui(
                 let content_size = ui.available_size();
                 ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
                     match *main_view {
-                        MainView::Source => source_preview(ui, document, source_highlight_cache),
+                        MainView::Source => source_preview(
+                            ui,
+                            document,
+                            source_highlight_cache,
+                            source_scroll_state,
+                            source_scroll_rect,
+                            source_wheel_sample,
+                            source_perf_frame,
+                        ),
                         MainView::Icon => icon_preview(ui, document, icon_clip_rect),
                         MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
                     }
@@ -10994,12 +11056,121 @@ fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
 
 const SOURCE_ROW_HEIGHT: f32 = 20.0;
 const SOURCE_HEADER_HEIGHT: f32 = 24.0;
+const SOURCE_SCROLL_NOTCH_ROWS: f32 = 2.75;
+const SOURCE_SCROLL_SMOOTH_SECONDS: f32 = 0.09;
+const SOURCE_SCROLL_EPSILON: f32 = 0.25;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceWheelKind {
+    LineDelta,
+    PixelDelta,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceWheelSample {
+    kind: SourceWheelKind,
+    delta_y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourcePerfFrame {
+    rows: usize,
+    source_ui: Duration,
+    highlight: Duration,
+    wheel: Option<SourceWheelSample>,
+    scroll_offset: f32,
+}
+
+#[derive(Debug)]
+struct SourceScrollState {
+    selected_class: Option<String>,
+    current_y: f32,
+    target_y: f32,
+    max_y: f32,
+    last_update: Instant,
+    initialized: bool,
+    active: bool,
+    override_default_wheel: bool,
+}
+
+impl SourceScrollState {
+    fn new() -> Self {
+        Self {
+            selected_class: None,
+            current_y: 0.0,
+            target_y: 0.0,
+            max_y: 0.0,
+            last_update: Instant::now(),
+            initialized: false,
+            active: false,
+            override_default_wheel: false,
+        }
+    }
+
+    fn sync_class(&mut self, selected_class: Option<&str>) {
+        let selected_class = selected_class.map(str::to_owned);
+        if self.selected_class == selected_class {
+            return;
+        }
+        self.selected_class = selected_class;
+        self.current_y = 0.0;
+        self.target_y = 0.0;
+        self.max_y = 0.0;
+        self.initialized = false;
+        self.active = false;
+        self.override_default_wheel = false;
+    }
+
+    fn enqueue_line_delta(&mut self, delta_y: f32) {
+        if !self.initialized {
+            self.current_y = self.target_y;
+            self.initialized = true;
+        }
+        self.target_y = (self.target_y - delta_y * SOURCE_ROW_HEIGHT * SOURCE_SCROLL_NOTCH_ROWS)
+            .clamp(0.0, self.max_y);
+        self.active = true;
+        self.override_default_wheel = true;
+        self.last_update = Instant::now();
+    }
+
+    fn advance(&mut self) {
+        if !self.initialized {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f32()
+            .clamp(0.0, 0.1);
+        self.last_update = now;
+        if !self.active {
+            return;
+        }
+        let alpha = 1.0 - (-dt / SOURCE_SCROLL_SMOOTH_SECONDS).exp();
+        self.current_y += (self.target_y - self.current_y) * alpha;
+        if (self.target_y - self.current_y).abs() <= SOURCE_SCROLL_EPSILON {
+            self.current_y = self.target_y;
+            self.active = false;
+        }
+    }
+
+    fn set_bounds(&mut self, max_y: f32) {
+        self.max_y = max_y.max(0.0);
+        self.current_y = self.current_y.clamp(0.0, self.max_y);
+        self.target_y = self.target_y.clamp(0.0, self.max_y);
+    }
+}
 
 fn source_preview(
     ui: &mut egui::Ui,
     document: Option<&UiDocument>,
     source_highlight_cache: &mut SourceHighlightCache,
+    source_scroll_state: &mut SourceScrollState,
+    source_scroll_rect: &mut Option<egui::Rect>,
+    source_wheel_sample: Option<SourceWheelSample>,
+    source_perf_frame: &mut Option<SourcePerfFrame>,
 ) {
+    *source_scroll_rect = None;
     let frame = Frame::none()
         .fill(theme_surface())
         .rounding(Rounding::same(8.0))
@@ -11038,14 +11209,32 @@ fn source_preview(
         }
         ui.add_space(8.0);
         if let Some(document) = document {
+            let source_ui_started = Instant::now();
+            let mut highlight_time = Duration::ZERO;
+            let mut visible_rows = 0;
+            source_scroll_state.sync_class(document.selected_class.as_deref());
             let scroll_height = ui.available_height().max(0.0);
             let scroll_width = ui.available_width().max(0.0);
             let scroll_delta = ui.input(|input| input.raw_scroll_delta);
             let pointer_position = ui.ctx().pointer_latest_pos();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
-            let offset_before = egui::scroll_area::State::load(ui.ctx(), scroll_id)
-                .map_or(Vec2::ZERO, |state| state.offset);
+            let mut state_before =
+                egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
+            if !source_scroll_state.initialized {
+                source_scroll_state.current_y = state_before.offset.y;
+                source_scroll_state.target_y = state_before.offset.y;
+                source_scroll_state.initialized = true;
+            } else if !source_scroll_state.active && !source_scroll_state.override_default_wheel {
+                source_scroll_state.current_y = state_before.offset.y;
+                source_scroll_state.target_y = state_before.offset.y;
+            }
+            source_scroll_state.advance();
+            if source_scroll_state.active || source_scroll_state.override_default_wheel {
+                state_before.offset.y = source_scroll_state.current_y;
+                state_before.store(ui.ctx(), scroll_id);
+            }
+            let offset_before = state_before.offset;
             let scroll_output = egui::ScrollArea::both()
                 .id_source(scroll_id_source)
                 .max_height(scroll_height)
@@ -11057,12 +11246,29 @@ fn source_preview(
                     SOURCE_ROW_HEIGHT,
                     document.source_lines.len(),
                     |ui, row_range| {
+                        visible_rows += row_range.len();
                         for row in row_range {
-                            let (layout_job, _) = source_highlight_cache.layout_job(document, row);
+                            let (layout_job, elapsed) =
+                                source_highlight_cache.layout_job(document, row);
+                            highlight_time += elapsed;
                             render_source_line(ui, row, layout_job);
                         }
                     },
                 );
+            *source_scroll_rect = Some(scroll_output.inner_rect);
+            let max_scroll_y =
+                (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
+            source_scroll_state.set_bounds(max_scroll_y);
+            let mut final_state = scroll_output.state;
+            if source_scroll_state.active || source_scroll_state.override_default_wheel {
+                final_state.offset.y = source_scroll_state.current_y;
+                final_state.store(ui.ctx(), scroll_id);
+            } else {
+                source_scroll_state.current_y = final_state.offset.y;
+                source_scroll_state.target_y = final_state.offset.y;
+                source_scroll_state.initialized = true;
+            }
+            source_scroll_state.override_default_wheel = false;
             trace_source_scroll(
                 document,
                 scroll_delta,
@@ -11079,6 +11285,19 @@ fn source_preview(
                             .size(14.0)
                             .color(theme_text_secondary()),
                     );
+                });
+            }
+            if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some()
+                && (source_wheel_sample.is_some()
+                    || source_scroll_state.active
+                    || scroll_delta != Vec2::ZERO)
+            {
+                *source_perf_frame = Some(SourcePerfFrame {
+                    rows: visible_rows,
+                    source_ui: source_ui_started.elapsed(),
+                    highlight: highlight_time,
+                    wheel: source_wheel_sample,
+                    scroll_offset: source_scroll_state.current_y,
                 });
             }
         }
@@ -11120,6 +11339,33 @@ fn trace_source_scroll(
         document.selected_class.as_deref().unwrap_or("<none>"),
         output.state.offset,
         output.content_size.y,
+    );
+}
+
+fn trace_source_perf(profile: SourcePerfFrame, frame: Duration) {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_none() {
+        return;
+    }
+    let (wheel_kind, wheel_delta) = match profile.wheel {
+        Some(SourceWheelSample {
+            kind: SourceWheelKind::LineDelta,
+            delta_y,
+        }) => ("LineDelta", delta_y),
+        Some(SourceWheelSample {
+            kind: SourceWheelKind::PixelDelta,
+            delta_y,
+        }) => ("PixelDelta", delta_y),
+        None => ("None", 0.0),
+    };
+    let source_ui_us = profile.source_ui.as_secs_f64() * 1_000_000.0;
+    let highlight_us = profile.highlight.as_secs_f64() * 1_000_000.0;
+    let layout_us = source_ui_us - highlight_us;
+    eprintln!(
+        "[SOURCE PERF] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} layout_us={layout_us:.1} frame_ms={:.2}",
+        profile.rows,
+        wheel_kind,
+        profile.scroll_offset,
+        frame.as_secs_f64() * 1000.0,
     );
 }
 
@@ -15652,30 +15898,49 @@ fn main() {
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
-                            let owner = wheel_owner(
-                                app.main_view,
-                                egui_consumed,
-                                app.pointer_over_canvas(),
-                                app.modifiers.control_key(),
-                            );
-                            let amount = match delta {
-                                MouseScrollDelta::LineDelta(_, y) => y,
-                                MouseScrollDelta::PixelDelta(position) => {
-                                    position.y as f32 / 80.0
+                            let (wheel_kind, amount) = match delta {
+                                MouseScrollDelta::LineDelta(_, y) => {
+                                    (SourceWheelKind::LineDelta, y)
                                 }
+                                MouseScrollDelta::PixelDelta(position) => (
+                                    SourceWheelKind::PixelDelta,
+                                    position.y as f32 / 80.0,
+                                ),
                             };
-                            if owner == WheelOwner::CanvasZoom {
-                                app.zoom_at_cursor(amount);
+                            let source_line_scroll = wheel_kind == SourceWheelKind::LineDelta
+                                && !app.modifiers.control_key()
+                                && app.pointer_over_source_scroll();
+                            if source_line_scroll {
+                                app.enqueue_source_line_scroll(amount);
                                 app.request_redraw();
+                            } else {
+                                if app.main_view == MainView::Source
+                                    && app.pointer_over_source_scroll()
+                                {
+                                    app.source_wheel_sample = Some(SourceWheelSample {
+                                        kind: wheel_kind,
+                                        delta_y: amount,
+                                    });
+                                }
+                                let owner = wheel_owner(
+                                    app.main_view,
+                                    egui_consumed,
+                                    app.pointer_over_canvas(),
+                                    app.modifiers.control_key(),
+                                );
+                                if owner == WheelOwner::CanvasZoom {
+                                    app.zoom_at_cursor(amount);
+                                    app.request_redraw();
+                                }
+                                trace_source_wheel(
+                                    matches!(app.main_view, MainView::Source),
+                                    amount,
+                                    egui_consumed,
+                                    egui_repaint,
+                                    egui_repaint_requested,
+                                    owner,
+                                );
                             }
-                            trace_source_wheel(
-                                matches!(app.main_view, MainView::Source),
-                                amount,
-                                egui_consumed,
-                                egui_repaint,
-                                egui_repaint_requested,
-                                owner,
-                            );
                         }
                         _ => {}
                     }
@@ -16124,6 +16389,37 @@ end Top;
             wheel_owner(MainView::Diagram, false, true, false),
             WheelOwner::None
         );
+    }
+
+    #[test]
+    fn source_line_delta_uses_row_sized_target_and_clamps() {
+        let mut scroll = SourceScrollState::new();
+        scroll.initialized = true;
+        scroll.current_y = 100.0;
+        scroll.target_y = 100.0;
+        scroll.set_bounds(180.0);
+
+        scroll.enqueue_line_delta(1.0);
+        assert_eq!(scroll.target_y, 45.0);
+        assert!(scroll.active);
+        assert!(scroll.override_default_wheel);
+
+        scroll.enqueue_line_delta(-10.0);
+        assert_eq!(scroll.target_y, 180.0);
+    }
+
+    #[test]
+    fn source_scroll_state_does_not_overshoot_bounds() {
+        let mut scroll = SourceScrollState::new();
+        scroll.initialized = true;
+        scroll.current_y = 20.0;
+        scroll.target_y = 20.0;
+        scroll.set_bounds(40.0);
+        scroll.enqueue_line_delta(10.0);
+        scroll.advance();
+
+        assert!((0.0..=40.0).contains(&scroll.current_y));
+        assert!((0.0..=40.0).contains(&scroll.target_y));
     }
 
     #[test]
