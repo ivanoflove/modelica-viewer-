@@ -15479,6 +15479,94 @@ mod tests {
     }
 
     #[test]
+    fn route_rebuild_is_stable_after_cache_clear_and_reopen() {
+        let directory = std::env::temp_dir().join(format!(
+            "modelica-wgpu-route-rebuild-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create route rebuild directory");
+        let path = directory.join("RouteRebuild.mo");
+        let source = r#"
+connector Port
+  annotation(Diagram(graphics={Ellipse(extent={{-4,-4},{4,4}})}));
+end Port;
+model Top
+  Port a annotation(Placement(transformation(origin={0,20}, extent={{-10,-10},{10,10}})));
+  Port b annotation(Placement(transformation(origin={100,-30}, extent={{-10,-10},{10,10}})));
+equation
+  connect(a, b) annotation(Line(points={{-800,400},{800,400}}));
+end Top;
+"#;
+        fs::write(&path, source).expect("write route rebuild fixture");
+
+        let mut document = LoadedDocument::load(&path).expect("load route rebuild fixture");
+        let first_scene = document.diagram("Top").expect("initial diagram");
+        let first_routes = first_scene
+            .connections
+            .iter()
+            .map(|connection| canonical_connection_points(first_scene, connection))
+            .collect::<Vec<_>>();
+        let first_geometry = core_diagram_geometry(first_scene)
+            .into_iter()
+            .filter(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .map(|geometry| {
+                geometry
+                    .connection
+                    .expect("connection metadata")
+                    .line
+                    .points
+            })
+            .collect::<Vec<_>>();
+
+        document.invalidate_scene_caches();
+        let rebuilt_scene = document.diagram("Top").expect("rebuilt diagram");
+        let rebuilt_routes = rebuilt_scene
+            .connections
+            .iter()
+            .map(|connection| canonical_connection_points(rebuilt_scene, connection))
+            .collect::<Vec<_>>();
+        let rebuilt_geometry = core_diagram_geometry(rebuilt_scene)
+            .into_iter()
+            .filter(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .map(|geometry| {
+                geometry
+                    .connection
+                    .expect("connection metadata")
+                    .line
+                    .points
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rebuilt_routes, first_routes);
+        assert_eq!(rebuilt_geometry, first_geometry);
+
+        let reopened = LoadedDocument::load(&path).expect("reopen route rebuild fixture");
+        let reopened_scene = reopened.diagram("Top").expect("reopened diagram");
+        let reopened_routes = reopened_scene
+            .connections
+            .iter()
+            .map(|connection| canonical_connection_points(reopened_scene, connection))
+            .collect::<Vec<_>>();
+        let reopened_geometry = core_diagram_geometry(reopened_scene)
+            .into_iter()
+            .filter(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+            .map(|geometry| {
+                geometry
+                    .connection
+                    .expect("connection metadata")
+                    .line
+                    .points
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reopened_routes, first_routes);
+        assert_eq!(reopened_geometry, first_geometry);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn diagram_spatial_index_keeps_blank_queries_local() {
         let mut index = DiagramSpatialIndex::default();
         for component_index in 0..500 {
