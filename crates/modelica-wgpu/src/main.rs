@@ -423,10 +423,33 @@ fn build_save_plan(document: &LoadedDocument) -> Result<Vec<PendingFileSave>, St
 /// write phase may leave an accurately reported partial save.
 fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
     let plan = build_save_plan(document)?;
+    apply_save_plan(document, plan, write_file_atomic)
+}
+
+fn apply_save_plan<F>(
+    document: &mut LoadedDocument,
+    plan: Vec<PendingFileSave>,
+    mut write_file: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&std::path::Path, &str) -> Result<(), String>,
+{
+    let total_files = plan.len();
     let mut saved_files = 0;
     for file in plan {
-        write_file_atomic(&file.path, &file.contents)?;
-        document.apply_saved_file(file)?;
+        let path = file.path.clone();
+        if let Err(error) = write_file(&path, &file.contents) {
+            return Err(format!(
+                "save partially completed: {saved_files} of {total_files} file(s) saved; failed to save {}: {error}; remaining edits were kept in memory",
+                path.display()
+            ));
+        }
+        if let Err(error) = document.apply_saved_file(file) {
+            return Err(format!(
+                "save partially completed: {saved_files} of {total_files} file(s) saved; file {} was written but the in-memory state could not be refreshed: {error}",
+                path.display()
+            ));
+        }
         saved_files += 1;
     }
     Ok(saved_files)
@@ -744,6 +767,93 @@ mod save_tests {
             fs::read_to_string(&second_path).unwrap(),
             externally_changed_second
         );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn save_reports_partial_progress_when_a_later_file_write_fails() {
+        let directory = temp_directory("partial-write");
+        let first_path = directory.join("First.mo");
+        let second_path = directory.join("Second.mo");
+        let first_source = "model First\n  Real value;\nend First;\n";
+        let second_source = "model Second\n  Real value;\nend Second;\n";
+        let first_updated = "model First\n  Real changed;\nend First;\n";
+        let second_updated = "model Second\n  Real changed;\nend Second;\n";
+        fs::write(&first_path, first_source).unwrap();
+        fs::write(&second_path, second_source).unwrap();
+
+        let mut document = LoadedDocument {
+            path: first_path.clone(),
+            package_name: "PartialSaveTest".to_owned(),
+            class_names: Vec::new(),
+            model_tree: TreeNode::default(),
+            diagnostics: 0,
+            registry: RefCell::new(LibraryRegistry::default()),
+            icon_cache: HashMap::new(),
+            diagram_cache: HashMap::new(),
+            scene_resolution_stats: RefCell::new(SceneResolutionStats::default()),
+            class_sources: vec![
+                ClassSource {
+                    qualified_name: "First".to_owned(),
+                    source_file: first_path.clone(),
+                    source_range: SourceRange::new(0, first_source.len()),
+                },
+                ClassSource {
+                    qualified_name: "Second".to_owned(),
+                    source_file: second_path.clone(),
+                    source_range: SourceRange::new(0, second_source.len()),
+                },
+            ],
+            source_overrides: HashMap::from([
+                ("First".to_owned(), first_updated.to_owned()),
+                ("Second".to_owned(), second_updated.to_owned()),
+            ]),
+            saved_class_text: HashMap::from([
+                ("First".to_owned(), first_source.to_owned()),
+                ("Second".to_owned(), second_source.to_owned()),
+            ]),
+            source_versions: HashMap::new(),
+        };
+
+        let plan = build_save_plan(&document).expect("save plan should validate");
+        let error = apply_save_plan(&mut document, plan, |path, contents| {
+            if path == second_path {
+                Err("simulated write failure".to_owned())
+            } else {
+                write_file_atomic(path, contents)
+            }
+        })
+        .expect_err("the second file should fail");
+
+        assert!(
+            error.contains("save partially completed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("1 of 2 file(s) saved"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("Second.mo"), "unexpected error: {error}");
+        assert!(
+            error.contains("simulated write failure"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), first_updated);
+        assert_eq!(fs::read_to_string(&second_path).unwrap(), second_source);
+        assert!(!document.source_overrides.contains_key("First"));
+        assert_eq!(
+            document.source_overrides.get("Second"),
+            Some(&second_updated.to_owned())
+        );
+        assert_eq!(
+            document.saved_class_text.get("First"),
+            Some(&first_updated.trim_end_matches('\n').to_owned())
+        );
+        assert_eq!(
+            document.saved_class_text.get("Second"),
+            Some(&second_source.to_owned())
+        );
+
         let _ = fs::remove_dir_all(&directory);
     }
 
