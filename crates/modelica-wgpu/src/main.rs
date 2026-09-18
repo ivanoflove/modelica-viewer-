@@ -555,9 +555,9 @@ mod save_tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
-    // These regressions assert the desired behavior. Run them explicitly with
-    // `cargo test -p modelica-wgpu save_tests::repeat_save -- --ignored` until
-    // A06 clears the successfully saved edits.
+    // These regressions cover saves whose replacement changes the byte length
+    // of the edited class. The following class must remain addressable after
+    // the save, and a repeated save must be a no-op.
     fn assert_repeat_save_after_length_change(label: &str, before: &str, after: &str) {
         struct Fixture {
             directory: PathBuf,
@@ -605,7 +605,6 @@ mod save_tests {
     }
 
     #[test]
-    #[ignore = "A02 known failure: A06 still needs to clear saved edits"]
     fn repeat_save_after_class_grows_is_a_noop() {
         assert_repeat_save_after_length_change(
             "repeat-grow",
@@ -615,7 +614,6 @@ mod save_tests {
     }
 
     #[test]
-    #[ignore = "A02 known failure: A06 still needs to clear saved edits"]
     fn repeat_save_after_class_shrinks_is_a_noop() {
         assert_repeat_save_after_length_change(
             "repeat-shrink",
@@ -625,13 +623,33 @@ mod save_tests {
     }
 
     #[test]
-    #[ignore = "A02 known failure: A06 still needs to clear saved edits"]
     fn repeat_save_after_utf8_byte_length_changes_is_a_noop() {
         assert_repeat_save_after_length_change(
             "repeat-utf8",
             "model A \"Temperature\"\n  Real value;\nend A;",
             "model A \"温度设定值与测量值\"\n  Real value;\nend A;",
         );
+    }
+
+    #[test]
+    fn restoring_saved_class_text_clears_the_pending_override() {
+        let directory = temp_directory("restore-saved-text");
+        let source = "model A\n  Real value;\nend A;\n";
+        let (mut document, path) = temp_document(
+            &directory,
+            "Restore.mo",
+            source,
+            &[("A", source, "model A\n  Real changed;\nend A;\n")],
+        );
+
+        document.set_class_text("A", source.to_owned());
+        assert!(!document.source_overrides.contains_key("A"));
+        assert_eq!(save_edited_classes(&mut document).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+
+        document.set_class_text("A", "model A\n  Real changed again;\nend A;\n".to_owned());
+        assert!(document.source_overrides.contains_key("A"));
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -2284,8 +2302,16 @@ impl LoadedDocument {
     }
 
     fn set_class_text(&mut self, qualified_name: &str, text: String) {
-        self.source_overrides
-            .insert(qualified_name.to_owned(), text);
+        let matches_saved_text = self
+            .saved_class_text
+            .get(qualified_name)
+            .is_some_and(|saved| saved == &text);
+        if matches_saved_text {
+            self.source_overrides.remove(qualified_name);
+        } else {
+            self.source_overrides
+                .insert(qualified_name.to_owned(), text);
+        }
         self.invalidate_scene_caches();
         self.refresh_registry_source(qualified_name);
         let version = self
@@ -2330,6 +2356,7 @@ impl LoadedDocument {
                 })?;
             self.saved_class_text
                 .insert(class.qualified_name.clone(), text.to_owned());
+            self.source_overrides.remove(&class.qualified_name);
         }
 
         self.registry
