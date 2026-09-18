@@ -502,6 +502,85 @@ mod save_tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
+    // These regressions assert the desired behavior. Run them explicitly with
+    // `cargo test -p modelica-wgpu save_tests::repeat_save -- --ignored` until
+    // A04/A06 repair saved ranges and clear the successfully saved edits.
+    fn assert_repeat_save_after_length_change(label: &str, before: &str, after: &str) {
+        struct Fixture {
+            directory: PathBuf,
+            path: PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Only remove this test's file and its now-empty directory,
+                // including when a regression assertion unwinds.
+                let _ = fs::remove_file(&self.path);
+                let _ = fs::remove_dir(&self.directory);
+            }
+        }
+
+        assert_ne!(before.len(), after.len(), "fixture must change byte length");
+        let directory = temp_directory(label);
+        let fixture = Fixture {
+            path: directory.join("Repeated.mo"),
+            directory,
+        };
+        let header = "// Preserve the file header.\n";
+        let neighbor = "\n\nmodel Neighbor\n  Real untouched;\nend Neighbor;\n";
+        let original = format!("{header}{before}{neighbor}");
+        let expected = format!("{header}{after}{neighbor}");
+        fs::write(&fixture.path, &original).expect("write regression fixture");
+
+        let mut document = LoadedDocument::load(&fixture.path).expect("load regression fixture");
+        assert_eq!(document.class_text("A").as_deref(), Some(before));
+        document.set_class_text("A", after.to_owned());
+        assert_eq!(save_edited_classes(&mut document).expect("first save"), 1);
+        assert_eq!(fs::read_to_string(&fixture.path).unwrap(), expected);
+
+        // No external writes or additional edits occur between the two saves.
+        let second_save = save_edited_classes(&mut document);
+        assert_eq!(
+            fs::read_to_string(&fixture.path).unwrap(),
+            expected,
+            "a repeated save must preserve the edited class and its neighbor"
+        );
+        assert_eq!(
+            second_save.expect("second save must accept the text just saved by this document"),
+            0,
+            "a second save without new edits must not rewrite the file"
+        );
+    }
+
+    #[test]
+    #[ignore = "A02 known failure: saved byte ranges/dirty state need A04/A06 repair"]
+    fn repeat_save_after_class_grows_is_a_noop() {
+        assert_repeat_save_after_length_change(
+            "repeat-grow",
+            "model A\n  parameter Real value = 1;\nend A;",
+            "model A\n  parameter Real value = 123456789;\nend A;",
+        );
+    }
+
+    #[test]
+    #[ignore = "A02 known failure: saved byte ranges/dirty state need A04/A06 repair"]
+    fn repeat_save_after_class_shrinks_is_a_noop() {
+        assert_repeat_save_after_length_change(
+            "repeat-shrink",
+            "model A\n  parameter Real value = 123456789;\nend A;",
+            "model A\n  parameter Real value = 1;\nend A;",
+        );
+    }
+
+    #[test]
+    #[ignore = "A02 known failure: saved byte ranges/dirty state need A04/A06 repair"]
+    fn repeat_save_after_utf8_byte_length_changes_is_a_noop() {
+        assert_repeat_save_after_length_change(
+            "repeat-utf8",
+            "model A \"Temperature\"\n  Real value;\nend A;",
+            "model A \"温度设定值与测量值\"\n  Real value;\nend A;",
+        );
+    }
+
     #[test]
     fn save_refuses_to_overwrite_a_file_changed_on_disk() {
         let directory = temp_directory("tamper");
