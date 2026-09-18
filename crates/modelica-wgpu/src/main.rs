@@ -2459,6 +2459,15 @@ enum EditCommand {
     },
 }
 
+fn record_successful_edit(
+    history: &mut Vec<EditCommand>,
+    redo_history: &mut Vec<EditCommand>,
+    command: EditCommand,
+) {
+    history.push(command);
+    redo_history.clear();
+}
+
 impl MainView {
     fn label(self) -> &'static str {
         match self {
@@ -7636,13 +7645,16 @@ impl App {
         document.set_class_text(&class_name, candidate.clone());
         document.replace_icon(&class_name, resolved_icon);
         document.replace_diagram(&class_name, resolved_diagram);
-        self.history.push(EditCommand::CreateDiagramConnection {
-            class_name,
-            connection_key,
-            before_source: source_before,
-            after_source: candidate,
-        });
-        self.redo_history.clear();
+        record_successful_edit(
+            &mut self.history,
+            &mut self.redo_history,
+            EditCommand::CreateDiagramConnection {
+                class_name,
+                connection_key,
+                before_source: source_before,
+                after_source: candidate,
+            },
+        );
         self.load_error = None;
         self.rebuild_selected_scenes();
         self.set_diagram_selection(DiagramSelection::Connection(connection_id));
@@ -7708,15 +7720,18 @@ impl App {
         document.set_class_text(&class_name, candidate.clone());
         document.replace_icon(&class_name, resolved_icon);
         document.replace_diagram(&class_name, resolved_diagram);
-        self.history.push(EditCommand::MoveIconGraphic {
-            class_name,
-            graphic_id,
-            before_geometry,
-            after_geometry,
-            before_source: source_before,
-            after_source: candidate,
-        });
-        self.redo_history.clear();
+        record_successful_edit(
+            &mut self.history,
+            &mut self.redo_history,
+            EditCommand::MoveIconGraphic {
+                class_name,
+                graphic_id,
+                before_geometry,
+                after_geometry,
+                before_source: source_before,
+                after_source: candidate,
+            },
+        );
         self.load_error = None;
         self.rebuild_selected_scenes();
     }
@@ -8085,16 +8100,19 @@ impl App {
             &component_name,
             format_args!("delta={delta:?} source_connection_edits={source_connection_edit_count}"),
         );
-        self.history.push(EditCommand::MoveDiagramComponent {
-            class_name,
-            component_id,
-            before_origin,
-            after_origin: canonical_after_origin,
-            before_source: source_before,
-            after_source: candidate,
-            connection_edits,
-        });
-        self.redo_history.clear();
+        record_successful_edit(
+            &mut self.history,
+            &mut self.redo_history,
+            EditCommand::MoveDiagramComponent {
+                class_name,
+                component_id,
+                before_origin,
+                after_origin: canonical_after_origin,
+                before_source: source_before,
+                after_source: candidate,
+                connection_edits,
+            },
+        );
         self.load_error = None;
         let hit_cache_started = Instant::now();
         self.diagram_hit_cache =
@@ -8399,14 +8417,17 @@ impl App {
         if profile.enabled {
             profile.hit_index_update = hit_index_started.elapsed();
         }
-        self.history.push(EditCommand::MoveDiagramConnection {
-            class_name,
-            connection_key,
-            before_points,
-            after_points: canonical_points,
-            endpoint_constraint,
-        });
-        self.redo_history.clear();
+        record_successful_edit(
+            &mut self.history,
+            &mut self.redo_history,
+            EditCommand::MoveDiagramConnection {
+                class_name,
+                connection_key,
+                before_points,
+                after_points: canonical_points,
+                endpoint_constraint,
+            },
+        );
         self.load_error = None;
     }
 
@@ -8584,16 +8605,19 @@ impl App {
         document.set_class_text(&class_name, candidate.clone());
         document.replace_icon(&class_name, resolved_icon);
         document.replace_diagram(&class_name, resolved_diagram);
-        self.history.push(EditCommand::ResizeDiagramComponent {
-            class_name,
-            component_id,
-            before_extent,
-            after_extent,
-            before_source: source_before,
-            after_source: candidate,
-            connection_edits,
-        });
-        self.redo_history.clear();
+        record_successful_edit(
+            &mut self.history,
+            &mut self.redo_history,
+            EditCommand::ResizeDiagramComponent {
+                class_name,
+                component_id,
+                before_extent,
+                after_extent,
+                before_source: source_before,
+                after_source: candidate,
+                connection_edits,
+            },
+        );
         self.load_error = None;
         self.rebuild_selected_scenes();
     }
@@ -15194,6 +15218,29 @@ fn main() {
 mod tests {
     use super::*;
     use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
+
+    fn sample_create_command() -> EditCommand {
+        EditCommand::CreateDiagramConnection {
+            class_name: "Test".to_owned(),
+            connection_key: ConnectionKey {
+                owner_class: "Test".to_owned(),
+                lhs: ConnectorRef::parse("a.x"),
+                rhs: ConnectorRef::parse("b.y"),
+                occurrence: 0,
+            },
+            before_source: "model Test end Test;".to_owned(),
+            after_source: "model Test equation connect(a.x, b.y); end Test;".to_owned(),
+        }
+    }
+
+    #[test]
+    fn successful_new_edit_records_and_clears_redo_history() {
+        let mut history = vec![sample_create_command()];
+        let mut redo_history = vec![sample_create_command()];
+        record_successful_edit(&mut history, &mut redo_history, sample_create_command());
+        assert_eq!(history.len(), 2);
+        assert!(redo_history.is_empty());
+    }
 
     fn connection_test_scene(
         lhs_position: CorePoint,
