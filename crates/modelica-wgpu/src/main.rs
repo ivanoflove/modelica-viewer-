@@ -2468,6 +2468,11 @@ fn record_successful_edit(
     redo_history.clear();
 }
 
+fn reset_edit_history(history: &mut Vec<EditCommand>, redo_history: &mut Vec<EditCommand>) {
+    history.clear();
+    redo_history.clear();
+}
+
 impl MainView {
     fn label(self) -> &'static str {
         match self {
@@ -9139,6 +9144,7 @@ impl App {
             self.zoom,
         );
         self.document = Some(document);
+        reset_edit_history(&mut self.history, &mut self.redo_history);
         self.selected_class = None;
         self.refresh_ui_document();
         self.expanded_nodes.clear();
@@ -15239,6 +15245,15 @@ mod tests {
         let mut redo_history = vec![sample_create_command()];
         record_successful_edit(&mut history, &mut redo_history, sample_create_command());
         assert_eq!(history.len(), 2);
+        assert!(redo_history.is_empty());
+    }
+
+    #[test]
+    fn switching_documents_resets_both_history_stacks() {
+        let mut history = vec![sample_create_command()];
+        let mut redo_history = vec![sample_create_command()];
+        reset_edit_history(&mut history, &mut redo_history);
+        assert!(history.is_empty());
         assert!(redo_history.is_empty());
     }
 
