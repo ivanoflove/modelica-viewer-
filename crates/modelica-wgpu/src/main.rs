@@ -9867,6 +9867,7 @@ impl App {
         let update_buffers = update_buffers_started
             .map(|started| started.elapsed())
             .unwrap_or(Duration::ZERO);
+        let source_scene_encode_started = profile_enabled.then(Instant::now);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("modelica-wgpu render pass"),
@@ -10008,6 +10009,9 @@ impl App {
                 .render(&mut ui_pass, &paint_jobs, &screen_descriptor);
         }
         command_buffers.push(encoder.finish());
+        let source_scene_encode = source_scene_encode_started
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
         let scene_encode = scene_encode_started.elapsed();
         let queue_submit_started = Instant::now();
         self.queue.submit(command_buffers);
@@ -10031,7 +10035,7 @@ impl App {
                 CancelFrameTiming {
                     ui: ui_done,
                     egui_tessellation,
-                    scene_encode,
+                    scene_encode: source_scene_encode,
                     queue_submit,
                     present,
                     frame_total: total,
