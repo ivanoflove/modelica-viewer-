@@ -193,6 +193,7 @@ impl<'a> DiagramResolver<'a> {
             };
             let type_name = declaration.declared_type_name;
             let name = declaration.instance_name;
+            let dimensions = declaration.dimensions;
             let Some(placement) =
                 find_call(&record.annotation, "Placement").and_then(parse_placement)
             else {
@@ -217,6 +218,7 @@ impl<'a> DiagramResolver<'a> {
                 name,
                 source_owner: class.qualified_name.clone(),
                 type_name: type_name.clone(),
+                dimensions,
                 resolved_type_qualified_name: None,
                 class_kind: None,
                 origin: transformation.origin,
@@ -238,6 +240,7 @@ impl<'a> DiagramResolver<'a> {
                     self.registry,
                     &component_class,
                     &component_source,
+                    &component.name,
                 );
                 component.resolved_icon = Some(Box::new(icon));
                 if matches!(
@@ -297,8 +300,13 @@ impl<'a> DiagramResolver<'a> {
 struct IconResolverAdapter;
 
 impl IconResolverAdapter {
-    fn resolve(registry: &mut LibraryRegistry, class: &Class, source: &str) -> IconScene {
-        crate::IconResolver::new(registry).resolve(class, source)
+    fn resolve(
+        registry: &mut LibraryRegistry,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+    ) -> IconScene {
+        crate::IconResolver::new(registry).resolve_for_instance(class, source, instance_name)
     }
 }
 
@@ -319,6 +327,7 @@ fn resolve_diagram_layer(class: &Class, source: &str) -> Option<IconScene> {
             qualified_name: class.qualified_name.clone(),
             kind: crate::scene::GraphicOwnerKind::Own,
             instance_name: None,
+            dimensions: Vec::new(),
         };
         graphic.transform = crate::scene::Transform2D::identity();
         graphic.editable = false;
@@ -526,10 +535,12 @@ fn parse_connection(
             ConnectorRef {
                 component_name: String::new(),
                 connector_path: String::new(),
+                subscripts: Vec::new(),
             },
             ConnectorRef {
                 component_name: String::new(),
                 connector_path: String::new(),
+                subscripts: Vec::new(),
             },
             0,
         ),
@@ -545,13 +556,7 @@ fn parse_connection(
 }
 
 fn connector_ref(value: &str) -> ConnectorRef {
-    let (component_name, connector_path) = value
-        .split_once('.')
-        .map_or((value, ""), |(component, connector)| (component, connector));
-    ConnectorRef {
-        component_name: component_name.trim().to_owned(),
-        connector_path: connector_path.trim().to_owned(),
-    }
+    ConnectorRef::parse(value)
 }
 
 fn split_top_level(value: &str) -> Vec<&str> {
@@ -891,6 +896,45 @@ end Top;
     }
 
     #[test]
+    fn diagram_component_icons_expand_name_for_each_instance() {
+        let source = r#"
+model Unit
+  annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%name")}));
+end Unit;
+
+model Top
+  Unit left annotation(Placement(transformation(extent={{-80,-10},{-60,10}})));
+  Unit right annotation(Placement(transformation(extent={{60,-10},{80,10}})));
+end Top;
+"#;
+        let file = parse(source, "DiagramText.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("DiagramText.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[1], source, &mut registry);
+
+        for (name, component) in [
+            ("left", &scene.components[0]),
+            ("right", &scene.components[1]),
+        ] {
+            let text = component
+                .resolved_icon
+                .as_ref()
+                .and_then(|icon| {
+                    icon.graphics
+                        .iter()
+                        .find_map(|graphic| match &graphic.graphic {
+                            crate::scene::Graphic::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                })
+                .expect("component label");
+            assert_eq!(text, name);
+        }
+    }
+
+    #[test]
     fn masks_nested_class_diagram_annotations() {
         let source = r#"package P
   model Child annotation(Diagram(graphics={Rectangle(extent={{-1,-1},{1,1}})})); end Child;
@@ -925,13 +969,75 @@ end Top;
         let scene = resolve_diagram(&file.classes[0], source, &mut registry);
         let connection = &scene.connections[0];
         assert_eq!(connection.lhs.component_name, "mixer");
-        assert_eq!(connection.lhs.connector_path, "ports_a[2]");
+        assert_eq!(connection.lhs.connector_path, "ports_a");
+        assert_eq!(connection.lhs.subscripts, vec!["2"]);
         assert_eq!(connection.rhs.component_name, "h2grid");
         assert_eq!(connection.rhs.connector_path, "port");
+        assert!(connection.rhs.subscripts.is_empty());
         assert_eq!(connection.key.owner_class, "Top");
         assert_eq!(connection.key.occurrence, 0);
         assert_eq!(connection.line.as_ref().unwrap().points.len(), 3);
         assert!(connection.line_source_range.is_some());
+    }
+
+    #[test]
+    fn parses_scalar_nested_and_array_connector_references() {
+        let cases = [
+            ("port", "port", "", Vec::<String>::new()),
+            ("ports[1]", "ports", "", vec!["1".to_owned()]),
+            ("ports[nPorts]", "ports", "", vec!["nPorts".to_owned()]),
+            ("mixer.port", "mixer", "port", Vec::<String>::new()),
+            ("mixer.ports[2]", "mixer", "ports", vec!["2".to_owned()]),
+            (
+                "mixer.manifold.ports[2]",
+                "mixer",
+                "manifold.ports",
+                vec!["2".to_owned()],
+            ),
+        ];
+        for (value, component_name, connector_path, subscripts) in cases {
+            let reference = super::connector_ref(value);
+            assert_eq!(reference.component_name, component_name, "{value}");
+            assert_eq!(reference.connector_path, connector_path, "{value}");
+            assert_eq!(reference.subscripts, subscripts, "{value}");
+            assert_eq!(reference.text(), value, "{value}");
+        }
+    }
+
+    #[test]
+    fn resolves_vector_component_dimensions_and_each_connection_element() {
+        let source = r#"
+connector Port
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end Port;
+
+model Top
+  Port ports[3] annotation(Placement(transformation(extent={{-80,-10},{-60,10}})));
+  Port target annotation(Placement(transformation(extent={{60,-10},{80,10}})));
+equation
+  connect(ports[1], target) annotation(Line(points={{-60,0},{60,0}}));
+  connect(ports[2], target) annotation(Line(points={{-60,1},{60,1}}));
+  connect(ports[3], target) annotation(Line(points={{-60,2},{60,2}}));
+end Top;
+"#;
+        let file = parse(source, "VectorDiagram.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("VectorDiagram.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[1], source, &mut registry);
+        let ports = scene
+            .components
+            .iter()
+            .find(|component| component.name == "ports")
+            .expect("vector connector component");
+        assert_eq!(ports.dimensions, vec!["3"]);
+        assert_eq!(scene.connections.len(), 3);
+        for (index, connection) in scene.connections.iter().enumerate() {
+            assert_eq!(connection.lhs.component_name, "ports");
+            assert_eq!(connection.lhs.connector_path, "");
+            assert_eq!(connection.lhs.subscripts, vec![(index + 1).to_string()]);
+        }
     }
 
     #[test]
