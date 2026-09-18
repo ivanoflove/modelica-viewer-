@@ -307,50 +307,76 @@ fn write_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), Strin
     }
 }
 
-/// Persist every class edited in memory back to its own `.mo` file.
+struct PendingSourceEdit {
+    start: usize,
+    end: usize,
+    updated: String,
+    qualified: String,
+}
+
+struct PendingFileSave {
+    path: PathBuf,
+    edits: Vec<PendingSourceEdit>,
+    contents: String,
+}
+
+/// Build and validate every file's save plan before writing any file.
 ///
-/// The save is transactional: each replacement is only applied when the
+/// The plan validates each replacement when the
 /// on-disk slice still equals the text the document last loaded or wrote.
-/// An externally modified file therefore aborts the save instead of being
+/// An externally modified file therefore aborts the plan instead of being
 /// silently corrupted. Edits touching the same file are applied back-to-front
 /// so earlier offsets stay valid.
-fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
+fn build_save_plan(document: &LoadedDocument) -> Result<Vec<PendingFileSave>, String> {
     if document.source_overrides.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    struct PendingEdit {
-        start: usize,
-        end: usize,
-        updated: String,
-        qualified: String,
-    }
-    let mut by_file = std::collections::BTreeMap::<std::path::PathBuf, Vec<PendingEdit>>::new();
+    let mut by_file = std::collections::BTreeMap::<PathBuf, Vec<PendingSourceEdit>>::new();
     for class in &document.class_sources {
         let Some(updated) = document.source_overrides.get(&class.qualified_name) else {
             continue;
         };
         let range = class.source_range;
-        if range.end <= range.start {
+        if range.start > range.end {
+            return Err(format!(
+                "invalid source range {}:{} for {}",
+                range.start, range.end, class.qualified_name
+            ));
+        }
+        if range.start == range.end {
             continue;
         }
         by_file
             .entry(class.source_file.clone())
             .or_default()
-            .push(PendingEdit {
+            .push(PendingSourceEdit {
                 start: range.start,
                 end: range.end,
                 updated: updated.clone(),
                 qualified: class.qualified_name.clone(),
             });
     }
-    let mut saved_files = 0;
+    let mut plan = Vec::with_capacity(by_file.len());
     for (path, mut edits) in by_file {
-        // Later ranges first: earlier replacement offsets remain valid because
-        // the edits never overlap inside one class and each class range comes
-        // from the same parsed document.
-        edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
         let disk_original =
             fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        edits.sort_by_key(|edit| edit.start);
+        for pair in edits.windows(2) {
+            let previous = &pair[0];
+            let current = &pair[1];
+            if current.start < previous.end {
+                return Err(format!(
+                    "overlapping source edits in {}: {} [{}..{}] overlaps {} [{}..{}]",
+                    path.display(),
+                    previous.qualified,
+                    previous.start,
+                    previous.end,
+                    current.qualified,
+                    current.start,
+                    current.end,
+                ));
+            }
+        }
         for edit in &edits {
             if edit.end > disk_original.len() || disk_original.get(edit.start..edit.end).is_none() {
                 return Err(format!(
@@ -377,11 +403,29 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
             }
         }
         let mut disk = disk_original;
-        for edit in &edits {
+        for edit in edits.iter().rev() {
             disk.replace_range(edit.start..edit.end, &edit.updated);
         }
-        write_file_atomic(&path, &disk)?;
-        for edit in &edits {
+        plan.push(PendingFileSave {
+            path,
+            edits,
+            contents: disk,
+        });
+    }
+    Ok(plan)
+}
+
+/// Persist every class edited in memory back to its own `.mo` file.
+///
+/// All validation happens in `build_save_plan` before the first write. Writes
+/// are still performed one file at a time, so a filesystem failure during the
+/// write phase may leave an accurately reported partial save.
+fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
+    let plan = build_save_plan(document)?;
+    let mut saved_files = 0;
+    for file in plan {
+        write_file_atomic(&file.path, &file.contents)?;
+        for edit in &file.edits {
             document
                 .saved_class_text
                 .insert(edit.qualified.clone(), edit.updated.clone());
@@ -607,6 +651,132 @@ mod save_tests {
         assert!(disk.starts_with("// externally edited"));
         assert!(disk.contains("class A model M end A"));
         assert!(disk.contains("class B model N end B"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn save_validates_all_files_before_writing_any_file() {
+        let directory = temp_directory("plan-all-files");
+        let first_path = directory.join("First.mo");
+        let second_path = directory.join("Second.mo");
+        let first_source = "model First\n  Real value;\nend First;\n";
+        let second_source = "model Second\n  Real value;\nend Second;\n";
+        fs::write(&first_path, first_source).unwrap();
+        fs::write(&second_path, second_source).unwrap();
+
+        let mut source_overrides = HashMap::new();
+        source_overrides.insert(
+            "First".to_owned(),
+            "model First\n  Real changed;\nend First;\n".to_owned(),
+        );
+        source_overrides.insert(
+            "Second".to_owned(),
+            "model Second\n  Real changed;\nend Second;\n".to_owned(),
+        );
+        let class_sources = vec![
+            ClassSource {
+                qualified_name: "First".to_owned(),
+                source_file: first_path.clone(),
+                source_range: SourceRange::new(0, first_source.len()),
+            },
+            ClassSource {
+                qualified_name: "Second".to_owned(),
+                source_file: second_path.clone(),
+                source_range: SourceRange::new(0, second_source.len()),
+            },
+        ];
+        let saved_class_text = HashMap::from([
+            ("First".to_owned(), first_source.to_owned()),
+            ("Second".to_owned(), second_source.to_owned()),
+        ]);
+        let mut document = LoadedDocument {
+            path: first_path.clone(),
+            package_name: "PlanTest".to_owned(),
+            class_names: Vec::new(),
+            model_tree: TreeNode::default(),
+            diagnostics: 0,
+            registry: RefCell::new(LibraryRegistry::default()),
+            icon_cache: HashMap::new(),
+            diagram_cache: HashMap::new(),
+            scene_resolution_stats: RefCell::new(SceneResolutionStats::default()),
+            class_sources,
+            source_overrides,
+            saved_class_text,
+            source_versions: HashMap::new(),
+        };
+
+        let externally_changed_second = "// changed externally\n".to_owned() + second_source;
+        fs::write(&second_path, &externally_changed_second).unwrap();
+        let error = save_edited_classes(&mut document).expect_err("plan must reject conflict");
+        assert!(
+            error.contains("changed on disk"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read_to_string(&first_path).unwrap(), first_source);
+        assert_eq!(
+            fs::read_to_string(&second_path).unwrap(),
+            externally_changed_second
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn save_rejects_overlapping_class_edits_before_writing() {
+        let directory = temp_directory("plan-overlap");
+        let path = directory.join("Nested.mo");
+        let source = "model Parent\n  model Child\n  end Child;\nend Parent;\n";
+        fs::write(&path, source).unwrap();
+        let parent_start = source.find("model Parent").unwrap();
+        let parent_end = source.len();
+        let child_start = source.find("model Child").unwrap();
+        let child_end = source.find("end Child;").unwrap() + "end Child;".len();
+        let parent_text = source[parent_start..parent_end].to_owned();
+        let child_text = source[child_start..child_end].to_owned();
+        let mut document = LoadedDocument {
+            path: path.clone(),
+            package_name: "OverlapTest".to_owned(),
+            class_names: Vec::new(),
+            model_tree: TreeNode::default(),
+            diagnostics: 0,
+            registry: RefCell::new(LibraryRegistry::default()),
+            icon_cache: HashMap::new(),
+            diagram_cache: HashMap::new(),
+            scene_resolution_stats: RefCell::new(SceneResolutionStats::default()),
+            class_sources: vec![
+                ClassSource {
+                    qualified_name: "Parent".to_owned(),
+                    source_file: path.clone(),
+                    source_range: SourceRange::new(parent_start, parent_end),
+                },
+                ClassSource {
+                    qualified_name: "Parent.Child".to_owned(),
+                    source_file: path.clone(),
+                    source_range: SourceRange::new(child_start, child_end),
+                },
+            ],
+            source_overrides: HashMap::from([
+                (
+                    "Parent".to_owned(),
+                    parent_text.replace("Parent", "ParentRenamed"),
+                ),
+                (
+                    "Parent.Child".to_owned(),
+                    child_text.replace("Child", "ChildRenamed"),
+                ),
+            ]),
+            saved_class_text: HashMap::from([
+                ("Parent".to_owned(), parent_text),
+                ("Parent.Child".to_owned(), child_text),
+            ]),
+            source_versions: HashMap::new(),
+        };
+
+        let error = save_edited_classes(&mut document).expect_err("overlap must be rejected");
+        assert!(
+            error.contains("overlapping source edits"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
         let _ = fs::remove_dir_all(&directory);
     }
 
