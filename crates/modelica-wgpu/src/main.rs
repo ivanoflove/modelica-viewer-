@@ -16791,6 +16791,129 @@ mod tests {
     }
 
     #[test]
+    fn multi_interface_inherited_scene_rebuilds_stale_routes_from_semantics() {
+        let source = r#"
+connector Port
+  annotation(Diagram(graphics={Ellipse(extent={{-4,-4},{4,4}})}));
+end Port;
+
+partial model Base
+  Port p1 annotation(Placement(transformation(origin={-150,0}, extent={{-10,-10},{10,10}})));
+  Port p2 annotation(Placement(transformation(origin={-50,0}, extent={{-10,-10},{10,10}})));
+  Port p3 annotation(Placement(transformation(origin={50,0}, extent={{-10,-10},{10,10}})));
+  Port p4 annotation(Placement(transformation(origin={150,0}, extent={{-10,-10},{10,10}})));
+equation
+  connect(p1, p2) annotation(Line(points={{-150,0},{-50,0}}));
+  connect(p2, p3) annotation(Line(points={{-50,0},{50,0}}));
+  connect(p3, p4) annotation(Line(points={{50,0},{150,0}}));
+end Base;
+
+model Child
+  extends Base;
+  Port external annotation(Placement(transformation(origin={250,0}, extent={{-10,-10},{10,10}})));
+equation
+  connect(p4, external) annotation(Line(points={{150,0},{250,0}}));
+end Child;
+"#;
+        let file = parse(source, "MultiInterface.mo").expect("parse multi-interface fixture");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("MultiInterface.mo", source)
+            .expect("register multi-interface fixture");
+        let child = file
+            .classes
+            .iter()
+            .find(|class| class.name == "Child")
+            .expect("Child class");
+        let child_source = source
+            .get(child.source_range.start..child.source_range.end)
+            .expect("Child source range");
+        let mut scene = resolve_diagram(child, source, &mut registry);
+
+        assert_eq!(scene.components.len(), 5);
+        assert_eq!(scene.connections.len(), 4);
+        assert_eq!(
+            scene
+                .connections
+                .iter()
+                .filter(|connection| connection.key.owner_class == "Base")
+                .count(),
+            3
+        );
+        assert_eq!(
+            scene
+                .connections
+                .iter()
+                .filter(|connection| connection.key.owner_class == "Child")
+                .count(),
+            1
+        );
+
+        // Keep the source route deliberately far from every current endpoint.
+        // This simulates a placement change that left the serialized Line
+        // annotation behind while retaining connector identity.
+        let stale_points = vec![
+            CorePoint {
+                x: -900.0,
+                y: 700.0,
+            },
+            CorePoint { x: 900.0, y: 700.0 },
+        ];
+        for connection in &mut scene.connections {
+            connection
+                .line
+                .as_mut()
+                .expect("fixture connection line")
+                .points = stale_points.clone();
+        }
+
+        for connection in &scene.connections {
+            let (semantic_first, semantic_last) =
+                strict_connection_points(&scene, connection).expect("semantic endpoints");
+            let raw_points = connection
+                .line
+                .as_ref()
+                .expect("fixture connection line")
+                .points
+                .clone();
+            let (route, fallback) =
+                resolved_connection_display_route(&scene, connection, &raw_points)
+                    .expect("stale route should be repaired");
+            assert_eq!(fallback, ConnectionRouteFallback::CanonicalOrthogonal);
+            assert_eq!(route.first(), Some(&semantic_first));
+            assert_eq!(route.last(), Some(&semantic_last));
+            assert!(valid_interactive_connection_route(&route));
+            assert!(displayed_connection_points_match_invariant(
+                &scene, connection, &route
+            ));
+
+            if connection.key.owner_class == "Base" {
+                assert!(
+                    connection_source_editable_in_class(connection, "Child", child_source).is_err()
+                );
+            } else {
+                connection_source_editable_in_class(connection, "Child", child_source)
+                    .expect("Child-owned connection should be editable");
+            }
+        }
+
+        let geometries = core_diagram_geometry(&scene);
+        assert_eq!(
+            geometries
+                .iter()
+                .filter(|geometry| geometry.layer == DiagramRenderLayer::Connection)
+                .count(),
+            4
+        );
+        assert!(scene.connections.iter().all(|connection| connection
+            .line
+            .as_ref()
+            .expect("source line")
+            .points
+            == stale_points));
+    }
+
+    #[test]
     fn endpoint_overdraw_enters_directional_connector_bounds() {
         let input_target = endpoint_overdraw_target(
             CorePoint { x: 0.0, y: 0.0 },
