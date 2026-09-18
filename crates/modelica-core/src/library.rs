@@ -471,6 +471,8 @@ impl LibraryRegistry {
         let parsed = parse(&source, &path).map_err(|error| {
             Diagnostic::warning("SOURCE_PARSE", format!("{}: {error}", path.display()))
         })?;
+        self.classes
+            .retain(|_, location| location.source_file != path);
         self.sources.insert(path.clone(), source);
         for class in &parsed.classes {
             self.index_class_location(class);
@@ -704,6 +706,34 @@ mod tests {
         assert_eq!(package.qualified_name, "Demo");
         assert_eq!(package.classes[0].qualified_name, "Demo.Thing");
         fs::remove_file(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn re_registering_source_replaces_class_locations_for_that_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("modelica-core-reregister-{nonce}.mo"));
+        let initial = "model A end A; model B end B;";
+        let updated = "model A end A; model C end C;";
+        fs::write(&path, initial).expect("write fixture");
+        let mut registry = LibraryRegistry::default();
+
+        registry
+            .register_source(path.clone(), initial)
+            .expect("register initial source");
+        assert!(registry.resolve("A").is_some());
+        assert!(registry.resolve("B").is_some());
+
+        registry
+            .register_source(path.clone(), updated)
+            .expect("register updated source");
+        assert!(registry.resolve("A").is_some());
+        assert!(registry.resolve("B").is_none());
+        assert!(registry.resolve("C").is_some());
+
+        fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]

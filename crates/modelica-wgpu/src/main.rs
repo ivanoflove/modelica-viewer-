@@ -316,8 +316,8 @@ struct PendingSourceEdit {
 
 struct PendingFileSave {
     path: PathBuf,
-    edits: Vec<PendingSourceEdit>,
     contents: String,
+    class_sources: Vec<ClassSource>,
 }
 
 /// Build and validate every file's save plan before writing any file.
@@ -406,10 +406,11 @@ fn build_save_plan(document: &LoadedDocument) -> Result<Vec<PendingFileSave>, St
         for edit in edits.iter().rev() {
             disk.replace_range(edit.start..edit.end, &edit.updated);
         }
+        let class_sources = parsed_class_sources(&disk, &path)?;
         plan.push(PendingFileSave {
             path,
-            edits,
             contents: disk,
+            class_sources,
         });
     }
     Ok(plan)
@@ -425,11 +426,7 @@ fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
     let mut saved_files = 0;
     for file in plan {
         write_file_atomic(&file.path, &file.contents)?;
-        for edit in &file.edits {
-            document
-                .saved_class_text
-                .insert(edit.qualified.clone(), edit.updated.clone());
-        }
+        document.apply_saved_file(file)?;
         saved_files += 1;
     }
     Ok(saved_files)
@@ -495,41 +492,53 @@ mod save_tests {
     #[test]
     fn save_replaces_only_the_edited_class_range() {
         let directory = temp_directory("single");
-        let content = "within X; class A model M end A; class B model N end B;";
+        let content = "within X; model A\n  Real value;\nend A; model B\n  Real untouched;\nend B;";
         let mut document = temp_document(
             &directory,
             "Single.mo",
             content,
-            &[("X.A", "class A model M end A", "class A model M2 end A")],
+            &[(
+                "X.A",
+                "model A\n  Real value;\nend A;",
+                "model A\n  Real value = 2;\nend A;",
+            )],
         )
         .0;
         let saved = save_edited_classes(&mut document).expect("save succeeds");
         assert_eq!(saved, 1);
         let result = fs::read_to_string(&document.path).unwrap();
-        assert!(result.contains("class A model M2 end A"));
-        assert!(result.contains("class B model N end B"));
-        assert!(!result.contains("class A model M end A"));
+        assert!(result.contains("model A\n  Real value = 2;\nend A;"));
+        assert!(result.contains("model B\n  Real untouched;\nend B;"));
+        assert!(!result.contains("model A\n  Real value;\nend A;"));
         let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
     fn save_applies_back_to_front_when_two_classes_share_a_file() {
         let directory = temp_directory("shared");
-        let content = "class A model M end A; class B model N end B;";
+        let content = "model A\n  Real value;\nend A; model B\n  Real value;\nend B;";
         let (mut document, path) = temp_document(
             &directory,
             "Shared.mo",
             content,
             &[
-                ("B", "class B model N end B", "class B model N2 end B"),
-                ("A", "class A model M end A", "class A model M2 end A"),
+                (
+                    "B",
+                    "model B\n  Real value;\nend B;",
+                    "model B\n  Real value = 2;\nend B;",
+                ),
+                (
+                    "A",
+                    "model A\n  Real value;\nend A;",
+                    "model A\n  Real value = 2;\nend A;",
+                ),
             ],
         );
         let saved = save_edited_classes(&mut document).expect("save succeeds");
         assert_eq!(saved, 1);
         let result = fs::read_to_string(&path).unwrap();
-        assert!(result.contains("class A model M2 end A"));
-        assert!(result.contains("class B model N2 end B"));
+        assert!(result.contains("model A\n  Real value = 2;\nend A;"));
+        assert!(result.contains("model B\n  Real value = 2;\nend B;"));
         // No leftover temp files next to the source.
         let leftovers = fs::read_dir(&directory)
             .unwrap()
@@ -548,7 +557,7 @@ mod save_tests {
 
     // These regressions assert the desired behavior. Run them explicitly with
     // `cargo test -p modelica-wgpu save_tests::repeat_save -- --ignored` until
-    // A04/A06 repair saved ranges and clear the successfully saved edits.
+    // A06 clears the successfully saved edits.
     fn assert_repeat_save_after_length_change(label: &str, before: &str, after: &str) {
         struct Fixture {
             directory: PathBuf,
@@ -596,7 +605,7 @@ mod save_tests {
     }
 
     #[test]
-    #[ignore = "A02 known failure: saved byte ranges/dirty state need A04/A06 repair"]
+    #[ignore = "A02 known failure: A06 still needs to clear saved edits"]
     fn repeat_save_after_class_grows_is_a_noop() {
         assert_repeat_save_after_length_change(
             "repeat-grow",
@@ -606,7 +615,7 @@ mod save_tests {
     }
 
     #[test]
-    #[ignore = "A02 known failure: saved byte ranges/dirty state need A04/A06 repair"]
+    #[ignore = "A02 known failure: A06 still needs to clear saved edits"]
     fn repeat_save_after_class_shrinks_is_a_noop() {
         assert_repeat_save_after_length_change(
             "repeat-shrink",
@@ -616,7 +625,7 @@ mod save_tests {
     }
 
     #[test]
-    #[ignore = "A02 known failure: saved byte ranges/dirty state need A04/A06 repair"]
+    #[ignore = "A02 known failure: A06 still needs to clear saved edits"]
     fn repeat_save_after_utf8_byte_length_changes_is_a_noop() {
         assert_repeat_save_after_length_change(
             "repeat-utf8",
@@ -777,6 +786,54 @@ mod save_tests {
             "unexpected error: {error}"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn save_updates_following_class_ranges_after_length_change() {
+        let directory = temp_directory("updated-ranges");
+        let source = "model A\n  Real value;\nend A;\n\nmodel B\n  Real value;\nend B;\n";
+        let a_source = "model A\n  Real value;\nend A;";
+        let b_source = "model B\n  Real value;\nend B;";
+        let (mut document, path) = temp_document(
+            &directory,
+            "Ranges.mo",
+            source,
+            &[
+                ("A", a_source, "model A\n  Real value = 123456789;\nend A;"),
+                ("B", b_source, "model B\n  Real value = 2;\nend B;"),
+            ],
+        );
+        document.source_overrides.remove("B");
+
+        assert_eq!(save_edited_classes(&mut document).expect("first save"), 1);
+        let disk_after_first = fs::read_to_string(&path).unwrap();
+        let b_range = document
+            .class_sources
+            .iter()
+            .find(|class| class.qualified_name == "B")
+            .map(|class| class.source_range)
+            .expect("updated B range");
+        assert_eq!(&disk_after_first[b_range.start..b_range.end], b_source);
+        assert_eq!(
+            document
+                .registry
+                .borrow()
+                .resolve("B")
+                .expect("registry B range")
+                .source_range,
+            b_range
+        );
+
+        document.source_overrides.remove("A");
+        document.source_overrides.insert(
+            "B".to_owned(),
+            "model B\n  Real value = 222222222;\nend B;".to_owned(),
+        );
+        assert_eq!(save_edited_classes(&mut document).expect("second save"), 1);
+        let disk_after_second = fs::read_to_string(&path).unwrap();
+        assert!(disk_after_second.contains("Real value = 123456789;"));
+        assert!(disk_after_second.contains("Real value = 222222222;"));
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -2233,6 +2290,50 @@ impl LoadedDocument {
         *version = version.saturating_add(1);
     }
 
+    fn apply_saved_file(&mut self, file: PendingFileSave) -> Result<(), String> {
+        let old_names = self
+            .class_sources
+            .iter()
+            .filter(|class| class.source_file == file.path)
+            .map(|class| class.qualified_name.clone())
+            .collect::<HashSet<_>>();
+        let new_names = file
+            .class_sources
+            .iter()
+            .map(|class| class.qualified_name.clone())
+            .collect::<HashSet<_>>();
+
+        self.class_sources
+            .retain(|class| class.source_file != file.path);
+        self.class_sources.extend(file.class_sources.clone());
+
+        for removed in old_names.difference(&new_names) {
+            self.saved_class_text.remove(removed);
+            self.source_overrides.remove(removed);
+            self.source_versions.remove(removed);
+        }
+        for class in &file.class_sources {
+            let text = file
+                .contents
+                .get(class.source_range.start..class.source_range.end)
+                .ok_or_else(|| {
+                    format!(
+                        "saved class range is invalid for {} in {}",
+                        class.qualified_name,
+                        file.path.display()
+                    )
+                })?;
+            self.saved_class_text
+                .insert(class.qualified_name.clone(), text.to_owned());
+        }
+
+        self.registry
+            .borrow_mut()
+            .register_source(file.path, file.contents)
+            .map_err(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))?;
+        Ok(())
+    }
+
     fn invalidate_scene_caches(&mut self) {
         for cache in self.icon_cache.values_mut() {
             *cache = OnceLock::new();
@@ -2462,6 +2563,27 @@ fn collect_class_source(class: &Class, output: &mut Vec<ClassSource>) {
     });
     for child in &class.children {
         collect_class_source(child, output);
+    }
+}
+
+fn parsed_class_sources(source: &str, source_file: &FsPath) -> Result<Vec<ClassSource>, String> {
+    let parsed = parse(source, source_file)
+        .map_err(|error| format!("{}: {error}", source_file.display()))?;
+    let mut class_sources = Vec::new();
+    for class in &parsed.classes {
+        collect_parsed_class_source(class, source_file, &mut class_sources);
+    }
+    Ok(class_sources)
+}
+
+fn collect_parsed_class_source(class: &Class, source_file: &FsPath, output: &mut Vec<ClassSource>) {
+    output.push(ClassSource {
+        qualified_name: class.qualified_name.clone(),
+        source_file: source_file.to_owned(),
+        source_range: class.source_range,
+    });
+    for child in &class.children {
+        collect_parsed_class_source(child, source_file, output);
     }
 }
 
