@@ -18047,6 +18047,92 @@ end BoundarySig;
     }
 
     #[test]
+    fn component_edit_history_and_scene_commit_move_together() {
+        let (scene, connection) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let before_points = connection.line.as_ref().expect("test line").points.clone();
+        let after_origin = CorePoint { x: 20.0, y: 30.0 };
+        let after_points = connection_route_for_component_translation(
+            &before_points,
+            CorePoint { x: 0.0, y: 0.0 },
+            0.0,
+            (
+                before_points[0],
+                *before_points.last().expect("line endpoint"),
+            ),
+            true,
+            false,
+            after_origin,
+        );
+
+        let mut committed_scene = scene.clone();
+        committed_scene.components[0].origin = after_origin;
+        let mut committed_connection = connection.clone();
+        committed_connection
+            .line
+            .as_mut()
+            .expect("test line")
+            .points = after_points.clone();
+        committed_scene.connections = vec![committed_connection.clone()];
+
+        assert!(connection_points_match_invariants(
+            &committed_scene,
+            &committed_connection,
+            &after_points,
+        ));
+
+        let command = EditCommand::MoveDiagramComponent {
+            class_name: "Test".to_owned(),
+            component_id: "a-id".to_owned(),
+            before_origin: scene.components[0].origin,
+            after_origin,
+            before_source: "before".to_owned(),
+            after_source: "after".to_owned(),
+            connection_edits: vec![ConnectionLineEdit {
+                connection_key: connection.key.clone(),
+                before_points: before_points.clone(),
+                after_points: after_points.clone(),
+                line_origin: CorePoint { x: 0.0, y: 0.0 },
+            }],
+        };
+        let mut history = Vec::new();
+        let mut redo_history = vec![sample_create_command()];
+        record_successful_edit(&mut history, &mut redo_history, command);
+        assert!(redo_history.is_empty());
+        let Some(EditCommand::MoveDiagramComponent {
+            after_origin: recorded_origin,
+            connection_edits,
+            ..
+        }) = history.last()
+        else {
+            panic!("component edit was not recorded");
+        };
+        assert_eq!(*recorded_origin, after_origin);
+        assert_eq!(connection_edits[0].after_points, after_points);
+
+        let original_component_origin = scene.components[0].origin;
+        let original_connection_points = before_points.clone();
+        let invalid_points = vec![after_origin, *before_points.last().expect("line endpoint")];
+        assert!(!valid_interactive_connection_route(&invalid_points));
+
+        // A failed preflight must not partially apply either side of the edit.
+        assert_eq!(scene.components[0].origin, original_component_origin);
+        assert_eq!(
+            scene.connections[0]
+                .line
+                .as_ref()
+                .expect("test line")
+                .points,
+            original_connection_points
+        );
+        assert_eq!(history.len(), 1);
+        assert!(redo_history.is_empty());
+    }
+
+    #[test]
     fn component_translation_manhattan_fallback_keeps_invalid_preview_orthogonal() {
         let base_route = vec![
             CorePoint { x: 0.0, y: 0.0 },
