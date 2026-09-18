@@ -7841,84 +7841,37 @@ impl App {
         // All connection ranges and expected text come from the same source and
         // scene snapshot. Do not resolve a candidate while building this list.
         let connection_edit_started = Instant::now();
-        let mut connection_source_edits = Vec::with_capacity(connected_connections.len());
-        for snapshot in &connected_connections {
-            if !snapshot.source_editable
-                || !snapshot.preview_route_valid
-                || !valid_interactive_connection_route(&snapshot.preview_points)
-            {
-                continue;
+        let connection_source_edits = match build_component_connection_edits(
+            &current_scene,
+            &class_name,
+            &source_before,
+            &connected_connections,
+        ) {
+            Ok(edits) => edits,
+            Err(error) => {
+                trace_component_edit(
+                    "connection-source-edit-rejected",
+                    &component_id,
+                    &component_name,
+                    &error,
+                );
+                self.load_error = Some(format!("Diagram edit rejected: {error}"));
+                let _ = self.rollback_component_preview(&component_id, &connected_connections);
+                return;
             }
-            let Some(connection) = current_scene
-                .connections
-                .iter()
-                .find(|connection| connection.key == snapshot.connection_key)
-            else {
-                continue;
-            };
-            if connection_source_editable_in_class(connection, &class_name, &source_before).is_err()
-            {
-                continue;
-            }
-            let Some(line) = connection.line.as_ref() else {
-                continue;
-            };
-            if points_nearly_equal(&line.points, &snapshot.preview_points) {
-                continue;
-            }
-            let edit = match connection_points_edit_for_key(
-                &source_before,
-                &current_scene,
-                &snapshot.connection_key,
-                &snapshot.preview_points,
-            ) {
-                Ok(edit) => edit,
-                Err(error) => {
-                    trace_component_edit(
-                        "connection-source-edit-skipped",
-                        &component_id,
-                        &component_name,
-                        format_args!("key={:?} error={error}", snapshot.connection_key),
-                    );
-                    continue;
-                }
-            };
-            connection_source_edits.push((
-                ConnectionLineEdit {
-                    connection_key: snapshot.connection_key.clone(),
-                    before_points: snapshot.source_line_points.clone(),
-                    after_points: snapshot.preview_points.clone(),
-                    line_origin: line.origin,
-                },
-                edit,
-            ));
-        }
+        };
         profile.connection_edit_build = connection_edit_started.elapsed();
 
-        // A failed connection invariant is the only reason to retry. The
-        // normal path is exactly one transaction, one parse and one resolve;
-        // retrying without the invalid connection keeps failures rare and
-        // bounded instead of reverting to one resolve per connection.
-        let mut excluded_connections = HashSet::new();
-        let mut accepted = None;
-        for attempt in 0..2 {
-            let mut source_edits = Vec::with_capacity(1 + connection_source_edits.len());
-            source_edits.push(component_edit.clone());
-            let mut attempt_connection_edits = Vec::with_capacity(connection_source_edits.len());
-            for (connection_edit, source_edit) in &connection_source_edits {
-                if excluded_connections.contains(&connection_edit.connection_key) {
-                    continue;
-                }
-                source_edits.push(source_edit.clone());
-                attempt_connection_edits.push(connection_edit.clone());
-            }
-
-            let validated_started = Instant::now();
-            let validated = match apply_validated_source_edits_with_parsed(
-                &source_before,
-                source_edits,
-                version,
-            ) {
+        let mut source_edits = Vec::with_capacity(1 + connection_source_edits.len());
+        source_edits.push(component_edit);
+        source_edits.extend(
+            connection_source_edits
+                .iter()
+                .map(|(_, source_edit)| source_edit.clone()),
+        );
+        let validated_started = Instant::now();
+        let validated =
+            match apply_validated_source_edits_with_parsed(&source_before, source_edits, version) {
                 Ok(validated) => validated,
                 Err(error) => {
                     profile.transaction_apply += validated_started.elapsed();
@@ -7927,98 +7880,78 @@ impl App {
                     return;
                 }
             };
-            profile.transaction_apply += validated.transaction_apply;
-            profile.parse += validated.parse;
-            profile.parse_count += 1;
-            let candidate = validated.source;
-            let resolve_started = Instant::now();
-            profile.resolve_count += 1;
-            let scenes = self.document.as_ref().and_then(|document| {
-                document
-                    .resolve_candidate_scenes_from_parsed(
-                        &class_name,
-                        &candidate,
-                        &validated.parsed,
-                    )
-                    .ok()
-            });
-            profile.scene_resolve += resolve_started.elapsed();
-            let Some((resolved_icon, resolved_diagram)) = scenes else {
-                self.load_error = Some("Diagram edit could not resolve candidate source".into());
-                let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                return;
-            };
-
-            let validation_started = Instant::now();
-            let Some(resolved_component) = resolved_diagram
-                .components
-                .iter()
-                .find(|component| component.id == component_id)
-            else {
-                profile.validation += validation_started.elapsed();
-                self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-                let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                return;
-            };
-            if !point_nearly_equal(resolved_component.origin, after_origin) {
-                profile.validation += validation_started.elapsed();
-                self.load_error = Some("Diagram edit failed: component origin mismatch".into());
-                let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                return;
-            }
-            let invalid_connections = attempt_connection_edits
-                .iter()
-                .filter_map(|edit| {
-                    let connection = resolved_diagram
-                        .connections
-                        .iter()
-                        .find(|connection| connection.key == edit.connection_key);
-                    match connection {
-                        Some(connection) => connection_invariant_failure(
-                            &resolved_diagram,
-                            connection,
-                            &edit.after_points,
-                        )
-                        .map(|reason| (edit.connection_key.clone(), reason)),
-                        None => Some((
-                            edit.connection_key.clone(),
-                            "connection identity is no longer present",
-                        )),
-                    }
-                })
-                .collect::<Vec<_>>();
-            profile.validation += validation_started.elapsed();
-            if invalid_connections.is_empty() {
-                accepted = Some((
-                    candidate,
-                    resolved_icon,
-                    resolved_diagram,
-                    attempt_connection_edits,
-                ));
-                break;
-            }
-            if attempt == 0 {
-                for (key, reason) in invalid_connections {
-                    excluded_connections.insert(key.clone());
-                    trace_component_edit(
-                        "connection-source-edit-retry",
-                        &component_id,
-                        &component_name,
-                        format_args!("key={key:?} reason={reason}"),
-                    );
-                }
-            } else {
-                self.load_error = Some("Diagram edit failed: connection invariant mismatch".into());
-                let _ = self.rollback_component_preview(&component_id, &connected_connections);
-                return;
-            }
-        }
-
-        let Some((candidate, resolved_icon, resolved_diagram, connection_edits)) = accepted else {
-            self.load_error = Some("Diagram edit rejected: no candidate".into());
+        profile.transaction_apply += validated.transaction_apply;
+        profile.parse += validated.parse;
+        profile.parse_count += 1;
+        let candidate = validated.source;
+        let resolve_started = Instant::now();
+        profile.resolve_count += 1;
+        let scenes = self.document.as_ref().and_then(|document| {
+            document
+                .resolve_candidate_scenes_from_parsed(&class_name, &candidate, &validated.parsed)
+                .ok()
+        });
+        profile.scene_resolve += resolve_started.elapsed();
+        let Some((resolved_icon, resolved_diagram)) = scenes else {
+            self.load_error = Some("Diagram edit could not resolve candidate source".into());
             let _ = self.rollback_component_preview(&component_id, &connected_connections);
             return;
         };
+
+        let validation_started = Instant::now();
+        let Some(resolved_component) = resolved_diagram
+            .components
+            .iter()
+            .find(|component| component.id == component_id)
+        else {
+            profile.validation += validation_started.elapsed();
+            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
+            return;
+        };
+        if !point_nearly_equal(resolved_component.origin, after_origin) {
+            profile.validation += validation_started.elapsed();
+            self.load_error = Some("Diagram edit failed: component origin mismatch".into());
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
+            return;
+        }
+        let invalid_connections = connection_source_edits
+            .iter()
+            .filter_map(|(edit, _)| {
+                let connection = resolved_diagram
+                    .connections
+                    .iter()
+                    .find(|connection| connection.key == edit.connection_key);
+                match connection {
+                    Some(connection) => connection_invariant_failure(
+                        &resolved_diagram,
+                        connection,
+                        &edit.after_points,
+                    )
+                    .map(|reason| (edit.connection_key.clone(), reason)),
+                    None => Some((
+                        edit.connection_key.clone(),
+                        "connection identity is no longer present",
+                    )),
+                }
+            })
+            .collect::<Vec<_>>();
+        profile.validation += validation_started.elapsed();
+        if let Some((key, reason)) = invalid_connections.first() {
+            trace_component_edit(
+                "connection-validation-rejected",
+                &component_id,
+                &component_name,
+                format_args!("key={key:?} reason={reason}"),
+            );
+            self.load_error = Some(format!("Diagram edit failed: connection {key:?}: {reason}"));
+            let _ = self.rollback_component_preview(&component_id, &connected_connections);
+            return;
+        }
+        let connection_edits = connection_source_edits
+            .into_iter()
+            .map(|(connection_edit, _)| connection_edit)
+            .collect::<Vec<_>>();
         let canonical_after_origin = resolved_diagram
             .components
             .iter()
@@ -14057,6 +13990,77 @@ fn component_connection_drag_preflight(
     Ok(())
 }
 
+fn build_component_connection_edits(
+    scene: &CoreDiagramScene,
+    class_name: &str,
+    source: &str,
+    snapshots: &[ConnectionDragSnapshot],
+) -> Result<Vec<(ConnectionLineEdit, SourceEdit)>, String> {
+    let mut edits = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        if !snapshot.source_editable {
+            // Inherited/read-only connections are not written to the current
+            // class. Their display route is rebuilt from semantic endpoints.
+            continue;
+        }
+        if !snapshot.preview_route_valid
+            || !valid_interactive_connection_route(&snapshot.preview_points)
+        {
+            return Err(format!(
+                "connection {:?} has an invalid editable preview route",
+                snapshot.connection_key
+            ));
+        }
+        let connection = scene
+            .connections
+            .iter()
+            .find(|connection| connection.key == snapshot.connection_key)
+            .ok_or_else(|| {
+                format!(
+                    "connection {:?} is missing from the current scene",
+                    snapshot.connection_key
+                )
+            })?;
+        connection_source_editable_in_class(connection, class_name, source).map_err(|error| {
+            format!(
+                "connection {:?} source is no longer editable: {error}",
+                snapshot.connection_key
+            )
+        })?;
+        let line = connection.line.as_ref().ok_or_else(|| {
+            format!(
+                "connection {:?} has no editable Line annotation",
+                snapshot.connection_key
+            )
+        })?;
+        if points_nearly_equal(&line.points, &snapshot.preview_points) {
+            continue;
+        }
+        let source_edit = connection_points_edit_for_key(
+            source,
+            scene,
+            &snapshot.connection_key,
+            &snapshot.preview_points,
+        )
+        .map_err(|error| {
+            format!(
+                "connection {:?} source edit failed: {error}",
+                snapshot.connection_key
+            )
+        })?;
+        edits.push((
+            ConnectionLineEdit {
+                connection_key: snapshot.connection_key.clone(),
+                before_points: snapshot.source_line_points.clone(),
+                after_points: snapshot.preview_points.clone(),
+                line_origin: line.origin,
+            },
+            source_edit,
+        ));
+    }
+    Ok(edits)
+}
+
 fn connection_route_for_component_translation(
     base_route_points: &[CorePoint],
     line_origin: CorePoint,
@@ -18223,6 +18227,60 @@ end BoundarySig;
         assert!(snapshots
             .iter()
             .all(|snapshot| snapshot.preview_route_valid));
+    }
+
+    #[test]
+    fn editable_component_connection_preflight_rejects_invalid_preview() {
+        let (scene, _) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let mut snapshot = connection_drag_snapshots(&scene, "a", "Test", "")
+            .pop()
+            .expect("component connection snapshot");
+        snapshot.source_editable = true;
+        snapshot.preview_route_valid = false;
+        snapshot.preview_points = vec![
+            CorePoint { x: 20.0, y: 30.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+        ];
+
+        let error = build_component_connection_edits(&scene, "Test", "", &[snapshot])
+            .expect_err("editable invalid routes must reject the whole component edit");
+        assert!(error.contains("invalid editable preview route"));
+        assert_eq!(
+            scene.connections[0]
+                .line
+                .as_ref()
+                .expect("source line")
+                .points,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }]
+        );
+    }
+
+    #[test]
+    fn read_only_component_connection_preflight_is_display_only() {
+        let (scene, _) = connection_test_scene(
+            CorePoint { x: 0.0, y: 0.0 },
+            CorePoint { x: 100.0, y: 0.0 },
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }],
+        );
+        let snapshots = connection_drag_snapshots(&scene, "a", "Child", "");
+        assert_eq!(snapshots.len(), 1);
+        assert!(!snapshots[0].source_editable);
+
+        let edits = build_component_connection_edits(&scene, "Child", "", &snapshots)
+            .expect("read-only connections should not create source edits");
+        assert!(edits.is_empty());
+        assert_eq!(
+            scene.connections[0]
+                .line
+                .as_ref()
+                .expect("source line")
+                .points,
+            vec![CorePoint { x: 0.0, y: 0.0 }, CorePoint { x: 100.0, y: 0.0 }]
+        );
     }
 
     #[test]
