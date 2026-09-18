@@ -2655,6 +2655,7 @@ struct UiDocument {
     diagram_connections: usize,
     source_name: String,
     source_lines: Vec<String>,
+    source_max_line_chars: usize,
     source_version: u64,
 }
 
@@ -2664,32 +2665,74 @@ struct SourceHighlightCacheKey {
     source_version: u64,
     dark_theme: bool,
     accent_theme: AccentTheme,
+    pixels_per_point_bits: u32,
+}
+
+#[derive(Default)]
+struct SourceLineCache {
+    number_galley: Option<Arc<egui::Galley>>,
+    code_galley: Option<Arc<egui::Galley>>,
 }
 
 #[derive(Default)]
 struct SourceHighlightCache {
     key: Option<SourceHighlightCacheKey>,
-    lines: Vec<Option<LayoutJob>>,
+    lines: Vec<SourceLineCache>,
+    max_line_width: f32,
+    cache_hits: usize,
+    cache_misses: usize,
 }
 
 impl SourceHighlightCache {
-    fn prepare(&mut self, document: &UiDocument) {
+    fn prepare(&mut self, document: &UiDocument, pixels_per_point: f32) {
         let key = SourceHighlightCacheKey {
             selected_class: document.selected_class.clone(),
             source_version: document.source_version,
             dark_theme: is_dark_theme(),
             accent_theme: active_accent(),
+            pixels_per_point_bits: pixels_per_point.to_bits(),
         };
         if self.key.as_ref() != Some(&key) || self.lines.len() != document.source_lines.len() {
             self.key = Some(key);
-            self.lines = (0..document.source_lines.len()).map(|_| None).collect();
+            self.lines = (0..document.source_lines.len())
+                .map(|_| SourceLineCache::default())
+                .collect();
+            self.max_line_width = 0.0;
+            self.cache_hits = 0;
+            self.cache_misses = 0;
         }
     }
 
-    fn layout_job(&mut self, document: &UiDocument, row: usize) -> (LayoutJob, Duration) {
-        self.prepare(document);
-        if let Some(job) = self.lines.get(row).and_then(Option::as_ref) {
-            return (job.clone(), Duration::ZERO);
+    fn content_width(&mut self, ui: &egui::Ui, document: &UiDocument) -> f32 {
+        self.prepare(document, ui.ctx().pixels_per_point());
+        if self.max_line_width == 0.0 {
+            let probe = ui.painter().layout_no_wrap(
+                "M".to_owned(),
+                ui_mono_font(12.0),
+                Color32::PLACEHOLDER,
+            );
+            // Keep the horizontal extent stable before long or Unicode rows
+            // become visible during a virtualized scroll.
+            self.max_line_width =
+                document.source_max_line_chars as f32 * probe.size().x * 1.25 + 8.0;
+        }
+        (SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP + self.max_line_width).max(ui.available_width())
+    }
+
+    fn galleys(
+        &mut self,
+        ui: &egui::Ui,
+        document: &UiDocument,
+        row: usize,
+    ) -> (Arc<egui::Galley>, Arc<egui::Galley>, Duration) {
+        self.prepare(document, ui.ctx().pixels_per_point());
+        if let Some(line) = self.lines.get(row) {
+            if let (Some(number_galley), Some(code_galley)) =
+                (&line.number_galley, &line.code_galley)
+            {
+                self.cache_hits += 1;
+                return (number_galley.clone(), code_galley.clone(), Duration::ZERO);
+            }
         }
         let started = Instant::now();
         let job = modelica_layout_job(
@@ -2697,11 +2740,20 @@ impl SourceHighlightCache {
             &document.full_class_names,
             &document.short_class_names,
         );
+        let code_galley = ui.painter().layout_job(job);
+        let number_galley = ui.painter().layout_no_wrap(
+            format!("{:>4}", row + 1),
+            ui_mono_font(13.0),
+            theme_text_tertiary(),
+        );
         let elapsed = started.elapsed();
-        if let Some(cached) = self.lines.get_mut(row) {
-            *cached = Some(job.clone());
+        self.cache_misses += 1;
+        self.max_line_width = self.max_line_width.max(code_galley.size().x);
+        if let Some(line) = self.lines.get_mut(row) {
+            line.number_galley = Some(number_galley.clone());
+            line.code_galley = Some(code_galley.clone());
         }
-        (job, elapsed)
+        (number_galley, code_galley, elapsed)
     }
 }
 
@@ -3056,6 +3108,12 @@ impl LoadedDocument {
             .as_deref()
             .and_then(|class_name| self.class_source(class_name))
             .unwrap_or_default();
+        let source_lines = source.lines().map(str::to_owned).collect::<Vec<_>>();
+        let source_max_line_chars = source_lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or_default();
         let icon_graphics = selected_class
             .as_deref()
             .and_then(|class_name| self.icon(class_name))
@@ -3103,7 +3161,8 @@ impl LoadedDocument {
             diagram_unresolved_bases,
             diagram_connections,
             source_name,
-            source_lines: source.lines().map(str::to_owned).collect(),
+            source_lines,
+            source_max_line_chars,
             source_version,
         }
     }
@@ -11056,6 +11115,8 @@ fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
 
 const SOURCE_ROW_HEIGHT: f32 = 20.0;
 const SOURCE_HEADER_HEIGHT: f32 = 24.0;
+const SOURCE_LINE_NUMBER_WIDTH: f32 = 40.0;
+const SOURCE_LINE_GAP: f32 = 12.0;
 const SOURCE_SCROLL_NOTCH_ROWS: f32 = 2.75;
 const SOURCE_SCROLL_SMOOTH_SECONDS: f32 = 0.09;
 const SOURCE_SCROLL_EPSILON: f32 = 0.25;
@@ -11218,6 +11279,7 @@ fn source_preview(
             let scroll_delta = ui.input(|input| input.raw_scroll_delta);
             let pointer_position = ui.ctx().pointer_latest_pos();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
+            let source_content_width = source_highlight_cache.content_width(ui, document);
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
             let mut state_before =
                 egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
@@ -11248,10 +11310,15 @@ fn source_preview(
                     |ui, row_range| {
                         visible_rows += row_range.len();
                         for row in row_range {
-                            let (layout_job, elapsed) =
-                                source_highlight_cache.layout_job(document, row);
+                            let (number_galley, code_galley, elapsed) =
+                                source_highlight_cache.galleys(ui, document, row);
                             highlight_time += elapsed;
-                            render_source_line(ui, row, layout_job);
+                            render_source_line(
+                                ui,
+                                number_galley,
+                                code_galley,
+                                source_content_width,
+                            );
                         }
                     },
                 );
@@ -11304,21 +11371,32 @@ fn source_preview(
     });
 }
 
-fn render_source_line(ui: &mut egui::Ui, row: usize, layout_job: LayoutJob) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(SOURCE_ROW_HEIGHT);
-        ui.label(
-            RichText::new(format!("{:>4}", row + 1))
-                .monospace()
-                .size(13.0)
-                .color(theme_text_tertiary()),
-        );
-        ui.add(
-            egui::Label::new(layout_job)
-                .wrap_mode(egui::TextWrapMode::Extend)
-                .selectable(false),
-        );
-    });
+fn render_source_line(
+    ui: &mut egui::Ui,
+    number_galley: Arc<egui::Galley>,
+    code_galley: Arc<egui::Galley>,
+    content_width: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(content_width.max(ui.available_width()), SOURCE_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let painter = ui.painter();
+    let number_y = rect.top() + (SOURCE_ROW_HEIGHT - number_galley.size().y) * 0.5;
+    let code_y = rect.top() + (SOURCE_ROW_HEIGHT - code_galley.size().y) * 0.5;
+    painter.galley(
+        Pos2::new(rect.left(), number_y),
+        number_galley,
+        theme_text_tertiary(),
+    );
+    painter.galley(
+        Pos2::new(
+            rect.left() + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
+            code_y,
+        ),
+        code_galley,
+        theme_text_primary(),
+    );
 }
 
 fn trace_source_scroll(
