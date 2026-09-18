@@ -4669,6 +4669,11 @@ struct DragProfile {
     gpu_upload: Duration,
     scene_scan: Duration,
     egui_tessellation: Duration,
+    egui_run: Duration,
+    texture_update: Duration,
+    update_buffers: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
     ui: Duration,
     encode: Duration,
     present: Duration,
@@ -4691,6 +4696,11 @@ impl DragProfile {
             gpu_upload: Duration::ZERO,
             scene_scan: Duration::ZERO,
             egui_tessellation: Duration::ZERO,
+            egui_run: Duration::ZERO,
+            texture_update: Duration::ZERO,
+            update_buffers: Duration::ZERO,
+            scene_encode: Duration::ZERO,
+            queue_submit: Duration::ZERO,
             ui: Duration::ZERO,
             encode: Duration::ZERO,
             present: Duration::ZERO,
@@ -4741,6 +4751,11 @@ impl DragProfile {
         total: Duration,
         scene_scan: Duration,
         egui_tessellation: Duration,
+        egui_run: Duration,
+        texture_update: Duration,
+        update_buffers: Duration,
+        scene_encode: Duration,
+        queue_submit: Duration,
     ) {
         if !self.enabled {
             return;
@@ -4748,6 +4763,11 @@ impl DragProfile {
         self.frames += 1;
         self.scene_scan += scene_scan;
         self.egui_tessellation += egui_tessellation;
+        self.egui_run += egui_run;
+        self.texture_update += texture_update;
+        self.update_buffers += update_buffers;
+        self.scene_encode += scene_encode;
+        self.queue_submit += queue_submit;
         self.ui += ui;
         self.encode += encode;
         self.present += present;
@@ -4776,7 +4796,7 @@ impl DragProfile {
         };
         let micros = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
         eprintln!(
-            "drag-profile: events={} frames={} p50_ms={:.2} p95_ms={:.2} worst_ms={:.2} preview_update_us={:.1} input_us={:.1} interaction_clone_us={:.1} snap_us={:.1} reanchor_us={:.1} tessellation_us={:.1} gpu_upload_us={:.1} scene_scan_us={:.1} egui_tessellation_us={:.1} ui_us={:.1} encode_us={:.1} present_us={:.1}",
+            "drag-profile: events={} frames={} p50_ms={:.2} p95_ms={:.2} worst_ms={:.2} preview_update_us={:.1} input_us={:.1} interaction_clone_us={:.1} snap_us={:.1} reanchor_us={:.1} tessellation_us={:.1} gpu_upload_us={:.1} scene_scan_us={:.1} egui_run_us={:.1} egui_tessellation_us={:.1} texture_update_us={:.1} egui_update_buffers_us={:.1} scene_encode_us={:.1} queue_submit_us={:.1} ui_us={:.1} encode_us={:.1} present_us={:.1}",
             self.events,
             self.frames,
             percentile(0.50),
@@ -4790,7 +4810,12 @@ impl DragProfile {
             micros(self.tessellation),
             micros(self.gpu_upload),
             micros(self.scene_scan),
+            micros(self.egui_run),
             micros(self.egui_tessellation),
+            micros(self.texture_update),
+            micros(self.update_buffers),
+            micros(self.scene_encode),
+            micros(self.queue_submit),
             micros(self.ui),
             micros(self.encode),
             micros(self.present),
@@ -4806,7 +4831,12 @@ impl DragProfile {
         self.tessellation = Duration::ZERO;
         self.gpu_upload = Duration::ZERO;
         self.scene_scan = Duration::ZERO;
+        self.egui_run = Duration::ZERO;
         self.egui_tessellation = Duration::ZERO;
+        self.texture_update = Duration::ZERO;
+        self.update_buffers = Duration::ZERO;
+        self.scene_encode = Duration::ZERO;
+        self.queue_submit = Duration::ZERO;
         self.ui = Duration::ZERO;
         self.encode = Duration::ZERO;
         self.present = Duration::ZERO;
@@ -10066,6 +10096,11 @@ impl App {
                 total,
                 scene_scan,
                 egui_tessellation,
+                egui_run,
+                texture_update,
+                update_buffers,
+                source_scene_encode,
+                queue_submit,
             );
         }
         if self.connection_creation_active() {
