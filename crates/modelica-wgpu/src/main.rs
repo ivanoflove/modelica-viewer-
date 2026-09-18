@@ -15484,6 +15484,10 @@ fn main() {
                             }
                         }
                         WindowEvent::MouseInput { state, button, .. } => {
+                            if app.pending_document_action.is_some() {
+                                app.request_redraw();
+                                return;
+                            }
                             // A connection-creation click must not clone the
                             // current selection before entering its hot path.
                             let selection_before = (!app.connection_creation_active())
