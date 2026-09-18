@@ -785,6 +785,11 @@ mod save_tests {
             error.contains("overlapping source edits"),
             "unexpected error: {error}"
         );
+        assert!(error.contains("Parent"), "parent name missing: {error}");
+        assert!(
+            error.contains("Parent.Child"),
+            "child name missing: {error}"
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
         let _ = fs::remove_dir_all(&directory);
     }
