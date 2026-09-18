@@ -8598,7 +8598,7 @@ impl App {
         self.rebuild_selected_scenes();
     }
 
-    fn apply_edit_command(&mut self, command: &EditCommand, after: bool) {
+    fn apply_edit_command(&mut self, command: &EditCommand, after: bool) -> Result<(), String> {
         match command {
             EditCommand::MoveIconGraphic {
                 class_name,
@@ -8614,20 +8614,22 @@ impl App {
                 } else {
                     before_geometry
                 };
-                let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
-                        document.resolve_candidate_scenes(class_name, source).ok()
-                    })
-                else {
-                    return;
-                };
+                let document = self
+                    .document
+                    .as_ref()
+                    .ok_or_else(|| "icon undo/redo failed: no document is open".to_owned())?;
+                let (resolved_icon, resolved_diagram) = document
+                    .resolve_candidate_scenes(class_name, source)
+                    .map_err(|error| format!("icon undo/redo candidate failed: {error}"))?;
                 if !resolved_icon.graphics.iter().any(|graphic| {
                     graphic.id.0 == *graphic_id && graphic.graphic == *expected_geometry
                 }) {
-                    return;
+                    return Err(format!(
+                        "icon undo/redo failed: graphic `{graphic_id}` no longer matches"
+                    ));
                 }
                 let Some(document) = self.document.as_mut() else {
-                    return;
+                    return Err("icon undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, source.clone());
                 document.replace_icon(class_name, resolved_icon);
@@ -8644,18 +8646,20 @@ impl App {
             } => {
                 let source = if after { after_source } else { before_source };
                 let expected_origin = if after { *after_origin } else { *before_origin };
-                let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
-                        document.resolve_candidate_scenes(class_name, source).ok()
-                    })
-                else {
-                    return;
-                };
+                let document = self
+                    .document
+                    .as_ref()
+                    .ok_or_else(|| "component undo/redo failed: no document is open".to_owned())?;
+                let (resolved_icon, resolved_diagram) = document
+                    .resolve_candidate_scenes(class_name, source)
+                    .map_err(|error| format!("component undo/redo candidate failed: {error}"))?;
                 if !resolved_diagram.components.iter().any(|component| {
                     component.id == *component_id
                         && point_nearly_equal(component.origin, expected_origin)
                 }) {
-                    return;
+                    return Err(format!(
+                        "component undo/redo failed: component `{component_id}` no longer matches"
+                    ));
                 }
                 for edit in connection_edits {
                     let expected_points = if after {
@@ -8668,10 +8672,16 @@ impl App {
                         .iter()
                         .find(|connection| connection.key == edit.connection_key)
                     else {
-                        return;
+                        return Err(format!(
+                            "component undo/redo failed: connection {:?} is missing",
+                            edit.connection_key
+                        ));
                     };
                     let Some(line) = connection.line.as_ref() else {
-                        return;
+                        return Err(format!(
+                            "component undo/redo failed: connection {:?} has no Line",
+                            edit.connection_key
+                        ));
                     };
                     if !point_nearly_equal(line.origin, edit.line_origin)
                         || !connection_points_match_invariants(
@@ -8680,11 +8690,14 @@ impl App {
                             expected_points,
                         )
                     {
-                        return;
+                        return Err(format!(
+                            "component undo/redo failed: connection {:?} geometry no longer matches",
+                            edit.connection_key
+                        ));
                     }
                 }
                 let Some(document) = self.document.as_mut() else {
-                    return;
+                    return Err("component undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, source.clone());
                 document.replace_icon(class_name, resolved_icon);
@@ -8699,49 +8712,53 @@ impl App {
             } => {
                 let expected_points = if after { after_points } else { before_points };
                 let Some(document) = self.document.as_ref() else {
-                    return;
+                    return Err("connection undo/redo failed: no document is open".to_owned());
                 };
                 let Some(source) = document.class_text(class_name) else {
-                    return;
+                    return Err(format!(
+                        "connection undo/redo failed: class `{class_name}` is missing"
+                    ));
                 };
                 let Some(scene) = document.diagram(class_name) else {
-                    return;
+                    return Err(format!(
+                        "connection undo/redo failed: class `{class_name}` has no Diagram"
+                    ));
                 };
                 let version = document.source_version(class_name);
-                let Ok(edit) =
+                let edit =
                     connection_points_edit_for_key(&source, scene, connection_key, expected_points)
-                else {
-                    return;
-                };
-                let Ok(candidate) = apply_validated_source_edits(&source, vec![edit], version)
-                else {
-                    return;
-                };
-                let Some((resolved_icon, resolved_diagram)) = document
+                        .map_err(|error| {
+                            format!("connection undo/redo source is stale: {error}")
+                        })?;
+                let candidate = apply_validated_source_edits(&source, vec![edit], version)
+                    .map_err(|error| {
+                        format!("connection undo/redo source patch failed: {error}")
+                    })?;
+                let (resolved_icon, resolved_diagram) = document
                     .resolve_candidate_scenes(class_name, &candidate)
-                    .ok()
-                else {
-                    return;
-                };
+                    .map_err(|error| format!("connection undo/redo candidate failed: {error}"))?;
                 let Some(connection) = resolved_diagram
                     .connections
                     .iter()
                     .find(|connection| connection.key == *connection_key)
                 else {
-                    return;
+                    return Err(format!(
+                        "connection undo/redo failed: connection {:?} is missing",
+                        connection_key
+                    ));
                 };
-                if connection_invariant_failure_with_constraint(
+                if let Some(reason) = connection_invariant_failure_with_constraint(
                     &resolved_diagram,
                     connection,
                     expected_points,
                     Some(*endpoint_constraint),
-                )
-                .is_some()
-                {
-                    return;
+                ) {
+                    return Err(format!(
+                        "connection undo/redo failed: geometry validation failed: {reason}"
+                    ));
                 }
                 let Some(document) = self.document.as_mut() else {
-                    return;
+                    return Err("connection undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, candidate);
                 document.replace_icon(class_name, resolved_icon);
@@ -8754,22 +8771,28 @@ impl App {
                 after_source,
             } => {
                 let source = if after { after_source } else { before_source };
-                let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
-                        document.resolve_candidate_scenes(class_name, source).ok()
-                    })
-                else {
-                    return;
-                };
+                let document = self.document.as_ref().ok_or_else(|| {
+                    "connection creation undo/redo failed: no document is open".to_owned()
+                })?;
+                let (resolved_icon, resolved_diagram) = document
+                    .resolve_candidate_scenes(class_name, source)
+                    .map_err(|error| {
+                        format!("connection creation undo/redo candidate failed: {error}")
+                    })?;
                 let has_connection = resolved_diagram
                     .connections
                     .iter()
                     .any(|connection| connection.key == *connection_key);
                 if has_connection != after {
-                    return;
+                    return Err(format!(
+                        "connection creation undo/redo failed: connection {:?} presence mismatch",
+                        connection_key
+                    ));
                 }
                 let Some(document) = self.document.as_mut() else {
-                    return;
+                    return Err(
+                        "connection creation undo/redo failed: document disappeared".to_owned()
+                    );
                 };
                 document.set_class_text(class_name, source.clone());
                 document.replace_icon(class_name, resolved_icon);
@@ -8786,18 +8809,20 @@ impl App {
             } => {
                 let source = if after { after_source } else { before_source };
                 let expected_extent = if after { after_extent } else { before_extent };
-                let Some((resolved_icon, resolved_diagram)) =
-                    self.document.as_ref().and_then(|document| {
-                        document.resolve_candidate_scenes(class_name, source).ok()
-                    })
-                else {
-                    return;
-                };
+                let document = self
+                    .document
+                    .as_ref()
+                    .ok_or_else(|| "resize undo/redo failed: no document is open".to_owned())?;
+                let (resolved_icon, resolved_diagram) = document
+                    .resolve_candidate_scenes(class_name, source)
+                    .map_err(|error| format!("resize undo/redo candidate failed: {error}"))?;
                 if !resolved_diagram.components.iter().any(|component| {
                     component.id == *component_id
                         && component.placement_extent == Some(*expected_extent)
                 }) {
-                    return;
+                    return Err(format!(
+                        "resize undo/redo failed: component `{component_id}` extent no longer matches"
+                    ));
                 }
                 for edit in connection_edits {
                     let expected_points = if after {
@@ -8810,10 +8835,16 @@ impl App {
                         .iter()
                         .find(|connection| connection.key == edit.connection_key)
                     else {
-                        return;
+                        return Err(format!(
+                            "resize undo/redo failed: connection {:?} is missing",
+                            edit.connection_key
+                        ));
                     };
                     let Some(line) = connection.line.as_ref() else {
-                        return;
+                        return Err(format!(
+                            "resize undo/redo failed: connection {:?} has no Line",
+                            edit.connection_key
+                        ));
                     };
                     if !point_nearly_equal(line.origin, edit.line_origin)
                         || !connection_points_match_invariants(
@@ -8822,11 +8853,14 @@ impl App {
                             expected_points,
                         )
                     {
-                        return;
+                        return Err(format!(
+                            "resize undo/redo failed: connection {:?} geometry no longer matches",
+                            edit.connection_key
+                        ));
                     }
                 }
                 let Some(document) = self.document.as_mut() else {
-                    return;
+                    return Err("resize undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, source.clone());
                 document.replace_icon(class_name, resolved_icon);
@@ -8835,22 +8869,37 @@ impl App {
         }
         self.load_error = None;
         self.rebuild_selected_scenes();
+        Ok(())
     }
 
     fn undo(&mut self) {
-        let Some(command) = self.history.pop() else {
+        let Some(command) = self.history.last().cloned() else {
             return;
         };
-        self.apply_edit_command(&command, false);
-        self.redo_history.push(command);
+        match self.apply_edit_command(&command, false) {
+            Ok(()) => {
+                self.history.pop();
+                self.redo_history.push(command);
+            }
+            Err(error) => {
+                self.load_error = Some(format!("Undo failed: {error}"));
+            }
+        }
     }
 
     fn redo(&mut self) {
-        let Some(command) = self.redo_history.pop() else {
+        let Some(command) = self.redo_history.last().cloned() else {
             return;
         };
-        self.apply_edit_command(&command, true);
-        self.history.push(command);
+        match self.apply_edit_command(&command, true) {
+            Ok(()) => {
+                self.redo_history.pop();
+                self.history.push(command);
+            }
+            Err(error) => {
+                self.load_error = Some(format!("Redo failed: {error}"));
+            }
+        }
     }
 
     fn persist_edits(&mut self) -> Result<usize, String> {
