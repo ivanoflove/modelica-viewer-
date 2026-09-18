@@ -4747,30 +4747,24 @@ impl DragProfile {
         &mut self,
         ui: Duration,
         encode: Duration,
-        present: Duration,
         total: Duration,
         scene_scan: Duration,
-        egui_tessellation: Duration,
-        egui_run: Duration,
-        texture_update: Duration,
-        update_buffers: Duration,
-        scene_encode: Duration,
-        queue_submit: Duration,
+        timings: FrameStageTimings,
     ) {
         if !self.enabled {
             return;
         }
         self.frames += 1;
         self.scene_scan += scene_scan;
-        self.egui_tessellation += egui_tessellation;
-        self.egui_run += egui_run;
-        self.texture_update += texture_update;
-        self.update_buffers += update_buffers;
-        self.scene_encode += scene_encode;
-        self.queue_submit += queue_submit;
+        self.egui_tessellation += timings.egui_tessellation;
+        self.egui_run += timings.egui_run;
+        self.texture_update += timings.texture_update;
+        self.update_buffers += timings.update_buffers;
+        self.scene_encode += timings.scene_encode;
+        self.queue_submit += timings.queue_submit;
         self.ui += ui;
         self.encode += encode;
-        self.present += present;
+        self.present += timings.present;
         if self.frame_samples.len() == 240 {
             self.frame_samples.pop_front();
         }
@@ -10092,15 +10086,18 @@ impl App {
             self.drag_profile.record_frame(
                 ui_done,
                 render_encode,
-                total.saturating_sub(gpu_uploaded),
                 total,
                 scene_scan,
-                egui_tessellation,
-                egui_run,
-                texture_update,
-                update_buffers,
-                source_scene_encode,
-                queue_submit,
+                FrameStageTimings {
+                    egui_run,
+                    egui_tessellation,
+                    texture_update,
+                    update_buffers,
+                    scene_encode: source_scene_encode,
+                    queue_submit,
+                    present,
+                    frame_total: total,
+                },
             );
         }
         if self.connection_creation_active() {
@@ -10142,7 +10139,7 @@ impl App {
         let source_frame_seen = if let Some(profile) = self.source_perf_frame.take() {
             trace_source_frame(
                 profile,
-                SourceFrameTimings {
+                FrameStageTimings {
                     egui_run,
                     egui_tessellation,
                     texture_update,
@@ -11531,7 +11528,7 @@ fn trace_source_scroll(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SourceFrameTimings {
+struct FrameStageTimings {
     egui_run: Duration,
     egui_tessellation: Duration,
     texture_update: Duration,
@@ -11542,7 +11539,7 @@ struct SourceFrameTimings {
     frame_total: Duration,
 }
 
-fn trace_source_frame(profile: SourcePerfFrame, timings: SourceFrameTimings) {
+fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
     if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_none() {
         return;
     }
