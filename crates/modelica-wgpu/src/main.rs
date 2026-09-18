@@ -864,6 +864,31 @@ mod save_tests {
     }
 
     #[test]
+    fn save_after_undo_and_redo_sequence_keeps_source_state_consistent() {
+        let directory = temp_directory("save-undo-redo");
+        let source = "model A\n  Real value;\nend A;\n";
+        let changed = "model A\n  Real changed;\nend A;";
+        let path = directory.join("UndoRedo.mo");
+        fs::write(&path, source).unwrap();
+        let mut document = LoadedDocument::load(&path).expect("load undo/redo fixture");
+        let original_text = document.class_text("A").expect("original class text");
+
+        document.set_class_text("A", changed.to_owned());
+        assert_eq!(save_edited_classes(&mut document).unwrap(), 1);
+        let saved_disk = fs::read_to_string(&path).unwrap();
+        assert!(saved_disk.contains("Real changed;"));
+        document.set_class_text("A", original_text);
+        assert_eq!(save_edited_classes(&mut document).unwrap(), 1);
+        let undone_disk = fs::read_to_string(&path).unwrap();
+        assert!(undone_disk.contains("Real value;"));
+
+        document.set_class_text("A", changed.to_owned());
+        assert_eq!(save_edited_classes(&mut document).unwrap(), 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved_disk);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn save_refuses_to_overwrite_a_file_changed_on_disk() {
         let directory = temp_directory("tamper");
         let content = "class A model M end A; class B model N end B;";
