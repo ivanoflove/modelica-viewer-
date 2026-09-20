@@ -12,6 +12,7 @@ use std::{
 };
 
 use bytemuck::{Pod, Zeroable};
+use egui::epaint::TextShape;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, Layout, Margin,
@@ -82,6 +83,8 @@ const ROUTE_REPAIR_MAX_DETOUR_RATIO: f32 = 4.0;
 const DIAGRAM_HIT_GRID_CELL_SIZE: f32 = 64.0;
 const UI_FONT_MEDIUM: &str = "modelica-ui-medium";
 const UI_FONT_SEMIBOLD: &str = "modelica-ui-semibold";
+const UI_FONT_ITALIC: &str = "modelica-ui-italic";
+const UI_FONT_SEMIBOLD_ITALIC: &str = "modelica-ui-semibold-italic";
 const UI_FONT_MONO: &str = "modelica-ui-mono";
 const UI_FONT_SYMBOLS: &str = "modelica-ui-symbols";
 
@@ -3360,6 +3363,22 @@ fn install_ui_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/opentype/inter/Inter-SemiBold.otf",
         "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
     ];
+    let italic_candidates = [
+        r"C:\Windows\Fonts\Inter-Italic.ttf",
+        r"C:\Windows\Fonts\NotoSans-Italic.ttf",
+        "/usr/share/fonts/inter/Inter-Italic.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-Italic.ttf",
+        "/usr/share/fonts/opentype/inter/Inter-Italic.otf",
+        "/usr/share/fonts/noto/NotoSans-Italic.ttf",
+    ];
+    let semibold_italic_candidates = [
+        r"C:\Windows\Fonts\Inter-SemiBoldItalic.ttf",
+        r"C:\Windows\Fonts\NotoSans-SemiBoldItalic.ttf",
+        "/usr/share/fonts/inter/Inter-SemiBoldItalic.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-SemiBoldItalic.ttf",
+        "/usr/share/fonts/opentype/inter/Inter-SemiBoldItalic.otf",
+        "/usr/share/fonts/noto/NotoSans-SemiBoldItalic.ttf",
+    ];
     // Keep CJK UI text legible on all supported desktops. The environment
     // override is useful for portable builds that ship their own font file.
     let cjk_override = std::env::var("MODELICA_VIEWER_CJK_FONT").ok();
@@ -3397,6 +3416,14 @@ fn install_ui_fonts(ctx: &egui::Context) {
         .iter()
         .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
     let semibold_path = semibold.as_ref().map(|(path, _)| *path);
+    let italic = italic_candidates
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let italic_path = italic.as_ref().map(|(path, _)| *path);
+    let semibold_italic = semibold_italic_candidates
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
+    let semibold_italic_path = semibold_italic.as_ref().map(|(path, _)| *path);
     let cjk = cjk_candidates
         .iter()
         .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)));
@@ -3441,6 +3468,23 @@ fn install_ui_fonts(ctx: &egui::Context) {
         // out.
         medium_key.clone()
     };
+    let italic_key = if let Some((_, bytes)) = italic {
+        fonts
+            .font_data
+            .insert(UI_FONT_ITALIC.to_owned(), FontData::from_owned(bytes));
+        UI_FONT_ITALIC.to_owned()
+    } else {
+        medium_key.clone()
+    };
+    let semibold_italic_key = if let Some((_, bytes)) = semibold_italic {
+        fonts.font_data.insert(
+            UI_FONT_SEMIBOLD_ITALIC.to_owned(),
+            FontData::from_owned(bytes),
+        );
+        UI_FONT_SEMIBOLD_ITALIC.to_owned()
+    } else {
+        semibold_key.clone()
+    };
     let cjk_key = cjk.map(|(_, bytes)| {
         let key = "modelica-cjk".to_owned();
         fonts
@@ -3467,17 +3511,38 @@ fn install_ui_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(FontFamily::Name(UI_FONT_MEDIUM.into()), ui_fallback.clone());
-    let mut semibold_fallback = vec![semibold_key, medium_key.clone()];
+    let mut semibold_fallback = vec![semibold_key.clone(), medium_key.clone()];
     if let Some(cjk_key) = cjk_key.as_ref() {
         semibold_fallback.push(cjk_key.clone());
     }
     if let Some(symbols_key) = symbols_key.as_ref() {
         semibold_fallback.push(symbols_key.clone());
     }
-    semibold_fallback.extend(default_proportional);
+    semibold_fallback.extend(default_proportional.clone());
     fonts
         .families
         .insert(FontFamily::Name(UI_FONT_SEMIBOLD.into()), semibold_fallback);
+    let mut italic_fallback = vec![italic_key, medium_key.clone()];
+    if let Some(cjk_key) = cjk_key.as_ref() {
+        italic_fallback.push(cjk_key.clone());
+    }
+    italic_fallback.extend(default_proportional.clone());
+    fonts
+        .families
+        .insert(FontFamily::Name(UI_FONT_ITALIC.into()), italic_fallback);
+    let mut semibold_italic_fallback = vec![
+        semibold_italic_key,
+        semibold_key.clone(),
+        medium_key.clone(),
+    ];
+    if let Some(cjk_key) = cjk_key.as_ref() {
+        semibold_italic_fallback.push(cjk_key.clone());
+    }
+    semibold_italic_fallback.extend(default_proportional.clone());
+    fonts.families.insert(
+        FontFamily::Name(UI_FONT_SEMIBOLD_ITALIC.into()),
+        semibold_italic_fallback,
+    );
     let mut mono_fallback = default_monospace;
     mono_fallback.insert(0, medium_key.clone());
     if let Some(cjk_key) = cjk_key.as_ref() {
@@ -3493,6 +3558,12 @@ fn install_ui_fonts(ctx: &egui::Context) {
     }
     if let Some(path) = semibold_path {
         eprintln!("modelica-wgpu: installed semibold UI font from {path}");
+    }
+    if let Some(path) = italic_path {
+        eprintln!("modelica-wgpu: installed italic model text font from {path}");
+    }
+    if let Some(path) = semibold_italic_path {
+        eprintln!("modelica-wgpu: installed semibold italic model text font from {path}");
     }
     if let Some(path) = cjk_path {
         eprintln!("modelica-wgpu: installed CJK fallback font from {path}");
@@ -3617,10 +3688,18 @@ struct ModelTextOverlayItem {
     text: String,
     corners: [CorePoint; 4],
     color: [u8; 3],
-    font_size: f32,
+    font_size: Option<f32>,
+    font_name: Option<String>,
     scale: f32,
+    scale_x: f32,
+    scale_y: f32,
+    extent_width: f32,
+    extent_height: f32,
+    angle: f32,
     alignment: ModelTextAlignment,
     bold: bool,
+    italic: bool,
+    underline: bool,
     minimum_screen_px: f32,
 }
 
@@ -12285,10 +12364,21 @@ fn model_text_overlay_item(
         text: resolve_modelica_text(&text.text, context),
         corners,
         color: text.color,
-        font_size: text.font_size.unwrap_or(10.0),
+        font_size: text.font_size,
+        font_name: text.font_name.clone(),
         scale: transform_scale(transform),
+        scale_x: transform.scale_x,
+        scale_y: transform.scale_y,
+        extent_width: (extent.p2.x - extent.p1.x).abs(),
+        extent_height: (extent.p2.y - extent.p1.y).abs(),
+        angle: text.rotation + transform.rotation,
         alignment: model_text_alignment(text.horizontal_alignment.as_deref()),
         bold: text.text_style.iter().any(|style| style.contains("Bold")),
+        italic: text.text_style.iter().any(|style| style.contains("Italic")),
+        underline: text
+            .text_style
+            .iter()
+            .any(|style| style.contains("UnderLine") || style.contains("Underline")),
         minimum_screen_px: if text.text.contains("%name") {
             MIN_SCREEN_MODEL_NAME_TEXT_PX
         } else {
@@ -12364,39 +12454,125 @@ fn draw_model_text_overlay(
             continue;
         }
         let screen_corners = item.corners.map(to_screen);
-        let min_x = screen_corners
-            .iter()
-            .map(|point| point.x)
-            .fold(f32::INFINITY, f32::min);
-        let max_x = screen_corners
-            .iter()
-            .map(|point| point.x)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let center_y = screen_corners.iter().map(|point| point.y).sum::<f32>() / 4.0;
-        let (position, align) = match item.alignment {
-            ModelTextAlignment::Left => (Pos2::new(min_x, center_y), Align2::LEFT_CENTER),
-            ModelTextAlignment::Center => (
-                Pos2::new((min_x + max_x) * 0.5, center_y),
-                Align2::CENTER_CENTER,
-            ),
-            ModelTextAlignment::Right => (Pos2::new(max_x, center_y), Align2::RIGHT_CENTER),
+        let x_axis = screen_corners[1] - screen_corners[0];
+        let y_axis = screen_corners[3] - screen_corners[0];
+        let alignment_fraction = match item.alignment {
+            ModelTextAlignment::Left => 0.0,
+            ModelTextAlignment::Center => 0.5,
+            ModelTextAlignment::Right => 1.0,
         };
-        let font_size = (item.font_size * item.scale * zoom)
-            .max(item.minimum_screen_px / pixels_per_point)
-            .min(28.0);
-        let font = if item.bold {
-            ui_semibold_font(font_size)
+        // A mirrored placement changes the box's x direction, but it must
+        // not mirror the glyphs themselves. Use the matching visual side as
+        // the alignment anchor and keep the font orientation readable.
+        let alignment_fraction = if item.scale_x < 0.0 {
+            1.0 - alignment_fraction
         } else {
-            ui_font(font_size)
+            alignment_fraction
         };
-        painter.text(
-            position,
-            align,
-            &item.text,
-            font,
-            Color32::from_rgb(item.color[0], item.color[1], item.color[2]),
+        let anchor = screen_corners[0] + x_axis * alignment_fraction + y_axis * 0.5;
+        let angle = if diagram {
+            -item.angle.to_radians()
+        } else {
+            item.angle.to_radians()
+        };
+        let color = Color32::from_rgb(item.color[0], item.color[1], item.color[2]);
+        let available_width =
+            (item.extent_width * item.scale_x.abs() * zoom / pixels_per_point).max(1.0);
+        let available_height =
+            (item.extent_height * item.scale_y.abs() * zoom / pixels_per_point).max(1.0);
+        let font_size = model_text_font_size(
+            &painter,
+            item,
+            available_width,
+            available_height,
+            zoom,
+            pixels_per_point,
+            color,
         );
+        let font = model_text_font(font_size, item.font_name.as_deref(), item.bold, item.italic);
+        let galley = painter.layout_no_wrap(item.text.clone(), font, color);
+        let aligned_x = match item.alignment {
+            ModelTextAlignment::Left => 0.0,
+            ModelTextAlignment::Center => galley.size().x * 0.5,
+            ModelTextAlignment::Right => galley.size().x,
+        };
+        let glyph_offset = rotate_text_vector(
+            Vec2::new(
+                if item.scale_x < 0.0 {
+                    galley.size().x - aligned_x
+                } else {
+                    aligned_x
+                },
+                galley.size().y * 0.5,
+            ),
+            angle,
+        );
+        let mut shape = TextShape::new(anchor - glyph_offset, galley, color).with_angle(angle);
+        if item.underline {
+            shape = shape.with_underline(Stroke::new((font_size * 0.08).max(1.0), color));
+        }
+        painter.add(shape);
     }
+}
+
+fn rotate_text_vector(vector: Vec2, angle: f32) -> Vec2 {
+    let (sin, cos) = angle.sin_cos();
+    Vec2::new(
+        vector.x * cos - vector.y * sin,
+        vector.x * sin + vector.y * cos,
+    )
+}
+
+fn model_text_font_size(
+    painter: &egui::Painter,
+    item: &ModelTextOverlayItem,
+    available_width: f32,
+    available_height: f32,
+    zoom: f32,
+    pixels_per_point: f32,
+    color: Color32,
+) -> f32 {
+    let scale = item.scale * zoom;
+    let explicit = item
+        .font_size
+        .filter(|font_size| *font_size > 0.0)
+        .map(|font_size| font_size * scale);
+    let size = explicit.unwrap_or_else(|| {
+        let probe_font = model_text_font(1.0, item.font_name.as_deref(), item.bold, item.italic);
+        let probe = painter.layout_no_wrap(item.text.clone(), probe_font, color);
+        let width_fit = if probe.size().x > 0.0 {
+            available_width / probe.size().x
+        } else {
+            f32::INFINITY
+        };
+        let height_fit = if probe.size().y > 0.0 {
+            available_height / probe.size().y
+        } else {
+            f32::INFINITY
+        };
+        width_fit.min(height_fit) * 0.88
+    });
+    size.max(item.minimum_screen_px / pixels_per_point)
+        .min(28.0)
+}
+
+fn model_text_font(size: f32, name: Option<&str>, bold: bool, italic: bool) -> FontId {
+    let is_monospace = name.is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        name.contains("courier") || name.contains("mono")
+    });
+    let family = if is_monospace {
+        FontFamily::Name(UI_FONT_MONO.into())
+    } else if bold && italic {
+        FontFamily::Name(UI_FONT_SEMIBOLD_ITALIC.into())
+    } else if bold {
+        FontFamily::Name(UI_FONT_SEMIBOLD.into())
+    } else if italic {
+        FontFamily::Name(UI_FONT_ITALIC.into())
+    } else {
+        FontFamily::Name(UI_FONT_MEDIUM.into())
+    };
+    FontId::new(size, family)
 }
 
 fn build_scene(
@@ -18880,6 +19056,48 @@ end BoundarySig;
             &context,
         );
         assert_eq!(name_item.minimum_screen_px, MIN_SCREEN_MODEL_NAME_TEXT_PX);
+    }
+
+    #[test]
+    fn model_text_style_flags_preserve_italic_underline_font_and_rotation() {
+        let text = modelica_core::scene::TextGraphic {
+            origin: CorePoint { x: 0.0, y: 0.0 },
+            rotation: 30.0,
+            extent: modelica_core::scene::Extent {
+                p1: CorePoint { x: -20.0, y: -5.0 },
+                p2: CorePoint { x: 20.0, y: 5.0 },
+            },
+            text: "styled".to_owned(),
+            color: [0, 0, 0],
+            fill_color: None,
+            fill_pattern: None,
+            font_size: None,
+            font_name: Some("Courier New".to_owned()),
+            horizontal_alignment: Some("TextAlignment.Right".to_owned()),
+            text_style: vec![
+                "TextStyle.Bold".to_owned(),
+                "TextStyle.Italic".to_owned(),
+                "TextStyle.UnderLine".to_owned(),
+            ],
+        };
+        let item = model_text_overlay_item(
+            &text,
+            Transform2D {
+                rotation: 15.0,
+                scale_x: -1.0,
+                scale_y: 1.0,
+                ..Transform2D::identity()
+            },
+            &text_context("instance", "Component"),
+        );
+        assert!(item.font_size.is_none());
+        assert_eq!(item.font_name.as_deref(), Some("Courier New"));
+        assert!(item.bold && item.italic && item.underline);
+        assert_eq!(item.alignment, ModelTextAlignment::Right);
+        assert_eq!(item.angle, 45.0);
+        let rotated = rotate_text_vector(Vec2::new(1.0, 0.0), std::f32::consts::FRAC_PI_2);
+        assert!(rotated.x.abs() < 0.0001);
+        assert!((rotated.y - 1.0).abs() < 0.0001);
     }
 
     #[test]
