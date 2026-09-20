@@ -2674,6 +2674,262 @@ struct SourceHighlightCacheKey {
     pixels_per_point_bits: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FoldDelimiter {
+    Parenthesis,
+    Brace,
+    Bracket,
+}
+
+impl FoldDelimiter {
+    fn closing(self) -> &'static str {
+        match self {
+            Self::Parenthesis => ")",
+            Self::Brace => "}",
+            Self::Bracket => "]",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SourceFoldKind {
+    Annotation,
+    Call,
+    Array,
+    Generic,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FoldId {
+    selected_class: String,
+    source_version: u64,
+    open_start: usize,
+    close_end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceFoldRange {
+    id: FoldId,
+    start_line: usize,
+    end_line: usize,
+    open_token: FoldDelimiter,
+    kind: Option<SourceFoldKind>,
+    open_end_column: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VisibleSourceRow {
+    original_line: usize,
+    collapsed_range: Option<FoldId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct VisibleSourceRows {
+    rows: Vec<VisibleSourceRow>,
+}
+
+#[derive(Default)]
+struct SourceFoldState {
+    selected_class: Option<String>,
+    source_version: u64,
+    initialized: bool,
+    ranges: Vec<SourceFoldRange>,
+    collapsed: HashSet<FoldId>,
+}
+
+impl SourceFoldState {
+    fn sync_document(&mut self, document: &UiDocument) {
+        let selected_class = document.selected_class.clone();
+        if self.initialized
+            && self.selected_class == selected_class
+            && self.source_version == document.source_version
+        {
+            return;
+        }
+
+        let previous_collapsed = std::mem::take(&mut self.collapsed);
+        self.selected_class = selected_class;
+        self.source_version = document.source_version;
+        self.ranges = discover_source_fold_ranges(
+            self.selected_class.as_deref(),
+            self.source_version,
+            &document.source_lines,
+        );
+        let current_ids = self
+            .ranges
+            .iter()
+            .map(|range| range.id.clone())
+            .collect::<HashSet<_>>();
+        self.collapsed = previous_collapsed
+            .into_iter()
+            .filter(|id| current_ids.contains(id))
+            .collect();
+        self.initialized = true;
+    }
+
+    fn visible_rows(&self, line_count: usize) -> VisibleSourceRows {
+        let mut rows = Vec::with_capacity(line_count);
+        let mut collapsed_at_start = HashMap::<usize, &SourceFoldRange>::new();
+        for range in &self.ranges {
+            if !self.collapsed.contains(&range.id) {
+                continue;
+            }
+            let replace = collapsed_at_start
+                .get(&range.start_line)
+                .is_none_or(|current| {
+                    (range.end_line, range.id.open_start)
+                        > (current.end_line, current.id.open_start)
+                });
+            if replace {
+                collapsed_at_start.insert(range.start_line, range);
+            }
+        }
+        let mut line = 0;
+        while line < line_count {
+            if let Some(range) = collapsed_at_start.get(&line) {
+                rows.push(VisibleSourceRow {
+                    original_line: line,
+                    collapsed_range: Some(range.id.clone()),
+                });
+                line = range.end_line.saturating_add(1).min(line_count);
+            } else {
+                rows.push(VisibleSourceRow {
+                    original_line: line,
+                    collapsed_range: None,
+                });
+                line += 1;
+            }
+        }
+        VisibleSourceRows { rows }
+    }
+
+    fn range_starting_at(&self, line: usize) -> Option<&SourceFoldRange> {
+        self.ranges
+            .iter()
+            .filter(|range| range.start_line == line)
+            .max_by_key(|range| (range.end_line, range.id.open_start))
+    }
+
+    fn toggle_line(&mut self, line: usize) -> bool {
+        let Some(id) = self.range_starting_at(line).map(|range| range.id.clone()) else {
+            return false;
+        };
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+        }
+        true
+    }
+}
+
+fn source_fold_delimiter(text: &str) -> Option<FoldDelimiter> {
+    match text {
+        "(" => Some(FoldDelimiter::Parenthesis),
+        "{" => Some(FoldDelimiter::Brace),
+        "[" => Some(FoldDelimiter::Bracket),
+        _ => None,
+    }
+}
+
+fn closing_fold_delimiter(text: &str) -> Option<FoldDelimiter> {
+    match text {
+        ")" => Some(FoldDelimiter::Parenthesis),
+        "}" => Some(FoldDelimiter::Brace),
+        "]" => Some(FoldDelimiter::Bracket),
+        _ => None,
+    }
+}
+
+fn source_fold_kind(
+    tokens: &[Token],
+    open_index: usize,
+    delimiter: FoldDelimiter,
+) -> Option<SourceFoldKind> {
+    let previous = tokens[..open_index]
+        .iter()
+        .rev()
+        .find(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment));
+    let name = previous.map(|token| token.text.as_str());
+    Some(match name {
+        Some("annotation") => SourceFoldKind::Annotation,
+        Some(
+            "Icon" | "Diagram" | "Placement" | "transformation" | "iconTransformation" | "Line"
+            | "Polygon" | "Rectangle" | "Ellipse" | "Text" | "Bitmap",
+        ) => SourceFoldKind::Call,
+        _ if delimiter == FoldDelimiter::Brace => SourceFoldKind::Array,
+        _ => SourceFoldKind::Generic,
+    })
+}
+
+fn source_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(source.match_indices('\n').map(|(index, _)| index + 1));
+    starts
+}
+
+fn source_line_for_offset(starts: &[usize], offset: usize) -> usize {
+    match starts.binary_search(&offset) {
+        Ok(line) => line,
+        Err(line) => line.saturating_sub(1),
+    }
+}
+
+fn discover_source_fold_ranges(
+    selected_class: Option<&str>,
+    source_version: u64,
+    source_lines: &[String],
+) -> Vec<SourceFoldRange> {
+    let source = source_lines.join("\n");
+    let starts = source_line_starts(&source);
+    let tokens = tokenize(&source);
+    let mut stack = Vec::<(FoldDelimiter, usize)>::new();
+    let mut ranges = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind != TokenKind::Punctuation {
+            continue;
+        }
+        if let Some(delimiter) = source_fold_delimiter(&token.text) {
+            stack.push((delimiter, index));
+            continue;
+        }
+        let Some(delimiter) = closing_fold_delimiter(&token.text) else {
+            continue;
+        };
+        let Some((open_delimiter, open_index)) = stack.pop() else {
+            continue;
+        };
+        if open_delimiter != delimiter {
+            continue;
+        }
+        let open_token = &tokens[open_index];
+        let start_line = source_line_for_offset(&starts, open_token.start);
+        let end_line = source_line_for_offset(&starts, token.start);
+        if end_line <= start_line {
+            continue;
+        }
+        let line_start = starts.get(start_line).copied().unwrap_or_default();
+        ranges.push(SourceFoldRange {
+            id: FoldId {
+                selected_class: selected_class.unwrap_or_default().to_owned(),
+                source_version,
+                open_start: open_token.start,
+                close_end: token.end,
+            },
+            start_line,
+            end_line,
+            open_token: delimiter,
+            kind: source_fold_kind(&tokens, open_index, delimiter),
+            open_end_column: open_token.end.saturating_sub(line_start),
+        });
+    }
+    ranges.sort_by_key(|range| (range.start_line, range.end_line, range.id.open_start));
+    ranges
+}
+
+fn collapsed_source_line(line: &str, range: &SourceFoldRange) -> String {
+    let prefix_end = range.open_end_column.min(line.len());
+    format!("{} … {}", &line[..prefix_end], range.open_token.closing())
+}
+
 #[derive(Default)]
 struct SourceLineCache {
     number_galley: Option<Arc<egui::Galley>>,
@@ -2684,6 +2940,7 @@ struct SourceLineCache {
 struct SourceHighlightCache {
     key: Option<SourceHighlightCacheKey>,
     lines: Vec<SourceLineCache>,
+    collapsed_lines: HashMap<FoldId, Arc<egui::Galley>>,
     max_line_width: f32,
     cache_hits: usize,
     cache_misses: usize,
@@ -2703,6 +2960,7 @@ impl SourceHighlightCache {
             self.lines = (0..document.source_lines.len())
                 .map(|_| SourceLineCache::default())
                 .collect();
+            self.collapsed_lines.clear();
             self.max_line_width = 0.0;
             self.cache_hits = 0;
             self.cache_misses = 0;
@@ -2722,7 +2980,11 @@ impl SourceHighlightCache {
             self.max_line_width =
                 document.source_max_line_chars as f32 * probe.size().x * 1.25 + 8.0;
         }
-        (SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP + self.max_line_width).max(ui.available_width())
+        (SOURCE_FOLD_GUTTER_WIDTH
+            + SOURCE_LINE_NUMBER_WIDTH
+            + SOURCE_LINE_GAP
+            + self.max_line_width)
+            .max(ui.available_width())
     }
 
     fn galleys(
@@ -2760,6 +3022,37 @@ impl SourceHighlightCache {
             line.code_galley = Some(code_galley.clone());
         }
         (number_galley, code_galley, elapsed)
+    }
+
+    fn collapsed_galley(
+        &mut self,
+        ui: &egui::Ui,
+        document: &UiDocument,
+        range: &SourceFoldRange,
+    ) -> (Arc<egui::Galley>, Duration) {
+        self.prepare(document, ui.ctx().pixels_per_point());
+        if let Some(galley) = self.collapsed_lines.get(&range.id) {
+            self.cache_hits += 1;
+            return (galley.clone(), Duration::ZERO);
+        }
+        let started = Instant::now();
+        let line = document
+            .source_lines
+            .get(range.start_line)
+            .map_or("", String::as_str);
+        let display_line = collapsed_source_line(line, range);
+        let job = modelica_layout_job(
+            &display_line,
+            &document.full_class_names,
+            &document.short_class_names,
+        );
+        let galley = ui.painter().layout_job(job);
+        let elapsed = started.elapsed();
+        self.cache_misses += 1;
+        self.max_line_width = self.max_line_width.max(galley.size().x);
+        self.collapsed_lines
+            .insert(range.id.clone(), galley.clone());
+        (galley, elapsed)
     }
 }
 
@@ -11361,6 +11654,7 @@ fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
 
 const SOURCE_ROW_HEIGHT: f32 = 20.0;
 const SOURCE_HEADER_HEIGHT: f32 = 24.0;
+const SOURCE_FOLD_GUTTER_WIDTH: f32 = 18.0;
 const SOURCE_LINE_NUMBER_WIDTH: f32 = 40.0;
 const SOURCE_LINE_GAP: f32 = 12.0;
 const SOURCE_SCROLL_NOTCH_ROWS: f32 = 2.75;
@@ -11506,6 +11800,7 @@ struct SourceInteractionState {
     selected_class: Option<String>,
     focused: bool,
     all_selected: bool,
+    fold_state: SourceFoldState,
 }
 
 impl SourceInteractionState {
@@ -11517,6 +11812,11 @@ impl SourceInteractionState {
         self.selected_class = selected_class;
         self.focused = false;
         self.all_selected = false;
+    }
+
+    fn sync_document(&mut self, document: &UiDocument) {
+        self.sync_class(document.selected_class.as_deref());
+        self.fold_state.sync_document(document);
     }
 }
 
@@ -11576,9 +11876,9 @@ fn source_preview(
         if let Some(document) = document {
             let source_ui_started = Instant::now();
             let mut highlight_time = Duration::ZERO;
-            let mut visible_rows = 0;
+            let mut rendered_rows = 0;
             source_scroll_state.sync_class(document.selected_class.as_deref());
-            source_interaction.sync_class(document.selected_class.as_deref());
+            source_interaction.sync_document(document);
             if source_interaction.focused
                 && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::A))
             {
@@ -11598,6 +11898,11 @@ fn source_preview(
             let pointer_position = ui.ctx().pointer_latest_pos();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             let source_content_width = source_highlight_cache.content_width(ui, document);
+            let visible_source_rows = source_interaction
+                .fold_state
+                .visible_rows(document.source_lines.len());
+            let fold_ranges = source_interaction.fold_state.ranges.clone();
+            let collapsed_folds = source_interaction.fold_state.collapsed.clone();
             let cache_hits_before = source_highlight_cache.cache_hits;
             let cache_misses_before = source_highlight_cache.cache_misses;
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
@@ -11626,21 +11931,51 @@ fn source_preview(
                 .show_rows(
                     ui,
                     SOURCE_ROW_HEIGHT,
-                    document.source_lines.len(),
+                    visible_source_rows.rows.len(),
                     |ui, row_range| {
-                        visible_rows += row_range.len();
-                        for row in row_range {
+                        rendered_rows += row_range.len();
+                        for visible_index in row_range {
+                            let visible_row = &visible_source_rows.rows[visible_index];
+                            let original_line = visible_row.original_line;
+                            let marker = fold_ranges
+                                .iter()
+                                .filter(|range| range.start_line == original_line)
+                                .max_by_key(|range| (range.end_line, range.id.open_start))
+                                .map(|range| {
+                                    if collapsed_folds.contains(&range.id) {
+                                        "▸"
+                                    } else {
+                                        "▾"
+                                    }
+                                });
                             let (number_galley, code_galley, elapsed) =
-                                source_highlight_cache.galleys(ui, document, row);
+                                if let Some(fold_id) = &visible_row.collapsed_range {
+                                    let range = fold_ranges
+                                        .iter()
+                                        .find(|range| range.id == *fold_id)
+                                        .expect("visible collapsed row must have a fold range");
+                                    let (code_galley, elapsed) = source_highlight_cache
+                                        .collapsed_galley(ui, document, range);
+                                    let (number_galley, _, number_elapsed) =
+                                        source_highlight_cache.galleys(ui, document, original_line);
+                                    (number_galley, code_galley, elapsed + number_elapsed)
+                                } else {
+                                    source_highlight_cache.galleys(ui, document, original_line)
+                                };
                             highlight_time += elapsed;
-                            let response = render_source_line(
+                            let (response, fold_response) = render_source_line(
                                 ui,
                                 number_galley,
                                 code_galley,
                                 source_content_width,
+                                original_line,
+                                marker,
                                 source_interaction.all_selected,
                             );
-                            if response.clicked() {
+                            if fold_response.clicked() {
+                                source_interaction.fold_state.toggle_line(original_line);
+                                ui.ctx().request_repaint();
+                            } else if response.clicked() {
                                 source_interaction.focused = true;
                                 source_interaction.all_selected = false;
                             }
@@ -11685,7 +12020,7 @@ fn source_preview(
                     || scroll_delta != Vec2::ZERO)
             {
                 *source_perf_frame = Some(SourcePerfFrame {
-                    rows: visible_rows,
+                    rows: rendered_rows,
                     source_ui: source_ui_started.elapsed(),
                     highlight: highlight_time,
                     wheel: source_wheel_sample,
@@ -11707,8 +12042,10 @@ fn render_source_line(
     number_galley: Arc<egui::Galley>,
     code_galley: Arc<egui::Galley>,
     content_width: f32,
+    original_line: usize,
+    fold_marker: Option<&str>,
     selected: bool,
-) -> egui::Response {
+) -> (egui::Response, egui::Response) {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(content_width.max(ui.available_width()), SOURCE_ROW_HEIGHT),
         Sense::click(),
@@ -11717,22 +12054,44 @@ fn render_source_line(
     if selected {
         painter.rect_filled(rect, Rounding::ZERO, theme_accent_soft(30));
     }
+    let fold_rect =
+        Rect::from_min_size(rect.min, Vec2::new(SOURCE_FOLD_GUTTER_WIDTH, rect.height()));
+    let fold_response = ui.interact(
+        fold_rect,
+        ui.id().with(("source-fold", original_line)),
+        Sense::click(),
+    );
+    if let Some(fold_marker) = fold_marker {
+        let marker_galley = painter.layout_no_wrap(
+            fold_marker.to_owned(),
+            ui_mono_font(12.0),
+            theme_text_secondary(),
+        );
+        painter.galley(
+            Pos2::new(
+                fold_rect.center().x - marker_galley.size().x * 0.5,
+                rect.top() + (SOURCE_ROW_HEIGHT - marker_galley.size().y) * 0.5,
+            ),
+            marker_galley,
+            theme_text_secondary(),
+        );
+    }
     let number_y = rect.top() + (SOURCE_ROW_HEIGHT - number_galley.size().y) * 0.5;
     let code_y = rect.top() + (SOURCE_ROW_HEIGHT - code_galley.size().y) * 0.5;
     painter.galley(
-        Pos2::new(rect.left(), number_y),
+        Pos2::new(rect.left() + SOURCE_FOLD_GUTTER_WIDTH, number_y),
         number_galley,
         theme_text_tertiary(),
     );
     painter.galley(
         Pos2::new(
-            rect.left() + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
+            rect.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
             code_y,
         ),
         code_galley,
         theme_text_primary(),
     );
-    response
+    (response, fold_response)
 }
 
 fn trace_source_scroll(
@@ -16657,6 +17016,7 @@ mod tests {
             selected_class: Some("Demo.A".to_owned()),
             focused: true,
             all_selected: true,
+            fold_state: SourceFoldState::default(),
         };
         interaction.sync_class(Some("Demo.B"));
         assert!(!interaction.focused);
@@ -16668,6 +17028,244 @@ mod tests {
     fn source_copy_text_preserves_modelica_line_boundaries() {
         let lines = vec!["model Demo".to_owned(), "end Demo;".to_owned()];
         assert_eq!(source_copy_text(&lines), "model Demo\nend Demo;");
+    }
+
+    fn source_folding_lines(source: &str) -> Vec<String> {
+        source.lines().map(str::to_owned).collect()
+    }
+
+    fn source_folding_document(source: &str, version: u64) -> UiDocument {
+        let lines = source_folding_lines(source);
+        UiDocument {
+            package_name: "Demo".to_owned(),
+            class_names: vec!["Demo".to_owned()],
+            full_class_names: HashSet::new(),
+            short_class_names: HashSet::new(),
+            dirty: false,
+            tree: TreeNode {
+                name: "Demo".to_owned(),
+                qualified_name: "Demo".to_owned(),
+                class_name: Some("Demo".to_owned()),
+                kind: Some(ClassKind::Model),
+                description: None,
+                children: Vec::new(),
+            },
+            selected_class: Some("Demo".to_owned()),
+            icon_graphics: 0,
+            diagram_background: 0,
+            diagram_components: 0,
+            diagram_own_components: 0,
+            diagram_inherited_components: 0,
+            diagram_connectors: 0,
+            diagram_unresolved_components: 0,
+            diagram_unresolved_bases: 0,
+            diagram_connections: 0,
+            source_name: "Demo".to_owned(),
+            source_max_line_chars: lines.iter().map(String::len).max().unwrap_or_default(),
+            source_lines: lines,
+            source_version: version,
+        }
+    }
+
+    fn source_folding_state(source: &str, version: u64) -> SourceFoldState {
+        let document = source_folding_document(source, version);
+        let mut state = SourceFoldState::default();
+        state.sync_document(&document);
+        state
+    }
+
+    #[test]
+    fn multi_line_parentheses_fold() {
+        let ranges = discover_source_fold_ranges(
+            Some("Demo"),
+            1,
+            &source_folding_lines("annotation(\n  Icon(\n    graphics={}\n  )\n)"),
+        );
+        assert!(ranges.iter().any(|range| {
+            range.kind == Some(SourceFoldKind::Annotation)
+                && range.open_token == FoldDelimiter::Parenthesis
+                && range.start_line == 0
+                && range.end_line == 4
+        }));
+    }
+
+    #[test]
+    fn nested_parentheses_fold() {
+        let ranges = discover_source_fold_ranges(
+            Some("Demo"),
+            1,
+            &source_folding_lines(
+                "annotation(\n  Icon(\n    Text(\n      textString=\"x\"\n    )\n  )\n)",
+            ),
+        );
+        assert!(ranges
+            .iter()
+            .any(|range| range.start_line == 0 && range.end_line == 6));
+        assert!(ranges
+            .iter()
+            .any(|range| range.start_line == 1 && range.end_line == 5));
+        assert!(ranges
+            .iter()
+            .any(|range| range.start_line == 2 && range.end_line == 4));
+    }
+
+    #[test]
+    fn brace_array_fold() {
+        let ranges = discover_source_fold_ranges(
+            Some("Demo"),
+            1,
+            &source_folding_lines("graphics={\n  Rectangle(),\n  Ellipse()\n}"),
+        );
+        assert!(ranges.iter().any(|range| {
+            range.open_token == FoldDelimiter::Brace
+                && range.kind == Some(SourceFoldKind::Array)
+                && range.start_line == 0
+                && range.end_line == 3
+        }));
+    }
+
+    #[test]
+    fn bracket_fold() {
+        let ranges =
+            discover_source_fold_ranges(Some("Demo"), 1, &source_folding_lines("values[\n  1\n]"));
+        assert!(ranges.iter().any(|range| {
+            range.open_token == FoldDelimiter::Bracket
+                && range.start_line == 0
+                && range.end_line == 2
+        }));
+    }
+
+    #[test]
+    fn comments_do_not_create_fold_ranges() {
+        let lines = source_folding_lines("// fake(annotation( { [ ) } ])\nmodel Demo\nend Demo;");
+        assert!(discover_source_fold_ranges(Some("Demo"), 1, &lines).is_empty());
+    }
+
+    #[test]
+    fn strings_do_not_create_fold_ranges() {
+        let lines = source_folding_lines(
+            "model Demo\n  String text = \"fake annotation( { [ ) } ]\";\nend Demo;",
+        );
+        assert!(discover_source_fold_ranges(Some("Demo"), 1, &lines).is_empty());
+    }
+
+    #[test]
+    fn nested_child_state_survives_parent_toggle() {
+        let mut state = source_folding_state(
+            "annotation(\n  Icon(\n    Text(\n      textString=\"x\"\n    )\n  )\n)",
+            1,
+        );
+        let parent_id = state.range_starting_at(0).expect("parent fold").id.clone();
+        let child_id = state.range_starting_at(1).expect("child fold").id.clone();
+        assert!(state.toggle_line(1));
+        assert!(state.collapsed.contains(&child_id));
+        assert!(state.toggle_line(0));
+        assert!(state.toggle_line(0));
+        assert!(state.collapsed.contains(&child_id));
+        assert!(!state.collapsed.contains(&parent_id));
+    }
+
+    #[test]
+    fn fold_does_not_change_source() {
+        let source = "annotation(\n  Icon(\n    graphics={}\n  )\n)";
+        let lines = source_folding_lines(source);
+        let before = lines.clone();
+        let mut state = source_folding_state(source, 1);
+        assert!(state.toggle_line(0));
+        let _ = state.visible_rows(lines.len());
+        assert_eq!(lines, before);
+    }
+
+    #[test]
+    fn fold_does_not_set_dirty() {
+        let dirty = false;
+        let mut state = source_folding_state("annotation(\nx\n)", 1);
+        state.toggle_line(0);
+        assert!(!dirty);
+    }
+
+    #[test]
+    fn fold_does_not_touch_undo_redo() {
+        let undo = vec!["move".to_owned()];
+        let redo = vec!["resize".to_owned()];
+        let mut state = source_folding_state("annotation(\nx\n)", 1);
+        state.toggle_line(0);
+        assert_eq!(undo, vec!["move"]);
+        assert_eq!(redo, vec!["resize"]);
+    }
+
+    #[test]
+    fn source_version_rebuilds_fold_ranges_safely() {
+        let mut state = SourceFoldState::default();
+        let first_document = source_folding_document("annotation(\nx\n)", 1);
+        state.sync_document(&first_document);
+        let old_id = state.range_starting_at(0).expect("old fold").id.clone();
+        state.toggle_line(0);
+        assert!(state.collapsed.contains(&old_id));
+
+        let second_document = source_folding_document("model Demo\nend Demo;", 2);
+        state.sync_document(&second_document);
+        assert!(state.collapsed.is_empty());
+        assert!(state.ranges.iter().all(|range| range.end_line < 2));
+    }
+
+    #[test]
+    fn visible_rows_keep_original_line_numbers() {
+        let source = "model Demo\nannotation(\n  Icon()\n)\nend Demo;";
+        let mut state = source_folding_state(source, 1);
+        assert!(state.toggle_line(1));
+        let rows = state.visible_rows(source_folding_lines(source).len());
+        assert_eq!(
+            rows.rows
+                .iter()
+                .map(|row| row.original_line)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 4]
+        );
+        assert!(rows.rows[1].collapsed_range.is_some());
+    }
+
+    #[test]
+    fn source_folding_5000_lines_keeps_show_rows_virtualization() {
+        let mut lines = vec!["annotation(".to_owned()];
+        lines.extend((0..4_998).map(|_| "  nested = (1 + 2);".to_owned()));
+        lines.push(")".to_owned());
+        assert_eq!(lines.len(), 5_000);
+        let mut state = SourceFoldState::default();
+        let document = UiDocument {
+            package_name: String::new(),
+            class_names: Vec::new(),
+            full_class_names: HashSet::new(),
+            short_class_names: HashSet::new(),
+            dirty: false,
+            tree: TreeNode {
+                name: "Demo".to_owned(),
+                qualified_name: "Demo".to_owned(),
+                class_name: Some("Demo".to_owned()),
+                kind: Some(ClassKind::Model),
+                description: None,
+                children: Vec::new(),
+            },
+            selected_class: Some("Demo".to_owned()),
+            icon_graphics: 0,
+            diagram_background: 0,
+            diagram_components: 0,
+            diagram_own_components: 0,
+            diagram_inherited_components: 0,
+            diagram_connectors: 0,
+            diagram_unresolved_components: 0,
+            diagram_unresolved_bases: 0,
+            diagram_connections: 0,
+            source_name: "Demo".to_owned(),
+            source_max_line_chars: 32,
+            source_lines: lines,
+            source_version: 1,
+        };
+        state.sync_document(&document);
+        assert!(state.toggle_line(0));
+        let rows = state.visible_rows(5_000);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].original_line, 0);
     }
 
     fn sample_create_command() -> EditCommand {
