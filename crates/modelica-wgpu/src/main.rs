@@ -5269,6 +5269,7 @@ struct App {
     ui_document: Option<UiDocument>,
     source_highlight_cache: SourceHighlightCache,
     source_scroll_state: SourceScrollState,
+    source_interaction: SourceInteractionState,
     source_scroll_rect: Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: Option<SourcePerfFrame>,
@@ -5632,6 +5633,7 @@ impl App {
             ui_document: None,
             source_highlight_cache: SourceHighlightCache::default(),
             source_scroll_state: SourceScrollState::new(),
+            source_interaction: SourceInteractionState::default(),
             source_scroll_rect: None,
             source_wheel_sample: None,
             source_perf_frame: None,
@@ -9572,6 +9574,7 @@ impl App {
         let mut source_highlight_cache = std::mem::take(&mut self.source_highlight_cache);
         let mut source_scroll_state =
             std::mem::replace(&mut self.source_scroll_state, SourceScrollState::new());
+        let mut source_interaction = std::mem::take(&mut self.source_interaction);
         let mut source_scroll_rect = self.source_scroll_rect;
         let source_wheel_sample = self.source_wheel_sample;
         let mut source_perf_frame = None;
@@ -9637,6 +9640,7 @@ impl App {
                 document_loading,
                 &mut source_highlight_cache,
                 &mut source_scroll_state,
+                &mut source_interaction,
                 &mut source_scroll_rect,
                 source_wheel_sample,
                 &mut source_perf_frame,
@@ -9684,6 +9688,7 @@ impl App {
         let egui_run = ui_build_started.elapsed();
         self.source_highlight_cache = source_highlight_cache;
         self.source_scroll_state = source_scroll_state;
+        self.source_interaction = source_interaction;
         self.source_scroll_rect = source_scroll_rect;
         self.source_perf_frame = source_perf_frame;
         let ui_build = ui_build_started.elapsed();
@@ -10327,11 +10332,19 @@ fn theme_code_type() -> Color32 {
     }
 }
 
-fn theme_code_qualified() -> Color32 {
+fn theme_code_builtin() -> Color32 {
     if is_dark_theme() {
-        theme_rgb(184, 166, 237)
+        theme_rgb(104, 214, 166)
     } else {
-        theme_rgb(90, 64, 145)
+        theme_rgb(37, 128, 91)
+    }
+}
+
+fn theme_code_operator() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(220, 184, 244)
+    } else {
+        theme_rgb(119, 79, 151)
     }
 }
 
@@ -10530,6 +10543,7 @@ fn draw_preview_ui(
     document_loading: bool,
     source_highlight_cache: &mut SourceHighlightCache,
     source_scroll_state: &mut SourceScrollState,
+    source_interaction: &mut SourceInteractionState,
     source_scroll_rect: &mut Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: &mut Option<SourcePerfFrame>,
@@ -10946,6 +10960,7 @@ fn draw_preview_ui(
                             document,
                             source_highlight_cache,
                             source_scroll_state,
+                            source_interaction,
                             source_scroll_rect,
                             source_wheel_sample,
                             source_perf_frame,
@@ -11012,6 +11027,7 @@ fn tree_row(
     icon: &str,
     label: &str,
     identity: &str,
+    kind: &str,
     selected: bool,
     indent: f32,
 ) -> (egui::Response, egui::Response) {
@@ -11059,20 +11075,115 @@ fn tree_row(
     } else {
         theme_text_primary()
     };
-    let label_galley =
-        ui.painter()
-            .layout_no_wrap(tree_row_label(icon, label), label_font, label_color);
+    let kind_font = ui_mono_font(9.0);
+    let kind_color = if selected {
+        theme_accent_strong()
+    } else {
+        theme_text_tertiary()
+    };
+    let kind_galley = ui
+        .painter()
+        .layout_no_wrap(kind.to_owned(), kind_font, kind_color);
+    let label_max_width =
+        (rect.right() - 8.0 - kind_galley.size().x - 8.0 - text_position.x).max(24.0);
+    let label_galley = ui.painter().layout_no_wrap(
+        ellipsize_tree_label(
+            ui.painter(),
+            icon,
+            label,
+            label_font.clone(),
+            label_color,
+            label_max_width,
+        ),
+        label_font,
+        label_color,
+    );
     let label_position = Pos2::new(
         text_position.x,
         rect.center().y - label_galley.size().y * 0.5,
     );
     ui.painter()
         .galley(label_position, label_galley.clone(), label_color);
+    ui.painter().galley(
+        Pos2::new(
+            (rect.right() - 8.0 - kind_galley.size().x)
+                .max(label_position.x + label_galley.size().x + 6.0),
+            rect.center().y - kind_galley.size().y * 0.5,
+        ),
+        kind_galley,
+        kind_color,
+    );
     (response, marker_response)
 }
 
 fn tree_row_label(icon: &str, label: &str) -> String {
     format!("{icon}  {label}")
+}
+
+fn theme_code_annotation() -> Color32 {
+    if is_dark_theme() {
+        theme_rgb(234, 174, 111)
+    } else {
+        theme_rgb(157, 86, 30)
+    }
+}
+
+fn ellipsize_tree_label(
+    painter: &egui::Painter,
+    icon: &str,
+    label: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> String {
+    let full = tree_row_label(icon, label);
+    if painter
+        .layout_no_wrap(full.clone(), font.clone(), color)
+        .size()
+        .x
+        <= max_width
+    {
+        return full;
+    }
+    let characters = label.chars().collect::<Vec<_>>();
+    let ellipsis = '…';
+    let fits = |count: usize| {
+        let prefix = characters[..count].iter().collect::<String>();
+        painter
+            .layout_no_wrap(format!("{icon}  {prefix}{ellipsis}"), font.clone(), color)
+            .size()
+            .x
+            <= max_width
+    };
+    let mut low = 0;
+    let mut high = characters.len();
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    format!(
+        "{icon}  {}{ellipsis}",
+        characters[..low].iter().collect::<String>()
+    )
+}
+
+fn tree_node_kind_label(kind: Option<ClassKind>) -> &'static str {
+    match kind {
+        Some(ClassKind::Package) => "package",
+        Some(ClassKind::Model) => "model",
+        Some(ClassKind::Block) => "block",
+        Some(ClassKind::Connector | ClassKind::ExpandableConnector) => "connector",
+        Some(ClassKind::Record | ClassKind::OperatorRecord) => "record",
+        Some(ClassKind::Function | ClassKind::OperatorFunction) => "function",
+        Some(ClassKind::Type) => "type",
+        Some(ClassKind::Class) => "class",
+        Some(ClassKind::Operator) => "operator",
+        None => "",
+    }
 }
 
 fn document_tree(
@@ -11117,6 +11228,7 @@ fn render_tree_node(
         icon,
         &node.name,
         &node.qualified_name,
+        tree_node_kind_label(node.kind),
         selected,
         depth as f32,
     );
@@ -11310,11 +11422,36 @@ impl SourceScrollState {
     }
 }
 
+#[derive(Default)]
+struct SourceInteractionState {
+    selected_class: Option<String>,
+    focused: bool,
+    all_selected: bool,
+}
+
+impl SourceInteractionState {
+    fn sync_class(&mut self, selected_class: Option<&str>) {
+        let selected_class = selected_class.map(str::to_owned);
+        if self.selected_class == selected_class {
+            return;
+        }
+        self.selected_class = selected_class;
+        self.focused = false;
+        self.all_selected = false;
+    }
+}
+
+fn source_copy_text(lines: &[String]) -> String {
+    lines.join("\n")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn source_preview(
     ui: &mut egui::Ui,
     document: Option<&UiDocument>,
     source_highlight_cache: &mut SourceHighlightCache,
     source_scroll_state: &mut SourceScrollState,
+    source_interaction: &mut SourceInteractionState,
     source_scroll_rect: &mut Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: &mut Option<SourcePerfFrame>,
@@ -11362,6 +11499,20 @@ fn source_preview(
             let mut highlight_time = Duration::ZERO;
             let mut visible_rows = 0;
             source_scroll_state.sync_class(document.selected_class.as_deref());
+            source_interaction.sync_class(document.selected_class.as_deref());
+            if source_interaction.focused
+                && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::A))
+            {
+                source_interaction.all_selected = true;
+            }
+            if source_interaction.focused
+                && source_interaction.all_selected
+                && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::C))
+            {
+                ui.output_mut(|output| {
+                    output.copied_text = source_copy_text(&document.source_lines);
+                });
+            }
             let scroll_height = ui.available_height().max(0.0);
             let scroll_width = ui.available_width().max(0.0);
             let scroll_delta = ui.input(|input| input.raw_scroll_delta);
@@ -11403,12 +11554,17 @@ fn source_preview(
                             let (number_galley, code_galley, elapsed) =
                                 source_highlight_cache.galleys(ui, document, row);
                             highlight_time += elapsed;
-                            render_source_line(
+                            let response = render_source_line(
                                 ui,
                                 number_galley,
                                 code_galley,
                                 source_content_width,
+                                source_interaction.all_selected,
                             );
+                            if response.clicked() {
+                                source_interaction.focused = true;
+                                source_interaction.all_selected = false;
+                            }
                         }
                     },
                 );
@@ -11472,12 +11628,16 @@ fn render_source_line(
     number_galley: Arc<egui::Galley>,
     code_galley: Arc<egui::Galley>,
     content_width: f32,
-) {
-    let (rect, _) = ui.allocate_exact_size(
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
         Vec2::new(content_width.max(ui.available_width()), SOURCE_ROW_HEIGHT),
-        Sense::hover(),
+        Sense::click(),
     );
     let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, Rounding::ZERO, theme_accent_soft(30));
+    }
     let number_y = rect.top() + (SOURCE_ROW_HEIGHT - number_galley.size().y) * 0.5;
     let code_y = rect.top() + (SOURCE_ROW_HEIGHT - code_galley.size().y) * 0.5;
     painter.galley(
@@ -11493,6 +11653,7 @@ fn render_source_line(
         code_galley,
         theme_text_primary(),
     );
+    response
 }
 
 fn trace_source_scroll(
@@ -11586,6 +11747,36 @@ fn trace_source_wheel(
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceTokenRole {
+    Keyword,
+    Annotation,
+    Type,
+    Builtin,
+    Number,
+    String,
+    Comment,
+    Operator,
+    Punctuation,
+    Function,
+    Identifier,
+    Whitespace,
+}
+
+const SOURCE_ANNOTATION_CALLS: &[&str] = &[
+    "Icon",
+    "Diagram",
+    "Placement",
+    "transformation",
+    "iconTransformation",
+    "Line",
+    "Polygon",
+    "Rectangle",
+    "Ellipse",
+    "Text",
+    "Bitmap",
+];
+
 fn modelica_layout_job(
     line: &str,
     full_class_names: &HashSet<String>,
@@ -11595,23 +11786,13 @@ fn modelica_layout_job(
     let font_id = ui_mono_font(12.0);
     let tokens = tokenize(line);
     for (index, token) in tokens.iter().enumerate() {
-        let color = match token.kind {
-            TokenKind::Keyword => theme_code_keyword(),
-            TokenKind::Number => theme_code_number(),
-            TokenKind::String => theme_code_string(),
-            TokenKind::Comment => theme_code_comment(),
-            TokenKind::Punctuation => theme_code_punctuation(),
-            TokenKind::Identifier => {
-                identifier_color(&tokens, index, full_class_names, short_class_names)
-            }
-            TokenKind::Unknown | TokenKind::Whitespace => theme_text_primary(),
-        };
+        let role = source_token_role(&tokens, index, full_class_names, short_class_names);
         job.append(
             &token.text,
             0.0,
             TextFormat {
                 font_id: font_id.clone(),
-                color,
+                color: source_token_color(role),
                 ..Default::default()
             },
         );
@@ -11619,29 +11800,84 @@ fn modelica_layout_job(
     job
 }
 
-fn identifier_color(
+fn source_token_role(
     tokens: &[Token],
     index: usize,
     full_class_names: &HashSet<String>,
     short_class_names: &HashSet<String>,
-) -> Color32 {
+) -> SourceTokenRole {
     let token = &tokens[index];
-    if is_builtin_type(&token.text)
-        || full_class_names.contains(&token.text)
-        || short_class_names.contains(&token.text)
+    if matches!(token.kind, TokenKind::Whitespace) {
+        return SourceTokenRole::Whitespace;
+    }
+    if matches!(token.kind, TokenKind::Comment) {
+        return SourceTokenRole::Comment;
+    }
+    if matches!(token.kind, TokenKind::String) {
+        return SourceTokenRole::String;
+    }
+    if matches!(token.kind, TokenKind::Number) {
+        return SourceTokenRole::Number;
+    }
+    if token.text == "annotation" {
+        return SourceTokenRole::Annotation;
+    }
+    if is_source_operator(&token.text) {
+        return SourceTokenRole::Operator;
+    }
+    if matches!(token.kind, TokenKind::Punctuation) {
+        return SourceTokenRole::Punctuation;
+    }
+    if matches!(token.kind, TokenKind::Keyword) {
+        return SourceTokenRole::Keyword;
+    }
+    if matches!(token.kind, TokenKind::Identifier) && is_builtin_type(&token.text) {
+        return SourceTokenRole::Builtin;
+    }
+    if matches!(token.kind, TokenKind::Identifier)
+        && SOURCE_ANNOTATION_CALLS.contains(&token.text.as_str())
+        && next_non_trivia(tokens, index).is_some_and(|next| next.text == "(")
     {
-        return theme_code_type();
+        return SourceTokenRole::Annotation;
     }
-
-    if adjacent_punctuation(tokens, index, ".") {
-        return theme_code_qualified();
+    if matches!(token.kind, TokenKind::Identifier)
+        && (full_class_names.contains(&token.text)
+            || short_class_names.contains(&token.text)
+            || token.text.chars().next().is_some_and(char::is_uppercase)
+            || adjacent_punctuation(tokens, index, "."))
+    {
+        return SourceTokenRole::Type;
     }
-
-    if next_non_trivia(tokens, index).is_some_and(|next| next.text == "(") {
-        return theme_code_function();
+    if matches!(token.kind, TokenKind::Identifier)
+        && next_non_trivia(tokens, index).is_some_and(|next| next.text == "(")
+    {
+        return SourceTokenRole::Function;
     }
+    if matches!(token.kind, TokenKind::Identifier) {
+        SourceTokenRole::Identifier
+    } else {
+        SourceTokenRole::Whitespace
+    }
+}
 
-    theme_text_primary()
+fn source_token_color(role: SourceTokenRole) -> Color32 {
+    match role {
+        SourceTokenRole::Keyword => theme_code_keyword(),
+        SourceTokenRole::Annotation => theme_code_annotation(),
+        SourceTokenRole::Type => theme_code_type(),
+        SourceTokenRole::Builtin => theme_code_builtin(),
+        SourceTokenRole::Number => theme_code_number(),
+        SourceTokenRole::String => theme_code_string(),
+        SourceTokenRole::Comment => theme_code_comment(),
+        SourceTokenRole::Operator => theme_code_operator(),
+        SourceTokenRole::Punctuation => theme_code_punctuation(),
+        SourceTokenRole::Function => theme_code_function(),
+        SourceTokenRole::Identifier | SourceTokenRole::Whitespace => theme_text_primary(),
+    }
+}
+
+fn is_source_operator(value: &str) -> bool {
+    matches!(value, "=" | "+" | "-" | "*" | "/" | "^" | ":")
 }
 
 fn is_builtin_type(value: &str) -> bool {
@@ -16197,6 +16433,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tree_rows_expose_kind_without_description_text() {
+        assert_eq!(tree_node_kind_label(Some(ClassKind::Block)), "block");
+        assert_eq!(
+            tree_node_kind_label(Some(ClassKind::Connector)),
+            "connector"
+        );
+        assert_eq!(tree_node_kind_label(Some(ClassKind::Package)), "package");
+        assert_eq!(tree_node_kind_label(None), "");
+
+        let visible_text = tree_row_label("□", "Heater");
+        assert_eq!(visible_text, "□  Heater");
+        assert!(!visible_text.contains("等温"));
+    }
+
+    #[test]
+    fn source_token_roles_match_electron_highlighting_categories() {
+        let tokens = tokenize(
+            "model Demo\n  Real x = 1 + f(y);\n  annotation(Icon(graphics={Rectangle()})); // note",
+        );
+        let full_class_names = HashSet::from(["Demo".to_owned()]);
+        let short_class_names = HashSet::from(["Demo".to_owned()]);
+        let role_for = |text: &str| {
+            let index = tokens
+                .iter()
+                .position(|token| token.text == text)
+                .expect("token should be present");
+            source_token_role(&tokens, index, &full_class_names, &short_class_names)
+        };
+
+        assert_eq!(role_for("model"), SourceTokenRole::Keyword);
+        assert_eq!(role_for("Demo"), SourceTokenRole::Type);
+        assert_eq!(role_for("Real"), SourceTokenRole::Builtin);
+        assert_eq!(role_for("="), SourceTokenRole::Operator);
+        assert_eq!(role_for("1"), SourceTokenRole::Number);
+        assert_eq!(role_for("f"), SourceTokenRole::Function);
+        assert_eq!(role_for("annotation"), SourceTokenRole::Annotation);
+        assert_eq!(role_for("Icon"), SourceTokenRole::Annotation);
+        assert_eq!(role_for("// note"), SourceTokenRole::Comment);
+    }
+
+    #[test]
+    fn source_interaction_resets_selection_when_class_changes() {
+        let mut interaction = SourceInteractionState {
+            selected_class: Some("Demo.A".to_owned()),
+            focused: true,
+            all_selected: true,
+        };
+        interaction.sync_class(Some("Demo.B"));
+        assert!(!interaction.focused);
+        assert!(!interaction.all_selected);
+        assert_eq!(interaction.selected_class.as_deref(), Some("Demo.B"));
+    }
+
+    #[test]
+    fn source_copy_text_preserves_modelica_line_boundaries() {
+        let lines = vec!["model Demo".to_owned(), "end Demo;".to_owned()];
+        assert_eq!(source_copy_text(&lines), "model Demo\nend Demo;");
     }
 
     fn sample_create_command() -> EditCommand {
