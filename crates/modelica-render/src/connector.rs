@@ -805,6 +805,7 @@ mod tests {
             type_name: "Port".into(),
             dimensions: Vec::new(),
             resolved_type_qualified_name: Some("Example.Port".into()),
+            model_text_context: modelica_core::ModelTextContext::default(),
             class_kind: kind,
             origin,
             rotation: 0.0,

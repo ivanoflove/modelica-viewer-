@@ -5,6 +5,7 @@ use crate::diagnostics::Diagnostic;
 use crate::graphics::resolve_icon_call;
 use crate::lexer::{TokenKind, tokenize};
 use crate::library::LibraryRegistry;
+use crate::modelica_text::{ModelTextContext, resolve_modelica_text};
 use crate::scene::{
     CoordinateSystem, GraphicId, GraphicOwner, GraphicOwnerKind, IconScene, ResolvedGraphic,
     Transform2D,
@@ -36,8 +37,27 @@ impl<'a> IconResolver<'a> {
         source: &str,
         instance_name: &str,
     ) -> IconScene {
+        self.resolve_for_instance_with_parameters(class, source, instance_name, HashMap::new())
+    }
+
+    /// Resolve an Icon with static parameter modifiers from a placed
+    /// component instance. Dynamic expressions remain unresolved macros.
+    pub fn resolve_for_instance_with_parameters(
+        &mut self,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+        parameter_bindings: HashMap<String, String>,
+    ) -> IconScene {
+        let context = ModelTextContext::new(
+            class.qualified_name.clone(),
+            class.name.clone(),
+            instance_name.to_owned(),
+            parameter_defaults(class, source),
+            parameter_bindings,
+        );
         let mut visiting = Vec::new();
-        self.resolve_inner(class, source, &mut visiting, instance_name)
+        self.resolve_inner(class, source, &mut visiting, &context)
     }
 
     fn resolve_inner(
@@ -45,7 +65,7 @@ impl<'a> IconResolver<'a> {
         class: &Class,
         source: &str,
         visiting: &mut Vec<String>,
-        instance_name: &str,
+        context: &ModelTextContext,
     ) -> IconScene {
         if visiting.iter().any(|name| name == &class.qualified_name) {
             return empty_scene(
@@ -81,7 +101,14 @@ impl<'a> IconResolver<'a> {
                 ));
                 continue;
             };
-            let mut base = self.resolve_inner(&base_class, &base_source, visiting, instance_name);
+            let base_context = ModelTextContext::new(
+                base_class.qualified_name.clone(),
+                base_class.name.clone(),
+                context.instance_name.clone(),
+                parameter_defaults(&base_class, &base_source),
+                context.parameter_bindings.clone(),
+            );
+            let mut base = self.resolve_inner(&base_class, &base_source, visiting, &base_context);
             mark_inherited_graphics(&mut base);
             inherited = Some(match inherited.take() {
                 None => base,
@@ -92,13 +119,8 @@ impl<'a> IconResolver<'a> {
                 }
             });
         }
-        let connector_graphics = self.resolve_public_connector_graphics(
-            class,
-            source,
-            visiting,
-            instance_name,
-            &mut diagnostics,
-        );
+        let connector_graphics =
+            self.resolve_public_connector_graphics(class, source, visiting, &mut diagnostics);
         let mut result = match (inherited, own) {
             (None, None) => empty_scene(class, diagnostics),
             (Some(mut base), None) => {
@@ -133,8 +155,7 @@ impl<'a> IconResolver<'a> {
             }
         };
         result.graphics.extend(connector_graphics);
-        let parameter_defaults = parameter_defaults(class, source);
-        expand_text_macros(&mut result, class, instance_name, &parameter_defaults);
+        expand_text_macros(&mut result, context);
         visiting.pop();
         for diagnostic in &mut result.diagnostics {
             diagnostic.owner = Some(class.qualified_name.clone());
@@ -147,7 +168,6 @@ impl<'a> IconResolver<'a> {
         class: &Class,
         source: &str,
         visiting: &mut Vec<String>,
-        _instance_name: &str,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Vec<ResolvedGraphic> {
         let mut graphics = Vec::new();
@@ -182,11 +202,18 @@ impl<'a> IconResolver<'a> {
             ) {
                 continue;
             }
+            let child_context = ModelTextContext::new(
+                component_class.qualified_name.clone(),
+                component_class.name.clone(),
+                component.name.clone(),
+                parameter_defaults(&component_class, &component_source),
+                HashMap::new(),
+            );
             let child = self.resolve_inner(
                 &component_class,
                 &component_source,
                 visiting,
-                &component.name,
+                &child_context,
             );
             let coordinate_system = child.coordinate_system;
             let placement = placement_transform(coordinate_system, transformation);
@@ -454,93 +481,16 @@ fn parse_number(value: &AnnotationValue) -> Option<f32> {
     parse_number_value(value)
 }
 
-fn expand_text_macros(
-    scene: &mut IconScene,
-    class: &Class,
-    instance_name: &str,
-    defaults: &HashMap<String, String>,
-) {
+fn expand_text_macros(scene: &mut IconScene, context: &ModelTextContext) {
     for graphic in &mut scene.graphics {
         let crate::scene::Graphic::Text(text) = &mut graphic.graphic else {
             continue;
         };
-        text.text = expand_text(&text.text, class, instance_name, defaults);
+        text.text = resolve_modelica_text(&text.text, context);
     }
 }
 
-fn expand_text(
-    template: &str,
-    class: &Class,
-    instance_name: &str,
-    defaults: &HashMap<String, String>,
-) -> String {
-    let mut output = String::with_capacity(template.len());
-    let chars = template.chars().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] != '%' {
-            output.push(chars[index]);
-            index += 1;
-            continue;
-        }
-        if chars.get(index + 1) == Some(&'%') {
-            output.push('%');
-            index += 2;
-            continue;
-        }
-        let braced = chars.get(index + 1) == Some(&'{');
-        let (start, mut end) = if braced {
-            let start = index + 2;
-            let end = chars[start..]
-                .iter()
-                .position(|character| *character == '}')
-                .map_or(start, |offset| start + offset);
-            (start, end)
-        } else {
-            let start = index + 1;
-            let mut end = start;
-            while chars
-                .get(end)
-                .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
-            {
-                end += 1;
-            }
-            (start, end)
-        };
-        if end == start {
-            output.push('%');
-            index += 1;
-            continue;
-        }
-        let key = chars[start..end].iter().collect::<String>();
-        if braced && chars.get(end) == Some(&'}') {
-            end += 1;
-        }
-        match key.as_str() {
-            "name" => output.push_str(instance_name),
-            "class" => output.push_str(&class.name),
-            _ if defaults.contains_key(&key) => {
-                output.push_str(defaults.get(&key).expect("checked parameter default key"))
-            }
-            _ => append_unresolved_macro(&mut output, &key, braced),
-        }
-        index = end;
-    }
-    output
-}
-
-fn append_unresolved_macro(output: &mut String, key: &str, braced: bool) {
-    output.push('%');
-    if braced {
-        output.push('{');
-    }
-    output.push_str(key);
-    if braced {
-        output.push('}');
-    }
-}
-
-fn parameter_defaults(class: &Class, source: &str) -> HashMap<String, String> {
+pub(crate) fn parameter_defaults(class: &Class, source: &str) -> HashMap<String, String> {
     let range = class.source_range;
     let Some(class_source) = source.get(range.start..range.end) else {
         return HashMap::new();

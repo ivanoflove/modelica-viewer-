@@ -1,4 +1,5 @@
 use crate::diagnostics::Diagnostic;
+use crate::modelica_text::ModelTextContext;
 use crate::{ClassKind, SourceRange};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -206,6 +207,10 @@ pub struct ComponentInstance {
     /// evaluated by the diagram resolver alone.
     pub dimensions: Vec<String>,
     pub resolved_type_qualified_name: Option<String>,
+    /// Static context used by Text graphics belonging to this component's
+    /// resolved class. Keeping it with the scene object avoids reparsing
+    /// parameter declarations in the UI/render loop.
+    pub model_text_context: ModelTextContext,
     pub class_kind: Option<ClassKind>,
     pub origin: Point,
     pub rotation: f32,

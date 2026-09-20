@@ -1,4 +1,5 @@
 use crate::lexer::{Token, TokenKind};
+use std::collections::HashMap;
 
 /// The declaration head shared by Icon and Diagram resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +137,104 @@ pub fn parse_component_declaration(tokens: &[Token]) -> Option<ComponentDeclarat
     })
 }
 
+/// Parse simple named modifier values from a component declaration, such as
+/// `Component(gain=2, label="hot") instance`.
+///
+/// This deliberately keeps source-like scalar text and does not attempt to
+/// evaluate Modelica expressions. Complex modifiers are ignored so callers
+/// can still resolve the remaining static text macros safely.
+pub fn parse_parameter_bindings(tokens: &[Token]) -> HashMap<String, String> {
+    let declaration = parse_component_declaration(tokens);
+    let Some(declaration) = declaration else {
+        return HashMap::new();
+    };
+    let Some(instance_index) = tokens
+        .iter()
+        .position(|token| token.text == declaration.instance_name)
+    else {
+        return HashMap::new();
+    };
+
+    let mut index = instance_index + 1;
+    while tokens.get(index).is_some_and(|token| token.text == "[") {
+        let Some(close) = matching_delimiter(tokens, index, "[", "]") else {
+            return HashMap::new();
+        };
+        index = close + 1;
+    }
+    if tokens.get(index).is_none_or(|token| token.text != "(") {
+        return HashMap::new();
+    }
+    let Some(close) = matching_delimiter(tokens, index, "(", ")") else {
+        return HashMap::new();
+    };
+
+    let mut bindings = HashMap::new();
+    let mut segment_start = index + 1;
+    let mut depth: usize = 0;
+    for cursor in (index + 1)..=close {
+        let at_end = cursor == close;
+        if !at_end {
+            match tokens[cursor].text.as_str() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if (!at_end && tokens[cursor].text != ",") || depth != 0 {
+            continue;
+        }
+        let segment = &tokens[segment_start..cursor];
+        if let Some((name, value)) = parse_named_scalar(segment) {
+            bindings.insert(name, value);
+        }
+        segment_start = cursor + 1;
+    }
+    bindings
+}
+
+fn matching_delimiter(tokens: &[Token], open: usize, left: &str, right: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        if token.text == left {
+            depth += 1;
+        } else if token.text == right {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn parse_named_scalar(tokens: &[Token]) -> Option<(String, String)> {
+    let equals = tokens.iter().position(|token| token.text == "=")?;
+    let name = tokens[..equals]
+        .iter()
+        .rev()
+        .find(|token| token.kind == TokenKind::Identifier)
+        .map(|token| token.text.clone())?;
+    let value_tokens = tokens[equals + 1..]
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment))
+        .collect::<Vec<_>>();
+    if value_tokens.is_empty()
+        || value_tokens
+            .iter()
+            .any(|token| matches!(token.text.as_str(), "(" | ")" | "{" | "}"))
+    {
+        return None;
+    }
+    Some((
+        name,
+        value_tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<String>(),
+    ))
+}
+
 fn is_name_token(token: &Token) -> bool {
     matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword)
 }
@@ -188,7 +287,7 @@ fn parse_bracket_dimension(tokens: &[&Token], index: &mut usize) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::parse_component_declaration;
+    use super::{parse_component_declaration, parse_parameter_bindings};
     use crate::lexer::tokenize;
 
     fn parse(value: &str) -> (String, String, Vec<String>) {
@@ -246,5 +345,14 @@ mod tests {
             parse("FluidPorts_a ports[n,m]"),
             ("FluidPorts_a".into(), "ports".into(), vec!["n,m".into()])
         );
+    }
+
+    #[test]
+    fn parses_simple_named_parameter_bindings() {
+        let bindings = parse_parameter_bindings(&tokenize(
+            "Modelica.Blocks.Sources.RealExpression source(y=3.5, description=\"hot\")",
+        ));
+        assert_eq!(bindings.get("y"), Some(&"3.5".to_owned()));
+        assert_eq!(bindings.get("description"), Some(&"\"hot\"".to_owned()));
     }
 }

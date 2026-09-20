@@ -36,9 +36,9 @@ use modelica_core::scene::{
 use modelica_core::{
     apply_source_transaction,
     lexer::{tokenize, Token, TokenKind},
-    parse, parse_component_declaration, resolve_diagram, Class, ClassKind, IconResolver, Library,
-    LibraryKind, LibraryRegistry, ModelicaFile, PackageLoader, PackageMember, PackageNode,
-    SourceEdit, SourceRange, SourceTransaction,
+    parse, parse_component_declaration, resolve_diagram, resolve_modelica_text, Class, ClassKind,
+    IconResolver, Library, LibraryKind, LibraryRegistry, ModelTextContext, ModelicaFile,
+    PackageLoader, PackageMember, PackageNode, SourceEdit, SourceRange, SourceTransaction,
 };
 use modelica_render::{
     canonicalize_orthogonal_points, connector_anchor_hit_distance, connector_anchors,
@@ -12195,6 +12195,13 @@ fn collect_model_text_overlay_items(
         return Vec::new();
     };
     let display_class_name = class_name.rsplit('.').next().unwrap_or(class_name);
+    let class_text_context = ModelTextContext::new(
+        class_name.to_owned(),
+        display_class_name.to_owned(),
+        display_class_name.to_owned(),
+        HashMap::new(),
+        HashMap::new(),
+    );
     let mut items = Vec::new();
 
     match main_view {
@@ -12208,8 +12215,7 @@ fn collect_model_text_overlay_items(
                     items.push(model_text_overlay_item(
                         text,
                         resolved.transform,
-                        display_class_name,
-                        display_class_name,
+                        &class_text_context,
                     ));
                 }
             }
@@ -12223,8 +12229,7 @@ fn collect_model_text_overlay_items(
                     items.push(model_text_overlay_item(
                         text,
                         Transform2D::identity(),
-                        display_class_name,
-                        display_class_name,
+                        &class_text_context,
                     ));
                 }
             }
@@ -12239,18 +12244,12 @@ fn collect_model_text_overlay_items(
                     .filter(|(component_id, _)| *component_id == component.id.as_str())
                     .map(|(_, preview)| preview);
                 let placement = effective_component_transform(layer, component, preview);
-                let component_class_name = component
-                    .resolved_type_qualified_name
-                    .as_deref()
-                    .and_then(|name| name.rsplit('.').next())
-                    .unwrap_or(component.type_name.as_str());
                 for resolved in &layer.graphics {
                     if let CoreGraphic::Text(text) = &resolved.graphic {
                         items.push(model_text_overlay_item(
                             text,
                             compose_transform(placement, resolved.transform),
-                            &component.name,
-                            component_class_name,
+                            &component.model_text_context,
                         ));
                     }
                 }
@@ -12263,8 +12262,7 @@ fn collect_model_text_overlay_items(
 fn model_text_overlay_item(
     text: &modelica_core::scene::TextGraphic,
     transform: Transform2D,
-    instance_name: &str,
-    class_name: &str,
+    context: &ModelTextContext,
 ) -> ModelTextOverlayItem {
     let extent = text.extent;
     let local_corners = [
@@ -12284,7 +12282,7 @@ fn model_text_overlay_item(
         CorePoint { x, y }
     });
     ModelTextOverlayItem {
-        text: expand_model_text(&text.text, instance_name, class_name),
+        text: resolve_modelica_text(&text.text, context),
         corners,
         color: text.color,
         font_size: text.font_size.unwrap_or(10.0),
@@ -12317,15 +12315,6 @@ fn trace_component_preview(preview: Option<(&str, ComponentPreviewPlacement)>) {
         preview.delta.x,
         preview.delta.y,
     );
-}
-
-fn expand_model_text(template: &str, instance_name: &str, class_name: &str) -> String {
-    let escaped_percent = '\u{0}';
-    template
-        .replace("%%", &escaped_percent.to_string())
-        .replace("%name", instance_name)
-        .replace("%class", class_name)
-        .replace(escaped_percent, "%")
 }
 
 fn model_text_alignment(value: Option<&str>) -> ModelTextAlignment {
@@ -16397,6 +16386,16 @@ mod tests {
     use super::*;
     use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
 
+    fn text_context(instance_name: &str, class_name: &str) -> ModelTextContext {
+        ModelTextContext::new(
+            format!("Demo.{class_name}"),
+            class_name,
+            instance_name,
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
     #[test]
     fn tree_row_keeps_descriptions_in_metadata_but_not_visible_text() {
         let nodes = [
@@ -16539,6 +16538,7 @@ mod tests {
             type_name: "Port".to_owned(),
             dimensions: Vec::new(),
             resolved_type_qualified_name: Some("Test.Port".to_owned()),
+            model_text_context: ModelTextContext::default(),
             class_kind: Some(ClassKind::Connector),
             origin,
             rotation: 0.0,
@@ -18713,6 +18713,7 @@ end BoundarySig;
             type_name: "Port".to_owned(),
             dimensions: Vec::new(),
             resolved_type_qualified_name: Some("Port".to_owned()),
+            model_text_context: ModelTextContext::default(),
             class_kind: Some(ClassKind::Connector),
             origin: CorePoint { x: 0.0, y: 0.0 },
             rotation: 0.0,
@@ -18840,7 +18841,10 @@ end BoundarySig;
     #[test]
     fn model_text_macros_and_annotation_color_are_preserved() {
         assert_eq!(
-            expand_model_text("%%name %name (%class)", "sink", "BoundarySig"),
+            resolve_modelica_text(
+                "%%name %name (%class)",
+                &text_context("sink", "BoundarySig"),
+            ),
             "%name sink (BoundarySig)"
         );
         let text = modelica_core::scene::TextGraphic {
@@ -18859,7 +18863,8 @@ end BoundarySig;
             horizontal_alignment: Some("TextAlignment.Left".to_owned()),
             text_style: vec!["TextStyle.Bold".to_owned()],
         };
-        let item = model_text_overlay_item(&text, Transform2D::identity(), "sink", "BoundarySig");
+        let context = text_context("sink", "BoundarySig");
+        let item = model_text_overlay_item(&text, Transform2D::identity(), &context);
         assert_eq!(item.text, "sink");
         assert_eq!(item.color, [0, 0, 127]);
         assert_eq!(item.alignment, ModelTextAlignment::Left);
@@ -18872,8 +18877,7 @@ end BoundarySig;
                 ..text
             },
             Transform2D::identity(),
-            "sink",
-            "BoundarySig",
+            &context,
         );
         assert_eq!(name_item.minimum_screen_px, MIN_SCREEN_MODEL_NAME_TEXT_PX);
     }
@@ -18894,6 +18898,7 @@ end BoundarySig;
             type_name: "Component".to_owned(),
             dimensions: Vec::new(),
             resolved_type_qualified_name: Some("Test.Component".to_owned()),
+            model_text_context: ModelTextContext::default(),
             class_kind: Some(ClassKind::Model),
             origin: CorePoint { x: 50.0, y: -20.0 },
             rotation: 90.0,
@@ -18938,8 +18943,9 @@ end BoundarySig;
             effective_component_transform(&icon, &component, Some(moved_preview)),
             Transform2D::identity(),
         );
-        let base_item = model_text_overlay_item(&text, base_transform, "cpa", "Component");
-        let moved_item = model_text_overlay_item(&text, moved_transform, "cpa", "Component");
+        let context = text_context("cpa", "Component");
+        let base_item = model_text_overlay_item(&text, base_transform, &context);
+        let moved_item = model_text_overlay_item(&text, moved_transform, &context);
 
         assert_eq!(moved_item.text, base_item.text);
         assert_eq!(moved_item.scale, base_item.scale);
@@ -18960,8 +18966,7 @@ end BoundarySig;
         let resized_item = model_text_overlay_item(
             &text,
             effective_component_transform(&icon, &component, Some(resized_preview)),
-            "cpa",
-            "Component",
+            &context,
         );
         assert!(resized_item.scale > base_item.scale);
     }
@@ -18984,15 +18989,15 @@ end BoundarySig;
             horizontal_alignment: None,
             text_style: Vec::new(),
         };
-        let base = model_text_overlay_item(&text, Transform2D::identity(), "cpa", "Component");
+        let context = text_context("cpa", "Component");
+        let base = model_text_overlay_item(&text, Transform2D::identity(), &context);
         let moved = model_text_overlay_item(
             &text,
             Transform2D {
                 translation: CorePoint { x: 20.0, y: 10.0 },
                 ..Transform2D::identity()
             },
-            "cpa",
-            "Component",
+            &context,
         );
         assert_eq!(moved.text, "H2,O2,H2O,N2");
         for (base, moved) in base.corners.iter().zip(moved.corners) {
@@ -19050,6 +19055,7 @@ end BoundarySig;
                 type_name: name.to_owned(),
                 dimensions: Vec::new(),
                 resolved_type_qualified_name: Some(name.to_owned()),
+                model_text_context: ModelTextContext::default(),
                 class_kind: Some(class_kind),
                 origin: CorePoint { x: 0.0, y: 0.0 },
                 rotation: 0.0,

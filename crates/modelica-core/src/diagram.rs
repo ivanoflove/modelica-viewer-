@@ -2,13 +2,14 @@ use std::collections::HashMap;
 
 use crate::annotation::{AnnotationCall, AnnotationValue, parse_call};
 use crate::ast::{Class, ClassKind, SourceRange};
-use crate::component::parse_component_declaration;
+use crate::component::{parse_component_declaration, parse_parameter_bindings};
 use crate::diagnostics::Diagnostic;
 use crate::graphics::{
     resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call, resolve_icon_call,
 };
 use crate::lexer::{Token, TokenKind, tokenize};
 use crate::library::LibraryRegistry;
+use crate::modelica_text::ModelTextContext;
 use crate::scene::{
     ComponentInstance, ConnectionKey, ConnectorRef, DiagramBounds, DiagramConnection, DiagramScene,
     Extent, Graphic, IconScene, LineGraphic, Point,
@@ -186,11 +187,11 @@ impl<'a> DiagramResolver<'a> {
             .filter(|record| record.owner == AnnotationOwner::Component)
             .enumerate()
         {
-            let Some(declaration) =
-                parse_component_declaration(&statement_tokens(&tokens, record.token_index))
-            else {
+            let statement = statement_tokens(&tokens, record.token_index);
+            let Some(declaration) = parse_component_declaration(&statement) else {
                 continue;
             };
+            let parameter_bindings = parse_parameter_bindings(&statement);
             let type_name = declaration.declared_type_name;
             let name = declaration.instance_name;
             let dimensions = declaration.dimensions;
@@ -220,6 +221,7 @@ impl<'a> DiagramResolver<'a> {
                 type_name: type_name.clone(),
                 dimensions,
                 resolved_type_qualified_name: None,
+                model_text_context: ModelTextContext::default(),
                 class_kind: None,
                 origin: transformation.origin,
                 rotation: transformation.rotation,
@@ -236,11 +238,19 @@ impl<'a> DiagramResolver<'a> {
                 component.resolved_type_qualified_name =
                     Some(component_class.qualified_name.clone());
                 component.class_kind = Some(component_class.kind);
+                component.model_text_context = ModelTextContext::new(
+                    component_class.qualified_name.clone(),
+                    component_class.name.clone(),
+                    component.name.clone(),
+                    crate::icon::parameter_defaults(&component_class, &component_source),
+                    parameter_bindings.clone(),
+                );
                 let icon = IconResolverAdapter::resolve(
                     self.registry,
                     &component_class,
                     &component_source,
                     &component.name,
+                    parameter_bindings,
                 );
                 component.resolved_icon = Some(Box::new(icon));
                 if matches!(
@@ -305,8 +315,14 @@ impl IconResolverAdapter {
         class: &Class,
         source: &str,
         instance_name: &str,
+        parameter_bindings: HashMap<String, String>,
     ) -> IconScene {
-        crate::IconResolver::new(registry).resolve_for_instance(class, source, instance_name)
+        crate::IconResolver::new(registry).resolve_for_instance_with_parameters(
+            class,
+            source,
+            instance_name,
+            parameter_bindings,
+        )
     }
 }
 
@@ -932,6 +948,48 @@ end Top;
                 .expect("component label");
             assert_eq!(text, name);
         }
+    }
+
+    #[test]
+    fn diagram_component_text_uses_parameter_binding_over_default() {
+        let source = r#"
+model Unit
+  parameter Real label = 42;
+  annotation(Icon(graphics={Text(extent={{-40,-10},{40,10}}, textString="%label/%{label}")}));
+end Unit;
+
+model Top
+  Unit unit(label=7) annotation(Placement(transformation(extent={{-10,-10},{10,10}})));
+end Top;
+"#;
+        let file = parse(source, "DiagramParameterText.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("DiagramParameterText.mo", source)
+            .expect("index");
+        let scene = resolve_diagram(&file.classes[1], source, &mut registry);
+        let component = &scene.components[0];
+        assert_eq!(
+            component.model_text_context.parameter_defaults["label"],
+            "42"
+        );
+        assert_eq!(
+            component.model_text_context.parameter_bindings["label"],
+            "7"
+        );
+        let text = component
+            .resolved_icon
+            .as_ref()
+            .and_then(|icon| {
+                icon.graphics
+                    .iter()
+                    .find_map(|graphic| match &graphic.graphic {
+                        crate::scene::Graphic::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+            })
+            .expect("parameter text");
+        assert_eq!(text, "7/7");
     }
 
     #[test]
