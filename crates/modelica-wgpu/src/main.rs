@@ -2631,6 +2631,9 @@ struct TreeNode {
     qualified_name: String,
     class_name: Option<String>,
     kind: Option<ClassKind>,
+    // Kept as model metadata for future properties, tooltip, search, or docs
+    // views; the model tree intentionally does not render it inline.
+    #[allow(dead_code)]
     description: Option<String>,
     children: Vec<TreeNode>,
 }
@@ -11009,7 +11012,6 @@ fn tree_row(
     icon: &str,
     label: &str,
     identity: &str,
-    description: Option<&str>,
     selected: bool,
     indent: f32,
 ) -> (egui::Response, egui::Response) {
@@ -11059,30 +11061,18 @@ fn tree_row(
     };
     let label_galley =
         ui.painter()
-            .layout_no_wrap(format!("{icon}  {label}"), label_font, label_color);
+            .layout_no_wrap(tree_row_label(icon, label), label_font, label_color);
     let label_position = Pos2::new(
         text_position.x,
         rect.center().y - label_galley.size().y * 0.5,
     );
     ui.painter()
         .galley(label_position, label_galley.clone(), label_color);
-    if let Some(description) = description {
-        let description_text = format!("  — {description}");
-        let description_font = ui_font(12.0);
-        let description_color = theme_text_secondary();
-        let description_galley =
-            ui.painter()
-                .layout_no_wrap(description_text, description_font, description_color);
-        ui.painter().galley(
-            Pos2::new(
-                label_position.x + label_galley.size().x + 3.0,
-                rect.center().y - description_galley.size().y * 0.5,
-            ),
-            description_galley,
-            description_color,
-        );
-    }
     (response, marker_response)
+}
+
+fn tree_row_label(icon: &str, label: &str) -> String {
+    format!("{icon}  {label}")
 }
 
 fn document_tree(
@@ -11127,7 +11117,6 @@ fn render_tree_node(
         icon,
         &node.name,
         &node.qualified_name,
-        node.description.as_deref(),
         selected,
         depth as f32,
     );
@@ -16171,6 +16160,44 @@ fn main() {
 mod tests {
     use super::*;
     use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
+
+    #[test]
+    fn tree_row_keeps_descriptions_in_metadata_but_not_visible_text() {
+        let nodes = [
+            TreeNode {
+                name: "Heater".to_owned(),
+                qualified_name: "Demo.Heater".to_owned(),
+                class_name: Some("Demo.Heater".to_owned()),
+                kind: Some(ClassKind::Block),
+                description: Some("一等温吸附干燥器（很长的中文说明）".to_owned()),
+                children: Vec::new(),
+            },
+            TreeNode {
+                name: "Nested".to_owned(),
+                qualified_name: "Demo.Parent.Nested".to_owned(),
+                class_name: Some("Demo.Parent.Nested".to_owned()),
+                kind: Some(ClassKind::Model),
+                description: None,
+                children: Vec::new(),
+            },
+        ];
+
+        for node in nodes {
+            let visible_text = tree_row_label(tree_node_icon(node.kind), &node.name);
+            assert_eq!(
+                visible_text,
+                format!("{}  {}", tree_node_icon(node.kind), node.name)
+            );
+            assert!(!visible_text.contains('—'));
+            assert!(!visible_text.contains("干燥器"));
+            if node.name == "Heater" {
+                assert_eq!(
+                    node.description.as_deref(),
+                    Some("一等温吸附干燥器（很长的中文说明）")
+                );
+            }
+        }
+    }
 
     fn sample_create_command() -> EditCommand {
         EditCommand::CreateDiagramConnection {
