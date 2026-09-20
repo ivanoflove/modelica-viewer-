@@ -2740,6 +2740,7 @@ struct SourceFoldState {
 impl SourceFoldState {
     fn sync_document(&mut self, document: &UiDocument) {
         let selected_class = document.selected_class.clone();
+        let new_class = !self.initialized || self.selected_class != selected_class;
         if self.initialized
             && self.selected_class == selected_class
             && self.source_version == document.source_version
@@ -2760,10 +2761,14 @@ impl SourceFoldState {
             .iter()
             .map(|range| range.id.clone())
             .collect::<HashSet<_>>();
-        self.collapsed = previous_collapsed
-            .into_iter()
-            .filter(|id| current_ids.contains(id))
-            .collect();
+        self.collapsed = if new_class {
+            current_ids
+        } else {
+            previous_collapsed
+                .into_iter()
+                .filter(|id| current_ids.contains(id))
+                .collect()
+        };
         self.initialized = true;
     }
 
@@ -17157,12 +17162,21 @@ mod tests {
         );
         let parent_id = state.range_starting_at(0).expect("parent fold").id.clone();
         let child_id = state.range_starting_at(1).expect("child fold").id.clone();
+        state.collapsed.clear();
         assert!(state.toggle_line(1));
         assert!(state.collapsed.contains(&child_id));
         assert!(state.toggle_line(0));
         assert!(state.toggle_line(0));
         assert!(state.collapsed.contains(&child_id));
         assert!(!state.collapsed.contains(&parent_id));
+    }
+
+    #[test]
+    fn source_folds_are_collapsed_by_default() {
+        let state = source_folding_state("annotation(\n  Icon(\n    graphics={}\n  )\n)", 1);
+        assert!(!state.ranges.is_empty());
+        assert_eq!(state.collapsed.len(), state.ranges.len());
+        assert_eq!(state.visible_rows(5).rows.len(), 1);
     }
 
     #[test]
@@ -17200,7 +17214,6 @@ mod tests {
         let first_document = source_folding_document("annotation(\nx\n)", 1);
         state.sync_document(&first_document);
         let old_id = state.range_starting_at(0).expect("old fold").id.clone();
-        state.toggle_line(0);
         assert!(state.collapsed.contains(&old_id));
 
         let second_document = source_folding_document("model Demo\nend Demo;", 2);
@@ -17213,6 +17226,7 @@ mod tests {
     fn visible_rows_keep_original_line_numbers() {
         let source = "model Demo\nannotation(\n  Icon()\n)\nend Demo;";
         let mut state = source_folding_state(source, 1);
+        state.collapsed.clear();
         assert!(state.toggle_line(1));
         let rows = state.visible_rows(source_folding_lines(source).len());
         assert_eq!(
@@ -17262,7 +17276,6 @@ mod tests {
             source_version: 1,
         };
         state.sync_document(&document);
-        assert!(state.toggle_line(0));
         let rows = state.visible_rows(5_000);
         assert_eq!(rows.rows.len(), 1);
         assert_eq!(rows.rows[0].original_line, 0);
