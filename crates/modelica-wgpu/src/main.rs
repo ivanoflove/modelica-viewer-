@@ -19101,6 +19101,61 @@ end BoundarySig;
     }
 
     #[test]
+    fn text_parity_fixture_reaches_wgpu_overlay_inputs() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../modelica-core/tests/fixtures/TextParity.mo"
+        ));
+        let _file = parse(source, "TextParity.mo").expect("parse TextParity fixture");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("TextParity.mo", source)
+            .expect("index TextParity fixture");
+        let (class, class_source) = registry
+            .resolve_class("TextParity")
+            .expect("TextParity class");
+        let icon = IconResolver::new(&mut registry).resolve(&class, &class_source);
+        let styled = icon
+            .graphics
+            .iter()
+            .find_map(|graphic| match &graphic.graphic {
+                CoreGraphic::Text(text) if text.text == "Bold Italic" => Some(text),
+                _ => None,
+            })
+            .expect("styled Text graphic");
+        let item = model_text_overlay_item(
+            styled,
+            Transform2D::identity(),
+            &text_context("TextParity", "TextParity"),
+        );
+        assert!(item.bold && item.italic);
+
+        let diagram = resolve_diagram(&class, &class_source, &mut registry);
+        let component = diagram
+            .components
+            .iter()
+            .find(|component| component.name == "instance")
+            .expect("TextParity component");
+        let component_text = component
+            .resolved_icon
+            .as_ref()
+            .expect("component icon")
+            .graphics
+            .iter()
+            .find_map(|graphic| match &graphic.graphic {
+                CoreGraphic::Text(text) if text.text == "Instance override" => Some(text),
+                _ => None,
+            })
+            .expect("parameterized component Text graphic");
+        let component_item = model_text_overlay_item(
+            component_text,
+            Transform2D::identity(),
+            &component.model_text_context,
+        );
+        assert_eq!(component_item.text, "Instance override");
+    }
+
+    #[test]
     fn diagram_text_preview_uses_the_same_move_transform_as_component_geometry() {
         let coordinate_system = modelica_core::scene::CoordinateSystem::default();
         let icon = CoreIconScene {

@@ -226,13 +226,15 @@ fn parse_named_scalar(tokens: &[Token]) -> Option<(String, String)> {
     {
         return None;
     }
-    Some((
-        name,
-        value_tokens
-            .iter()
-            .map(|token| token.text.as_str())
-            .collect::<String>(),
-    ))
+    let value = value_tokens
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect::<String>();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .map_or_else(|| value.clone(), |value| value.replace("\"\"", "\""));
+    Some((name, value))
 }
 
 fn is_name_token(token: &Token) -> bool {
@@ -353,6 +355,6 @@ mod tests {
             "Modelica.Blocks.Sources.RealExpression source(y=3.5, description=\"hot\")",
         ));
         assert_eq!(bindings.get("y"), Some(&"3.5".to_owned()));
-        assert_eq!(bindings.get("description"), Some(&"\"hot\"".to_owned()));
+        assert_eq!(bindings.get("description"), Some(&"hot".to_owned()));
     }
 }

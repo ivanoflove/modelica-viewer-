@@ -1022,4 +1022,58 @@ end IEH_CPP;
         assert!((connector.transform.scale_x - 0.1).abs() < 0.001);
         assert!((connector.transform.scale_y - 0.1).abs() < 0.001);
     }
+
+    #[test]
+    fn text_parity_fixture_resolves_inherited_and_parameterized_text() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/TextParity.mo"
+        ));
+        let file = parse(source, "TextParity.mo").expect("parse TextParity fixture");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("TextParity.mo", source)
+            .expect("index TextParity fixture");
+        let (class, class_source) = registry
+            .resolve_class("TextParity")
+            .expect("TextParity class");
+        let scene = IconResolver::new(&mut registry).resolve(&class, &class_source);
+        let texts = scene
+            .graphics
+            .iter()
+            .filter_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text),
+                _ => None,
+            })
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"ordinary text"));
+        assert!(texts.contains(&"%label"));
+        assert!(texts.contains(&"%{label}"));
+
+        let diagram = crate::resolve_diagram(&class, &class_source, &mut registry);
+        let component = diagram
+            .components
+            .iter()
+            .find(|component| component.name == "instance")
+            .expect("TextParity instance");
+        assert_eq!(
+            component.model_text_context.parameter_bindings["label"],
+            "Instance override"
+        );
+        let component_texts = component
+            .resolved_icon
+            .as_ref()
+            .expect("component icon")
+            .graphics
+            .iter()
+            .filter_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(component_texts.contains(&"inherited"));
+        assert!(component_texts.contains(&"Instance override"));
+        assert!(file.classes.iter().any(|class| class.name == "TextParity"));
+    }
 }
