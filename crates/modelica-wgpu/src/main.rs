@@ -2720,7 +2720,7 @@ struct SourceFoldRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VisibleSourceRow {
     original_line: usize,
-    collapsed_range: Option<FoldId>,
+    fold_range_index: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2735,6 +2735,12 @@ struct SourceFoldState {
     initialized: bool,
     ranges: Vec<SourceFoldRange>,
     collapsed: HashSet<FoldId>,
+    range_by_start_line: HashMap<usize, usize>,
+    range_by_id: HashMap<FoldId, usize>,
+    visible_rows: VisibleSourceRows,
+    fold_layout_rebuild_count: u64,
+    fold_layout_rebuild_time: Duration,
+    fold_sync_time: Duration,
 }
 
 impl SourceFoldState {
@@ -2748,6 +2754,7 @@ impl SourceFoldState {
             return;
         }
 
+        let sync_started = Instant::now();
         let previous_collapsed = std::mem::take(&mut self.collapsed);
         self.selected_class = selected_class;
         self.source_version = document.source_version;
@@ -2770,58 +2777,81 @@ impl SourceFoldState {
                 .collect()
         };
         self.initialized = true;
+        self.rebuild_fold_layout(document.source_lines.len());
+        self.fold_sync_time += sync_started.elapsed();
     }
 
-    fn visible_rows(&self, line_count: usize) -> VisibleSourceRows {
-        let mut rows = Vec::with_capacity(line_count);
-        let mut collapsed_at_start = HashMap::<usize, &SourceFoldRange>::new();
-        for range in &self.ranges {
-            if !self.collapsed.contains(&range.id) {
-                continue;
-            }
-            let replace = collapsed_at_start
+    fn rebuild_fold_layout(&mut self, line_count: usize) {
+        let started = Instant::now();
+        self.range_by_start_line.clear();
+        self.range_by_id.clear();
+        for (index, range) in self.ranges.iter().enumerate() {
+            self.range_by_id.insert(range.id.clone(), index);
+            let replace = self
+                .range_by_start_line
                 .get(&range.start_line)
+                .and_then(|current| self.ranges.get(*current))
                 .is_none_or(|current| {
                     (range.end_line, range.id.open_start)
                         > (current.end_line, current.id.open_start)
                 });
             if replace {
-                collapsed_at_start.insert(range.start_line, range);
+                self.range_by_start_line.insert(range.start_line, index);
             }
         }
+        let mut collapsed_at_start = HashMap::<usize, usize>::new();
+        for (index, range) in self.ranges.iter().enumerate() {
+            if !self.collapsed.contains(&range.id) {
+                continue;
+            }
+            let replace = collapsed_at_start
+                .get(&range.start_line)
+                .and_then(|current| self.ranges.get(*current))
+                .is_none_or(|current| {
+                    (range.end_line, range.id.open_start)
+                        > (current.end_line, current.id.open_start)
+                });
+            if replace {
+                collapsed_at_start.insert(range.start_line, index);
+            }
+        }
+        let mut rows = Vec::with_capacity(line_count);
         let mut line = 0;
         while line < line_count {
-            if let Some(range) = collapsed_at_start.get(&line) {
+            if let Some(&range_index) = collapsed_at_start.get(&line) {
+                let range = &self.ranges[range_index];
                 rows.push(VisibleSourceRow {
                     original_line: line,
-                    collapsed_range: Some(range.id.clone()),
+                    fold_range_index: Some(range_index),
                 });
                 line = range.end_line.saturating_add(1).min(line_count);
             } else {
                 rows.push(VisibleSourceRow {
                     original_line: line,
-                    collapsed_range: None,
+                    fold_range_index: None,
                 });
                 line += 1;
             }
         }
-        VisibleSourceRows { rows }
+        self.visible_rows = VisibleSourceRows { rows };
+        self.fold_layout_rebuild_count += 1;
+        self.fold_layout_rebuild_time += started.elapsed();
     }
 
     fn range_starting_at(&self, line: usize) -> Option<&SourceFoldRange> {
-        self.ranges
-            .iter()
-            .filter(|range| range.start_line == line)
-            .max_by_key(|range| (range.end_line, range.id.open_start))
+        self.range_by_start_line
+            .get(&line)
+            .and_then(|index| self.ranges.get(*index))
     }
 
-    fn toggle_line(&mut self, line: usize) -> bool {
+    fn toggle_line(&mut self, line: usize, line_count: usize) -> bool {
         let Some(id) = self.range_starting_at(line).map(|range| range.id.clone()) else {
             return false;
         };
         if !self.collapsed.remove(&id) {
             self.collapsed.insert(id);
         }
+        self.rebuild_fold_layout(line_count);
         true
     }
 }
@@ -2946,6 +2976,7 @@ struct SourceHighlightCache {
     key: Option<SourceHighlightCacheKey>,
     lines: Vec<SourceLineCache>,
     collapsed_lines: HashMap<FoldId, Arc<egui::Galley>>,
+    fold_marker_galleys: Option<(Arc<egui::Galley>, Arc<egui::Galley>)>,
     max_line_width: f32,
     cache_hits: usize,
     cache_misses: usize,
@@ -2966,6 +2997,7 @@ impl SourceHighlightCache {
                 .map(|_| SourceLineCache::default())
                 .collect();
             self.collapsed_lines.clear();
+            self.fold_marker_galleys = None;
             self.max_line_width = 0.0;
             self.cache_hits = 0;
             self.cache_misses = 0;
@@ -3058,6 +3090,26 @@ impl SourceHighlightCache {
         self.collapsed_lines
             .insert(range.id.clone(), galley.clone());
         (galley, elapsed)
+    }
+
+    fn fold_marker_galleys(
+        &mut self,
+        ui: &egui::Ui,
+        document: &UiDocument,
+    ) -> (Arc<egui::Galley>, Arc<egui::Galley>) {
+        self.prepare(document, ui.ctx().pixels_per_point());
+        if let Some((expanded, collapsed)) = &self.fold_marker_galleys {
+            return (expanded.clone(), collapsed.clone());
+        }
+        let expanded =
+            ui.painter()
+                .layout_no_wrap("▾".to_owned(), ui_mono_font(12.0), theme_text_secondary());
+        let collapsed =
+            ui.painter()
+                .layout_no_wrap("▸".to_owned(), ui_mono_font(12.0), theme_text_secondary());
+        let markers = (expanded, collapsed);
+        self.fold_marker_galleys = Some(markers.clone());
+        markers
     }
 }
 
@@ -11683,6 +11735,10 @@ struct SourcePerfFrame {
     rows: usize,
     source_ui: Duration,
     highlight: Duration,
+    fold_sync: Duration,
+    visible_map_rebuild: Duration,
+    visible_row_lookup: Duration,
+    fold_layout_rebuild_count: u64,
     wheel: Option<SourceWheelSample>,
     scroll_offset: f32,
     cache_hits: usize,
@@ -11881,7 +11937,11 @@ fn source_preview(
         if let Some(document) = document {
             let source_ui_started = Instant::now();
             let mut highlight_time = Duration::ZERO;
+            let mut visible_row_lookup = Duration::ZERO;
             let mut rendered_rows = 0;
+            let fold_sync_before = source_interaction.fold_state.fold_sync_time;
+            let fold_layout_time_before = source_interaction.fold_state.fold_layout_rebuild_time;
+            let fold_layout_count_before = source_interaction.fold_state.fold_layout_rebuild_count;
             source_scroll_state.sync_class(document.selected_class.as_deref());
             source_interaction.sync_document(document);
             if source_interaction.focused
@@ -11903,11 +11963,8 @@ fn source_preview(
             let pointer_position = ui.ctx().pointer_latest_pos();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             let source_content_width = source_highlight_cache.content_width(ui, document);
-            let visible_source_rows = source_interaction
-                .fold_state
-                .visible_rows(document.source_lines.len());
-            let fold_ranges = source_interaction.fold_state.ranges.clone();
-            let collapsed_folds = source_interaction.fold_state.collapsed.clone();
+            let (expanded_marker_galley, collapsed_marker_galley) =
+                source_highlight_cache.fold_marker_galleys(ui, document);
             let cache_hits_before = source_highlight_cache.cache_hits;
             let cache_misses_before = source_highlight_cache.cache_misses;
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
@@ -11927,38 +11984,45 @@ fn source_preview(
                 state_before.store(ui.ctx(), scroll_id);
             }
             let offset_before = state_before.offset;
-            let scroll_output = egui::ScrollArea::both()
-                .id_source(scroll_id_source)
-                .max_height(scroll_height)
-                .max_width(scroll_width)
-                .auto_shrink([false, false])
-                .drag_to_scroll(false)
-                .show_rows(
-                    ui,
-                    SOURCE_ROW_HEIGHT,
-                    visible_source_rows.rows.len(),
-                    |ui, row_range| {
-                        rendered_rows += row_range.len();
-                        for visible_index in row_range {
-                            let visible_row = &visible_source_rows.rows[visible_index];
-                            let original_line = visible_row.original_line;
-                            let marker = fold_ranges
-                                .iter()
-                                .filter(|range| range.start_line == original_line)
-                                .max_by_key(|range| (range.end_line, range.id.open_start))
-                                .map(|range| {
-                                    if collapsed_folds.contains(&range.id) {
-                                        "▸"
+            let mut fold_toggle_line = None;
+            let source_all_selected = source_interaction.all_selected;
+            let scroll_output = {
+                let fold_state = &source_interaction.fold_state;
+                let visible_source_rows = &fold_state.visible_rows.rows;
+                let fold_ranges = &fold_state.ranges;
+                let collapsed_folds = &fold_state.collapsed;
+                let range_by_start_line = &fold_state.range_by_start_line;
+                egui::ScrollArea::both()
+                    .id_source(scroll_id_source)
+                    .max_height(scroll_height)
+                    .max_width(scroll_width)
+                    .auto_shrink([false, false])
+                    .drag_to_scroll(false)
+                    .show_rows(
+                        ui,
+                        SOURCE_ROW_HEIGHT,
+                        visible_source_rows.len(),
+                        |ui, row_range| {
+                            rendered_rows += row_range.len();
+                            for visible_index in row_range {
+                                let visible_row = &visible_source_rows[visible_index];
+                                let original_line = visible_row.original_line;
+                                let lookup_started = Instant::now();
+                                let range_index = range_by_start_line.get(&original_line).copied();
+                                let marker = range_index.map(|index| {
+                                    if collapsed_folds.contains(&fold_ranges[index].id) {
+                                        collapsed_marker_galley.clone()
                                     } else {
-                                        "▾"
+                                        expanded_marker_galley.clone()
                                     }
                                 });
-                            let (number_galley, code_galley, elapsed) =
-                                if let Some(fold_id) = &visible_row.collapsed_range {
-                                    let range = fold_ranges
-                                        .iter()
-                                        .find(|range| range.id == *fold_id)
-                                        .expect("visible collapsed row must have a fold range");
+                                let range = visible_row
+                                    .fold_range_index
+                                    .and_then(|index| fold_ranges.get(index));
+                                let lookup_elapsed = lookup_started.elapsed();
+                                let (number_galley, code_galley, elapsed) = if let Some(range) =
+                                    range
+                                {
                                     let (code_galley, elapsed) = source_highlight_cache
                                         .collapsed_galley(ui, document, range);
                                     let (number_galley, _, number_elapsed) =
@@ -11967,26 +12031,38 @@ fn source_preview(
                                 } else {
                                     source_highlight_cache.galleys(ui, document, original_line)
                                 };
-                            highlight_time += elapsed;
-                            let (response, fold_response) = render_source_line(
-                                ui,
-                                number_galley,
-                                code_galley,
-                                source_content_width,
-                                original_line,
-                                marker,
-                                source_interaction.all_selected,
-                            );
-                            if fold_response.clicked() {
-                                source_interaction.fold_state.toggle_line(original_line);
-                                ui.ctx().request_repaint();
-                            } else if response.clicked() {
-                                source_interaction.focused = true;
-                                source_interaction.all_selected = false;
+                                highlight_time += elapsed;
+                                let fold_response = render_source_line(
+                                    ui,
+                                    number_galley,
+                                    code_galley,
+                                    source_content_width,
+                                    original_line,
+                                    marker,
+                                    source_all_selected,
+                                );
+                                if fold_response.is_some_and(|response| response.clicked()) {
+                                    fold_toggle_line = Some(original_line);
+                                }
+                                visible_row_lookup += lookup_elapsed;
                             }
-                        }
-                    },
-                );
+                        },
+                    )
+            };
+            let viewport_response = ui.interact(
+                scroll_output.inner_rect,
+                ui.id().with("source-viewport"),
+                Sense::click(),
+            );
+            if let Some(line) = fold_toggle_line {
+                source_interaction
+                    .fold_state
+                    .toggle_line(line, document.source_lines.len());
+                ui.ctx().request_repaint();
+            } else if viewport_response.clicked() {
+                source_interaction.focused = true;
+                source_interaction.all_selected = false;
+            }
             *source_scroll_rect = Some(scroll_output.inner_rect);
             let max_scroll_y =
                 (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
@@ -12028,6 +12104,19 @@ fn source_preview(
                     rows: rendered_rows,
                     source_ui: source_ui_started.elapsed(),
                     highlight: highlight_time,
+                    fold_sync: source_interaction
+                        .fold_state
+                        .fold_sync_time
+                        .saturating_sub(fold_sync_before),
+                    visible_map_rebuild: source_interaction
+                        .fold_state
+                        .fold_layout_rebuild_time
+                        .saturating_sub(fold_layout_time_before),
+                    visible_row_lookup,
+                    fold_layout_rebuild_count: source_interaction
+                        .fold_state
+                        .fold_layout_rebuild_count
+                        .saturating_sub(fold_layout_count_before),
                     wheel: source_wheel_sample,
                     scroll_offset: source_scroll_state.current_y,
                     cache_hits: source_highlight_cache
@@ -12048,12 +12137,12 @@ fn render_source_line(
     code_galley: Arc<egui::Galley>,
     content_width: f32,
     original_line: usize,
-    fold_marker: Option<&str>,
+    fold_marker: Option<Arc<egui::Galley>>,
     selected: bool,
-) -> (egui::Response, egui::Response) {
-    let (rect, response) = ui.allocate_exact_size(
+) -> Option<egui::Response> {
+    let (rect, _) = ui.allocate_exact_size(
         Vec2::new(content_width.max(ui.available_width()), SOURCE_ROW_HEIGHT),
-        Sense::click(),
+        Sense::hover(),
     );
     let painter = ui.painter();
     if selected {
@@ -12061,16 +12150,11 @@ fn render_source_line(
     }
     let fold_rect =
         Rect::from_min_size(rect.min, Vec2::new(SOURCE_FOLD_GUTTER_WIDTH, rect.height()));
-    let fold_response = ui.interact(
-        fold_rect,
-        ui.id().with(("source-fold", original_line)),
-        Sense::click(),
-    );
-    if let Some(fold_marker) = fold_marker {
-        let marker_galley = painter.layout_no_wrap(
-            fold_marker.to_owned(),
-            ui_mono_font(12.0),
-            theme_text_secondary(),
+    let fold_response = fold_marker.map(|marker_galley| {
+        let response = ui.interact(
+            fold_rect,
+            ui.id().with(("source-fold", original_line)),
+            Sense::click(),
         );
         painter.galley(
             Pos2::new(
@@ -12080,7 +12164,8 @@ fn render_source_line(
             marker_galley,
             theme_text_secondary(),
         );
-    }
+        response
+    });
     let number_y = rect.top() + (SOURCE_ROW_HEIGHT - number_galley.size().y) * 0.5;
     let code_y = rect.top() + (SOURCE_ROW_HEIGHT - code_galley.size().y) * 0.5;
     painter.galley(
@@ -12096,7 +12181,7 @@ fn render_source_line(
         code_galley,
         theme_text_primary(),
     );
-    (response, fold_response)
+    fold_response
 }
 
 fn trace_source_scroll(
@@ -12149,6 +12234,9 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
     };
     let source_ui_us = profile.source_ui.as_secs_f64() * 1_000_000.0;
     let highlight_us = profile.highlight.as_secs_f64() * 1_000_000.0;
+    let fold_sync_us = profile.fold_sync.as_secs_f64() * 1_000_000.0;
+    let visible_map_rebuild_us = profile.visible_map_rebuild.as_secs_f64() * 1_000_000.0;
+    let visible_row_lookup_us = profile.visible_row_lookup.as_secs_f64() * 1_000_000.0;
     let cache_total = profile.cache_hits + profile.cache_misses;
     let cache_hit_rate = if cache_total == 0 {
         100.0
@@ -12156,11 +12244,12 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
         profile.cache_hits as f64 / cache_total as f64 * 100.0
     };
     eprintln!(
-        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} egui_tessellation_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
+        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} egui_tessellation_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
         profile.rows,
         wheel_kind,
         profile.scroll_offset,
         timings.egui_run.as_secs_f64() * 1_000_000.0,
+        profile.fold_layout_rebuild_count,
         timings.egui_tessellation.as_secs_f64() * 1_000_000.0,
         timings.update_buffers.as_secs_f64() * 1_000_000.0,
         timings.texture_update.as_secs_f64() * 1_000_000.0,
@@ -17163,10 +17252,10 @@ mod tests {
         let parent_id = state.range_starting_at(0).expect("parent fold").id.clone();
         let child_id = state.range_starting_at(1).expect("child fold").id.clone();
         state.collapsed.clear();
-        assert!(state.toggle_line(1));
+        assert!(state.toggle_line(1, 7));
         assert!(state.collapsed.contains(&child_id));
-        assert!(state.toggle_line(0));
-        assert!(state.toggle_line(0));
+        assert!(state.toggle_line(0, 7));
+        assert!(state.toggle_line(0, 7));
         assert!(state.collapsed.contains(&child_id));
         assert!(!state.collapsed.contains(&parent_id));
     }
@@ -17176,7 +17265,23 @@ mod tests {
         let state = source_folding_state("annotation(\n  Icon(\n    graphics={}\n  )\n)", 1);
         assert!(!state.ranges.is_empty());
         assert_eq!(state.collapsed.len(), state.ranges.len());
-        assert_eq!(state.visible_rows(5).rows.len(), 1);
+        assert_eq!(state.visible_rows.rows.len(), 1);
+    }
+
+    #[test]
+    fn source_fold_layout_is_cached_during_scroll_frames() {
+        let document = source_folding_document("annotation(\n  Icon(\n    graphics={}\n  )\n)", 1);
+        let mut state = SourceFoldState::default();
+        state.sync_document(&document);
+        let rebuild_count = state.fold_layout_rebuild_count;
+        let visible_row_count = state.visible_rows.rows.len();
+        for _ in 0..100 {
+            state.sync_document(&document);
+        }
+        assert_eq!(state.fold_layout_rebuild_count, rebuild_count);
+        assert_eq!(state.visible_rows.rows.len(), visible_row_count);
+        assert!(state.range_by_start_line.contains_key(&0));
+        assert!(!state.range_by_id.is_empty());
     }
 
     #[test]
@@ -17185,8 +17290,8 @@ mod tests {
         let lines = source_folding_lines(source);
         let before = lines.clone();
         let mut state = source_folding_state(source, 1);
-        assert!(state.toggle_line(0));
-        let _ = state.visible_rows(lines.len());
+        assert!(state.toggle_line(0, lines.len()));
+        let _ = state.visible_rows.rows.len();
         assert_eq!(lines, before);
     }
 
@@ -17194,7 +17299,7 @@ mod tests {
     fn fold_does_not_set_dirty() {
         let dirty = false;
         let mut state = source_folding_state("annotation(\nx\n)", 1);
-        state.toggle_line(0);
+        state.toggle_line(0, 3);
         assert!(!dirty);
     }
 
@@ -17203,7 +17308,7 @@ mod tests {
         let undo = vec!["move".to_owned()];
         let redo = vec!["resize".to_owned()];
         let mut state = source_folding_state("annotation(\nx\n)", 1);
-        state.toggle_line(0);
+        state.toggle_line(0, 3);
         assert_eq!(undo, vec!["move"]);
         assert_eq!(redo, vec!["resize"]);
     }
@@ -17227,8 +17332,8 @@ mod tests {
         let source = "model Demo\nannotation(\n  Icon()\n)\nend Demo;";
         let mut state = source_folding_state(source, 1);
         state.collapsed.clear();
-        assert!(state.toggle_line(1));
-        let rows = state.visible_rows(source_folding_lines(source).len());
+        assert!(state.toggle_line(1, 5));
+        let rows = &state.visible_rows;
         assert_eq!(
             rows.rows
                 .iter()
@@ -17236,7 +17341,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 4]
         );
-        assert!(rows.rows[1].collapsed_range.is_some());
+        assert!(rows.rows[1].fold_range_index.is_some());
     }
 
     #[test]
@@ -17276,7 +17381,7 @@ mod tests {
             source_version: 1,
         };
         state.sync_document(&document);
-        let rows = state.visible_rows(5_000);
+        let rows = &state.visible_rows;
         assert_eq!(rows.rows.len(), 1);
         assert_eq!(rows.rows[0].original_line, 0);
     }
