@@ -13,6 +13,7 @@ pub mod graphics;
 pub mod icon;
 pub mod lexer;
 pub mod library;
+pub mod modelica_text;
 pub mod parser;
 pub mod resolver;
 pub mod scene;
@@ -24,7 +25,10 @@ pub use diagnostics::{Diagnostic, Severity};
 pub use diagram::{DiagramResolver, resolve_diagram};
 pub use graphics::{resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call};
 pub use icon::IconResolver;
-pub use library::{Library, LibraryKind, LibraryRegistry, PackageLoader, PackageNode};
+pub use library::{
+    Library, LibraryKind, LibraryRegistry, PackageLoader, PackageMember, PackageNode,
+};
+pub use modelica_text::{ModelTextContext, resolve_modelica_text};
 pub use parser::{ParseError, parse, requalify_class_tree};
 pub use scene::{
     ConnectionKey, ConnectorRef, DiagramDebugStats, DiagramScene, Graphic, GraphicId, GraphicOwner,
