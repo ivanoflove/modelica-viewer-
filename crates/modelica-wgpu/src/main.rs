@@ -58,7 +58,7 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const MSAA_SAMPLES: u32 = 4;
+const DEFAULT_MSAA_SAMPLES: u32 = 4;
 const INITIAL_ZOOM: f32 = 3.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 24.0;
@@ -5677,6 +5677,7 @@ struct App {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    msaa_samples: u32,
     msaa_view: wgpu::TextureView,
     background_pipeline: wgpu::RenderPipeline,
     background_buffer: wgpu::Buffer,
@@ -5764,6 +5765,23 @@ fn select_present_mode(
         .unwrap_or(wgpu::PresentMode::Fifo)
 }
 
+fn configured_msaa_samples() -> u32 {
+    match std::env::var("MODELICA_WGPU_MSAA")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("1") => 1,
+        Some("4") | None => DEFAULT_MSAA_SAMPLES,
+        Some(value) => {
+            eprintln!(
+                "modelica-wgpu: unsupported MODELICA_WGPU_MSAA={value:?}; using {DEFAULT_MSAA_SAMPLES}x"
+            );
+            DEFAULT_MSAA_SAMPLES
+        }
+    }
+}
+
 impl App {
     async fn new(window: Arc<Window>, document: Option<LoadedDocument>) -> Self {
         let size = window.inner_size();
@@ -5802,6 +5820,7 @@ impl App {
             .expect("failed to create wgpu device");
 
         let capabilities = surface.get_capabilities(&adapter);
+        let msaa_samples = configured_msaa_samples();
         let format = capabilities
             .formats
             .iter()
@@ -5818,6 +5837,15 @@ impl App {
             .map(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false"))
             .unwrap_or(false);
         let present_mode = select_present_mode(&capabilities.present_modes, no_vsync);
+        if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some()
+            || std::env::var_os("MODELICA_WGPU_PROFILE_DRAG").is_some()
+        {
+            eprintln!(
+                "[WGPU FRAME POLICY] selected_present_mode={present_mode:?} supported_present_modes={:?} vsync={} desired_maximum_frame_latency=1 msaa_samples={msaa_samples}",
+                capabilities.present_modes,
+                !no_vsync,
+            );
+        }
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -5938,7 +5966,7 @@ impl App {
                 conservative: false,
             },
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: msaa_samples,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -5988,7 +6016,7 @@ impl App {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: msaa_samples,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -6009,7 +6037,7 @@ impl App {
             None,
             INITIAL_ZOOM,
         );
-        let msaa_view = create_msaa_view(&device, &config);
+        let msaa_view = create_msaa_view(&device, &config, msaa_samples);
         let egui_ctx = egui::Context::default();
         install_ui_fonts(&egui_ctx);
         set_theme(
@@ -6041,6 +6069,7 @@ impl App {
             device,
             queue,
             config,
+            msaa_samples,
             msaa_view,
             background_pipeline,
             background_buffer,
@@ -9744,7 +9773,7 @@ impl App {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.msaa_view = create_msaa_view(&self.device, &self.config);
+        self.msaa_view = create_msaa_view(&self.device, &self.config, self.msaa_samples);
         self.update_view_uniform();
     }
 
@@ -10574,20 +10603,18 @@ impl App {
         }
 
         let source_frame_seen = if let Some(profile) = self.source_perf_frame.take() {
-            trace_source_frame(
-                profile,
-                FrameStageTimings {
-                    egui_run,
-                    egui_tessellation,
-                    texture_update,
-                    update_buffers,
-                    scene_encode,
-                    queue_submit,
-                    present,
-                    frame_total: total,
-                },
-            );
-            self.source_frame_stats.record(total);
+            let timings = FrameStageTimings {
+                egui_run,
+                egui_tessellation,
+                texture_update,
+                update_buffers,
+                scene_encode,
+                queue_submit,
+                present,
+                frame_total: total,
+            };
+            trace_source_frame(profile, timings);
+            self.source_frame_stats.record(profile, timings);
             true
         } else {
             false
@@ -10609,6 +10636,7 @@ impl App {
 fn create_msaa_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
 ) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -10619,7 +10647,7 @@ fn create_msaa_view(
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: MSAA_SAMPLES,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: config.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -11747,33 +11775,151 @@ struct SourcePerfFrame {
 
 #[derive(Default)]
 struct SourceFrameStats {
-    frame_times: Vec<Duration>,
+    samples: Vec<SourceFrameSample>,
+    last_frame_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceFrameSample {
+    frame_total: Duration,
+    frame_interval: Option<Duration>,
+    egui_run: Duration,
+    source_ui: Duration,
+    highlight: Duration,
+    egui_tessellation: Duration,
+    update_buffers: Duration,
+    texture_update: Duration,
+    scene_encode: Duration,
+    queue_submit: Duration,
+    present: Duration,
 }
 
 impl SourceFrameStats {
-    fn record(&mut self, frame_time: Duration) {
-        self.frame_times.push(frame_time);
+    fn record(&mut self, profile: SourcePerfFrame, timings: FrameStageTimings) {
+        let now = Instant::now();
+        let frame_interval = self
+            .last_frame_at
+            .replace(now)
+            .map(|previous| now - previous);
+        self.samples.push(SourceFrameSample {
+            frame_total: timings.frame_total,
+            frame_interval,
+            egui_run: timings.egui_run,
+            source_ui: profile.source_ui,
+            highlight: profile.highlight,
+            egui_tessellation: timings.egui_tessellation,
+            update_buffers: timings.update_buffers,
+            texture_update: timings.texture_update,
+            scene_encode: timings.scene_encode,
+            queue_submit: timings.queue_submit,
+            present: timings.present,
+        });
     }
 
     fn finish_session(&mut self) {
-        if self.frame_times.is_empty() {
+        if self.samples.is_empty() {
             return;
         }
-        let mut values = self.frame_times.clone();
-        values.sort_unstable();
-        let percentile = |fraction: f64| {
-            let index = ((values.len() - 1) as f64 * fraction).round() as usize;
-            values[index].as_secs_f64() * 1000.0
+        let values = |select: fn(&SourceFrameSample) -> Duration| {
+            self.samples.iter().map(select).collect::<Vec<_>>()
+        };
+        let intervals = self
+            .samples
+            .iter()
+            .filter_map(|sample| sample.frame_interval)
+            .collect::<Vec<_>>();
+        let frame_totals = values(|sample| sample.frame_total);
+        let interval_p50 = duration_percentile_ms(&intervals, 0.50);
+        let measured_budget_ms = if interval_p50 > 0.0 {
+            interval_p50
+        } else {
+            duration_percentile_ms(&frame_totals, 0.50)
+        };
+        let refresh_budget_ms = std::env::var("MODELICA_WGPU_REFRESH_HZ")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|hz| *hz > 0.0)
+            .map_or(measured_budget_ms, |hz| 1_000.0 / hz);
+        let missed_budget_frames = frame_totals
+            .iter()
+            .filter(|duration| duration.as_secs_f64() * 1_000.0 > refresh_budget_ms)
+            .count();
+        let missed_refresh_frames = intervals
+            .iter()
+            .filter(|duration| duration.as_secs_f64() * 1_000.0 > refresh_budget_ms * 1.5)
+            .count();
+        let interval_values = intervals
+            .iter()
+            .map(|duration| duration.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        let interval_mean = if interval_values.is_empty() {
+            0.0
+        } else {
+            interval_values.iter().sum::<f64>() / interval_values.len() as f64
+        };
+        let interval_stddev = if interval_values.len() < 2 {
+            0.0
+        } else {
+            let variance = interval_values
+                .iter()
+                .map(|value| (value - interval_mean).powi(2))
+                .sum::<f64>()
+                / interval_values.len() as f64;
+            variance.sqrt()
+        };
+        let p95 = |select: fn(&SourceFrameSample) -> Duration| {
+            duration_percentile_ms(&values(select), 0.95)
+        };
+        let p99 = |select: fn(&SourceFrameSample) -> Duration| {
+            duration_percentile_ms(&values(select), 0.99)
         };
         eprintln!(
-            "[SOURCE FRAME SUMMARY] samples={} frame_ms_p50={:.2} frame_ms_p95={:.2} frame_ms_worst={:.2}",
-            values.len(),
-            percentile(0.50),
-            percentile(0.95),
-            percentile(1.0),
+            "[SOURCE SESSION] samples={} refresh_budget_ms={refresh_budget_ms:.2} missed_budget_frames={missed_budget_frames} missed_refresh_frames={missed_refresh_frames} frame_ms_p50={:.2} frame_ms_p90={:.2} frame_ms_p95={:.2} frame_ms_p99={:.2} frame_ms_worst={:.2} interval_ms_mean={interval_mean:.2} interval_ms_stddev={interval_stddev:.2} interval_ms_p50={interval_p50:.2} interval_ms_p90={:.2} interval_ms_p95={:.2} interval_ms_p99={:.2} interval_ms_worst={:.2} egui_run_p95_us={:.1} source_ui_p95_us={:.1} highlight_p95_us={:.1} tessellation_p95_us={:.1} update_buffers_p95_us={:.1} texture_update_p95_us={:.1} encode_p95_us={:.1} submit_p95_us={:.1} present_p95_us={:.1}",
+            self.samples.len(),
+            duration_percentile_ms(&frame_totals, 0.50),
+            duration_percentile_ms(&frame_totals, 0.90),
+            duration_percentile_ms(&frame_totals, 0.95),
+            duration_percentile_ms(&frame_totals, 0.99),
+            duration_percentile_ms(&frame_totals, 1.0),
+            duration_percentile_ms(&intervals, 0.90),
+            duration_percentile_ms(&intervals, 0.95),
+            duration_percentile_ms(&intervals, 0.99),
+            duration_percentile_ms(&intervals, 1.0),
+            p95(|sample| sample.egui_run) * 1_000.0,
+            p95(|sample| sample.source_ui) * 1_000.0,
+            p95(|sample| sample.highlight) * 1_000.0,
+            p95(|sample| sample.egui_tessellation) * 1_000.0,
+            p95(|sample| sample.update_buffers) * 1_000.0,
+            p95(|sample| sample.texture_update) * 1_000.0,
+            p95(|sample| sample.scene_encode) * 1_000.0,
+            p95(|sample| sample.queue_submit) * 1_000.0,
+            p95(|sample| sample.present) * 1_000.0,
         );
-        self.frame_times.clear();
+        eprintln!(
+            "[SOURCE SESSION DETAIL] p99_us egui_run={:.1} source_ui={:.1} highlight={:.1} tessellation={:.1} update_buffers={:.1} texture_update={:.1} encode={:.1} submit={:.1} present={:.1}",
+            p99(|sample| sample.egui_run) * 1_000.0,
+            p99(|sample| sample.source_ui) * 1_000.0,
+            p99(|sample| sample.highlight) * 1_000.0,
+            p99(|sample| sample.egui_tessellation) * 1_000.0,
+            p99(|sample| sample.update_buffers) * 1_000.0,
+            p99(|sample| sample.texture_update) * 1_000.0,
+            p99(|sample| sample.scene_encode) * 1_000.0,
+            p99(|sample| sample.queue_submit) * 1_000.0,
+            p99(|sample| sample.present) * 1_000.0,
+        );
+        self.samples.clear();
+        self.last_frame_at = None;
     }
+}
+
+fn duration_percentile_ms(values: &[Duration], fraction: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+    sorted[index].as_secs_f64() * 1_000.0
 }
 
 #[derive(Debug)]
