@@ -14892,6 +14892,36 @@ fn logical_to_physical_pixels(position: Pos2, pixels_per_point: f32) -> Pos2 {
     Pos2::new(position.x * pixels_per_point, position.y * pixels_per_point)
 }
 
+#[allow(dead_code)] // Used by Source and tree paint paths in the following text-rendering tasks.
+fn snap_point_to_physical_pixel(point: Pos2, pixels_per_point: f32) -> Pos2 {
+    let pixels_per_point = valid_pixels_per_point(pixels_per_point);
+    Pos2::new(
+        snap_coordinate_to_physical_pixel(point.x, pixels_per_point),
+        snap_coordinate_to_physical_pixel(point.y, pixels_per_point),
+    )
+}
+
+#[allow(dead_code)] // Used by Source and tree paint paths in the following text-rendering tasks.
+fn snap_y_to_physical_pixel(point: Pos2, pixels_per_point: f32) -> Pos2 {
+    let pixels_per_point = valid_pixels_per_point(pixels_per_point);
+    Pos2::new(
+        point.x,
+        snap_coordinate_to_physical_pixel(point.y, pixels_per_point),
+    )
+}
+
+fn valid_pixels_per_point(pixels_per_point: f32) -> f32 {
+    if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    }
+}
+
+fn snap_coordinate_to_physical_pixel(coordinate: f32, pixels_per_point: f32) -> f32 {
+    (coordinate * pixels_per_point).round() / pixels_per_point
+}
+
 fn canvas_event_allowed_for(main_view: MainView, pointer_over_canvas: bool) -> bool {
     canvas_navigation_enabled_for(main_view) && pointer_over_canvas
 }
@@ -18230,6 +18260,35 @@ end Top;
         let fractional = logical_to_physical_pixels(logical, 1.25);
         assert!((fractional.x - 12.8125).abs() < f32::EPSILON);
         assert!((fractional.y - 14.375).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_positions_snap_to_physical_pixels_at_common_dpi_scales() {
+        let logical = Pos2::new(10.25, 11.5);
+        let expected = [
+            (1.0, Pos2::new(10.0, 12.0)),
+            (1.25, Pos2::new(10.4, 11.2)),
+            (1.5, Pos2::new(10.0, 17.0 / 1.5)),
+            (2.0, Pos2::new(10.5, 11.5)),
+        ];
+
+        for (pixels_per_point, expected_position) in expected {
+            let snapped = snap_point_to_physical_pixel(logical, pixels_per_point);
+            assert!((snapped.x - expected_position.x).abs() < 0.0001);
+            assert!((snapped.y - expected_position.y).abs() < 0.0001);
+            assert!(
+                (snapped.x * pixels_per_point - (snapped.x * pixels_per_point).round()).abs()
+                    < 0.0001
+            );
+            assert!(
+                (snapped.y * pixels_per_point - (snapped.y * pixels_per_point).round()).abs()
+                    < 0.0001
+            );
+
+            let snapped_y = snap_y_to_physical_pixel(logical, pixels_per_point);
+            assert_eq!(snapped_y.x, logical.x, "X must remain unchanged");
+            assert!((snapped_y.y - expected_position.y).abs() < 0.0001);
+        }
     }
 
     #[test]
