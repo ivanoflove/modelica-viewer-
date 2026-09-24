@@ -3030,7 +3030,6 @@ impl SourceHighlightCache {
         document: &UiDocument,
         row: usize,
     ) -> (Arc<egui::Galley>, Arc<egui::Galley>, Duration) {
-        self.prepare(document, ui.ctx().pixels_per_point());
         if let Some(line) = self.lines.get(row) {
             if let (Some(number_galley), Some(code_galley)) =
                 (&line.number_galley, &line.code_galley)
@@ -3067,7 +3066,6 @@ impl SourceHighlightCache {
         document: &UiDocument,
         range: &SourceFoldRange,
     ) -> (Arc<egui::Galley>, Duration) {
-        self.prepare(document, ui.ctx().pixels_per_point());
         if let Some(galley) = self.collapsed_lines.get(&range.id) {
             self.cache_hits += 1;
             return (galley.clone(), Duration::ZERO);
@@ -3092,12 +3090,7 @@ impl SourceHighlightCache {
         (galley, elapsed)
     }
 
-    fn fold_marker_galleys(
-        &mut self,
-        ui: &egui::Ui,
-        document: &UiDocument,
-    ) -> (Arc<egui::Galley>, Arc<egui::Galley>) {
-        self.prepare(document, ui.ctx().pixels_per_point());
+    fn fold_marker_galleys(&mut self, ui: &egui::Ui) -> (Arc<egui::Galley>, Arc<egui::Galley>) {
         if let Some((expanded, collapsed)) = &self.fold_marker_galleys {
             return (expanded.clone(), collapsed.clone());
         }
@@ -10511,6 +10504,14 @@ impl App {
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+        // Queue the next animation frame before a FIFO present can block on
+        // the compositor. This keeps the following frame eligible for the
+        // next refresh while leaving the idle event loop in ControlFlow::Wait.
+        let keep_source_scroll_animating =
+            self.main_view == MainView::Source && self.source_scroll_state.active;
+        if keep_source_scroll_animating {
+            self.request_redraw();
+        }
         let present_started = Instant::now();
         frame.present();
         let present = present_started.elapsed();
@@ -10620,9 +10621,7 @@ impl App {
             false
         };
         self.source_wheel_sample = None;
-        if self.main_view == MainView::Source && self.source_scroll_state.active {
-            self.request_redraw();
-        } else if source_frame_seen {
+        if !keep_source_scroll_animating && source_frame_seen {
             self.source_frame_stats.finish_session();
         }
 
@@ -12108,9 +12107,11 @@ fn source_preview(
             let scroll_delta = ui.input(|input| input.raw_scroll_delta);
             let pointer_position = ui.ctx().pointer_latest_pos();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
+            // Prepare/validate the source cache once; all per-visible-row
+            // lookups below reuse this class/version/theme key.
             let source_content_width = source_highlight_cache.content_width(ui, document);
             let (expanded_marker_galley, collapsed_marker_galley) =
-                source_highlight_cache.fold_marker_galleys(ui, document);
+                source_highlight_cache.fold_marker_galleys(ui);
             let cache_hits_before = source_highlight_cache.cache_hits;
             let cache_misses_before = source_highlight_cache.cache_misses;
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
