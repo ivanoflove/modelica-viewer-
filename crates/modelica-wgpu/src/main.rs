@@ -5821,6 +5821,8 @@ struct App {
     source_perf_frame: Option<SourcePerfFrame>,
     source_frame_stats: SourceFrameStats,
     expanded_nodes: HashSet<String>,
+    visible_tree_rows: VisibleTreeRowsCache,
+    tree_galley_cache: TreeGalleyCache,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -6213,6 +6215,8 @@ impl App {
             source_perf_frame: None,
             source_frame_stats: SourceFrameStats::default(),
             expanded_nodes: HashSet::new(),
+            visible_tree_rows: VisibleTreeRowsCache::default(),
+            tree_galley_cache: TreeGalleyCache::default(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -6314,6 +6318,8 @@ impl App {
             .document
             .as_ref()
             .map(|document| document.ui_summary(self.selected_class.as_deref()));
+        self.visible_tree_rows.invalidate();
+        self.tree_galley_cache.clear();
     }
 
     fn selected_connection_id(&self) -> Option<&str> {
@@ -10154,6 +10160,8 @@ impl App {
         let mut source_interaction = std::mem::take(&mut self.source_interaction);
         let mut source_scroll_rect = self.source_scroll_rect;
         let source_wheel_sample = self.source_wheel_sample;
+        let mut visible_tree_rows = std::mem::take(&mut self.visible_tree_rows);
+        let mut tree_galley_cache = std::mem::take(&mut self.tree_galley_cache);
         let mut source_perf_frame = None;
         let mut tree_ui = Duration::ZERO;
         let overlay_update_started = Instant::now();
@@ -10176,8 +10184,13 @@ impl App {
             DiagramSelection::Port(key) => self.diagram_anchor(key),
             _ => None,
         };
-        let diagram_component_preview = self.active_diagram_component_preview();
-        trace_component_preview(diagram_component_preview);
+        let diagram_component_preview = self
+            .active_diagram_component_preview()
+            .map(|(id, placement)| (id.to_owned(), placement));
+        let diagram_component_preview_ref = diagram_component_preview
+            .as_ref()
+            .map(|(id, placement)| (id.as_str(), *placement));
+        trace_component_preview(diagram_component_preview_ref);
         let overlay_update = overlay_update_started.elapsed();
         let pre_ui_prepare = overlay_update_started.duration_since(frame_started);
         let zoom = self.zoom;
@@ -10197,6 +10210,8 @@ impl App {
                 selected_class.as_deref(),
                 document_summary,
                 &mut expanded_nodes,
+                &mut visible_tree_rows,
+                &mut tree_galley_cache,
                 &mut open_requested,
                 &mut open_directory_requested,
                 &mut class_clicked,
@@ -10229,7 +10244,7 @@ impl App {
                     selected_class.as_deref(),
                     view,
                     if view == MainView::Diagram {
-                        diagram_component_preview
+                        diagram_component_preview_ref
                     } else {
                         None
                     },
@@ -10291,6 +10306,8 @@ impl App {
         self.source_interaction = source_interaction;
         self.source_scroll_rect = source_scroll_rect;
         self.source_perf_frame = source_perf_frame;
+        self.visible_tree_rows = visible_tree_rows;
+        self.tree_galley_cache = tree_galley_cache;
         let ui_build = ui_build_started.elapsed();
         if theme_mode != self.theme_mode || accent_theme != self.accent_theme {
             self.theme_mode = theme_mode;
@@ -10323,6 +10340,9 @@ impl App {
             }
         } else if collapse_all_requested {
             expanded_nodes.clear();
+        }
+        if expand_all_requested || collapse_all_requested {
+            self.visible_tree_rows.invalidate();
         }
         self.expanded_nodes = expanded_nodes;
         if expand_all_requested || collapse_all_requested {
@@ -11163,6 +11183,8 @@ fn draw_preview_ui(
     selected_class: Option<&str>,
     document: Option<&UiDocument>,
     expanded_nodes: &mut HashSet<String>,
+    visible_tree_rows: &mut VisibleTreeRowsCache,
+    tree_galley_cache: &mut TreeGalleyCache,
     open_requested: &mut bool,
     open_directory_requested: &mut bool,
     class_clicked: &mut Option<String>,
@@ -11456,6 +11478,8 @@ fn draw_preview_ui(
                     &document.tree,
                     selected_class,
                     expanded_nodes,
+                    visible_tree_rows,
+                    tree_galley_cache,
                     window_scale_factor,
                     trace_text_layout,
                 ) {
@@ -11707,6 +11731,148 @@ fn tree_row_galley_position(rect: Rect, x: f32, galley_height: f32, pixels_per_p
     )
 }
 
+const TREE_ROW_HEIGHT: f32 = 29.0;
+const TREE_GALLEY_CACHE_CAPACITY: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TreeTextRole {
+    Marker,
+    Label,
+    SelectedLabel,
+    Kind,
+}
+
+impl TreeTextRole {
+    fn font(self) -> FontId {
+        match self {
+            Self::Marker => ui_font(12.0),
+            Self::Label => ui_font(13.0),
+            Self::SelectedLabel => ui_semibold_font(13.0),
+            Self::Kind => ui_mono_font(9.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TreeGalleyKey {
+    text: String,
+    role: TreeTextRole,
+    color: [u8; 4],
+    max_width_bits: u32,
+    pixels_per_point_bits: u32,
+}
+
+#[derive(Default)]
+struct TreeGalleyCache {
+    entries: HashMap<TreeGalleyKey, Arc<egui::Galley>>,
+    insertion_order: VecDeque<TreeGalleyKey>,
+}
+
+impl TreeGalleyCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.insertion_order.clear();
+    }
+
+    fn galley(
+        &mut self,
+        painter: &egui::Painter,
+        text: String,
+        role: TreeTextRole,
+        color: Color32,
+        max_width: f32,
+        pixels_per_point: f32,
+    ) -> Arc<egui::Galley> {
+        let key = TreeGalleyKey {
+            text,
+            role,
+            color: color.to_array(),
+            max_width_bits: max_width.to_bits(),
+            pixels_per_point_bits: pixels_per_point.to_bits(),
+        };
+        if let Some(galley) = self.entries.get(&key) {
+            return Arc::clone(galley);
+        }
+
+        let galley = painter.layout_no_wrap(key.text.clone(), role.font(), color);
+        self.insert(key, Arc::clone(&galley));
+        galley
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn label_galley(
+        &mut self,
+        painter: &egui::Painter,
+        icon: &str,
+        label: &str,
+        role: TreeTextRole,
+        color: Color32,
+        max_width: f32,
+        pixels_per_point: f32,
+    ) -> Arc<egui::Galley> {
+        let key = TreeGalleyKey {
+            text: tree_row_label(icon, label),
+            role,
+            color: color.to_array(),
+            max_width_bits: max_width.to_bits(),
+            pixels_per_point_bits: pixels_per_point.to_bits(),
+        };
+        if let Some(galley) = self.entries.get(&key) {
+            return Arc::clone(galley);
+        }
+
+        let font = role.font();
+        let visible_text =
+            ellipsize_tree_label(painter, icon, label, font.clone(), color, max_width);
+        let galley = painter.layout_no_wrap(visible_text, font, color);
+        self.insert(key, Arc::clone(&galley));
+        galley
+    }
+
+    fn insert(&mut self, key: TreeGalleyKey, galley: Arc<egui::Galley>) {
+        if self.entries.len() >= TREE_GALLEY_CACHE_CAPACITY {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(key, galley);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VisibleTreeRow {
+    name: String,
+    qualified_name: String,
+    class_name: Option<String>,
+    kind: Option<ClassKind>,
+    depth: usize,
+    has_children: bool,
+}
+
+#[derive(Default)]
+struct VisibleTreeRowsCache {
+    rows: Option<Vec<VisibleTreeRow>>,
+}
+
+impl VisibleTreeRowsCache {
+    fn invalidate(&mut self) {
+        self.rows = None;
+    }
+
+    fn ensure(&mut self, root: &TreeNode, expanded_nodes: &HashSet<String>) {
+        if self.rows.is_none() {
+            self.rebuild(root, expanded_nodes);
+        }
+    }
+
+    fn rebuild(&mut self, root: &TreeNode, expanded_nodes: &HashSet<String>) {
+        let mut rows = Vec::new();
+        collect_visible_tree_rows(root, 0, expanded_nodes, &mut rows);
+        self.rows = Some(rows);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
@@ -11717,12 +11883,14 @@ fn tree_row(
     kind: &str,
     selected: bool,
     indent: f32,
+    text_cache: &mut TreeGalleyCache,
     trace_text_layout: bool,
     trace_sample: bool,
     window_scale_factor: f32,
 ) -> (egui::Response, egui::Response) {
     let row_width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(row_width, 29.0), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(row_width, TREE_ROW_HEIGHT), Sense::click());
     let marker_rect = Rect::from_min_size(
         Pos2::new(rect.left() + indent * 12.0, rect.top()),
         Vec2::new(24.0, rect.height()),
@@ -11749,9 +11917,14 @@ fn tree_row(
     }
     let pixels_per_point = ui.ctx().pixels_per_point();
     let marker_color = theme_text_tertiary();
-    let marker_galley = ui
-        .painter()
-        .layout_no_wrap(marker.to_owned(), ui_font(12.0), marker_color);
+    let marker_galley = text_cache.galley(
+        ui.painter(),
+        marker.to_owned(),
+        TreeTextRole::Marker,
+        marker_color,
+        0.0,
+        pixels_per_point,
+    );
     let marker_position = tree_row_galley_position(
         rect,
         rect.left() + indent * 12.0 + 8.0,
@@ -11764,38 +11937,39 @@ fn tree_row(
         Pos2::new(rect.left() + indent * 12.0 + 30.0, rect.center().y),
         pixels_per_point,
     );
-    let label_font = if selected {
-        ui_semibold_font(13.0)
+    let label_role = if selected {
+        TreeTextRole::SelectedLabel
     } else {
-        ui_font(13.0)
+        TreeTextRole::Label
     };
     let label_color = if selected {
         theme_accent_strong()
     } else {
         theme_text_primary()
     };
-    let kind_font = ui_mono_font(9.0);
     let kind_color = if selected {
         theme_accent_strong()
     } else {
         theme_text_tertiary()
     };
-    let kind_galley = ui
-        .painter()
-        .layout_no_wrap(kind.to_owned(), kind_font, kind_color);
+    let kind_galley = text_cache.galley(
+        ui.painter(),
+        kind.to_owned(),
+        TreeTextRole::Kind,
+        kind_color,
+        0.0,
+        pixels_per_point,
+    );
     let label_max_width =
         (rect.right() - 8.0 - kind_galley.size().x - 8.0 - text_position.x).max(24.0);
-    let label_galley = ui.painter().layout_no_wrap(
-        ellipsize_tree_label(
-            ui.painter(),
-            icon,
-            label,
-            label_font.clone(),
-            label_color,
-            label_max_width,
-        ),
-        label_font.clone(),
+    let label_galley = text_cache.label_galley(
+        ui.painter(),
+        icon,
+        label,
+        label_role,
         label_color,
+        label_max_width,
+        pixels_per_point,
     );
     let label_position = tree_row_galley_position(
         rect,
@@ -11811,15 +11985,16 @@ fn tree_row(
             None,
             label_position,
             None,
-            &label_font,
+            &label_role.font(),
             ui.ctx().pixels_per_point(),
             window_scale_factor,
         );
     }
+    let label_width = label_galley.size().x;
     ui.painter()
-        .galley(label_position, label_galley.clone(), label_color);
-    let kind_x = (rect.right() - 8.0 - kind_galley.size().x)
-        .max(label_position.x + label_galley.size().x + 6.0);
+        .galley(label_position, label_galley, label_color);
+    let kind_x =
+        (rect.right() - 8.0 - kind_galley.size().x).max(label_position.x + label_width + 6.0);
     let kind_position =
         tree_row_galley_position(rect, kind_x, kind_galley.size().y, pixels_per_point);
     ui.painter().galley(kind_position, kind_galley, kind_color);
@@ -11896,101 +12071,96 @@ fn tree_node_kind_label(kind: Option<ClassKind>) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn document_tree(
     ui: &mut egui::Ui,
     root: &TreeNode,
     selected_class: Option<&str>,
     expanded_nodes: &mut HashSet<String>,
+    visible_rows_cache: &mut VisibleTreeRowsCache,
+    text_cache: &mut TreeGalleyCache,
     window_scale_factor: f32,
     trace_text_layout: bool,
 ) -> Option<String> {
+    visible_rows_cache.ensure(root, expanded_nodes);
+    let rows = visible_rows_cache.rows.as_deref().unwrap_or_default();
     let mut clicked = None;
     let mut trace_sample_emitted = false;
+    let mut expanded_changed = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            render_tree_node(
-                ui,
-                root,
-                0,
-                selected_class,
-                expanded_nodes,
-                &mut clicked,
-                window_scale_factor,
-                trace_text_layout,
-                &mut trace_sample_emitted,
-            );
+        .show_rows(ui, TREE_ROW_HEIGHT, rows.len(), |ui, row_range| {
+            for row in &rows[row_range] {
+                let expanded = expanded_nodes.contains(&row.qualified_name);
+                let marker = if row.has_children {
+                    if expanded {
+                        "▾"
+                    } else {
+                        "▸"
+                    }
+                } else {
+                    "□"
+                };
+                let selected =
+                    selected_class.is_some() && row.class_name.as_deref() == selected_class;
+                let depth = row.depth;
+                let (response, marker_response) = tree_row(
+                    ui,
+                    marker,
+                    tree_node_icon(row.kind),
+                    &row.name,
+                    &row.qualified_name,
+                    tree_node_kind_label(row.kind),
+                    selected,
+                    depth as f32,
+                    text_cache,
+                    trace_text_layout,
+                    trace_text_layout && depth > 0 && !trace_sample_emitted,
+                    window_scale_factor,
+                );
+                if trace_text_layout && depth > 0 && !trace_sample_emitted {
+                    trace_sample_emitted = true;
+                }
+                if marker_response.clicked() {
+                    if row.has_children {
+                        if expanded {
+                            expanded_nodes.remove(&row.qualified_name);
+                        } else {
+                            expanded_nodes.insert(row.qualified_name.clone());
+                        }
+                        expanded_changed = true;
+                    }
+                } else if response.clicked() {
+                    if let Some(class_name) = &row.class_name {
+                        clicked = Some(class_name.clone());
+                    }
+                }
+            }
         });
+    if expanded_changed {
+        visible_rows_cache.rebuild(root, expanded_nodes);
+        ui.ctx().request_repaint();
+    }
     clicked
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_tree_node(
-    ui: &mut egui::Ui,
+fn collect_visible_tree_rows(
     node: &TreeNode,
     depth: usize,
-    selected_class: Option<&str>,
-    expanded_nodes: &mut HashSet<String>,
-    clicked: &mut Option<String>,
-    window_scale_factor: f32,
-    trace_text_layout: bool,
-    trace_sample_emitted: &mut bool,
+    expanded_nodes: &HashSet<String>,
+    rows: &mut Vec<VisibleTreeRow>,
 ) {
-    let has_children = !node.children.is_empty();
-    let expanded = expanded_nodes.contains(&node.qualified_name);
-    let marker = if has_children {
-        if expanded {
-            "▾"
-        } else {
-            "▸"
-        }
-    } else {
-        "□"
-    };
-    let icon = tree_node_icon(node.kind);
-    let selected = selected_class.is_some() && node.class_name.as_deref() == selected_class;
-    let (response, marker_response) = tree_row(
-        ui,
-        marker,
-        icon,
-        &node.name,
-        &node.qualified_name,
-        tree_node_kind_label(node.kind),
-        selected,
-        depth as f32,
-        trace_text_layout,
-        trace_text_layout && depth > 0 && !*trace_sample_emitted,
-        window_scale_factor,
-    );
-    if trace_text_layout && depth > 0 && !*trace_sample_emitted {
-        *trace_sample_emitted = true;
-    }
-    if marker_response.clicked() {
-        if has_children {
-            if expanded {
-                expanded_nodes.remove(&node.qualified_name);
-            } else {
-                expanded_nodes.insert(node.qualified_name.clone());
-            }
-        }
-    } else if response.clicked() {
-        if let Some(class_name) = &node.class_name {
-            *clicked = Some(class_name.clone());
-        }
-    }
-    if has_children && expanded_nodes.contains(&node.qualified_name) {
+    rows.push(VisibleTreeRow {
+        name: node.name.clone(),
+        qualified_name: node.qualified_name.clone(),
+        class_name: node.class_name.clone(),
+        kind: node.kind,
+        depth,
+        has_children: !node.children.is_empty(),
+    });
+    if expanded_nodes.contains(&node.qualified_name) {
         for child in &node.children {
-            render_tree_node(
-                ui,
-                child,
-                depth + 1,
-                selected_class,
-                expanded_nodes,
-                clicked,
-                window_scale_factor,
-                trace_text_layout,
-                trace_sample_emitted,
-            );
+            collect_visible_tree_rows(child, depth + 1, expanded_nodes, rows);
         }
     }
 }
@@ -17911,6 +18081,53 @@ mod tests {
         let visible_text = tree_row_label("□", "Heater");
         assert_eq!(visible_text, "□  Heater");
         assert!(!visible_text.contains("等温"));
+    }
+
+    #[test]
+    fn visible_tree_rows_follow_expanded_paths_and_cache_invalidation() {
+        let root = TreeNode {
+            name: "Demo".to_owned(),
+            qualified_name: "Demo".to_owned(),
+            children: vec![TreeNode {
+                name: "Package".to_owned(),
+                qualified_name: "Demo.Package".to_owned(),
+                children: vec![TreeNode {
+                    name: "Heater".to_owned(),
+                    qualified_name: "Demo.Package.Heater".to_owned(),
+                    class_name: Some("Demo.Package.Heater".to_owned()),
+                    kind: Some(ClassKind::Block),
+                    ..TreeNode::default()
+                }],
+                ..TreeNode::default()
+            }],
+            ..TreeNode::default()
+        };
+        let mut expanded = HashSet::new();
+        let mut cache = VisibleTreeRowsCache::default();
+
+        cache.ensure(&root, &expanded);
+        assert_eq!(cache.rows.as_ref().unwrap().len(), 1);
+
+        expanded.insert("Demo".to_owned());
+        cache.invalidate();
+        cache.ensure(&root, &expanded);
+        let rows = cache.rows.as_ref().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].qualified_name, "Demo.Package");
+        assert_eq!(rows[1].depth, 1);
+
+        expanded.insert("Demo.Package".to_owned());
+        cache.invalidate();
+        cache.ensure(&root, &expanded);
+        let rows = cache.rows.as_ref().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].name, "Heater");
+        assert_eq!(rows[2].depth, 2);
+
+        expanded.remove("Demo");
+        cache.invalidate();
+        cache.ensure(&root, &expanded);
+        assert_eq!(cache.rows.as_ref().unwrap().len(), 1);
     }
 
     #[test]
