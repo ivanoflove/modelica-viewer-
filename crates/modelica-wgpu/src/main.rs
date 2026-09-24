@@ -10858,10 +10858,14 @@ fn theme_text_disabled() -> Color32 {
 }
 
 fn theme_text_tertiary() -> Color32 {
-    if is_dark_theme() {
-        theme_rgb(126, 128, 140) // --text-tertiary: #7e808c
+    theme_text_tertiary_for(is_dark_theme())
+}
+
+fn theme_text_tertiary_for(dark: bool) -> Color32 {
+    if dark {
+        theme_rgb(150, 153, 165) // --text-tertiary: #9699a5
     } else {
-        theme_rgb(122, 127, 135) // --text-tertiary: #7a7f87
+        theme_rgb(105, 114, 125) // --text-tertiary: #69727d
     }
 }
 
@@ -17569,6 +17573,53 @@ fn main() {
 mod tests {
     use super::*;
     use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
+
+    fn relative_luminance(color: Color32) -> f32 {
+        let linearize = |channel: u8| {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+
+        0.2126 * linearize(color.r())
+            + 0.7152 * linearize(color.g())
+            + 0.0722 * linearize(color.b())
+    }
+
+    fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
+        let foreground_luminance = relative_luminance(foreground);
+        let background_luminance = relative_luminance(background);
+        (foreground_luminance.max(background_luminance) + 0.05)
+            / (foreground_luminance.min(background_luminance) + 0.05)
+    }
+
+    #[test]
+    fn tertiary_text_contrast_is_readable_but_remains_secondary() {
+        let light_surface = theme_rgb(255, 255, 255);
+        let dark_surface = theme_rgb(34, 36, 43);
+        let light_tertiary = theme_text_tertiary_for(false);
+        let dark_tertiary = theme_text_tertiary_for(true);
+        let light_secondary = theme_rgb(95, 99, 104);
+        let dark_secondary = theme_rgb(169, 171, 182);
+
+        let light_contrast = contrast_ratio(light_tertiary, light_surface);
+        let dark_contrast = contrast_ratio(dark_tertiary, dark_surface);
+        assert!(
+            light_contrast >= 4.5,
+            "light tertiary contrast: {light_contrast:.2}:1"
+        );
+        assert!(
+            dark_contrast >= 4.5,
+            "dark tertiary contrast: {dark_contrast:.2}:1"
+        );
+        assert!(contrast_ratio(light_secondary, light_surface) > light_contrast);
+        assert!(contrast_ratio(dark_secondary, dark_surface) > dark_contrast);
+        assert_eq!(light_tertiary.a(), 255);
+        assert_eq!(dark_tertiary.a(), 255);
+    }
 
     fn text_context(instance_name: &str, class_name: &str) -> ModelTextContext {
         ModelTextContext::new(
