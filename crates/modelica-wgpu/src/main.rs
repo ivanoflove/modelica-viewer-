@@ -10178,18 +10178,6 @@ impl App {
         };
         let diagram_component_preview = self.active_diagram_component_preview();
         trace_component_preview(diagram_component_preview);
-        let icon_text_items = collect_model_text_overlay_items(
-            self.document.as_ref(),
-            selected_class.as_deref(),
-            MainView::Icon,
-            None,
-        );
-        let diagram_text_items = collect_model_text_overlay_items(
-            self.document.as_ref(),
-            selected_class.as_deref(),
-            MainView::Diagram,
-            diagram_component_preview,
-        );
         let overlay_update = overlay_update_started.elapsed();
         let pre_ui_prepare = overlay_update_started.duration_since(frame_started);
         let zoom = self.zoom;
@@ -10199,6 +10187,7 @@ impl App {
         let pixels_per_point = window_scale_factor;
         let trace_text_layout = std::env::var_os("MODELICA_WGPU_TRACE_TEXT_LAYOUT").is_some();
         let ui_build_started = Instant::now();
+        let mut overlay_update = overlay_update;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_preview_ui(
                 ctx,
@@ -10233,28 +10222,48 @@ impl App {
                 window_scale_factor,
                 trace_text_layout,
             );
-            if main_view == MainView::Icon {
-                draw_model_text_overlay(
-                    ctx,
-                    icon_clip_rect,
-                    &icon_text_items,
-                    zoom,
-                    pan,
-                    viewport,
-                    pixels_per_point,
-                    false,
-                );
-            } else if main_view == MainView::Diagram {
-                draw_model_text_overlay(
-                    ctx,
-                    icon_clip_rect,
-                    &diagram_text_items,
-                    zoom,
-                    pan,
-                    viewport,
-                    pixels_per_point,
-                    true,
-                );
+            let text_collect_started = Instant::now();
+            let text_items = collect_active_model_text_overlay_items(main_view, |view| {
+                collect_model_text_overlay_items(
+                    self.document.as_ref(),
+                    selected_class.as_deref(),
+                    view,
+                    if view == MainView::Diagram {
+                        diagram_component_preview
+                    } else {
+                        None
+                    },
+                )
+            });
+            if let Some(text_items) = text_items {
+                overlay_update += text_collect_started.elapsed();
+                match main_view {
+                    MainView::Source => unreachable!("Source has no model text overlay"),
+                    MainView::Icon => {
+                        draw_model_text_overlay(
+                            ctx,
+                            icon_clip_rect,
+                            &text_items,
+                            zoom,
+                            pan,
+                            viewport,
+                            pixels_per_point,
+                            false,
+                        );
+                    }
+                    MainView::Diagram => {
+                        draw_model_text_overlay(
+                            ctx,
+                            icon_clip_rect,
+                            &text_items,
+                            zoom,
+                            pan,
+                            viewport,
+                            pixels_per_point,
+                            true,
+                        );
+                    }
+                }
             }
             if main_view == MainView::Diagram {
                 draw_diagram_selection_overlay(
@@ -13408,6 +13417,16 @@ fn collect_model_text_overlay_items(
         }
     }
     items
+}
+
+fn collect_active_model_text_overlay_items(
+    main_view: MainView,
+    collect: impl FnOnce(MainView) -> Vec<ModelTextOverlayItem>,
+) -> Option<Vec<ModelTextOverlayItem>> {
+    match main_view {
+        MainView::Source => None,
+        MainView::Icon | MainView::Diagram => Some(collect(main_view)),
+    }
 }
 
 fn model_text_overlay_item(
@@ -21042,6 +21061,28 @@ end BoundarySig;
             &context,
         );
         assert_eq!(name_item.minimum_screen_px, MIN_SCREEN_MODEL_NAME_TEXT_PX);
+    }
+
+    #[test]
+    fn source_view_skips_model_text_overlay_collection() {
+        let mut collection_calls = 0;
+        let items = collect_active_model_text_overlay_items(MainView::Source, |_| {
+            collection_calls += 1;
+            Vec::new()
+        });
+
+        assert!(items.is_none());
+        assert_eq!(collection_calls, 0);
+
+        for view in [MainView::Icon, MainView::Diagram] {
+            let items = collect_active_model_text_overlay_items(view, |collected_view| {
+                collection_calls += 1;
+                assert_eq!(collected_view, view);
+                Vec::new()
+            });
+            assert!(items.is_some());
+        }
+        assert_eq!(collection_calls, 2);
     }
 
     #[test]
