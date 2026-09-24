@@ -3689,9 +3689,46 @@ fn add_bundled_msl(registry: &mut LibraryRegistry) {
     }
 }
 
+fn build_font_fallback_chain(
+    primary_keys: &[String],
+    role_fallback_keys: &[Option<&str>],
+    system_fallback_keys: &[String],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(
+        primary_keys.len() + role_fallback_keys.len() + system_fallback_keys.len(),
+    );
+    for key in primary_keys
+        .iter()
+        .map(String::as_str)
+        .chain(role_fallback_keys.iter().filter_map(|key| *key))
+        .chain(system_fallback_keys.iter().map(String::as_str))
+    {
+        if !keys.iter().any(|existing| existing == key) {
+            keys.push(key.to_owned());
+        }
+    }
+    keys
+}
+
+fn trace_font_fallback_role(
+    role: &str,
+    requested_family: &str,
+    primary_key: &str,
+    primary_path: Option<&str>,
+    fallback_keys: &[String],
+) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_TEXT_LAYOUT").is_none() {
+        return;
+    }
+    eprintln!(
+        "[TEXT FONT] role={role} requested_family={requested_family} primary_key={primary_key:?} primary_file={primary_path:?} fallback_order={fallback_keys:?}"
+    );
+}
+
 fn install_ui_fonts(ctx: &egui::Context) {
     let medium_candidates = [
         r"C:\Windows\Fonts\Inter-Medium.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\NotoSans-Medium.ttf",
         "/usr/share/fonts/inter/Inter-Medium.ttf",
         "/usr/share/fonts/truetype/inter/Inter-Medium.ttf",
@@ -3700,6 +3737,8 @@ fn install_ui_fonts(ctx: &egui::Context) {
     ];
     let semibold_candidates = [
         r"C:\Windows\Fonts\Inter-SemiBold.ttf",
+        r"C:\Windows\Fonts\seguisb.ttf",
+        r"C:\Windows\Fonts\segoeuib.ttf",
         r"C:\Windows\Fonts\NotoSans-SemiBold.ttf",
         "/usr/share/fonts/inter/Inter-SemiBold.ttf",
         "/usr/share/fonts/truetype/inter/Inter-SemiBold.ttf",
@@ -3708,6 +3747,7 @@ fn install_ui_fonts(ctx: &egui::Context) {
     ];
     let italic_candidates = [
         r"C:\Windows\Fonts\Inter-Italic.ttf",
+        r"C:\Windows\Fonts\segoeuii.ttf",
         r"C:\Windows\Fonts\NotoSans-Italic.ttf",
         "/usr/share/fonts/inter/Inter-Italic.ttf",
         "/usr/share/fonts/truetype/inter/Inter-Italic.ttf",
@@ -3716,6 +3756,8 @@ fn install_ui_fonts(ctx: &egui::Context) {
     ];
     let semibold_italic_candidates = [
         r"C:\Windows\Fonts\Inter-SemiBoldItalic.ttf",
+        r"C:\Windows\Fonts\seguisbi.ttf",
+        r"C:\Windows\Fonts\segoeuiz.ttf",
         r"C:\Windows\Fonts\NotoSans-SemiBoldItalic.ttf",
         "/usr/share/fonts/inter/Inter-SemiBoldItalic.ttf",
         "/usr/share/fonts/truetype/inter/Inter-SemiBoldItalic.ttf",
@@ -3843,54 +3885,135 @@ fn install_ui_fonts(ctx: &egui::Context) {
         key
     });
 
-    let mut ui_fallback = vec![medium_key.clone()];
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        ui_fallback.push(cjk_key.clone());
-    }
-    if let Some(symbols_key) = symbols_key.as_ref() {
-        ui_fallback.push(symbols_key.clone());
-    }
-    ui_fallback.extend(default_proportional.clone());
+    let ui_fallback = build_font_fallback_chain(
+        std::slice::from_ref(&medium_key),
+        &[cjk_key.as_deref(), symbols_key.as_deref()],
+        &default_proportional,
+    );
+    let semibold_primary = semibold_path
+        .map(|_| vec![semibold_key.clone()])
+        .unwrap_or_default();
+    let semibold_fallback = build_font_fallback_chain(
+        &semibold_primary,
+        &[
+            cjk_key.as_deref(),
+            symbols_key.as_deref(),
+            Some(medium_key.as_str()),
+        ],
+        &default_proportional,
+    );
+    let italic_primary = italic_path.map(|_| vec![italic_key]).unwrap_or_default();
+    let italic_fallback = build_font_fallback_chain(
+        &italic_primary,
+        &[
+            cjk_key.as_deref(),
+            symbols_key.as_deref(),
+            Some(medium_key.as_str()),
+        ],
+        &default_proportional,
+    );
+    let semibold_italic_primary = semibold_italic_path
+        .map(|_| vec![semibold_italic_key])
+        .unwrap_or_default();
+    let semibold_italic_fallback = build_font_fallback_chain(
+        &semibold_italic_primary,
+        &[
+            cjk_key.as_deref(),
+            symbols_key.as_deref(),
+            Some(semibold_key.as_str()),
+            Some(medium_key.as_str()),
+        ],
+        &default_proportional,
+    );
+    let mono_fallback = build_font_fallback_chain(
+        &default_monospace,
+        &[
+            cjk_key.as_deref(),
+            symbols_key.as_deref(),
+            Some(medium_key.as_str()),
+        ],
+        &[],
+    );
+    let symbols_fallback = symbols_key
+        .as_ref()
+        .map(|key| vec![key.clone()])
+        .unwrap_or_default();
+
+    trace_font_fallback_role(
+        "ui-normal-and-tree",
+        UI_FONT_MEDIUM,
+        &medium_key,
+        medium_path,
+        &ui_fallback,
+    );
+    trace_font_fallback_role(
+        "ui-semibold-and-selected-tree",
+        UI_FONT_SEMIBOLD,
+        semibold_primary
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<no-dedicated-face>"),
+        semibold_path,
+        &semibold_fallback,
+    );
+    trace_font_fallback_role(
+        "modelica-text-italic",
+        UI_FONT_ITALIC,
+        italic_primary
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<none>"),
+        italic_path,
+        &italic_fallback,
+    );
+    trace_font_fallback_role(
+        "modelica-text-semibold-italic",
+        UI_FONT_SEMIBOLD_ITALIC,
+        semibold_italic_primary
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<none>"),
+        semibold_italic_path,
+        &semibold_italic_fallback,
+    );
+    trace_font_fallback_role(
+        "source-body-line-number-and-tree-kind",
+        UI_FONT_MONO,
+        mono_fallback
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<none>"),
+        None,
+        &mono_fallback,
+    );
+    trace_font_fallback_role(
+        "cjk-glyph-fallback",
+        "glyph-fallback",
+        cjk_key.as_deref().unwrap_or("<unavailable>"),
+        cjk_path,
+        cjk_key.as_slice(),
+    );
+    trace_font_fallback_role(
+        "unicode-symbols-fallback",
+        UI_FONT_SYMBOLS,
+        symbols_key.as_deref().unwrap_or("<unavailable>"),
+        symbols_path,
+        &symbols_fallback,
+    );
+
     fonts
         .families
         .insert(FontFamily::Name(UI_FONT_MEDIUM.into()), ui_fallback.clone());
-    let mut semibold_fallback = vec![semibold_key.clone(), medium_key.clone()];
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        semibold_fallback.push(cjk_key.clone());
-    }
-    if let Some(symbols_key) = symbols_key.as_ref() {
-        semibold_fallback.push(symbols_key.clone());
-    }
-    semibold_fallback.extend(default_proportional.clone());
     fonts
         .families
         .insert(FontFamily::Name(UI_FONT_SEMIBOLD.into()), semibold_fallback);
-    let mut italic_fallback = vec![italic_key, medium_key.clone()];
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        italic_fallback.push(cjk_key.clone());
-    }
-    italic_fallback.extend(default_proportional.clone());
     fonts
         .families
         .insert(FontFamily::Name(UI_FONT_ITALIC.into()), italic_fallback);
-    let mut semibold_italic_fallback = vec![
-        semibold_italic_key,
-        semibold_key.clone(),
-        medium_key.clone(),
-    ];
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        semibold_italic_fallback.push(cjk_key.clone());
-    }
-    semibold_italic_fallback.extend(default_proportional.clone());
     fonts.families.insert(
         FontFamily::Name(UI_FONT_SEMIBOLD_ITALIC.into()),
         semibold_italic_fallback,
     );
-    let mut mono_fallback = default_monospace;
-    mono_fallback.insert(0, medium_key.clone());
-    if let Some(cjk_key) = cjk_key.as_ref() {
-        mono_fallback.insert(1, cjk_key.clone());
-    }
     fonts
         .families
         .insert(FontFamily::Name(UI_FONT_MONO.into()), mono_fallback);
@@ -17547,6 +17670,82 @@ mod tests {
         assert_eq!(
             rect, original_rect,
             "paint snapping must not alter row geometry"
+        );
+    }
+
+    #[test]
+    fn font_roles_select_ui_mono_and_model_text_faces_explicitly() {
+        assert_eq!(
+            ui_font(12.0).family,
+            FontFamily::Name(UI_FONT_MEDIUM.into())
+        );
+        assert_eq!(
+            ui_semibold_font(12.0).family,
+            FontFamily::Name(UI_FONT_SEMIBOLD.into())
+        );
+        assert_eq!(
+            ui_mono_font(12.0).family,
+            FontFamily::Name(UI_FONT_MONO.into())
+        );
+        assert_eq!(
+            model_text_font(12.0, None, false, false).family,
+            FontFamily::Name(UI_FONT_MEDIUM.into())
+        );
+        assert_eq!(
+            model_text_font(12.0, None, true, false).family,
+            FontFamily::Name(UI_FONT_SEMIBOLD.into())
+        );
+        assert_eq!(
+            model_text_font(12.0, None, false, true).family,
+            FontFamily::Name(UI_FONT_ITALIC.into())
+        );
+        assert_eq!(
+            model_text_font(12.0, None, true, true).family,
+            FontFamily::Name(UI_FONT_SEMIBOLD_ITALIC.into())
+        );
+        assert_eq!(
+            model_text_font(12.0, Some("monospace"), true, true).family,
+            FontFamily::Name(UI_FONT_MONO.into())
+        );
+    }
+
+    #[test]
+    fn font_fallback_chains_prefer_cjk_and_symbols_before_generic_faces() {
+        let chain = build_font_fallback_chain(
+            &["seguisb".to_owned()],
+            &[Some("modelica-cjk"), Some(UI_FONT_SYMBOLS), Some("segoeui")],
+            &["egui-default".to_owned(), "modelica-cjk".to_owned()],
+        );
+
+        assert_eq!(
+            chain,
+            [
+                "seguisb",
+                "modelica-cjk",
+                UI_FONT_SYMBOLS,
+                "segoeui",
+                "egui-default"
+            ]
+        );
+
+        let missing_semibold_chain = build_font_fallback_chain(
+            &[],
+            &[Some("modelica-cjk"), Some(UI_FONT_SYMBOLS), Some("segoeui")],
+            &["egui-default".to_owned()],
+        );
+        assert_eq!(
+            missing_semibold_chain,
+            ["modelica-cjk", UI_FONT_SYMBOLS, "segoeui", "egui-default"]
+        );
+
+        let mono_chain = build_font_fallback_chain(
+            &["Hack".to_owned()],
+            &[Some("modelica-cjk"), Some(UI_FONT_SYMBOLS), Some("segoeui")],
+            &[],
+        );
+        assert_eq!(
+            mono_chain,
+            ["Hack", "modelica-cjk", UI_FONT_SYMBOLS, "segoeui"]
         );
     }
 
