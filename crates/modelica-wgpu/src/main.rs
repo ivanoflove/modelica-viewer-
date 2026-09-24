@@ -6137,10 +6137,9 @@ impl App {
         let Some(rect) = self.canvas_rect else {
             return false;
         };
-        let scale_factor = self.window.scale_factor() as f32;
-        rect.contains(Pos2::new(
-            self.cursor.x as f32 / scale_factor,
-            self.cursor.y as f32 / scale_factor,
+        rect.contains(physical_to_logical_position(
+            self.cursor,
+            self.window.scale_factor() as f32,
         ))
     }
 
@@ -6151,10 +6150,9 @@ impl App {
         let Some(rect) = self.source_scroll_rect else {
             return false;
         };
-        let scale_factor = self.window.scale_factor() as f32;
-        rect.contains(Pos2::new(
-            self.cursor.x as f32 / scale_factor,
-            self.cursor.y as f32 / scale_factor,
+        rect.contains(physical_to_logical_position(
+            self.cursor,
+            self.window.scale_factor() as f32,
         ))
     }
 
@@ -9879,7 +9877,7 @@ impl App {
             return;
         }
         let old_zoom = self.zoom;
-        self.zoom = (self.zoom * (1.0 + wheel_delta * 0.1)).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = zoom_after_wheel(old_zoom, wheel_delta);
         if (self.zoom - old_zoom).abs() < f32::EPSILON {
             return;
         }
@@ -12426,6 +12424,35 @@ fn trace_source_wheel(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn trace_canvas_wheel(
+    main_view: MainView,
+    control_pressed: bool,
+    cursor_physical: PhysicalPosition<f64>,
+    scale_factor: f32,
+    canvas_rect: Option<egui::Rect>,
+    egui_consumed: &str,
+    owner: WheelOwner,
+    sample: SourceWheelSample,
+    zoom_before: f32,
+    zoom_after: f32,
+) {
+    if std::env::var_os("MODELICA_WGPU_TRACE_CANVAS_WHEEL").is_none() {
+        return;
+    }
+    let cursor_logical = physical_to_logical_position(cursor_physical, scale_factor);
+    let pointer_over_canvas = canvas_rect.is_some_and(|rect| rect.contains(cursor_logical));
+    eprintln!(
+        "[CANVAS WHEEL] view={main_view:?} ctrl={control_pressed} pointer_over_canvas={pointer_over_canvas} egui_consumed={egui_consumed} owner={owner:?} delta_kind={:?} delta={:.3} cursor_physical=({:.1},{:.1}) cursor_logical=({:.1},{:.1}) scale_factor={scale_factor:.2} canvas_rect={canvas_rect:?} zoom_before={zoom_before:.4} zoom_after={zoom_after:.4}",
+        sample.kind,
+        sample.delta_y,
+        cursor_physical.x,
+        cursor_physical.y,
+        cursor_logical.x,
+        cursor_logical.y,
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceTokenRole {
     Keyword,
@@ -14733,6 +14760,14 @@ fn canvas_navigation_enabled_for(main_view: MainView) -> bool {
     matches!(main_view, MainView::Icon | MainView::Diagram)
 }
 
+fn physical_to_logical_position(position: PhysicalPosition<f64>, scale_factor: f32) -> Pos2 {
+    let scale_factor = scale_factor.max(f32::EPSILON);
+    Pos2::new(
+        position.x as f32 / scale_factor,
+        position.y as f32 / scale_factor,
+    )
+}
+
 fn canvas_event_allowed_for(main_view: MainView, pointer_over_canvas: bool) -> bool {
     canvas_navigation_enabled_for(main_view) && pointer_over_canvas
 }
@@ -14758,13 +14793,30 @@ fn wheel_owner(
     pointer_over_canvas: bool,
     control_pressed: bool,
 ) -> WheelOwner {
-    if egui_consumed {
-        WheelOwner::Egui
-    } else if should_zoom_canvas(main_view, pointer_over_canvas, control_pressed) {
+    if should_zoom_canvas(main_view, pointer_over_canvas, control_pressed) {
         WheelOwner::CanvasZoom
+    } else if egui_consumed {
+        WheelOwner::Egui
     } else {
         WheelOwner::None
     }
+}
+
+fn wheel_delta_sample(delta: MouseScrollDelta) -> SourceWheelSample {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => SourceWheelSample {
+            kind: SourceWheelKind::LineDelta,
+            delta_y: y,
+        },
+        MouseScrollDelta::PixelDelta(position) => SourceWheelSample {
+            kind: SourceWheelKind::PixelDelta,
+            delta_y: position.y as f32 / 80.0,
+        },
+    }
+}
+
+fn zoom_after_wheel(current_zoom: f32, wheel_delta: f32) -> f32 {
+    (current_zoom * (1.0 + wheel_delta * 0.1)).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
 fn delta_is_zero(delta: CorePoint) -> bool {
@@ -16884,9 +16936,22 @@ fn main() {
             event_loop.set_control_flow(ControlFlow::Wait);
             match event {
                 Event::WindowEvent { window_id, event } if window_id == app.window.id() => {
-                    let egui_response = app.egui_state.on_window_event(&app.window, &event);
-                    let egui_consumed = egui_response.consumed;
-                    let egui_repaint = egui_response.repaint;
+                    // Ctrl+wheel over an Icon/Diagram canvas is an explicit
+                    // canvas gesture. Do not first feed it to egui, where a
+                    // ScrollArea or zoom handler could consume it as well.
+                    let canvas_wheel_routed_exclusively =
+                        matches!(&event, WindowEvent::MouseWheel { .. })
+                            && should_zoom_canvas(
+                                app.main_view,
+                                app.pointer_over_canvas(),
+                                app.modifiers.control_key(),
+                            );
+                    let (egui_consumed, egui_repaint) = if canvas_wheel_routed_exclusively {
+                        (false, false)
+                    } else {
+                        let response = app.egui_state.on_window_event(&app.window, &event);
+                        (response.consumed, response.repaint)
+                    };
                     let egui_repaint_requested = egui_repaint
                         && !matches!(&event, WindowEvent::RedrawRequested)
                         // Interactive drag input is coalesced by pending_drag_position;
@@ -17100,16 +17165,9 @@ fn main() {
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
-                            let (wheel_kind, amount) = match delta {
-                                MouseScrollDelta::LineDelta(_, y) => {
-                                    (SourceWheelKind::LineDelta, y)
-                                }
-                                MouseScrollDelta::PixelDelta(position) => (
-                                    SourceWheelKind::PixelDelta,
-                                    position.y as f32 / 80.0,
-                                ),
-                            };
-                            let source_line_scroll = wheel_kind == SourceWheelKind::LineDelta
+                            let wheel_sample = wheel_delta_sample(delta);
+                            let amount = wheel_sample.delta_y;
+                            let source_line_scroll = wheel_sample.kind == SourceWheelKind::LineDelta
                                 && !app.modifiers.control_key()
                                 && app.pointer_over_source_scroll();
                             if source_line_scroll {
@@ -17120,8 +17178,8 @@ fn main() {
                                     && app.pointer_over_source_scroll()
                                 {
                                     app.source_wheel_sample = Some(SourceWheelSample {
-                                        kind: wheel_kind,
-                                        delta_y: amount,
+                                        kind: wheel_sample.kind,
+                                        delta_y: wheel_sample.delta_y,
                                     });
                                 }
                                 let owner = wheel_owner(
@@ -17130,10 +17188,30 @@ fn main() {
                                     app.pointer_over_canvas(),
                                     app.modifiers.control_key(),
                                 );
+                                let zoom_before = app.zoom;
                                 if owner == WheelOwner::CanvasZoom {
                                     app.zoom_at_cursor(amount);
                                     app.request_redraw();
                                 }
+                                let egui_consumed_trace = if canvas_wheel_routed_exclusively {
+                                    "not-dispatched"
+                                } else if egui_consumed {
+                                    "true"
+                                } else {
+                                    "false"
+                                };
+                                trace_canvas_wheel(
+                                    app.main_view,
+                                    app.modifiers.control_key(),
+                                    app.cursor,
+                                    app.window.scale_factor() as f32,
+                                    app.canvas_rect,
+                                    egui_consumed_trace,
+                                    owner,
+                                    wheel_sample,
+                                    zoom_before,
+                                    app.zoom,
+                                );
                                 trace_source_wheel(
                                     matches!(app.main_view, MainView::Source),
                                     amount,
@@ -17938,31 +18016,83 @@ end Top;
     }
 
     #[test]
-    fn wheel_owner_prioritizes_egui_over_canvas_zoom() {
+    fn canvas_ctrl_wheel_has_priority_inside_icon_and_diagram_canvases() {
+        for view in [MainView::Icon, MainView::Diagram] {
+            assert_eq!(
+                wheel_owner(view, true, true, true),
+                WheelOwner::CanvasZoom,
+                "{view:?} Ctrl+wheel should override generic egui consumption",
+            );
+            assert_eq!(
+                wheel_owner(view, false, true, true),
+                WheelOwner::CanvasZoom,
+                "{view:?} Ctrl+wheel should zoom even when egui did not consume it",
+            );
+        }
+    }
+
+    #[test]
+    fn wheel_ownership_matrix_keeps_source_and_non_canvas_wheels_out_of_canvas_zoom() {
         assert_eq!(
             wheel_owner(MainView::Source, true, true, true),
-            WheelOwner::Egui
-        );
-        assert_eq!(
-            wheel_owner(MainView::Diagram, true, true, true),
             WheelOwner::Egui
         );
         assert_eq!(
             wheel_owner(MainView::Source, false, true, true),
             WheelOwner::None
         );
+        for view in [MainView::Icon, MainView::Diagram] {
+            assert_eq!(wheel_owner(view, true, true, false), WheelOwner::Egui);
+            assert_eq!(wheel_owner(view, true, false, true), WheelOwner::Egui);
+            assert_eq!(wheel_owner(view, false, false, true), WheelOwner::None);
+            assert_eq!(wheel_owner(view, false, true, false), WheelOwner::None);
+        }
         assert_eq!(
-            wheel_owner(MainView::Diagram, false, true, true),
-            WheelOwner::CanvasZoom
+            wheel_owner(MainView::Source, true, true, false),
+            WheelOwner::Egui
         );
         assert_eq!(
-            wheel_owner(MainView::Icon, false, false, true),
+            wheel_owner(MainView::Source, false, true, false),
             WheelOwner::None
         );
-        assert_eq!(
-            wheel_owner(MainView::Diagram, false, true, false),
-            WheelOwner::None
-        );
+    }
+
+    #[test]
+    fn line_and_pixel_wheel_deltas_keep_up_and_down_directions() {
+        let line_up = wheel_delta_sample(MouseScrollDelta::LineDelta(0.0, 1.0));
+        let line_down = wheel_delta_sample(MouseScrollDelta::LineDelta(0.0, -1.0));
+        let pixel_up = wheel_delta_sample(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, 80.0,
+        )));
+        let pixel_down = wheel_delta_sample(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, -80.0,
+        )));
+
+        assert_eq!(line_up.kind, SourceWheelKind::LineDelta);
+        assert_eq!(line_up.delta_y, 1.0);
+        assert_eq!(line_down.delta_y, -1.0);
+        assert_eq!(pixel_up.kind, SourceWheelKind::PixelDelta);
+        assert_eq!(pixel_up.delta_y, 1.0);
+        assert_eq!(pixel_down.delta_y, -1.0);
+        for sample in [line_up, pixel_up] {
+            assert!(zoom_after_wheel(1.0, sample.delta_y) > 1.0);
+        }
+        for sample in [line_down, pixel_down] {
+            assert!(zoom_after_wheel(1.0, sample.delta_y) < 1.0);
+        }
+    }
+
+    #[test]
+    fn physical_cursor_maps_to_same_canvas_point_at_common_dpi_scales() {
+        for scale_factor in [1.0, 1.25, 1.5, 2.0] {
+            let physical = PhysicalPosition::new(
+                f64::from(240.0 * scale_factor),
+                f64::from(120.0 * scale_factor),
+            );
+            let logical = physical_to_logical_position(physical, scale_factor);
+            assert!((logical.x - 240.0).abs() < 0.001);
+            assert!((logical.y - 120.0).abs() < 0.001);
+        }
     }
 
     #[test]
