@@ -11487,6 +11487,13 @@ fn glass_frame() -> Frame {
         .inner_margin(Margin::same(10.0))
 }
 
+fn tree_row_galley_position(rect: Rect, x: f32, galley_height: f32, pixels_per_point: f32) -> Pos2 {
+    snap_point_to_physical_pixel(
+        Pos2::new(x, rect.center().y - galley_height * 0.5),
+        pixels_per_point,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
@@ -11527,13 +11534,22 @@ fn tree_row(
             Stroke::new(1.0_f32, theme_accent_soft(125)),
         );
     }
-    let text_position = Pos2::new(rect.left() + indent * 12.0 + 30.0, rect.center().y);
-    ui.painter().text(
-        Pos2::new(rect.left() + indent * 12.0 + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        marker,
-        ui_font(12.0),
-        theme_text_tertiary(),
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let marker_color = theme_text_tertiary();
+    let marker_galley = ui
+        .painter()
+        .layout_no_wrap(marker.to_owned(), ui_font(12.0), marker_color);
+    let marker_position = tree_row_galley_position(
+        rect,
+        rect.left() + indent * 12.0 + 8.0,
+        marker_galley.size().y,
+        pixels_per_point,
+    );
+    ui.painter()
+        .galley(marker_position, marker_galley, marker_color);
+    let text_position = snap_point_to_physical_pixel(
+        Pos2::new(rect.left() + indent * 12.0 + 30.0, rect.center().y),
+        pixels_per_point,
     );
     let label_font = if selected {
         ui_semibold_font(13.0)
@@ -11568,9 +11584,11 @@ fn tree_row(
         label_font.clone(),
         label_color,
     );
-    let label_position = Pos2::new(
+    let label_position = tree_row_galley_position(
+        rect,
         text_position.x,
-        rect.center().y - label_galley.size().y * 0.5,
+        label_galley.size().y,
+        pixels_per_point,
     );
     if trace_sample {
         trace_text_layout_sample(
@@ -11587,15 +11605,11 @@ fn tree_row(
     }
     ui.painter()
         .galley(label_position, label_galley.clone(), label_color);
-    ui.painter().galley(
-        Pos2::new(
-            (rect.right() - 8.0 - kind_galley.size().x)
-                .max(label_position.x + label_galley.size().x + 6.0),
-            rect.center().y - kind_galley.size().y * 0.5,
-        ),
-        kind_galley,
-        kind_color,
-    );
+    let kind_x = (rect.right() - 8.0 - kind_galley.size().x)
+        .max(label_position.x + label_galley.size().x + 6.0);
+    let kind_position =
+        tree_row_galley_position(rect, kind_x, kind_galley.size().y, pixels_per_point);
+    ui.painter().galley(kind_position, kind_galley, kind_color);
     (response, marker_response)
 }
 
@@ -14922,7 +14936,6 @@ fn logical_to_physical_pixels(position: Pos2, pixels_per_point: f32) -> Pos2 {
     Pos2::new(position.x * pixels_per_point, position.y * pixels_per_point)
 }
 
-#[allow(dead_code)] // Reserved for whole-position snapping in the model-tree paint path.
 fn snap_point_to_physical_pixel(point: Pos2, pixels_per_point: f32) -> Pos2 {
     let pixels_per_point = valid_pixels_per_point(pixels_per_point);
     Pos2::new(
@@ -17495,6 +17508,46 @@ mod tests {
         let visible_text = tree_row_label("□", "Heater");
         assert_eq!(visible_text, "□  Heater");
         assert!(!visible_text.contains("等温"));
+    }
+
+    #[test]
+    fn tree_marker_name_and_kind_positions_snap_at_common_dpi_scales() {
+        let rect = Rect::from_min_size(Pos2::new(13.25, 29.4), Vec2::new(260.0, 29.0));
+        let original_rect = rect;
+        let cases = [(0.0, 13.0, 17.3, 14.1), (3.0, 13.4, 17.6, 14.4)];
+
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            for (indent, marker_height, label_height, kind_height) in cases {
+                let marker_x = rect.left() + indent * 12.0 + 8.0;
+                let marker =
+                    tree_row_galley_position(rect, marker_x, marker_height, pixels_per_point);
+
+                let label_x = rect.left() + indent * 12.0 + 30.0;
+                let label_anchor = snap_point_to_physical_pixel(
+                    Pos2::new(label_x, rect.center().y),
+                    pixels_per_point,
+                );
+                let label =
+                    tree_row_galley_position(rect, label_anchor.x, label_height, pixels_per_point);
+
+                let kind_x = rect.right() - 8.0 - 31.0;
+                let kind = tree_row_galley_position(rect, kind_x, kind_height, pixels_per_point);
+
+                for (position, expected_x) in [(marker, marker_x), (label, label_x), (kind, kind_x)]
+                {
+                    for coordinate in [position.x, position.y] {
+                        let physical = coordinate * pixels_per_point;
+                        assert!((physical - physical.round()).abs() < 0.0001);
+                    }
+                    assert!((position.x - expected_x).abs() <= 0.5001 / pixels_per_point);
+                }
+            }
+        }
+
+        assert_eq!(
+            rect, original_rect,
+            "paint snapping must not alter row geometry"
+        );
     }
 
     #[test]
