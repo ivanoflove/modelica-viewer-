@@ -12026,9 +12026,9 @@ impl SourceScrollState {
         self.last_update = Instant::now();
     }
 
-    fn advance(&mut self) {
+    fn advance(&mut self, pixels_per_point: f32) -> bool {
         if !self.initialized {
-            return;
+            return false;
         }
         let now = Instant::now();
         let dt = now
@@ -12036,15 +12036,29 @@ impl SourceScrollState {
             .as_secs_f32()
             .clamp(0.0, 0.1);
         self.last_update = now;
+        self.advance_by(dt, pixels_per_point)
+    }
+
+    fn advance_by(&mut self, dt: f32, pixels_per_point: f32) -> bool {
         if !self.active {
-            return;
+            return false;
         }
+        let dt = dt.clamp(0.0, 0.1);
         let alpha = 1.0 - (-dt / SOURCE_SCROLL_SMOOTH_SECONDS).exp();
         self.current_y += (self.target_y - self.current_y) * alpha;
         if (self.target_y - self.current_y).abs() <= SOURCE_SCROLL_EPSILON {
             self.current_y = self.target_y;
             self.active = false;
+            self.snap_to_stable_pixel(pixels_per_point);
+            return true;
         }
+        false
+    }
+
+    fn snap_to_stable_pixel(&mut self, pixels_per_point: f32) {
+        self.current_y =
+            snap_scroll_offset_to_physical_pixel(self.current_y, self.max_y, pixels_per_point);
+        self.target_y = self.current_y;
     }
 
     fn set_bounds(&mut self, max_y: f32) {
@@ -12161,6 +12175,7 @@ fn source_preview(
             let scroll_width = ui.available_width().max(0.0);
             let scroll_delta = ui.input(|input| input.raw_scroll_delta);
             let pointer_position = ui.ctx().pointer_latest_pos();
+            let pixels_per_point = ui.ctx().pixels_per_point();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             // Prepare/validate the source cache once; all per-visible-row
             // lookups below reuse this class/version/theme key.
@@ -12180,8 +12195,11 @@ fn source_preview(
                 source_scroll_state.current_y = state_before.offset.y;
                 source_scroll_state.target_y = state_before.offset.y;
             }
-            source_scroll_state.advance();
-            if source_scroll_state.active || source_scroll_state.override_default_wheel {
+            let settled_this_frame = source_scroll_state.advance(pixels_per_point);
+            if source_scroll_state.active
+                || source_scroll_state.override_default_wheel
+                || settled_this_frame
+            {
                 state_before.offset.y = source_scroll_state.current_y;
                 state_before.store(ui.ctx(), scroll_id);
             }
@@ -12273,8 +12291,14 @@ fn source_preview(
             let max_scroll_y =
                 (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
             source_scroll_state.set_bounds(max_scroll_y);
+            if settled_this_frame {
+                source_scroll_state.snap_to_stable_pixel(pixels_per_point);
+            }
             let mut final_state = scroll_output.state;
-            if source_scroll_state.active || source_scroll_state.override_default_wheel {
+            if source_scroll_state.active
+                || source_scroll_state.override_default_wheel
+                || settled_this_frame
+            {
                 final_state.offset.y = source_scroll_state.current_y;
                 final_state.store(ui.ctx(), scroll_id);
             } else {
@@ -14925,6 +14949,17 @@ fn valid_pixels_per_point(pixels_per_point: f32) -> f32 {
 
 fn snap_coordinate_to_physical_pixel(coordinate: f32, pixels_per_point: f32) -> f32 {
     (coordinate * pixels_per_point).round() / pixels_per_point
+}
+
+fn snap_scroll_offset_to_physical_pixel(
+    offset: f32,
+    max_offset: f32,
+    pixels_per_point: f32,
+) -> f32 {
+    let pixels_per_point = valid_pixels_per_point(pixels_per_point);
+    let max_aligned_offset = (max_offset.max(0.0) * pixels_per_point).floor() / pixels_per_point;
+    snap_coordinate_to_physical_pixel(offset.max(0.0), pixels_per_point)
+        .clamp(0.0, max_aligned_offset)
 }
 
 fn canvas_event_allowed_for(main_view: MainView, pointer_over_canvas: bool) -> bool {
@@ -18340,10 +18375,62 @@ end Top;
         scroll.target_y = 20.0;
         scroll.set_bounds(40.0);
         scroll.enqueue_line_delta(10.0);
-        scroll.advance();
+        scroll.advance_by(0.05, 1.25);
 
         assert!((0.0..=40.0).contains(&scroll.current_y));
         assert!((0.0..=40.0).contains(&scroll.target_y));
+    }
+
+    #[test]
+    fn source_scroll_keeps_fractional_motion_then_snaps_when_settled() {
+        let pixels_per_point = 1.25;
+        let mut scroll = SourceScrollState::new();
+        scroll.initialized = true;
+        scroll.active = true;
+        scroll.current_y = 10.13;
+        scroll.target_y = 11.4;
+        scroll.set_bounds(50.0);
+        let target_y = scroll.target_y;
+
+        assert!(!scroll.advance_by(0.01, pixels_per_point));
+        assert!(scroll.active);
+        assert!(
+            (scroll.current_y * pixels_per_point - (scroll.current_y * pixels_per_point).round())
+                .abs()
+                > 0.01
+        );
+
+        let mut settled = false;
+        for _ in 0..20 {
+            if scroll.advance_by(0.1, pixels_per_point) {
+                settled = true;
+                break;
+            }
+        }
+
+        assert!(settled, "scroll animation should reach its target");
+        assert!(!scroll.active);
+        assert_eq!(scroll.current_y, scroll.target_y);
+        let physical_y = scroll.current_y * pixels_per_point;
+        assert!((physical_y - physical_y.round()).abs() < 0.0001);
+        assert!((scroll.current_y - target_y).abs() <= 0.5001 / pixels_per_point);
+    }
+
+    #[test]
+    fn settled_source_scroll_snap_stays_within_physical_bounds() {
+        let max_offset = 10.3;
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let offset =
+                snap_scroll_offset_to_physical_pixel(max_offset, max_offset, pixels_per_point);
+            let physical_offset = offset * pixels_per_point;
+            assert!((physical_offset - physical_offset.round()).abs() < 0.0001);
+            assert!((0.0..=max_offset).contains(&offset));
+
+            assert_eq!(
+                snap_scroll_offset_to_physical_pixel(-1.0, max_offset, pixels_per_point),
+                0.0
+            );
+        }
     }
 
     #[test]
