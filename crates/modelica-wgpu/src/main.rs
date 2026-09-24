@@ -9999,23 +9999,27 @@ impl App {
         if !self.canvas_navigation_enabled() {
             return;
         }
-        let old_zoom = self.zoom;
-        self.zoom = zoom_after_wheel(old_zoom, wheel_delta);
-        if (self.zoom - old_zoom).abs() < f32::EPSILON {
+        self.zoom_about_screen_point(
+            zoom_after_wheel(self.zoom, wheel_delta),
+            [self.cursor.x as f32, self.cursor.y as f32],
+        );
+    }
+
+    fn zoom_about_screen_point(&mut self, new_zoom: f32, anchor: [f32; 2]) {
+        if !self.canvas_navigation_enabled() {
             return;
         }
-        let center = [
+        let old_zoom = self.zoom;
+        let new_zoom = new_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        if (new_zoom - old_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let viewport_center = [
             self.config.width as f32 * 0.5,
             self.config.height as f32 * 0.5,
         ];
-        let cursor = [self.cursor.x as f32, self.cursor.y as f32];
-        let world_before = [
-            (cursor[0] - center[0] - self.pan[0]) / old_zoom,
-            (cursor[1] - center[1] - self.pan[1]) / old_zoom,
-        ];
-        let world_after = [world_before[0] * self.zoom, world_before[1] * self.zoom];
-        self.pan[0] += cursor[0] - center[0] - self.pan[0] - world_after[0];
-        self.pan[1] += cursor[1] - center[1] - self.pan[1] - world_after[1];
+        self.pan = pan_after_zoom_at_anchor(self.pan, old_zoom, new_zoom, viewport_center, anchor);
+        self.zoom = new_zoom;
         self.rebuild_scene_geometry_for_zoom();
         self.update_view_uniform();
     }
@@ -10138,6 +10142,7 @@ impl App {
         let mut open_directory_requested = false;
         let mut class_clicked = None;
         let mut fit_requested = false;
+        let mut zoom_action = None;
         let mut view_changed = false;
         let mut icon_clip_rect = None;
         let mut expand_all_requested = false;
@@ -10204,6 +10209,8 @@ impl App {
                 &mut open_requested,
                 &mut open_directory_requested,
                 &mut class_clicked,
+                zoom,
+                &mut zoom_action,
                 &mut fit_requested,
                 &mut view_changed,
                 &mut icon_clip_rect,
@@ -10317,7 +10324,19 @@ impl App {
         }
 
         if view_changed {
-            self.fit_scene();
+            if should_fit_scene_after_view_change(previous_main_view, self.main_view) {
+                self.fit_scene();
+            }
+            self.request_redraw();
+        }
+
+        if let Some(action) = zoom_action {
+            let anchor = canvas_center_physical_anchor(
+                self.canvas_rect,
+                self.window.scale_factor() as f32,
+                [self.config.width, self.config.height],
+            );
+            self.zoom_about_screen_point(zoom_after_toolbar_action(self.zoom, action), anchor);
             self.request_redraw();
         }
 
@@ -11118,6 +11137,8 @@ fn draw_preview_ui(
     open_requested: &mut bool,
     open_directory_requested: &mut bool,
     class_clicked: &mut Option<String>,
+    zoom: f32,
+    zoom_action: &mut Option<ZoomAction>,
     fit_requested: &mut bool,
     view_changed: &mut bool,
     icon_clip_rect: &mut Option<egui::Rect>,
@@ -11517,30 +11538,59 @@ fn draw_preview_ui(
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let fit_button = ui.add_sized(
-                            [54.0, 28.0],
-                            egui::Button::new(
-                                RichText::new("Fit").size(12.0).font(ui_semibold_font(12.0)),
-                            )
-                            .fill(theme_surface_soft(230))
-                            .stroke(Stroke::new(1.0_f32, theme_border(34)))
-                            .rounding(Rounding::same(4.0)),
-                        );
-                        if fit_button.clicked() {
-                            *fit_requested = true;
+                        if canvas_zoom_controls_visible_for(*main_view) {
+                            let fit_button = ui.add_sized(
+                                [54.0, 28.0],
+                                egui::Button::new(
+                                    RichText::new("Fit").size(12.0).font(ui_semibold_font(12.0)),
+                                )
+                                .fill(theme_surface_soft(230))
+                                .stroke(Stroke::new(1.0_f32, theme_border(34)))
+                                .rounding(Rounding::same(4.0)),
+                            );
+                            if fit_button.clicked() {
+                                *fit_requested = true;
+                            }
+
+                            let zoom_in_button = ui.add_sized(
+                                [28.0, 28.0],
+                                egui::Button::new(
+                                    RichText::new("+")
+                                        .size(16.0)
+                                        .font(ui_font(16.0))
+                                        .color(theme_text_secondary()),
+                                )
+                                .fill(theme_surface_soft(230))
+                                .stroke(Stroke::new(1.0_f32, theme_border(34)))
+                                .rounding(Rounding::same(4.0)),
+                            );
+                            if zoom_in_button.clicked() {
+                                *zoom_action = Some(ZoomAction::In);
+                            }
+
+                            ui.label(
+                                RichText::new(format!("{}%", zoom_percent(zoom)))
+                                    .size(12.0)
+                                    .font(ui_font(12.0))
+                                    .color(theme_text_tertiary()),
+                            );
+
+                            let zoom_out_button = ui.add_sized(
+                                [28.0, 28.0],
+                                egui::Button::new(
+                                    RichText::new("−")
+                                        .size(16.0)
+                                        .font(ui_font(16.0))
+                                        .color(theme_text_secondary()),
+                                )
+                                .fill(theme_surface_soft(230))
+                                .stroke(Stroke::new(1.0_f32, theme_border(34)))
+                                .rounding(Rounding::same(4.0)),
+                            );
+                            if zoom_out_button.clicked() {
+                                *zoom_action = Some(ZoomAction::Out);
+                            }
                         }
-                        ui.label(
-                            RichText::new("100%")
-                                .size(12.0)
-                                .font(ui_font(12.0))
-                                .color(theme_text_tertiary()),
-                        );
-                        ui.label(
-                            RichText::new("−  +")
-                                .size(16.0)
-                                .font(ui_font(16.0))
-                                .color(theme_text_secondary()),
-                        );
                     });
                 });
                 ui.separator();
@@ -11940,6 +11990,38 @@ const SOURCE_SCROLL_SMOOTH_SECONDS: f32 = 0.09;
 const SOURCE_SCROLL_EPSILON: f32 = 0.25;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceClickOwner {
+    Fold,
+    Viewport,
+    None,
+}
+
+fn source_click_owner(
+    viewport_rect: Rect,
+    pointer: Option<Pos2>,
+    fold_gutter_rect: Option<Rect>,
+) -> SourceClickOwner {
+    let Some(pointer) = pointer.filter(|position| viewport_rect.contains(*position)) else {
+        return SourceClickOwner::None;
+    };
+    if fold_gutter_rect.is_some_and(|rect| rect.contains(pointer)) {
+        SourceClickOwner::Fold
+    } else {
+        SourceClickOwner::Viewport
+    }
+}
+
+fn source_fold_marker_position(rect: Rect, galley_size: Vec2, pixels_per_point: f32) -> Pos2 {
+    snap_point_to_physical_pixel(
+        Pos2::new(
+            rect.center().x - galley_size.x * 0.5,
+            rect.center().y - galley_size.y * 0.5,
+        ),
+        pixels_per_point,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceWheelKind {
     LineDelta,
     PixelDelta,
@@ -12232,6 +12314,13 @@ impl SourceInteractionState {
         self.sync_class(document.selected_class.as_deref());
         self.fold_state.sync_document(document);
     }
+
+    fn focus_for_click_owner(&mut self, owner: SourceClickOwner) {
+        if owner == SourceClickOwner::Viewport {
+            self.focused = true;
+            self.all_selected = false;
+        }
+    }
 }
 
 fn source_copy_text(lines: &[String]) -> String {
@@ -12346,6 +12435,9 @@ fn source_preview(
             }
             let offset_before = state_before.offset;
             let mut fold_toggle_line = None;
+            let mut fold_gutter_rect_under_pointer = None;
+            let primary_clicked =
+                ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Primary));
             let source_all_selected = source_interaction.all_selected;
             let scroll_output = {
                 let fold_state = &source_interaction.fold_state;
@@ -12406,27 +12498,33 @@ fn source_preview(
                                     window_scale_factor,
                                     trace_text_layout && visible_index == trace_sample_row,
                                 );
-                                if fold_response.is_some_and(|response| response.clicked()) {
-                                    fold_toggle_line = Some(original_line);
+                                if let Some((response, fold_rect)) = fold_response {
+                                    if response.clicked() {
+                                        fold_toggle_line = Some(original_line);
+                                    }
+                                    if pointer_position
+                                        .is_some_and(|pointer| fold_rect.contains(pointer))
+                                    {
+                                        fold_gutter_rect_under_pointer = Some(fold_rect);
+                                    }
                                 }
                                 visible_row_lookup += lookup_elapsed;
                             }
                         },
                     )
             };
-            let viewport_response = ui.interact(
+            let click_owner = source_click_owner(
                 scroll_output.inner_rect,
-                ui.id().with("source-viewport"),
-                Sense::click(),
+                pointer_position,
+                fold_gutter_rect_under_pointer,
             );
             if let Some(line) = fold_toggle_line {
                 source_interaction
                     .fold_state
                     .toggle_line(line, document.source_lines.len());
                 ui.ctx().request_repaint();
-            } else if viewport_response.clicked() {
-                source_interaction.focused = true;
-                source_interaction.all_selected = false;
+            } else if primary_clicked {
+                source_interaction.focus_for_click_owner(click_owner);
             }
             *source_scroll_rect = Some(scroll_output.inner_rect);
             let max_scroll_y =
@@ -12514,7 +12612,7 @@ fn render_source_line(
     scroll_offset: f32,
     window_scale_factor: f32,
     trace_sample: bool,
-) -> Option<egui::Response> {
+) -> Option<(egui::Response, Rect)> {
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(content_width.max(ui.available_width()), SOURCE_ROW_HEIGHT),
         Sense::hover(),
@@ -12532,14 +12630,15 @@ fn render_source_line(
             Sense::click(),
         );
         painter.galley(
-            Pos2::new(
-                fold_rect.center().x - marker_galley.size().x * 0.5,
-                rect.top() + (SOURCE_ROW_HEIGHT - marker_galley.size().y) * 0.5,
+            source_fold_marker_position(
+                fold_rect,
+                marker_galley.size(),
+                ui.ctx().pixels_per_point(),
             ),
             marker_galley,
             theme_text_secondary(),
         );
-        response
+        (response, fold_rect)
     });
     let pixels_per_point = ui.ctx().pixels_per_point();
     let number_position = source_line_galley_position(
@@ -15051,6 +15150,16 @@ fn canvas_navigation_enabled_for(main_view: MainView) -> bool {
     matches!(main_view, MainView::Icon | MainView::Diagram)
 }
 
+fn canvas_zoom_controls_visible_for(main_view: MainView) -> bool {
+    canvas_navigation_enabled_for(main_view)
+}
+
+fn should_fit_scene_after_view_change(previous: MainView, current: MainView) -> bool {
+    previous != current
+        && canvas_navigation_enabled_for(previous)
+        && canvas_navigation_enabled_for(current)
+}
+
 fn physical_to_logical_position(position: PhysicalPosition<f64>, scale_factor: f32) -> Pos2 {
     let scale_factor = scale_factor.max(f32::EPSILON);
     Pos2::new(
@@ -15151,6 +15260,52 @@ fn wheel_delta_sample(delta: MouseScrollDelta) -> SourceWheelSample {
 
 fn zoom_after_wheel(current_zoom: f32, wheel_delta: f32) -> f32 {
     (current_zoom * (1.0 + wheel_delta * 0.1)).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZoomAction {
+    In,
+    Out,
+}
+
+fn zoom_after_toolbar_action(current_zoom: f32, action: ZoomAction) -> f32 {
+    let next = match action {
+        ZoomAction::In => current_zoom * 1.1,
+        ZoomAction::Out => current_zoom / 1.1,
+    };
+    next.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn zoom_percent(zoom: f32) -> u32 {
+    (zoom / INITIAL_ZOOM * 100.0).round() as u32
+}
+
+fn pan_after_zoom_at_anchor(
+    pan: [f32; 2],
+    old_zoom: f32,
+    new_zoom: f32,
+    viewport_center: [f32; 2],
+    anchor: [f32; 2],
+) -> [f32; 2] {
+    let world_before = [
+        (anchor[0] - viewport_center[0] - pan[0]) / old_zoom,
+        (anchor[1] - viewport_center[1] - pan[1]) / old_zoom,
+    ];
+    [
+        anchor[0] - viewport_center[0] - world_before[0] * new_zoom,
+        anchor[1] - viewport_center[1] - world_before[1] * new_zoom,
+    ]
+}
+
+fn canvas_center_physical_anchor(
+    canvas_rect: Option<Rect>,
+    scale_factor: f32,
+    viewport_size: [u32; 2],
+) -> [f32; 2] {
+    canvas_rect
+        .map(|rect| logical_to_physical_pixels(rect.center(), scale_factor))
+        .map(|center| [center.x, center.y])
+        .unwrap_or([viewport_size[0] as f32 * 0.5, viewport_size[1] as f32 * 0.5])
 }
 
 fn delta_is_zero(delta: CorePoint) -> bool {
@@ -17991,6 +18146,88 @@ mod tests {
     }
 
     #[test]
+    fn source_fold_marker_can_expand_and_collapse_from_its_line() {
+        let mut state = source_folding_state("annotation(\n  Icon()\n)", 1);
+        let fold_id = state
+            .range_starting_at(0)
+            .expect("annotation fold")
+            .id
+            .clone();
+        assert!(state.collapsed.contains(&fold_id));
+
+        assert!(state.toggle_line(0, 3));
+        assert!(!state.collapsed.contains(&fold_id));
+        assert!(state.toggle_line(0, 3));
+        assert!(state.collapsed.contains(&fold_id));
+    }
+
+    #[test]
+    fn source_fold_marker_stays_aligned_inside_its_click_gutter_at_common_dpi_scales() {
+        let row = Rect::from_min_size(Pos2::new(31.25, 47.4), Vec2::new(240.0, SOURCE_ROW_HEIGHT));
+        let fold_rect = Rect::from_min_size(
+            row.min,
+            Vec2::new(SOURCE_FOLD_GUTTER_WIDTH, SOURCE_ROW_HEIGHT),
+        );
+        assert_eq!(fold_rect.width(), 18.0);
+        assert_eq!(fold_rect.height(), SOURCE_ROW_HEIGHT);
+
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let marker_size = Vec2::new(8.0, 14.0);
+            let marker = source_fold_marker_position(fold_rect, marker_size, pixels_per_point);
+            let marker_center = marker + marker_size * 0.5;
+            assert!(fold_rect.contains(marker_center));
+            assert!((marker_center.x - fold_rect.center().x).abs() <= 0.5001 / pixels_per_point);
+            assert!((marker_center.y - fold_rect.center().y).abs() <= 0.5001 / pixels_per_point);
+        }
+    }
+
+    #[test]
+    fn source_click_policy_prioritizes_fold_then_viewport_and_ignores_outside_clicks() {
+        let viewport = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(300.0, 200.0));
+        let fold_gutter = Rect::from_min_size(viewport.min, Vec2::new(18.0, SOURCE_ROW_HEIGHT));
+        assert_eq!(
+            source_click_owner(viewport, Some(fold_gutter.center()), Some(fold_gutter)),
+            SourceClickOwner::Fold
+        );
+        assert_eq!(
+            source_click_owner(
+                viewport,
+                Some(Pos2::new(viewport.left() + 120.0, viewport.top() + 10.0)),
+                Some(fold_gutter),
+            ),
+            SourceClickOwner::Viewport
+        );
+        assert_eq!(
+            source_click_owner(
+                viewport,
+                Some(Pos2::new(viewport.right() + 1.0, viewport.top() + 10.0)),
+                Some(fold_gutter),
+            ),
+            SourceClickOwner::None
+        );
+        assert_eq!(
+            source_click_owner(viewport, None, Some(fold_gutter)),
+            SourceClickOwner::None
+        );
+    }
+
+    #[test]
+    fn fold_click_does_not_focus_source_or_clear_selection_but_body_click_does() {
+        let mut interaction = SourceInteractionState {
+            focused: false,
+            all_selected: true,
+            ..Default::default()
+        };
+        interaction.focus_for_click_owner(SourceClickOwner::Fold);
+        assert!(!interaction.focused);
+        assert!(interaction.all_selected);
+
+        interaction.focus_for_click_owner(SourceClickOwner::Viewport);
+        assert!(interaction.focused);
+        assert!(!interaction.all_selected);
+    }
+
+    #[test]
     fn source_fold_layout_is_cached_during_scroll_frames() {
         let document = source_folding_document("annotation(\n  Icon(\n    graphics={}\n  )\n)", 1);
         let mut state = SourceFoldState::default();
@@ -18510,6 +18747,97 @@ end Top;
         assert!(!should_zoom_canvas(MainView::Icon, true, false));
         assert!(should_zoom_canvas(MainView::Icon, true, true));
         assert!(!should_zoom_canvas(MainView::Source, true, true));
+    }
+
+    #[test]
+    fn source_has_no_canvas_zoom_controls_and_canvas_views_keep_them() {
+        assert!(!canvas_zoom_controls_visible_for(MainView::Source));
+        assert!(canvas_zoom_controls_visible_for(MainView::Icon));
+        assert!(canvas_zoom_controls_visible_for(MainView::Diagram));
+        assert!(!should_fit_scene_after_view_change(
+            MainView::Source,
+            MainView::Icon
+        ));
+        assert!(!should_fit_scene_after_view_change(
+            MainView::Source,
+            MainView::Diagram
+        ));
+        assert!(!should_fit_scene_after_view_change(
+            MainView::Icon,
+            MainView::Source
+        ));
+        assert!(should_fit_scene_after_view_change(
+            MainView::Icon,
+            MainView::Diagram
+        ));
+    }
+
+    #[test]
+    fn toolbar_zoom_in_and_out_use_a_clamped_ten_percent_step() {
+        assert!((zoom_after_toolbar_action(INITIAL_ZOOM, ZoomAction::In) - 3.3).abs() < 0.0001);
+        assert!(
+            (zoom_after_toolbar_action(INITIAL_ZOOM, ZoomAction::Out) - 3.0 / 1.1).abs() < 0.0001
+        );
+        assert_eq!(
+            zoom_after_toolbar_action(MAX_ZOOM, ZoomAction::In),
+            MAX_ZOOM
+        );
+        assert_eq!(
+            zoom_after_toolbar_action(MIN_ZOOM, ZoomAction::Out),
+            MIN_ZOOM
+        );
+    }
+
+    #[test]
+    fn zoom_percent_tracks_zoom_relative_to_initial_scale() {
+        assert_eq!(zoom_percent(INITIAL_ZOOM), 100);
+        assert_eq!(zoom_percent(INITIAL_ZOOM * 0.5), 50);
+        assert_eq!(zoom_percent(INITIAL_ZOOM * 0.75), 75);
+        assert_eq!(zoom_percent(INITIAL_ZOOM * 1.1), 110);
+        assert_eq!(zoom_percent(INITIAL_ZOOM * 2.0), 200);
+    }
+
+    #[test]
+    fn toolbar_zoom_anchor_uses_physical_canvas_center_and_preserves_world_point() {
+        let canvas_rect = Rect::from_min_size(Pos2::new(110.0, 80.0), Vec2::new(500.0, 320.0));
+        let anchor = canvas_center_physical_anchor(Some(canvas_rect), 1.5, [1800, 1200]);
+        assert_eq!(anchor, [540.0, 360.0]);
+
+        let pan = [37.0, -19.0];
+        let viewport_center = [900.0, 600.0];
+        let old_zoom = INITIAL_ZOOM;
+        let new_zoom = zoom_after_toolbar_action(old_zoom, ZoomAction::In);
+        let next_pan = pan_after_zoom_at_anchor(pan, old_zoom, new_zoom, viewport_center, anchor);
+        let world_before = [
+            (anchor[0] - viewport_center[0] - pan[0]) / old_zoom,
+            (anchor[1] - viewport_center[1] - pan[1]) / old_zoom,
+        ];
+        let world_after = [
+            (anchor[0] - viewport_center[0] - next_pan[0]) / new_zoom,
+            (anchor[1] - viewport_center[1] - next_pan[1]) / new_zoom,
+        ];
+        assert!((world_before[0] - world_after[0]).abs() < 0.0001);
+        assert!((world_before[1] - world_after[1]).abs() < 0.0001);
+    }
+
+    #[test]
+    fn canvas_wheel_zoom_preserves_the_cursor_anchor() {
+        let cursor = [375.0, 240.0];
+        let pan = [-28.0, 14.0];
+        let viewport_center = [800.0, 500.0];
+        let old_zoom = INITIAL_ZOOM;
+        let new_zoom = zoom_after_wheel(old_zoom, 2.0);
+        let next_pan = pan_after_zoom_at_anchor(pan, old_zoom, new_zoom, viewport_center, cursor);
+        let world_before = [
+            (cursor[0] - viewport_center[0] - pan[0]) / old_zoom,
+            (cursor[1] - viewport_center[1] - pan[1]) / old_zoom,
+        ];
+        let world_after = [
+            (cursor[0] - viewport_center[0] - next_pan[0]) / new_zoom,
+            (cursor[1] - viewport_center[1] - next_pan[1]) / new_zoom,
+        ];
+        assert!((world_before[0] - world_after[0]).abs() < 0.0001);
+        assert!((world_before[1] - world_after[1]).abs() < 0.0001);
     }
 
     #[test]
