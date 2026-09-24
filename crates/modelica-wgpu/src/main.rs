@@ -12719,6 +12719,7 @@ fn source_preview(
                                     marker,
                                     source_all_selected,
                                     source_scroll_state.current_y,
+                                    !source_scroll_state.active,
                                     window_scale_factor,
                                     trace_text_layout && visible_index == trace_sample_row,
                                 );
@@ -12837,6 +12838,7 @@ fn render_source_line(
     fold_marker: Option<Arc<egui::Galley>>,
     selected: bool,
     scroll_offset: f32,
+    snap_text_positions: bool,
     window_scale_factor: f32,
     trace_sample: bool,
 ) -> Option<(egui::Response, Rect)> {
@@ -12873,12 +12875,14 @@ fn render_source_line(
         rect.left() + SOURCE_FOLD_GUTTER_WIDTH,
         number_galley.size().y,
         pixels_per_point,
+        snap_text_positions,
     );
     let code_position = source_line_galley_position(
         rect,
         rect.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
         code_galley.size().y,
         pixels_per_point,
+        snap_text_positions,
     );
     if trace_sample {
         trace_text_layout_sample(
@@ -12914,9 +12918,15 @@ fn source_line_galley_position(
     x: f32,
     galley_height: f32,
     pixels_per_point: f32,
+    snap_to_pixel: bool,
 ) -> Pos2 {
     let y = rect.top() + (SOURCE_ROW_HEIGHT - galley_height) * 0.5;
-    snap_y_to_physical_pixel(Pos2::new(x, y), pixels_per_point)
+    let position = Pos2::new(x, y);
+    if snap_to_pixel {
+        snap_y_to_physical_pixel(position, pixels_per_point)
+    } else {
+        position
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -19262,13 +19272,28 @@ end Top;
             for galley_height in [14.5, 15.0] {
                 let unsnapped_y = rect.top() + (SOURCE_ROW_HEIGHT - galley_height) * 0.5;
                 let position =
-                    source_line_galley_position(rect, x, galley_height, pixels_per_point);
+                    source_line_galley_position(rect, x, galley_height, pixels_per_point, true);
 
                 assert_eq!(position.x, x);
                 let physical_y = position.y * pixels_per_point;
                 assert!((physical_y - physical_y.round()).abs() < 0.0001);
                 assert!((position.y - unsnapped_y).abs() <= 0.5001 / pixels_per_point);
             }
+        }
+    }
+
+    #[test]
+    fn active_source_scroll_keeps_fractional_text_positions() {
+        let rect = Rect::from_min_size(Pos2::new(17.25, 23.4), Vec2::new(640.0, SOURCE_ROW_HEIGHT));
+        let x = 51.125;
+        let galley_height = 14.5;
+
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let position =
+                source_line_galley_position(rect, x, galley_height, pixels_per_point, false);
+            let expected_y = rect.top() + (SOURCE_ROW_HEIGHT - galley_height) * 0.5;
+            assert_eq!(position.x, x);
+            assert_eq!(position.y, expected_y);
         }
     }
 
