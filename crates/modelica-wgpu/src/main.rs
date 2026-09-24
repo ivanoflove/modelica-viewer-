@@ -10065,7 +10065,9 @@ impl App {
         let zoom = self.zoom;
         let pan = self.pan;
         let viewport = [self.config.width, self.config.height];
-        let pixels_per_point = self.window.scale_factor() as f32;
+        let window_scale_factor = self.window.scale_factor() as f32;
+        let pixels_per_point = window_scale_factor;
+        let trace_text_layout = std::env::var_os("MODELICA_WGPU_TRACE_TEXT_LAYOUT").is_some();
         let ui_build_started = Instant::now();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             draw_preview_ui(
@@ -10095,6 +10097,8 @@ impl App {
                 &mut source_perf_frame,
                 self.pending_document_action.as_ref(),
                 &mut leave_decision,
+                window_scale_factor,
+                trace_text_layout,
             );
             if main_view == MainView::Icon {
                 draw_model_text_overlay(
@@ -11003,6 +11007,8 @@ fn draw_preview_ui(
     source_perf_frame: &mut Option<SourcePerfFrame>,
     pending_document_action: Option<&PendingDocumentAction>,
     leave_decision: &mut Option<LeaveDecision>,
+    window_scale_factor: f32,
+    trace_text_layout: bool,
 ) {
     // Keep the global Electron-aligned spacing and widget treatment intact;
     // only update the palette when the user changes light/dark or accent.
@@ -11264,9 +11270,14 @@ fn draw_preview_ui(
                     }
                 });
                 ui.add_space(6.0);
-                if let Some(clicked) =
-                    document_tree(ui, &document.tree, selected_class, expanded_nodes)
-                {
+                if let Some(clicked) = document_tree(
+                    ui,
+                    &document.tree,
+                    selected_class,
+                    expanded_nodes,
+                    window_scale_factor,
+                    trace_text_layout,
+                ) {
                     *class_clicked = Some(clicked);
                 }
             }
@@ -11418,6 +11429,8 @@ fn draw_preview_ui(
                             source_scroll_rect,
                             source_wheel_sample,
                             source_perf_frame,
+                            window_scale_factor,
+                            trace_text_layout,
                         ),
                         MainView::Icon => icon_preview(ui, document, icon_clip_rect),
                         MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
@@ -11484,6 +11497,9 @@ fn tree_row(
     kind: &str,
     selected: bool,
     indent: f32,
+    trace_text_layout: bool,
+    trace_sample: bool,
+    window_scale_factor: f32,
 ) -> (egui::Response, egui::Response) {
     let row_width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(Vec2::new(row_width, 29.0), Sense::click());
@@ -11549,13 +11565,26 @@ fn tree_row(
             label_color,
             label_max_width,
         ),
-        label_font,
+        label_font.clone(),
         label_color,
     );
     let label_position = Pos2::new(
         text_position.x,
         rect.center().y - label_galley.size().y * 0.5,
     );
+    if trace_sample {
+        trace_text_layout_sample(
+            trace_text_layout,
+            "tree-primary",
+            Some(label),
+            None,
+            label_position,
+            None,
+            &label_font,
+            ui.ctx().pixels_per_point(),
+            window_scale_factor,
+        );
+    }
     ui.painter()
         .galley(label_position, label_galley.clone(), label_color);
     ui.painter().galley(
@@ -11645,16 +11674,30 @@ fn document_tree(
     root: &TreeNode,
     selected_class: Option<&str>,
     expanded_nodes: &mut HashSet<String>,
+    window_scale_factor: f32,
+    trace_text_layout: bool,
 ) -> Option<String> {
     let mut clicked = None;
+    let mut trace_sample_emitted = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            render_tree_node(ui, root, 0, selected_class, expanded_nodes, &mut clicked);
+            render_tree_node(
+                ui,
+                root,
+                0,
+                selected_class,
+                expanded_nodes,
+                &mut clicked,
+                window_scale_factor,
+                trace_text_layout,
+                &mut trace_sample_emitted,
+            );
         });
     clicked
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tree_node(
     ui: &mut egui::Ui,
     node: &TreeNode,
@@ -11662,6 +11705,9 @@ fn render_tree_node(
     selected_class: Option<&str>,
     expanded_nodes: &mut HashSet<String>,
     clicked: &mut Option<String>,
+    window_scale_factor: f32,
+    trace_text_layout: bool,
+    trace_sample_emitted: &mut bool,
 ) {
     let has_children = !node.children.is_empty();
     let expanded = expanded_nodes.contains(&node.qualified_name);
@@ -11685,7 +11731,13 @@ fn render_tree_node(
         tree_node_kind_label(node.kind),
         selected,
         depth as f32,
+        trace_text_layout,
+        trace_text_layout && depth > 0 && !*trace_sample_emitted,
+        window_scale_factor,
     );
+    if trace_text_layout && depth > 0 && !*trace_sample_emitted {
+        *trace_sample_emitted = true;
+    }
     if marker_response.clicked() {
         if has_children {
             if expanded {
@@ -11708,6 +11760,9 @@ fn render_tree_node(
                 selected_class,
                 expanded_nodes,
                 clicked,
+                window_scale_factor,
+                trace_text_layout,
+                trace_sample_emitted,
             );
         }
     }
@@ -12038,6 +12093,8 @@ fn source_preview(
     source_scroll_rect: &mut Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: &mut Option<SourcePerfFrame>,
+    window_scale_factor: f32,
+    trace_text_layout: bool,
 ) {
     *source_scroll_rect = None;
     let frame = Frame::none()
@@ -12148,6 +12205,7 @@ fn source_preview(
                         SOURCE_ROW_HEIGHT,
                         visible_source_rows.len(),
                         |ui, row_range| {
+                            let trace_sample_row = row_range.start;
                             rendered_rows += row_range.len();
                             for visible_index in row_range {
                                 let visible_row = &visible_source_rows[visible_index];
@@ -12185,6 +12243,9 @@ fn source_preview(
                                     original_line,
                                     marker,
                                     source_all_selected,
+                                    source_scroll_state.current_y,
+                                    window_scale_factor,
+                                    trace_text_layout && visible_index == trace_sample_row,
                                 );
                                 if fold_response.is_some_and(|response| response.clicked()) {
                                     fold_toggle_line = Some(original_line);
@@ -12276,6 +12337,7 @@ fn source_preview(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_source_line(
     ui: &mut egui::Ui,
     number_galley: Arc<egui::Galley>,
@@ -12284,6 +12346,9 @@ fn render_source_line(
     original_line: usize,
     fold_marker: Option<Arc<egui::Galley>>,
     selected: bool,
+    scroll_offset: f32,
+    window_scale_factor: f32,
+    trace_sample: bool,
 ) -> Option<egui::Response> {
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(content_width.max(ui.available_width()), SOURCE_ROW_HEIGHT),
@@ -12313,6 +12378,34 @@ fn render_source_line(
     });
     let number_y = rect.top() + (SOURCE_ROW_HEIGHT - number_galley.size().y) * 0.5;
     let code_y = rect.top() + (SOURCE_ROW_HEIGHT - code_galley.size().y) * 0.5;
+    if trace_sample {
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        trace_text_layout_sample(
+            true,
+            "source-line-number",
+            None,
+            Some(original_line + 1),
+            Pos2::new(rect.left() + SOURCE_FOLD_GUTTER_WIDTH, number_y),
+            Some(scroll_offset),
+            &ui_mono_font(13.0),
+            pixels_per_point,
+            window_scale_factor,
+        );
+        trace_text_layout_sample(
+            true,
+            "source-body",
+            None,
+            Some(original_line + 1),
+            Pos2::new(
+                rect.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
+                code_y,
+            ),
+            Some(scroll_offset),
+            &ui_mono_font(12.0),
+            pixels_per_point,
+            window_scale_factor,
+        );
+    }
     painter.galley(
         Pos2::new(rect.left() + SOURCE_FOLD_GUTTER_WIDTH, number_y),
         number_galley,
@@ -12327,6 +12420,33 @@ fn render_source_line(
         theme_text_primary(),
     );
     fold_response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_text_layout_sample(
+    enabled: bool,
+    surface: &str,
+    sample_text: Option<&str>,
+    line_number: Option<usize>,
+    logical_position: Pos2,
+    scroll_offset: Option<f32>,
+    font_id: &FontId,
+    pixels_per_point: f32,
+    window_scale_factor: f32,
+) {
+    if !enabled {
+        return;
+    }
+    let physical_position = logical_to_physical_pixels(logical_position, pixels_per_point);
+    eprintln!(
+        "[TEXT LAYOUT] surface={surface} sample_text={sample_text:?} line={line_number:?} pixels_per_point={pixels_per_point:.3} window_scale_factor={window_scale_factor:.3} logical=({:.3},{:.3}) physical=({:.3},{:.3}) scroll_offset={scroll_offset:?} font_family={:?} font_size={:.2}",
+        logical_position.x,
+        logical_position.y,
+        physical_position.x,
+        physical_position.y,
+        font_id.family,
+        font_id.size,
+    );
 }
 
 fn trace_source_scroll(
@@ -14766,6 +14886,10 @@ fn physical_to_logical_position(position: PhysicalPosition<f64>, scale_factor: f
         position.x as f32 / scale_factor,
         position.y as f32 / scale_factor,
     )
+}
+
+fn logical_to_physical_pixels(position: Pos2, pixels_per_point: f32) -> Pos2 {
+    Pos2::new(position.x * pixels_per_point, position.y * pixels_per_point)
 }
 
 fn canvas_event_allowed_for(main_view: MainView, pointer_over_canvas: bool) -> bool {
@@ -18093,6 +18217,19 @@ end Top;
             assert!((logical.x - 240.0).abs() < 0.001);
             assert!((logical.y - 120.0).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn text_layout_diagnostic_reports_unrounded_physical_coordinates() {
+        let logical = Pos2::new(10.25, 11.5);
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            let physical = logical_to_physical_pixels(logical, pixels_per_point);
+            assert!((physical.x - logical.x * pixels_per_point).abs() < f32::EPSILON);
+            assert!((physical.y - logical.y * pixels_per_point).abs() < f32::EPSILON);
+        }
+        let fractional = logical_to_physical_pixels(logical, 1.25);
+        assert!((fractional.x - 12.8125).abs() < f32::EPSILON);
+        assert!((fractional.y - 14.375).abs() < f32::EPSILON);
     }
 
     #[test]
