@@ -12376,16 +12376,26 @@ fn render_source_line(
         );
         response
     });
-    let number_y = rect.top() + (SOURCE_ROW_HEIGHT - number_galley.size().y) * 0.5;
-    let code_y = rect.top() + (SOURCE_ROW_HEIGHT - code_galley.size().y) * 0.5;
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let number_position = source_line_galley_position(
+        rect,
+        rect.left() + SOURCE_FOLD_GUTTER_WIDTH,
+        number_galley.size().y,
+        pixels_per_point,
+    );
+    let code_position = source_line_galley_position(
+        rect,
+        rect.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
+        code_galley.size().y,
+        pixels_per_point,
+    );
     if trace_sample {
-        let pixels_per_point = ui.ctx().pixels_per_point();
         trace_text_layout_sample(
             true,
             "source-line-number",
             None,
             Some(original_line + 1),
-            Pos2::new(rect.left() + SOURCE_FOLD_GUTTER_WIDTH, number_y),
+            number_position,
             Some(scroll_offset),
             &ui_mono_font(13.0),
             pixels_per_point,
@@ -12396,30 +12406,26 @@ fn render_source_line(
             "source-body",
             None,
             Some(original_line + 1),
-            Pos2::new(
-                rect.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
-                code_y,
-            ),
+            code_position,
             Some(scroll_offset),
             &ui_mono_font(12.0),
             pixels_per_point,
             window_scale_factor,
         );
     }
-    painter.galley(
-        Pos2::new(rect.left() + SOURCE_FOLD_GUTTER_WIDTH, number_y),
-        number_galley,
-        theme_text_tertiary(),
-    );
-    painter.galley(
-        Pos2::new(
-            rect.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP,
-            code_y,
-        ),
-        code_galley,
-        theme_text_primary(),
-    );
+    painter.galley(number_position, number_galley, theme_text_tertiary());
+    painter.galley(code_position, code_galley, theme_text_primary());
     fold_response
+}
+
+fn source_line_galley_position(
+    rect: Rect,
+    x: f32,
+    galley_height: f32,
+    pixels_per_point: f32,
+) -> Pos2 {
+    let y = rect.top() + (SOURCE_ROW_HEIGHT - galley_height) * 0.5;
+    snap_y_to_physical_pixel(Pos2::new(x, y), pixels_per_point)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14892,7 +14898,7 @@ fn logical_to_physical_pixels(position: Pos2, pixels_per_point: f32) -> Pos2 {
     Pos2::new(position.x * pixels_per_point, position.y * pixels_per_point)
 }
 
-#[allow(dead_code)] // Used by Source and tree paint paths in the following text-rendering tasks.
+#[allow(dead_code)] // Reserved for whole-position snapping in the model-tree paint path.
 fn snap_point_to_physical_pixel(point: Pos2, pixels_per_point: f32) -> Pos2 {
     let pixels_per_point = valid_pixels_per_point(pixels_per_point);
     Pos2::new(
@@ -14901,7 +14907,6 @@ fn snap_point_to_physical_pixel(point: Pos2, pixels_per_point: f32) -> Pos2 {
     )
 }
 
-#[allow(dead_code)] // Used by Source and tree paint paths in the following text-rendering tasks.
 fn snap_y_to_physical_pixel(point: Pos2, pixels_per_point: f32) -> Pos2 {
     let pixels_per_point = valid_pixels_per_point(pixels_per_point);
     Pos2::new(
@@ -18288,6 +18293,25 @@ end Top;
             let snapped_y = snap_y_to_physical_pixel(logical, pixels_per_point);
             assert_eq!(snapped_y.x, logical.x, "X must remain unchanged");
             assert!((snapped_y.y - expected_position.y).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn source_line_number_and_body_positions_snap_y_without_changing_x() {
+        let rect = Rect::from_min_size(Pos2::new(17.25, 23.4), Vec2::new(640.0, SOURCE_ROW_HEIGHT));
+        let x = 51.125;
+
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            for galley_height in [14.5, 15.0] {
+                let unsnapped_y = rect.top() + (SOURCE_ROW_HEIGHT - galley_height) * 0.5;
+                let position =
+                    source_line_galley_position(rect, x, galley_height, pixels_per_point);
+
+                assert_eq!(position.x, x);
+                let physical_y = position.y * pixels_per_point;
+                assert!((physical_y - physical_y.round()).abs() < 0.0001);
+                assert!((position.y - unsnapped_y).abs() <= 0.5001 / pixels_per_point);
+            }
         }
     }
 
