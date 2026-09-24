@@ -10155,6 +10155,7 @@ impl App {
         let mut source_scroll_rect = self.source_scroll_rect;
         let source_wheel_sample = self.source_wheel_sample;
         let mut source_perf_frame = None;
+        let mut tree_ui = Duration::ZERO;
         let overlay_update_started = Instant::now();
         let selected_connection_points = self.selected_connection_overlay_points();
         let selected_component_overlay = self.selected_component_overlay();
@@ -10190,6 +10191,7 @@ impl App {
             diagram_component_preview,
         );
         let overlay_update = overlay_update_started.elapsed();
+        let pre_ui_prepare = overlay_update_started.duration_since(frame_started);
         let zoom = self.zoom;
         let pan = self.pan;
         let viewport = [self.config.width, self.config.height];
@@ -10225,6 +10227,7 @@ impl App {
                 &mut source_scroll_rect,
                 source_wheel_sample,
                 &mut source_perf_frame,
+                &mut tree_ui,
                 self.pending_document_action.as_ref(),
                 &mut leave_decision,
                 window_scale_factor,
@@ -10269,6 +10272,11 @@ impl App {
             }
         });
         let egui_run = ui_build_started.elapsed();
+        if let Some(profile) = source_perf_frame.as_mut() {
+            profile.pre_ui_prepare = pre_ui_prepare;
+            profile.overlay_update = overlay_update;
+            profile.tree_ui = tree_ui;
+        }
         self.source_highlight_cache = source_highlight_cache;
         self.source_scroll_state = source_scroll_state;
         self.source_interaction = source_interaction;
@@ -10495,6 +10503,7 @@ impl App {
             .map(|started| started.elapsed())
             .unwrap_or(Duration::ZERO);
         let source_scene_encode_started = profile_enabled.then(Instant::now);
+        let native_render_pass_started = profile_enabled.then(Instant::now);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("modelica-wgpu render pass"),
@@ -10617,6 +10626,10 @@ impl App {
                 }
             }
         }
+        let native_render_pass = native_render_pass_started
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let egui_render_pass_started = profile_enabled.then(Instant::now);
         {
             let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("modelica-wgpu egui pass"),
@@ -10635,6 +10648,9 @@ impl App {
             self.egui_renderer
                 .render(&mut ui_pass, &paint_jobs, &screen_descriptor);
         }
+        let egui_render_pass = egui_render_pass_started
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
         command_buffers.push(encoder.finish());
         let source_scene_encode = source_scene_encode_started
             .map(|started| started.elapsed())
@@ -10702,6 +10718,8 @@ impl App {
                 FrameStageTimings {
                     egui_run,
                     egui_tessellation,
+                    native_render_pass,
+                    egui_render_pass,
                     texture_update,
                     update_buffers,
                     scene_encode: source_scene_encode,
@@ -10751,6 +10769,8 @@ impl App {
             let timings = FrameStageTimings {
                 egui_run,
                 egui_tessellation,
+                native_render_pass,
+                egui_render_pass,
                 texture_update,
                 update_buffers,
                 scene_encode,
@@ -11153,6 +11173,7 @@ fn draw_preview_ui(
     source_scroll_rect: &mut Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: &mut Option<SourcePerfFrame>,
+    tree_ui_duration: &mut Duration,
     pending_document_action: Option<&PendingDocumentAction>,
     leave_decision: &mut Option<LeaveDecision>,
     window_scale_factor: f32,
@@ -11418,6 +11439,9 @@ fn draw_preview_ui(
                     }
                 });
                 ui.add_space(6.0);
+                let tree_ui_started = std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL")
+                    .is_some()
+                    .then(Instant::now);
                 if let Some(clicked) = document_tree(
                     ui,
                     &document.tree,
@@ -11427,6 +11451,9 @@ fn draw_preview_ui(
                     trace_text_layout,
                 ) {
                     *class_clicked = Some(clicked);
+                }
+                if let Some(started) = tree_ui_started {
+                    *tree_ui_duration += started.elapsed();
                 }
             }
             if document_loading {
@@ -12036,6 +12063,9 @@ struct SourceWheelSample {
 #[derive(Clone, Copy, Debug)]
 struct SourcePerfFrame {
     rows: usize,
+    pre_ui_prepare: Duration,
+    overlay_update: Duration,
+    tree_ui: Duration,
     source_ui: Duration,
     highlight: Duration,
     fold_sync: Duration,
@@ -12058,10 +12088,15 @@ struct SourceFrameStats {
 struct SourceFrameSample {
     frame_total: Duration,
     frame_interval: Option<Duration>,
+    pre_ui_prepare: Duration,
+    overlay_update: Duration,
+    tree_ui: Duration,
     egui_run: Duration,
     source_ui: Duration,
     highlight: Duration,
     egui_tessellation: Duration,
+    native_render_pass: Duration,
+    egui_render_pass: Duration,
     update_buffers: Duration,
     texture_update: Duration,
     scene_encode: Duration,
@@ -12079,10 +12114,15 @@ impl SourceFrameStats {
         self.samples.push(SourceFrameSample {
             frame_total: timings.frame_total,
             frame_interval,
+            pre_ui_prepare: profile.pre_ui_prepare,
+            overlay_update: profile.overlay_update,
+            tree_ui: profile.tree_ui,
             egui_run: timings.egui_run,
             source_ui: profile.source_ui,
             highlight: profile.highlight,
             egui_tessellation: timings.egui_tessellation,
+            native_render_pass: timings.native_render_pass,
+            egui_render_pass: timings.egui_render_pass,
             update_buffers: timings.update_buffers,
             texture_update: timings.texture_update,
             scene_encode: timings.scene_encode,
@@ -12149,7 +12189,7 @@ impl SourceFrameStats {
             duration_percentile_ms(&values(select), 0.99)
         };
         eprintln!(
-            "[SOURCE SESSION] samples={} refresh_budget_ms={refresh_budget_ms:.2} missed_budget_frames={missed_budget_frames} missed_refresh_frames={missed_refresh_frames} frame_ms_p50={:.2} frame_ms_p90={:.2} frame_ms_p95={:.2} frame_ms_p99={:.2} frame_ms_worst={:.2} interval_ms_mean={interval_mean:.2} interval_ms_stddev={interval_stddev:.2} interval_ms_p50={interval_p50:.2} interval_ms_p90={:.2} interval_ms_p95={:.2} interval_ms_p99={:.2} interval_ms_worst={:.2} egui_run_p95_us={:.1} source_ui_p95_us={:.1} highlight_p95_us={:.1} tessellation_p95_us={:.1} update_buffers_p95_us={:.1} texture_update_p95_us={:.1} encode_p95_us={:.1} submit_p95_us={:.1} present_p95_us={:.1}",
+            "[SOURCE SESSION] samples={} refresh_budget_ms={refresh_budget_ms:.2} missed_budget_frames={missed_budget_frames} missed_refresh_frames={missed_refresh_frames} frame_ms_p50={:.2} frame_ms_p90={:.2} frame_ms_p95={:.2} frame_ms_p99={:.2} frame_ms_worst={:.2} interval_ms_mean={interval_mean:.2} interval_ms_stddev={interval_stddev:.2} interval_ms_p50={interval_p50:.2} interval_ms_p90={:.2} interval_ms_p95={:.2} interval_ms_p99={:.2} interval_ms_worst={:.2} pre_ui_p95_us={:.1} overlay_collect_p95_us={:.1} tree_ui_p95_us={:.1} source_ui_p95_us={:.1} egui_run_p95_us={:.1} highlight_p95_us={:.1} tessellation_p95_us={:.1} native_pass_p95_us={:.1} egui_pass_p95_us={:.1} update_buffers_p95_us={:.1} texture_update_p95_us={:.1} encode_p95_us={:.1} submit_p95_us={:.1} present_p95_us={:.1}",
             self.samples.len(),
             duration_percentile_ms(&frame_totals, 0.50),
             duration_percentile_ms(&frame_totals, 0.90),
@@ -12160,10 +12200,15 @@ impl SourceFrameStats {
             duration_percentile_ms(&intervals, 0.95),
             duration_percentile_ms(&intervals, 0.99),
             duration_percentile_ms(&intervals, 1.0),
-            p95(|sample| sample.egui_run) * 1_000.0,
+            p95(|sample| sample.pre_ui_prepare) * 1_000.0,
+            p95(|sample| sample.overlay_update) * 1_000.0,
+            p95(|sample| sample.tree_ui) * 1_000.0,
             p95(|sample| sample.source_ui) * 1_000.0,
+            p95(|sample| sample.egui_run) * 1_000.0,
             p95(|sample| sample.highlight) * 1_000.0,
             p95(|sample| sample.egui_tessellation) * 1_000.0,
+            p95(|sample| sample.native_render_pass) * 1_000.0,
+            p95(|sample| sample.egui_render_pass) * 1_000.0,
             p95(|sample| sample.update_buffers) * 1_000.0,
             p95(|sample| sample.texture_update) * 1_000.0,
             p95(|sample| sample.scene_encode) * 1_000.0,
@@ -12571,6 +12616,9 @@ fn source_preview(
             {
                 *source_perf_frame = Some(SourcePerfFrame {
                     rows: rendered_rows,
+                    pre_ui_prepare: Duration::ZERO,
+                    overlay_update: Duration::ZERO,
+                    tree_ui: Duration::ZERO,
                     source_ui: source_ui_started.elapsed(),
                     highlight: highlight_time,
                     fold_sync: source_interaction
@@ -12744,6 +12792,8 @@ fn trace_source_scroll(
 struct FrameStageTimings {
     egui_run: Duration,
     egui_tessellation: Duration,
+    native_render_pass: Duration,
+    egui_render_pass: Duration,
     texture_update: Duration,
     update_buffers: Duration,
     scene_encode: Duration,
@@ -12779,13 +12829,18 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
         profile.cache_hits as f64 / cache_total as f64 * 100.0
     };
     eprintln!(
-        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} egui_tessellation_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
+        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} pre_ui_us={:.1} overlay_collect_us={:.1} tree_ui_us={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} egui_tessellation_us={:.1} native_pass_us={:.1} egui_pass_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
         profile.rows,
         wheel_kind,
         profile.scroll_offset,
+        profile.pre_ui_prepare.as_secs_f64() * 1_000_000.0,
+        profile.overlay_update.as_secs_f64() * 1_000_000.0,
+        profile.tree_ui.as_secs_f64() * 1_000_000.0,
         timings.egui_run.as_secs_f64() * 1_000_000.0,
         profile.fold_layout_rebuild_count,
         timings.egui_tessellation.as_secs_f64() * 1_000_000.0,
+        timings.native_render_pass.as_secs_f64() * 1_000_000.0,
+        timings.egui_render_pass.as_secs_f64() * 1_000_000.0,
         timings.update_buffers.as_secs_f64() * 1_000_000.0,
         timings.texture_update.as_secs_f64() * 1_000_000.0,
         timings.scene_encode.as_secs_f64() * 1_000_000.0,
