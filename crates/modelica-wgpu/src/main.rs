@@ -2736,10 +2736,18 @@ struct SourceFoldState {
     ranges: Vec<SourceFoldRange>,
     collapsed: HashSet<FoldId>,
     range_by_start_line: HashMap<usize, usize>,
+    ranges_by_start_line: HashMap<usize, Vec<usize>>,
     range_by_id: HashMap<FoldId, usize>,
     visible_rows: VisibleSourceRows,
     fold_layout_rebuild_count: u64,
     fold_layout_rebuild_time: Duration,
+    fold_index_rebuild_count: u64,
+    fold_index_rebuild_time: Duration,
+    fold_layout_splice_count: u64,
+    fold_layout_splice_time: Duration,
+    last_splice_removed_rows: usize,
+    last_splice_inserted_rows: usize,
+    last_toggle_expanded: Option<bool>,
     fold_sync_time: Duration,
 }
 
@@ -2783,10 +2791,25 @@ impl SourceFoldState {
 
     fn rebuild_fold_layout(&mut self, line_count: usize) {
         let started = Instant::now();
+        self.rebuild_fold_indexes();
+        self.visible_rows = VisibleSourceRows {
+            rows: self.visible_rows_in_range(0, line_count),
+        };
+        self.fold_layout_rebuild_count += 1;
+        self.fold_layout_rebuild_time += started.elapsed();
+    }
+
+    fn rebuild_fold_indexes(&mut self) {
+        let started = Instant::now();
         self.range_by_start_line.clear();
+        self.ranges_by_start_line.clear();
         self.range_by_id.clear();
         for (index, range) in self.ranges.iter().enumerate() {
             self.range_by_id.insert(range.id.clone(), index);
+            self.ranges_by_start_line
+                .entry(range.start_line)
+                .or_default()
+                .push(index);
             let replace = self
                 .range_by_start_line
                 .get(&range.start_line)
@@ -2799,32 +2822,33 @@ impl SourceFoldState {
                 self.range_by_start_line.insert(range.start_line, index);
             }
         }
-        let mut collapsed_at_start = HashMap::<usize, usize>::new();
-        for (index, range) in self.ranges.iter().enumerate() {
-            if !self.collapsed.contains(&range.id) {
-                continue;
-            }
-            let replace = collapsed_at_start
-                .get(&range.start_line)
-                .and_then(|current| self.ranges.get(*current))
-                .is_none_or(|current| {
-                    (range.end_line, range.id.open_start)
-                        > (current.end_line, current.id.open_start)
-                });
-            if replace {
-                collapsed_at_start.insert(range.start_line, index);
-            }
-        }
-        let mut rows = Vec::with_capacity(line_count);
-        let mut line = 0;
-        while line < line_count {
-            if let Some(&range_index) = collapsed_at_start.get(&line) {
+        self.fold_index_rebuild_count += 1;
+        self.fold_index_rebuild_time += started.elapsed();
+    }
+
+    fn collapsed_range_starting_at(&self, line: usize) -> Option<usize> {
+        self.ranges_by_start_line
+            .get(&line)?
+            .iter()
+            .copied()
+            .filter(|index| self.collapsed.contains(&self.ranges[*index].id))
+            .max_by_key(|index| {
+                let range = &self.ranges[*index];
+                (range.end_line, range.id.open_start)
+            })
+    }
+
+    fn visible_rows_in_range(&self, start_line: usize, end_line: usize) -> Vec<VisibleSourceRow> {
+        let mut rows = Vec::with_capacity(end_line.saturating_sub(start_line));
+        let mut line = start_line;
+        while line < end_line {
+            if let Some(range_index) = self.collapsed_range_starting_at(line) {
                 let range = &self.ranges[range_index];
                 rows.push(VisibleSourceRow {
                     original_line: line,
                     fold_range_index: Some(range_index),
                 });
-                line = range.end_line.saturating_add(1).min(line_count);
+                line = range.end_line.saturating_add(1).min(end_line);
             } else {
                 rows.push(VisibleSourceRow {
                     original_line: line,
@@ -2833,9 +2857,7 @@ impl SourceFoldState {
                 line += 1;
             }
         }
-        self.visible_rows = VisibleSourceRows { rows };
-        self.fold_layout_rebuild_count += 1;
-        self.fold_layout_rebuild_time += started.elapsed();
+        rows
     }
 
     fn range_starting_at(&self, line: usize) -> Option<&SourceFoldRange> {
@@ -2845,13 +2867,52 @@ impl SourceFoldState {
     }
 
     fn toggle_line(&mut self, line: usize, line_count: usize) -> bool {
-        let Some(id) = self.range_starting_at(line).map(|range| range.id.clone()) else {
+        let Some(range) = self.range_starting_at(line) else {
             return false;
         };
-        if !self.collapsed.remove(&id) {
+        let id = range.id.clone();
+        let Some(range_index) = self.range_by_id.get(&id).copied() else {
+            return false;
+        };
+
+        let Ok(row_index) = self
+            .visible_rows
+            .rows
+            .binary_search_by_key(&line, |row| row.original_line)
+        else {
+            if !self.collapsed.remove(&id) {
+                self.collapsed.insert(id);
+            }
+            return true;
+        };
+        let started = Instant::now();
+        let range = &self.ranges[range_index];
+        let expanding = self.collapsed.remove(&id);
+        if !expanding {
             self.collapsed.insert(id);
         }
-        self.rebuild_fold_layout(line_count);
+        let splice_start = row_index + 1;
+        let splice_end = self.visible_rows.rows[splice_start..]
+            .partition_point(|row| row.original_line <= range.end_line)
+            + splice_start;
+        let removed_rows = splice_end - splice_start;
+        let inserted_rows = if expanding {
+            self.visible_rows_in_range(
+                range.start_line.saturating_add(1),
+                range.end_line.saturating_add(1).min(line_count),
+            )
+        } else {
+            Vec::new()
+        };
+        let inserted_count = inserted_rows.len();
+        self.visible_rows
+            .rows
+            .splice(splice_start..splice_end, inserted_rows);
+        self.fold_layout_splice_count += 1;
+        self.fold_layout_splice_time += started.elapsed();
+        self.last_splice_removed_rows = removed_rows;
+        self.last_splice_inserted_rows = inserted_count;
+        self.last_toggle_expanded = Some(expanding);
         true
     }
 }
@@ -2980,6 +3041,9 @@ struct SourceHighlightCache {
     max_line_width: f32,
     cache_hits: usize,
     cache_misses: usize,
+    priority_prewarm_rows: VecDeque<usize>,
+    line_prewarm_cursor: usize,
+    fold_prewarm_cursor: usize,
 }
 
 impl SourceHighlightCache {
@@ -3001,7 +3065,105 @@ impl SourceHighlightCache {
             self.max_line_width = 0.0;
             self.cache_hits = 0;
             self.cache_misses = 0;
+            self.priority_prewarm_rows.clear();
+            self.line_prewarm_cursor = 0;
+            self.fold_prewarm_cursor = 0;
         }
+    }
+
+    fn prioritize_visible_rows(
+        &mut self,
+        visible_rows: &VisibleSourceRows,
+        start: usize,
+        count: usize,
+    ) {
+        self.priority_prewarm_rows.clear();
+        let end = start.saturating_add(count).min(visible_rows.rows.len());
+        self.priority_prewarm_rows.extend(
+            visible_rows.rows[start.min(end)..end]
+                .iter()
+                .map(|row| row.original_line),
+        );
+    }
+
+    fn has_prewarm_work(&self, document: &UiDocument, fold_state: &SourceFoldState) -> bool {
+        !self.priority_prewarm_rows.is_empty()
+            || self.line_prewarm_cursor < document.source_lines.len()
+            || self.fold_prewarm_cursor < fold_state.ranges.len()
+    }
+
+    fn warm_idle_batch(
+        &mut self,
+        ui: &egui::Ui,
+        document: &UiDocument,
+        fold_state: &SourceFoldState,
+        max_items: usize,
+        time_budget: Duration,
+    ) -> (usize, Duration) {
+        let started = Instant::now();
+        let mut items = 0;
+        while items < max_items && started.elapsed() < time_budget {
+            if let Some(line) = self.priority_prewarm_rows.pop_front() {
+                if self.warm_source_line(ui, document, fold_state, line) {
+                    items += 1;
+                }
+                continue;
+            }
+            if self.line_prewarm_cursor < document.source_lines.len() {
+                let line = self.line_prewarm_cursor;
+                self.line_prewarm_cursor += 1;
+                if !self.source_line_is_warm(line) {
+                    self.warm_source_line(ui, document, fold_state, line);
+                }
+                items += 1;
+                continue;
+            }
+            if self.fold_prewarm_cursor < fold_state.ranges.len() {
+                let range = &fold_state.ranges[self.fold_prewarm_cursor];
+                self.fold_prewarm_cursor += 1;
+                if fold_state.collapsed.contains(&range.id)
+                    && !self.collapsed_lines.contains_key(&range.id)
+                {
+                    let _ = self.collapsed_galley(ui, document, range);
+                }
+                items += 1;
+                continue;
+            }
+            break;
+        }
+        (items, started.elapsed())
+    }
+
+    fn source_line_is_warm(&self, line: usize) -> bool {
+        self.lines
+            .get(line)
+            .is_some_and(|cache| cache.number_galley.is_some() && cache.code_galley.is_some())
+    }
+
+    fn warm_source_line(
+        &mut self,
+        ui: &egui::Ui,
+        document: &UiDocument,
+        fold_state: &SourceFoldState,
+        line: usize,
+    ) -> bool {
+        let line_was_warm = self.source_line_is_warm(line);
+        let fold_range = fold_state
+            .visible_rows
+            .rows
+            .binary_search_by_key(&line, |row| row.original_line)
+            .ok()
+            .and_then(|index| fold_state.visible_rows.rows[index].fold_range_index)
+            .and_then(|index| fold_state.ranges.get(index));
+        let collapsed_was_warm =
+            fold_range.is_none_or(|range| self.collapsed_lines.contains_key(&range.id));
+        if !line_was_warm {
+            let _ = self.galleys(ui, document, line);
+        }
+        if let Some(range) = fold_range.filter(|_| !collapsed_was_warm) {
+            let _ = self.collapsed_galley(ui, document, range);
+        }
+        !line_was_warm || !collapsed_was_warm
     }
 
     fn content_width(&mut self, ui: &egui::Ui, document: &UiDocument) -> f32 {
@@ -5796,6 +5958,7 @@ struct App {
     msaa_samples: u32,
     msaa_view: wgpu::TextureView,
     background_pipeline: wgpu::RenderPipeline,
+    background_pipeline_1x: Option<wgpu::RenderPipeline>,
     background_buffer: wgpu::Buffer,
     background_bind_group: wgpu::BindGroup,
     background_dirty: bool,
@@ -5900,6 +6063,60 @@ fn configured_msaa_samples() -> u32 {
     }
 }
 
+fn scene_sample_count(main_view: MainView, configured_samples: u32) -> u32 {
+    if main_view == MainView::Source {
+        1
+    } else {
+        configured_samples
+    }
+}
+
+fn create_background_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    sample_count: u32,
+    label: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: "vs_main",
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        depth_stencil: None,
+        multiview: None,
+    })
+}
+
 impl App {
     async fn new(window: Arc<Window>, document: Option<LoadedDocument>) -> Self {
         let size = window.inner_size();
@@ -5956,10 +6173,11 @@ impl App {
             .unwrap_or(false);
         let present_mode = select_present_mode(&capabilities.present_modes, no_vsync);
         if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some()
+            || std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_FOLD").is_some()
             || std::env::var_os("MODELICA_WGPU_PROFILE_DRAG").is_some()
         {
             eprintln!(
-                "[WGPU FRAME POLICY] selected_present_mode={present_mode:?} supported_present_modes={:?} vsync={} desired_maximum_frame_latency=1 msaa_samples={msaa_samples}",
+                "[WGPU FRAME POLICY] selected_present_mode={present_mode:?} supported_present_modes={:?} vsync={} desired_maximum_frame_latency=1 canvas_msaa_samples={msaa_samples} source_samples=1",
                 capabilities.present_modes,
                 !no_vsync,
             );
@@ -6055,41 +6273,23 @@ impl App {
                 bind_group_layouts: &[&background_layout],
                 push_constant_ranges: &[],
             });
-        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("modelica-wgpu background pipeline"),
-            layout: Some(&background_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &background_shader,
-                entry_point: "vs_main",
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &background_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            multisample: wgpu::MultisampleState {
-                count: msaa_samples,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            depth_stencil: None,
-            multiview: None,
+        let background_pipeline = create_background_pipeline(
+            &device,
+            format,
+            &background_pipeline_layout,
+            &background_shader,
+            msaa_samples,
+            "modelica-wgpu background pipeline",
+        );
+        let background_pipeline_1x = (msaa_samples != 1).then(|| {
+            create_background_pipeline(
+                &device,
+                format,
+                &background_pipeline_layout,
+                &background_shader,
+                1,
+                "modelica-wgpu Source background pipeline",
+            )
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -6190,6 +6390,7 @@ impl App {
             msaa_samples,
             msaa_view,
             background_pipeline,
+            background_pipeline_1x,
             background_buffer,
             background_bind_group,
             background_dirty: true,
@@ -10533,12 +10734,24 @@ impl App {
             .unwrap_or(Duration::ZERO);
         let source_scene_encode_started = profile_enabled.then(Instant::now);
         let native_render_pass_started = profile_enabled.then(Instant::now);
+        let direct_render_target = scene_sample_count(self.main_view, self.msaa_samples) == 1;
+        let (render_target, resolve_target, background_pipeline) = if direct_render_target {
+            (
+                &view,
+                None,
+                self.background_pipeline_1x
+                    .as_ref()
+                    .unwrap_or(&self.background_pipeline),
+            )
+        } else {
+            (&self.msaa_view, Some(&view), &self.background_pipeline)
+        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("modelica-wgpu render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_view,
-                    resolve_target: Some(&view),
+                    view: render_target,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: if is_dark_theme() { 0.055 } else { 0.953 },
@@ -10553,13 +10766,12 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_pipeline(&self.background_pipeline);
+            pass.set_pipeline(background_pipeline);
             pass.set_bind_group(0, &self.background_bind_group, &[]);
             pass.draw(0..3, 0..1);
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.view_bind_group, &[]);
             if matches!(self.main_view, MainView::Icon | MainView::Diagram) {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.view_bind_group, &[]);
                 if let Some(rect) = icon_clip_rect {
                     let pixels_per_point = self.window.scale_factor() as f32;
                     let left = (rect.left() * pixels_per_point)
@@ -10696,8 +10908,8 @@ impl App {
         // Queue the next animation frame before a FIFO present can block on
         // the compositor. This keeps the following frame eligible for the
         // next refresh while leaving the idle event loop in ControlFlow::Wait.
-        let keep_source_scroll_animating =
-            self.main_view == MainView::Source && self.source_scroll_state.active;
+        let keep_source_scroll_animating = self.main_view == MainView::Source
+            && (self.source_scroll_state.active || self.source_scroll_state.motion.is_active());
         if keep_source_scroll_animating {
             self.request_redraw();
         }
@@ -10808,8 +11020,13 @@ impl App {
                 frame_total: total,
             };
             trace_source_frame(profile, timings);
-            self.source_frame_stats.record(profile, timings);
-            true
+            trace_source_fold(profile, timings, finished_at);
+            if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some() {
+                self.source_frame_stats.record(profile, timings);
+                true
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -12251,8 +12468,19 @@ struct SourcePerfFrame {
     visible_map_rebuild: Duration,
     visible_row_lookup: Duration,
     fold_layout_rebuild_count: u64,
+    fold_layout_splice_count: u64,
+    fold_layout_splice_time: Duration,
+    fold_layout_splice_rows_removed: usize,
+    fold_layout_splice_rows_inserted: usize,
+    prewarm_items: usize,
+    prewarm_time: Duration,
     wheel: Option<SourceWheelSample>,
+    scroll_motion: SourceScrollMotion,
     scroll_offset: f32,
+    scroll_offset_before: f32,
+    scroll_offset_delta: f32,
+    scroll_offset_changed: bool,
+    fold_profile: Option<SourceFoldProfile>,
     cache_hits: usize,
     cache_misses: usize,
 }
@@ -12431,6 +12659,33 @@ struct SourceScrollState {
     initialized: bool,
     active: bool,
     override_default_wheel: bool,
+    motion: SourceScrollMotion,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SourceScrollMotion {
+    #[default]
+    Idle,
+    SmoothWheel,
+    NativeWheel,
+    PixelWheel,
+    ScrollbarDrag,
+}
+
+impl SourceScrollMotion {
+    fn is_active(self) -> bool {
+        self != Self::Idle
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::SmoothWheel => "smooth-wheel",
+            Self::NativeWheel => "native-wheel",
+            Self::PixelWheel => "pixel-wheel",
+            Self::ScrollbarDrag => "scrollbar-drag",
+        }
+    }
 }
 
 impl SourceScrollState {
@@ -12444,6 +12699,7 @@ impl SourceScrollState {
             initialized: false,
             active: false,
             override_default_wheel: false,
+            motion: SourceScrollMotion::Idle,
         }
     }
 
@@ -12459,6 +12715,7 @@ impl SourceScrollState {
         self.initialized = false;
         self.active = false;
         self.override_default_wheel = false;
+        self.motion = SourceScrollMotion::Idle;
     }
 
     fn enqueue_line_delta(&mut self, delta_y: f32) {
@@ -12515,12 +12772,29 @@ impl SourceScrollState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceFoldProfile {
+    input_started_at: Instant,
+    line: usize,
+    expanded: bool,
+    range_lines: usize,
+    index_rebuild_time: Duration,
+    visible_rows_before: usize,
+    visible_rows_after: usize,
+    splice_time: Duration,
+    rows_removed: usize,
+    rows_inserted: usize,
+}
+
 #[derive(Default)]
 struct SourceInteractionState {
     selected_class: Option<String>,
     focused: bool,
     all_selected: bool,
     fold_state: SourceFoldState,
+    fold_pointer_line: Option<usize>,
+    fold_click_started_at: Option<(usize, Instant)>,
+    pending_fold_profile: Option<SourceFoldProfile>,
 }
 
 impl SourceInteractionState {
@@ -12532,6 +12806,9 @@ impl SourceInteractionState {
         self.selected_class = selected_class;
         self.focused = false;
         self.all_selected = false;
+        self.fold_pointer_line = None;
+        self.fold_click_started_at = None;
+        self.pending_fold_profile = None;
     }
 
     fn sync_document(&mut self, document: &UiDocument) {
@@ -12610,8 +12887,14 @@ fn source_preview(
             let fold_sync_before = source_interaction.fold_state.fold_sync_time;
             let fold_layout_time_before = source_interaction.fold_state.fold_layout_rebuild_time;
             let fold_layout_count_before = source_interaction.fold_state.fold_layout_rebuild_count;
+            let fold_splice_time_before = source_interaction.fold_state.fold_layout_splice_time;
+            let fold_splice_count_before = source_interaction.fold_state.fold_layout_splice_count;
             source_scroll_state.sync_class(document.selected_class.as_deref());
             source_interaction.sync_document(document);
+            let fold_index_rebuild_time_before =
+                source_interaction.fold_state.fold_index_rebuild_time;
+            let fold_profile_for_present = source_interaction.pending_fold_profile.take();
+            source_interaction.fold_pointer_line = None;
             if source_interaction.focused
                 && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::A))
             {
@@ -12627,8 +12910,11 @@ fn source_preview(
             }
             let scroll_height = ui.available_height().max(0.0);
             let scroll_width = ui.available_width().max(0.0);
+            let scroll_area_rect = ui.available_rect_before_wrap();
             let scroll_delta = ui.input(|input| input.raw_scroll_delta);
             let pointer_position = ui.ctx().pointer_latest_pos();
+            let primary_down =
+                ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
             let pixels_per_point = ui.ctx().pixels_per_point();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             // Prepare/validate the source cache once; all per-visible-row
@@ -12641,6 +12927,7 @@ fn source_preview(
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
             let mut state_before =
                 egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
+            let previous_motion = source_scroll_state.motion;
             if !source_scroll_state.initialized {
                 source_scroll_state.current_y = state_before.offset.y;
                 source_scroll_state.target_y = state_before.offset.y;
@@ -12650,6 +12937,45 @@ fn source_preview(
                 source_scroll_state.target_y = state_before.offset.y;
             }
             let settled_this_frame = source_scroll_state.advance(pixels_per_point);
+
+            let pointer_in_source_scroll =
+                pointer_position.is_some_and(|pointer| scroll_area_rect.contains(pointer));
+            let scrollbar_drag = primary_down
+                && (pointer_position.is_some_and(|pointer| {
+                    source_vertical_scrollbar_contains(scroll_area_rect, pointer)
+                }) || previous_motion == SourceScrollMotion::ScrollbarDrag);
+            let preserve_fractional_text_positions = primary_down && pointer_in_source_scroll;
+            let wheel_motion = source_wheel_sample.is_some()
+                || (pointer_in_source_scroll && scroll_delta != Vec2::ZERO);
+            let mut frame_motion = if source_scroll_state.active {
+                SourceScrollMotion::SmoothWheel
+            } else if scrollbar_drag {
+                SourceScrollMotion::ScrollbarDrag
+            } else if settled_this_frame {
+                SourceScrollMotion::Idle
+            } else if wheel_motion {
+                if source_wheel_sample
+                    .is_some_and(|sample| sample.kind == SourceWheelKind::PixelDelta)
+                {
+                    SourceScrollMotion::PixelWheel
+                } else {
+                    SourceScrollMotion::NativeWheel
+                }
+            } else {
+                SourceScrollMotion::Idle
+            };
+
+            let motion_ended = previous_motion.is_active() && !frame_motion.is_active();
+            if motion_ended && !settled_this_frame {
+                state_before.offset.y = snap_scroll_offset_to_physical_pixel(
+                    state_before.offset.y,
+                    source_scroll_state.max_y,
+                    pixels_per_point,
+                );
+                source_scroll_state.current_y = state_before.offset.y;
+                source_scroll_state.target_y = state_before.offset.y;
+                state_before.store(ui.ctx(), scroll_id);
+            }
             if source_scroll_state.active
                 || source_scroll_state.override_default_wheel
                 || settled_this_frame
@@ -12660,6 +12986,7 @@ fn source_preview(
             let offset_before = state_before.offset;
             let mut fold_toggle_line = None;
             let mut fold_gutter_rect_under_pointer = None;
+            let mut fold_line_under_pointer = None;
             let primary_clicked =
                 ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Primary));
             let source_all_selected = source_interaction.all_selected;
@@ -12719,7 +13046,10 @@ fn source_preview(
                                     marker,
                                     source_all_selected,
                                     source_scroll_state.current_y,
-                                    !source_scroll_state.active,
+                                    source_text_positions_should_snap(
+                                        frame_motion,
+                                        preserve_fractional_text_positions,
+                                    ),
                                     window_scale_factor,
                                     trace_text_layout && visible_index == trace_sample_row,
                                 );
@@ -12731,6 +13061,7 @@ fn source_preview(
                                         .is_some_and(|pointer| fold_rect.contains(pointer))
                                     {
                                         fold_gutter_rect_under_pointer = Some(fold_rect);
+                                        fold_line_under_pointer = Some(original_line);
                                     }
                                 }
                                 visible_row_lookup += lookup_elapsed;
@@ -12743,12 +13074,68 @@ fn source_preview(
                 pointer_position,
                 fold_gutter_rect_under_pointer,
             );
+            source_interaction.fold_pointer_line = fold_line_under_pointer;
             if let Some(line) = fold_toggle_line {
-                source_interaction
+                let fold_metadata =
+                    source_interaction
+                        .fold_state
+                        .range_starting_at(line)
+                        .map(|range| {
+                            (
+                                range.end_line.saturating_sub(range.start_line) + 1,
+                                source_interaction.fold_state.collapsed.contains(&range.id),
+                            )
+                        });
+                let input_started_at = source_interaction
+                    .fold_click_started_at
+                    .take()
+                    .filter(|(pressed_line, _)| *pressed_line == line)
+                    .map(|(_, started_at)| started_at);
+                let visible_rows_before = source_interaction.fold_state.visible_rows.rows.len();
+                let splice_time_before = source_interaction.fold_state.fold_layout_splice_time;
+                if source_interaction
                     .fold_state
-                    .toggle_line(line, document.source_lines.len());
+                    .toggle_line(line, document.source_lines.len())
+                {
+                    if let (Some(input_started_at), Some((range_lines, was_collapsed))) =
+                        (input_started_at, fold_metadata)
+                    {
+                        source_interaction.pending_fold_profile = Some(SourceFoldProfile {
+                            input_started_at,
+                            line,
+                            expanded: was_collapsed,
+                            range_lines,
+                            index_rebuild_time: source_interaction
+                                .fold_state
+                                .fold_index_rebuild_time
+                                .saturating_sub(fold_index_rebuild_time_before),
+                            visible_rows_before,
+                            visible_rows_after: source_interaction
+                                .fold_state
+                                .visible_rows
+                                .rows
+                                .len(),
+                            splice_time: source_interaction
+                                .fold_state
+                                .fold_layout_splice_time
+                                .saturating_sub(splice_time_before),
+                            rows_removed: source_interaction.fold_state.last_splice_removed_rows,
+                            rows_inserted: source_interaction.fold_state.last_splice_inserted_rows,
+                        });
+                    }
+                    let rows_per_viewport =
+                        (scroll_output.inner_rect.height() / SOURCE_ROW_HEIGHT).ceil() as usize;
+                    let first_visible_row =
+                        (scroll_output.state.offset.y / SOURCE_ROW_HEIGHT).floor() as usize;
+                    source_highlight_cache.prioritize_visible_rows(
+                        &source_interaction.fold_state.visible_rows,
+                        first_visible_row,
+                        rows_per_viewport.saturating_mul(2),
+                    );
+                }
                 ui.ctx().request_repaint();
             } else if primary_clicked {
+                source_interaction.fold_click_started_at = None;
                 source_interaction.focus_for_click_owner(click_owner);
             }
             *source_scroll_rect = Some(scroll_output.inner_rect);
@@ -12770,7 +13157,49 @@ fn source_preview(
                 source_scroll_state.target_y = final_state.offset.y;
                 source_scroll_state.initialized = true;
             }
+            let offset_after = final_state.offset.y;
+            let scroll_offset_delta = offset_after - offset_before.y;
+            let scroll_offset_changed = scroll_offset_delta.abs() > 0.01;
+            if source_scroll_state.active {
+                frame_motion = SourceScrollMotion::SmoothWheel;
+            } else if scrollbar_drag {
+                frame_motion = SourceScrollMotion::ScrollbarDrag;
+            } else if wheel_motion || scroll_offset_changed {
+                frame_motion = if source_wheel_sample
+                    .is_some_and(|sample| sample.kind == SourceWheelKind::PixelDelta)
+                {
+                    SourceScrollMotion::PixelWheel
+                } else {
+                    SourceScrollMotion::NativeWheel
+                };
+            } else {
+                frame_motion = SourceScrollMotion::Idle;
+            }
+            source_scroll_state.motion = frame_motion;
             source_scroll_state.override_default_wheel = false;
+            let interaction_active = frame_motion.is_active()
+                || primary_down
+                || primary_clicked
+                || source_wheel_sample.is_some()
+                || scroll_delta != Vec2::ZERO
+                || fold_toggle_line.is_some()
+                || ui.input(|input| !input.events.is_empty());
+            let (prewarm_items, prewarm_time) = if interaction_active {
+                (0, Duration::ZERO)
+            } else {
+                source_highlight_cache.warm_idle_batch(
+                    ui,
+                    document,
+                    &source_interaction.fold_state,
+                    12,
+                    Duration::from_micros(750),
+                )
+            };
+            let prewarm_pending =
+                source_highlight_cache.has_prewarm_work(document, &source_interaction.fold_state);
+            if prewarm_pending && !interaction_active {
+                ui.ctx().request_repaint_after(Duration::from_millis(32));
+            }
             trace_source_scroll(
                 document,
                 scroll_delta,
@@ -12789,11 +13218,19 @@ fn source_preview(
                     );
                 });
             }
-            if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some()
+            let source_scroll_profile_enabled =
+                std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some();
+            let source_fold_profile_enabled =
+                std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_FOLD").is_some();
+            let should_profile_scroll = source_scroll_profile_enabled
                 && (source_wheel_sample.is_some()
-                    || source_scroll_state.active
-                    || scroll_delta != Vec2::ZERO)
-            {
+                    || frame_motion.is_active()
+                    || scroll_offset_changed
+                    || motion_ended
+                    || prewarm_items > 0);
+            let should_profile_fold =
+                source_fold_profile_enabled && fold_profile_for_present.is_some();
+            if should_profile_scroll || should_profile_fold {
                 *source_perf_frame = Some(SourcePerfFrame {
                     rows: rendered_rows,
                     pre_ui_prepare: Duration::ZERO,
@@ -12814,8 +13251,31 @@ fn source_preview(
                         .fold_state
                         .fold_layout_rebuild_count
                         .saturating_sub(fold_layout_count_before),
+                    fold_layout_splice_count: source_interaction
+                        .fold_state
+                        .fold_layout_splice_count
+                        .saturating_sub(fold_splice_count_before),
+                    fold_layout_splice_time: source_interaction
+                        .fold_state
+                        .fold_layout_splice_time
+                        .saturating_sub(fold_splice_time_before),
+                    fold_layout_splice_rows_removed: source_interaction
+                        .fold_state
+                        .last_splice_removed_rows,
+                    fold_layout_splice_rows_inserted: source_interaction
+                        .fold_state
+                        .last_splice_inserted_rows,
+                    prewarm_items,
+                    prewarm_time,
                     wheel: source_wheel_sample,
+                    scroll_motion: frame_motion,
                     scroll_offset: source_scroll_state.current_y,
+                    scroll_offset_before: offset_before.y,
+                    scroll_offset_delta,
+                    scroll_offset_changed,
+                    fold_profile: should_profile_fold
+                        .then_some(fold_profile_for_present)
+                        .flatten(),
                     cache_hits: source_highlight_cache
                         .cache_hits
                         .saturating_sub(cache_hits_before),
@@ -12977,6 +13437,17 @@ fn trace_source_scroll(
     );
 }
 
+fn source_vertical_scrollbar_contains(area: Rect, pointer: Pos2) -> bool {
+    area.contains(pointer) && pointer.x >= area.right() - 24.0
+}
+
+fn source_text_positions_should_snap(
+    motion: SourceScrollMotion,
+    pointer_dragging_in_scroll_area: bool,
+) -> bool {
+    !motion.is_active() && !pointer_dragging_in_scroll_area
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FrameStageTimings {
     egui_run: Duration,
@@ -13011,6 +13482,8 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
     let fold_sync_us = profile.fold_sync.as_secs_f64() * 1_000_000.0;
     let visible_map_rebuild_us = profile.visible_map_rebuild.as_secs_f64() * 1_000_000.0;
     let visible_row_lookup_us = profile.visible_row_lookup.as_secs_f64() * 1_000_000.0;
+    let fold_splice_us = profile.fold_layout_splice_time.as_secs_f64() * 1_000_000.0;
+    let prewarm_us = profile.prewarm_time.as_secs_f64() * 1_000_000.0;
     let cache_total = profile.cache_hits + profile.cache_misses;
     let cache_hit_rate = if cache_total == 0 {
         100.0
@@ -13018,15 +13491,23 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
         profile.cache_hits as f64 / cache_total as f64 * 100.0
     };
     eprintln!(
-        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} scroll_offset={:.1} pre_ui_us={:.1} overlay_collect_us={:.1} tree_ui_us={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} egui_tessellation_us={:.1} native_pass_us={:.1} egui_pass_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
+        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} motion={} scroll_offset_before={:.2} scroll_offset={:.2} scroll_delta={:.2} offset_changed={} pre_ui_us={:.1} overlay_collect_us={:.1} tree_ui_us={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} prewarm_items={} prewarm_us={prewarm_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} fold_splice_count={} fold_splice_us={fold_splice_us:.1} fold_splice_removed={} fold_splice_inserted={} egui_tessellation_us={:.1} native_pass_us={:.1} egui_pass_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
         profile.rows,
         wheel_kind,
+        profile.scroll_motion.label(),
+        profile.scroll_offset_before,
         profile.scroll_offset,
+        profile.scroll_offset_delta,
+        profile.scroll_offset_changed,
         profile.pre_ui_prepare.as_secs_f64() * 1_000_000.0,
         profile.overlay_update.as_secs_f64() * 1_000_000.0,
         profile.tree_ui.as_secs_f64() * 1_000_000.0,
         timings.egui_run.as_secs_f64() * 1_000_000.0,
+        profile.prewarm_items,
         profile.fold_layout_rebuild_count,
+        profile.fold_layout_splice_count,
+        profile.fold_layout_splice_rows_removed,
+        profile.fold_layout_splice_rows_inserted,
         timings.egui_tessellation.as_secs_f64() * 1_000_000.0,
         timings.native_render_pass.as_secs_f64() * 1_000_000.0,
         timings.egui_render_pass.as_secs_f64() * 1_000_000.0,
@@ -13039,6 +13520,38 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
         1.0 / timings.frame_total.as_secs_f64().max(f64::EPSILON),
         profile.cache_hits,
         profile.cache_misses,
+    );
+}
+
+fn trace_source_fold(profile: SourcePerfFrame, timings: FrameStageTimings, presented_at: Instant) {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_FOLD").is_none() {
+        return;
+    }
+    let Some(fold) = profile.fold_profile else {
+        return;
+    };
+    let operation = if fold.expanded { "expand" } else { "collapse" };
+    let input_to_present = presented_at.saturating_duration_since(fold.input_started_at);
+    eprintln!(
+        "[SOURCE FOLD] operation={operation} line={} range_lines={} visible_rows_before={} visible_rows_after={} index_rebuild_us={:.1} visible_splice_us={:.1} rows_removed={} rows_inserted={} prewarm_items={} prewarm_us={:.1} galley_hits={} galley_misses={} source_ui_us={:.1} egui_run_us={:.1} tessellation_us={:.1} present_us={:.1} frame_ms={:.2} input_to_present_ms={:.2}",
+        fold.line + 1,
+        fold.range_lines,
+        fold.visible_rows_before,
+        fold.visible_rows_after,
+        fold.index_rebuild_time.as_secs_f64() * 1_000_000.0,
+        fold.splice_time.as_secs_f64() * 1_000_000.0,
+        fold.rows_removed,
+        fold.rows_inserted,
+        profile.prewarm_items,
+        profile.prewarm_time.as_secs_f64() * 1_000_000.0,
+        profile.cache_hits,
+        profile.cache_misses,
+        profile.source_ui.as_secs_f64() * 1_000_000.0,
+        timings.egui_run.as_secs_f64() * 1_000_000.0,
+        timings.egui_tessellation.as_secs_f64() * 1_000_000.0,
+        timings.present.as_secs_f64() * 1_000_000.0,
+        timings.frame_total.as_secs_f64() * 1000.0,
+        input_to_present.as_secs_f64() * 1000.0,
     );
 }
 
@@ -17823,6 +18336,15 @@ fn main() {
                                 app.request_redraw();
                                 return;
                             }
+                            if state == ElementState::Released
+                                && button == MouseButton::Left
+                                && app.main_view == MainView::Source
+                            {
+                                app.source_interaction.fold_click_started_at = app
+                                    .source_interaction
+                                    .fold_pointer_line
+                                    .map(|line| (line, Instant::now()));
+                            }
                             // A connection-creation click must not clone the
                             // current selection before entering its hot path.
                             let selection_before = (!app.connection_creation_active())
@@ -18289,6 +18811,7 @@ mod tests {
             focused: true,
             all_selected: true,
             fold_state: SourceFoldState::default(),
+            ..Default::default()
         };
         interaction.sync_class(Some("Demo.B"));
         assert!(!interaction.focused);
@@ -18460,6 +18983,105 @@ mod tests {
         assert!(!state.collapsed.contains(&fold_id));
         assert!(state.toggle_line(0, 3));
         assert!(state.collapsed.contains(&fold_id));
+    }
+
+    #[test]
+    fn nested_fold_toggles_splice_only_the_affected_visible_rows() {
+        let mut state = source_folding_state(
+            "annotation(\n  Icon(\n    Text(\n      textString=\"x\"\n    )\n  )\n)",
+            1,
+        );
+        let full_rebuilds = state.fold_layout_rebuild_count;
+
+        assert!(state.toggle_line(0, 7));
+        assert_eq!(
+            state
+                .visible_rows
+                .rows
+                .iter()
+                .map(|row| row.original_line)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 6]
+        );
+        assert!(state.toggle_line(1, 7));
+        assert_eq!(
+            state
+                .visible_rows
+                .rows
+                .iter()
+                .map(|row| row.original_line)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 5, 6]
+        );
+        assert!(state.toggle_line(2, 7));
+        assert_eq!(
+            state
+                .visible_rows
+                .rows
+                .iter()
+                .map(|row| row.original_line)
+                .collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert_eq!(state.fold_layout_rebuild_count, full_rebuilds);
+        assert_eq!(state.fold_layout_splice_count, 3);
+        assert!(state.last_splice_inserted_rows > 0);
+
+        assert!(state.toggle_line(1, 7));
+        assert_eq!(
+            state
+                .visible_rows
+                .rows
+                .iter()
+                .map(|row| row.original_line)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 6]
+        );
+        assert_eq!(state.fold_layout_rebuild_count, full_rebuilds);
+    }
+
+    #[test]
+    fn fold_expansion_warmup_prioritizes_viewport_and_one_viewport_overscan() {
+        let visible_rows = VisibleSourceRows {
+            rows: (0..100)
+                .map(|original_line| VisibleSourceRow {
+                    original_line,
+                    fold_range_index: None,
+                })
+                .collect(),
+        };
+        let mut cache = SourceHighlightCache::default();
+        cache.prioritize_visible_rows(&visible_rows, 24, 40);
+
+        assert_eq!(cache.priority_prewarm_rows.len(), 40);
+        assert_eq!(cache.priority_prewarm_rows.front(), Some(&24));
+        assert_eq!(cache.priority_prewarm_rows.back(), Some(&63));
+    }
+
+    #[test]
+    fn source_galley_prewarm_is_bounded_to_each_idle_batch() {
+        let source = (0..40)
+            .map(|line| format!("Real value{line} = {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = source_folding_document(&source, 1);
+        let fold_state = source_folding_state(&source, 1);
+        let mut cache = SourceHighlightCache::default();
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        let mut processed = 0;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                cache.content_width(ui, &document);
+                processed = cache
+                    .warm_idle_batch(ui, &document, &fold_state, 8, Duration::from_secs(1))
+                    .0;
+            });
+        });
+
+        assert_eq!(processed, 8);
+        assert!((0..8).all(|line| cache.source_line_is_warm(line)));
+        assert!(!cache.source_line_is_warm(8));
     }
 
     #[test]
@@ -19378,6 +20000,63 @@ end Top;
                 0.0
             );
         }
+    }
+
+    #[test]
+    fn source_scroll_motion_keeps_wheel_and_scrollbar_frames_active() {
+        for motion in [
+            SourceScrollMotion::SmoothWheel,
+            SourceScrollMotion::NativeWheel,
+            SourceScrollMotion::PixelWheel,
+            SourceScrollMotion::ScrollbarDrag,
+        ] {
+            assert!(
+                motion.is_active(),
+                "{motion:?} must keep redraw pacing active"
+            );
+        }
+        assert!(!SourceScrollMotion::Idle.is_active());
+    }
+
+    #[test]
+    fn source_text_stays_unsnapped_during_pointer_drag_even_before_offset_changes() {
+        assert!(!source_text_positions_should_snap(
+            SourceScrollMotion::Idle,
+            true
+        ));
+        assert!(!source_text_positions_should_snap(
+            SourceScrollMotion::ScrollbarDrag,
+            false
+        ));
+        assert!(source_text_positions_should_snap(
+            SourceScrollMotion::Idle,
+            false
+        ));
+    }
+
+    #[test]
+    fn source_vertical_scrollbar_hit_is_limited_to_right_edge() {
+        let area = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(400.0, 300.0));
+        assert!(source_vertical_scrollbar_contains(
+            area,
+            Pos2::new(398.0, 150.0)
+        ));
+        assert!(!source_vertical_scrollbar_contains(
+            area,
+            Pos2::new(375.0, 150.0)
+        ));
+        assert!(!source_vertical_scrollbar_contains(
+            area,
+            Pos2::new(398.0, 19.0)
+        ));
+    }
+
+    #[test]
+    fn source_rendering_is_single_sample_while_canvas_honors_msaa_setting() {
+        assert_eq!(scene_sample_count(MainView::Source, 4), 1);
+        assert_eq!(scene_sample_count(MainView::Icon, 4), 4);
+        assert_eq!(scene_sample_count(MainView::Diagram, 4), 4);
+        assert_eq!(scene_sample_count(MainView::Icon, 1), 1);
     }
 
     #[test]
