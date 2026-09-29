@@ -53,7 +53,7 @@ use wgpu::util::DeviceExt;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoopBuilder},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowBuilder},
 };
@@ -2839,7 +2839,7 @@ impl SourceFoldState {
     }
 
     fn visible_rows_in_range(&self, start_line: usize, end_line: usize) -> Vec<VisibleSourceRow> {
-        let mut rows = Vec::with_capacity(end_line.saturating_sub(start_line));
+        let mut rows = Vec::with_capacity(end_line.saturating_sub(start_line).min(256));
         let mut line = start_line;
         while line < end_line {
             if let Some(range_index) = self.collapsed_range_starting_at(line) {
@@ -2891,19 +2891,17 @@ impl SourceFoldState {
         if !expanding {
             self.collapsed.insert(id);
         }
-        let splice_start = row_index + 1;
+        let splice_start = row_index;
         let splice_end = self.visible_rows.rows[splice_start..]
             .partition_point(|row| row.original_line <= range.end_line)
             + splice_start;
         let removed_rows = splice_end - splice_start;
-        let inserted_rows = if expanding {
-            self.visible_rows_in_range(
-                range.start_line.saturating_add(1),
-                range.end_line.saturating_add(1).min(line_count),
-            )
-        } else {
-            Vec::new()
-        };
+        // Rebuild the affected interval including its header. A nested fold
+        // can start on the same line and remain collapsed after its parent opens.
+        let inserted_rows = self.visible_rows_in_range(
+            range.start_line,
+            range.end_line.saturating_add(1).min(line_count),
+        );
         let inserted_count = inserted_rows.len();
         self.visible_rows
             .rows
@@ -3032,6 +3030,12 @@ struct SourceLineCache {
     code_galley: Option<Arc<egui::Galley>>,
 }
 
+fn source_idle_layout_allowed(text: &str) -> bool {
+    // A time check cannot interrupt egui layout. Bound each idle work item as
+    // well; unusually long lines are only laid out when actually displayed.
+    text.len() <= 2_048
+}
+
 #[derive(Default)]
 struct SourceHighlightCache {
     key: Option<SourceHighlightCacheKey>,
@@ -3042,8 +3046,7 @@ struct SourceHighlightCache {
     cache_hits: usize,
     cache_misses: usize,
     priority_prewarm_rows: VecDeque<usize>,
-    line_prewarm_cursor: usize,
-    fold_prewarm_cursor: usize,
+    prewarm_window: Option<(usize, usize, u64)>,
 }
 
 impl SourceHighlightCache {
@@ -3066,8 +3069,7 @@ impl SourceHighlightCache {
             self.cache_hits = 0;
             self.cache_misses = 0;
             self.priority_prewarm_rows.clear();
-            self.line_prewarm_cursor = 0;
-            self.fold_prewarm_cursor = 0;
+            self.prewarm_window = None;
         }
     }
 
@@ -3086,10 +3088,26 @@ impl SourceHighlightCache {
         );
     }
 
-    fn has_prewarm_work(&self, document: &UiDocument, fold_state: &SourceFoldState) -> bool {
+    fn has_prewarm_work(&self) -> bool {
         !self.priority_prewarm_rows.is_empty()
-            || self.line_prewarm_cursor < document.source_lines.len()
-            || self.fold_prewarm_cursor < fold_state.ranges.len()
+    }
+
+    fn plan_viewport_prewarm(&mut self, folds: &SourceFoldState, first: usize, count: usize) {
+        let key = (first, count, folds.fold_layout_splice_count);
+        if self.prewarm_window == Some(key) {
+            return;
+        }
+        self.prewarm_window = Some(key);
+        // Prepare the current/next viewport first, then one viewport above.
+        // Only visible rows are candidates: collapsed bodies are never laid out.
+        self.prioritize_visible_rows(&folds.visible_rows, first, count.saturating_mul(2));
+        let end = first.min(folds.visible_rows.rows.len());
+        self.priority_prewarm_rows.extend(
+            folds.visible_rows.rows[end.saturating_sub(count)..end]
+                .iter()
+                .rev()
+                .map(|row| row.original_line),
+        );
     }
 
     fn warm_idle_batch(
@@ -3103,33 +3121,12 @@ impl SourceHighlightCache {
         let started = Instant::now();
         let mut items = 0;
         while items < max_items && started.elapsed() < time_budget {
-            if let Some(line) = self.priority_prewarm_rows.pop_front() {
-                if self.warm_source_line(ui, document, fold_state, line) {
-                    items += 1;
-                }
-                continue;
-            }
-            if self.line_prewarm_cursor < document.source_lines.len() {
-                let line = self.line_prewarm_cursor;
-                self.line_prewarm_cursor += 1;
-                if !self.source_line_is_warm(line) {
-                    self.warm_source_line(ui, document, fold_state, line);
-                }
-                items += 1;
-                continue;
-            }
-            if self.fold_prewarm_cursor < fold_state.ranges.len() {
-                let range = &fold_state.ranges[self.fold_prewarm_cursor];
-                self.fold_prewarm_cursor += 1;
-                if fold_state.collapsed.contains(&range.id)
-                    && !self.collapsed_lines.contains_key(&range.id)
-                {
-                    let _ = self.collapsed_galley(ui, document, range);
-                }
-                items += 1;
-                continue;
-            }
-            break;
+            let Some(line) = self.priority_prewarm_rows.pop_front() else {
+                break;
+            };
+            // Count attempts too: cache hits/skips must not cause an unbounded scan.
+            self.warm_source_line(ui, document, fold_state, line);
+            items += 1;
         }
         (items, started.elapsed())
     }
@@ -3147,7 +3144,6 @@ impl SourceHighlightCache {
         fold_state: &SourceFoldState,
         line: usize,
     ) -> bool {
-        let line_was_warm = self.source_line_is_warm(line);
         let fold_range = fold_state
             .visible_rows
             .rows
@@ -3155,15 +3151,39 @@ impl SourceHighlightCache {
             .ok()
             .and_then(|index| fold_state.visible_rows.rows[index].fold_range_index)
             .and_then(|index| fold_state.ranges.get(index));
-        let collapsed_was_warm =
-            fold_range.is_none_or(|range| self.collapsed_lines.contains_key(&range.id));
-        if !line_was_warm {
-            let _ = self.galleys(ui, document, line);
-        }
-        if let Some(range) = fold_range.filter(|_| !collapsed_was_warm) {
+        if let Some(range) = fold_range {
+            if self.collapsed_lines.contains_key(&range.id) {
+                return false;
+            }
+            let source = &document.source_lines[line];
+            let prefix = &source[..range.open_end_column.min(source.len())];
+            if !source_idle_layout_allowed(prefix) {
+                return false;
+            }
+            let _ = self.number_galley(ui, line);
             let _ = self.collapsed_galley(ui, document, range);
+            return true;
         }
-        !line_was_warm || !collapsed_was_warm
+        if self.source_line_is_warm(line)
+            || !source_idle_layout_allowed(&document.source_lines[line])
+        {
+            return false;
+        }
+        let _ = self.galleys(ui, document, line);
+        true
+    }
+
+    fn number_galley(&mut self, ui: &egui::Ui, row: usize) -> Arc<egui::Galley> {
+        self.lines[row]
+            .number_galley
+            .get_or_insert_with(|| {
+                ui.painter().layout_no_wrap(
+                    format!("{:>4}", row + 1),
+                    ui_mono_font(13.0),
+                    theme_text_tertiary(),
+                )
+            })
+            .clone()
     }
 
     fn content_width(&mut self, ui: &egui::Ui, document: &UiDocument) -> f32 {
@@ -3207,11 +3227,7 @@ impl SourceHighlightCache {
             &document.short_class_names,
         );
         let code_galley = ui.painter().layout_job(job);
-        let number_galley = ui.painter().layout_no_wrap(
-            format!("{:>4}", row + 1),
-            ui_mono_font(13.0),
-            theme_text_tertiary(),
-        );
+        let number_galley = self.number_galley(ui, row);
         let elapsed = started.elapsed();
         self.cache_misses += 1;
         self.max_line_width = self.max_line_width.max(code_galley.size().x);
@@ -6178,8 +6194,7 @@ impl App {
         {
             eprintln!(
                 "[WGPU FRAME POLICY] selected_present_mode={present_mode:?} supported_present_modes={:?} vsync={} desired_maximum_frame_latency=1 canvas_msaa_samples={msaa_samples} source_samples=1",
-                capabilities.present_modes,
-                !no_vsync,
+                capabilities.present_modes, !no_vsync,
             );
         }
         let config = wgpu::SurfaceConfiguration {
@@ -10691,7 +10706,8 @@ impl App {
             || self.connection_creation_profile.enabled
             || self.cancel_e2e_profile.enabled
             || self.deselect_profile.enabled
-            || std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some();
+            || std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some()
+            || std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_FOLD").is_some();
         let egui_tessellation_started = profile_enabled.then(Instant::now);
         let paint_jobs = self
             .egui_ctx
@@ -13025,17 +13041,18 @@ fn source_preview(
                                     .fold_range_index
                                     .and_then(|index| fold_ranges.get(index));
                                 let lookup_elapsed = lookup_started.elapsed();
-                                let (number_galley, code_galley, elapsed) = if let Some(range) =
-                                    range
-                                {
-                                    let (code_galley, elapsed) = source_highlight_cache
-                                        .collapsed_galley(ui, document, range);
-                                    let (number_galley, _, number_elapsed) =
-                                        source_highlight_cache.galleys(ui, document, original_line);
-                                    (number_galley, code_galley, elapsed + number_elapsed)
-                                } else {
-                                    source_highlight_cache.galleys(ui, document, original_line)
-                                };
+                                let (number_galley, code_galley, elapsed) =
+                                    if let Some(range) = range {
+                                        let (code_galley, elapsed) = source_highlight_cache
+                                            .collapsed_galley(ui, document, range);
+                                        let number_started = Instant::now();
+                                        let number_galley =
+                                            source_highlight_cache.number_galley(ui, original_line);
+                                        let number_elapsed = number_started.elapsed();
+                                        (number_galley, code_galley, elapsed + number_elapsed)
+                                    } else {
+                                        source_highlight_cache.galleys(ui, document, original_line)
+                                    };
                                 highlight_time += elapsed;
                                 let fold_response = render_source_line(
                                     ui,
@@ -13123,15 +13140,6 @@ fn source_preview(
                             rows_inserted: source_interaction.fold_state.last_splice_inserted_rows,
                         });
                     }
-                    let rows_per_viewport =
-                        (scroll_output.inner_rect.height() / SOURCE_ROW_HEIGHT).ceil() as usize;
-                    let first_visible_row =
-                        (scroll_output.state.offset.y / SOURCE_ROW_HEIGHT).floor() as usize;
-                    source_highlight_cache.prioritize_visible_rows(
-                        &source_interaction.fold_state.visible_rows,
-                        first_visible_row,
-                        rows_per_viewport.saturating_mul(2),
-                    );
                 }
                 ui.ctx().request_repaint();
             } else if primary_clicked {
@@ -13177,6 +13185,14 @@ fn source_preview(
             }
             source_scroll_state.motion = frame_motion;
             source_scroll_state.override_default_wheel = false;
+            let rows_per_viewport =
+                (scroll_output.inner_rect.height() / SOURCE_ROW_HEIGHT).ceil() as usize;
+            let first_visible_row = (offset_after / SOURCE_ROW_HEIGHT).floor() as usize;
+            source_highlight_cache.plan_viewport_prewarm(
+                &source_interaction.fold_state,
+                first_visible_row,
+                rows_per_viewport,
+            );
             let interaction_active = frame_motion.is_active()
                 || primary_down
                 || primary_clicked
@@ -13195,8 +13211,7 @@ fn source_preview(
                     Duration::from_micros(750),
                 )
             };
-            let prewarm_pending =
-                source_highlight_cache.has_prewarm_work(document, &source_interaction.fold_state);
+            let prewarm_pending = source_highlight_cache.has_prewarm_work();
             if prewarm_pending && !interaction_active {
                 ui.ctx().request_repaint_after(Duration::from_millis(32));
             }
@@ -14488,9 +14503,17 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
         let Some(icon) = component.diagram_layer() else {
             eprintln!(
                 "diagram diagnostic component={} type={:?} owner={} has no diagram layer (icon_graphics={} diagram_graphics={})",
-                component.name, component.resolved_type_qualified_name, component.source_owner
-                    , component.resolved_icon.as_deref().map_or(0, |scene| scene.graphics.len())
-                    , component.resolved_diagram.as_deref().map_or(0, |scene| scene.graphics.len())
+                component.name,
+                component.resolved_type_qualified_name,
+                component.source_owner,
+                component
+                    .resolved_icon
+                    .as_deref()
+                    .map_or(0, |scene| scene.graphics.len()),
+                component
+                    .resolved_diagram
+                    .as_deref()
+                    .map_or(0, |scene| scene.graphics.len())
             );
             continue;
         };
@@ -14524,7 +14547,10 @@ fn log_diagram_geometry_diagnostics(scene: &CoreDiagramScene, geometries: &[Geom
             component.rotation,
             component.placement_extent,
             icon.coordinate_system.extent,
-            component.resolved_icon.as_deref().map_or(0, |scene| scene.graphics.len()),
+            component
+                .resolved_icon
+                .as_deref()
+                .map_or(0, |scene| scene.graphics.len()),
             component
                 .resolved_diagram
                 .as_deref()
@@ -14923,9 +14949,7 @@ fn trace_connection_reanchor(
     }
     eprintln!(
         "[CONNECTION REANCHOR] component_id={component_id} connection_key={:?} source_editable={} old_endpoint={old_endpoint:?} new_semantic_endpoint={semantic_endpoint:?} committed_display_endpoint={committed_endpoint:?} route_fallback={fallback:?} source_edit_error={:?}",
-        snapshot.connection_key,
-        snapshot.source_editable,
-        snapshot.source_edit_error,
+        snapshot.connection_key, snapshot.source_editable, snapshot.source_edit_error,
     );
 }
 
@@ -18146,6 +18170,31 @@ fn wants_pan(button: MouseButton, control_pressed: bool) -> bool {
     button == MouseButton::Middle || (button == MouseButton::Left && control_pressed)
 }
 
+#[derive(Default)]
+struct RepaintSchedule {
+    deadline: Option<Instant>,
+}
+
+impl RepaintSchedule {
+    fn request(&mut self, deadline: Instant) {
+        self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn control_flow(&self) -> ControlFlow {
+        self.deadline
+            .map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
+    }
+}
+
 #[allow(deprecated)]
 fn main() {
     let input = env::args_os().nth(1).map(PathBuf::from);
@@ -18171,7 +18220,9 @@ fn main() {
             None
         }
     };
-    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let event_loop = EventLoopBuilder::<Instant>::with_user_event()
+        .build()
+        .expect("failed to create event loop");
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("modelica-wgpu UI preview")
@@ -18180,6 +18231,13 @@ fn main() {
             .expect("failed to create window"),
     );
     let mut app = pollster::block_on(App::new(window.clone(), document));
+    let repaint_proxy = event_loop.create_proxy();
+    app.egui_ctx.set_request_repaint_callback(move |request| {
+        if let Some(deadline) = Instant::now().checked_add(request.delay) {
+            let _ = repaint_proxy.send_event(deadline);
+        }
+    });
+    let mut repaint_schedule = RepaintSchedule::default();
     if let Some(doc) = app.document.as_ref() {
         expand_top_level(&mut app.expanded_nodes, &doc.model_tree);
     }
@@ -18189,8 +18247,8 @@ fn main() {
 
     event_loop
         .run(move |event, event_loop| {
-            event_loop.set_control_flow(ControlFlow::Wait);
             match event {
+                Event::UserEvent(deadline) => repaint_schedule.request(deadline),
                 Event::WindowEvent { window_id, event } if window_id == app.window.id() => {
                     // Ctrl+wheel over an Icon/Diagram canvas is an explicit
                     // canvas gesture. Do not first feed it to egui, where a
@@ -18223,6 +18281,9 @@ fn main() {
                             app.request_redraw();
                         }
                         WindowEvent::RedrawRequested => {
+                            // This frame satisfies all previously received requests.
+                            // Requests made during render arrive as subsequent user events.
+                            repaint_schedule.deadline = None;
                             let mut cancel_redraw = app.begin_cancel_redraw();
                             let deselect_redraw = app.begin_deselect_redraw();
                             let flush_started = Instant::now();
@@ -18493,7 +18554,12 @@ fn main() {
                         event_loop.exit();
                     }
                 }
-                Event::AboutToWait => {}
+                Event::AboutToWait => {
+                    if repaint_schedule.take_due(Instant::now()) {
+                        app.request_redraw();
+                    }
+                    event_loop.set_control_flow(repaint_schedule.control_flow());
+                }
                 _ => {}
             }
         })
@@ -18981,8 +19047,10 @@ mod tests {
 
         assert!(state.toggle_line(0, 3));
         assert!(!state.collapsed.contains(&fold_id));
+        assert!(state.visible_rows.rows[0].fold_range_index.is_none());
         assert!(state.toggle_line(0, 3));
         assert!(state.collapsed.contains(&fold_id));
+        assert!(state.visible_rows.rows[0].fold_range_index.is_some());
     }
 
     #[test]
@@ -19073,6 +19141,7 @@ mod tests {
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
                 cache.content_width(ui, &document);
+                cache.plan_viewport_prewarm(&fold_state, 0, 20);
                 processed = cache
                     .warm_idle_batch(ui, &document, &fold_state, 8, Duration::from_secs(1))
                     .0;
@@ -19082,6 +19151,130 @@ mod tests {
         assert_eq!(processed, 8);
         assert!((0..8).all(|line| cache.source_line_is_warm(line)));
         assert!(!cache.source_line_is_warm(8));
+    }
+
+    #[test]
+    fn source_idle_prewarm_skips_hidden_bodies_and_long_lines() {
+        let source = format!(
+            "annotation(\n{}\n)\n{}\nReal x;",
+            "x".repeat(8_000),
+            "y".repeat(8_000)
+        );
+        let document = source_folding_document(&source, 1);
+        let folds = source_folding_state(&source, 1);
+        let mut cache = SourceHighlightCache::default();
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                cache.content_width(ui, &document);
+                cache.plan_viewport_prewarm(&folds, 0, 10);
+                cache.warm_idle_batch(ui, &document, &folds, 12, Duration::from_secs(1));
+                assert!(!cache.has_prewarm_work());
+                // An unchanged viewport must not restart exhausted/skipped work.
+                cache.plan_viewport_prewarm(&folds, 0, 10);
+                assert!(!cache.has_prewarm_work());
+            });
+        });
+        assert!(cache.lines[0].number_galley.is_some());
+        assert!(cache.lines[0].code_galley.is_none());
+        assert_eq!(cache.collapsed_lines.len(), 1);
+        assert!(cache.lines[1].code_galley.is_none());
+        assert!(cache.lines[3].code_galley.is_none());
+        assert!(cache.source_line_is_warm(4));
+    }
+
+    #[test]
+    fn source_prewarm_tracks_viewport_without_scanning_whole_document() {
+        let source = (0..1_000).map(|_| "Real x;").collect::<Vec<_>>().join("\n");
+        let folds = source_folding_state(&source, 1);
+        let mut cache = SourceHighlightCache::default();
+        cache.plan_viewport_prewarm(&folds, 500, 20);
+        assert_eq!(cache.priority_prewarm_rows.len(), 60);
+        assert_eq!(cache.priority_prewarm_rows.front(), Some(&500));
+        assert!(cache
+            .priority_prewarm_rows
+            .iter()
+            .all(|line| (480..540).contains(line)));
+        cache.plan_viewport_prewarm(&folds, 900, 20);
+        assert_eq!(cache.priority_prewarm_rows.front(), Some(&900));
+        assert!(cache
+            .priority_prewarm_rows
+            .iter()
+            .all(|line| (880..940).contains(line)));
+    }
+
+    #[test]
+    fn source_fold_splices_match_fresh_layout_including_header_text() {
+        let source = "annotation(\n Icon(\n Text(\n textString=\"x\"\n )\n )\n)";
+        let mut folds = source_folding_state(source, 1);
+        for line in [0, 1, 2, 1, 0, 0, 1, 2, 0] {
+            assert!(folds.toggle_line(line, 7));
+            let expected = folds.visible_rows_in_range(0, 7);
+            let actual = &folds.visible_rows.rows;
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(actual.original_line, expected.original_line);
+                assert_eq!(actual.fold_range_index, expected.fold_range_index);
+            }
+        }
+    }
+
+    #[test]
+    fn repaint_schedule_wakes_when_due_and_returns_to_wait() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(32);
+        let mut schedule = RepaintSchedule::default();
+        assert_eq!(schedule.control_flow(), ControlFlow::Wait);
+        schedule.request(later);
+        schedule.request(later + Duration::from_secs(1));
+        assert_eq!(schedule.control_flow(), ControlFlow::WaitUntil(later));
+        assert!(!schedule.take_due(now));
+        assert!(schedule.take_due(later));
+        assert_eq!(schedule.control_flow(), ControlFlow::Wait);
+        schedule.request(later);
+        schedule.request(now);
+        assert!(schedule.take_due(now));
+    }
+
+    #[test]
+    fn egui_repaint_callback_drives_delayed_and_immediate_wakeup_without_input() {
+        let context = egui::Context::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        context.set_request_repaint_callback(move |request| {
+            sender.send(Instant::now() + request.delay).unwrap();
+        });
+        // Settle egui's initial frames without any mouse/keyboard events.
+        for _ in 0..4 {
+            let _ = context.run(egui::RawInput::default(), |_| {});
+        }
+        while receiver.try_recv().is_ok() {}
+        let mut schedule = RepaintSchedule::default();
+        let now = Instant::now();
+        context.request_repaint_after(Duration::from_millis(32));
+        let delayed = receiver
+            .try_recv()
+            .expect("delayed repaint reached integration");
+        assert!(delayed > now);
+        schedule.request(delayed);
+        assert!(!schedule.take_due(now));
+        assert!(schedule.take_due(delayed));
+        context.request_repaint();
+        schedule.request(
+            receiver
+                .try_recv()
+                .expect("fold repaint reached integration"),
+        );
+        assert!(schedule.take_due(Instant::now()));
+    }
+
+    #[test]
+    fn same_line_nested_fold_splice_matches_full_rebuild() {
+        let mut folds = source_folding_state("annotation(Icon(\n graphics={}\n)\n)", 1);
+        for _ in 0..4 {
+            assert!(folds.toggle_line(0, 4));
+            assert_eq!(folds.visible_rows.rows, folds.visible_rows_in_range(0, 4));
+        }
     }
 
     #[test]
@@ -21371,12 +21564,9 @@ end Child;
                 .count(),
             4
         );
-        assert!(scene.connections.iter().all(|connection| connection
-            .line
-            .as_ref()
-            .expect("source line")
-            .points
-            == stale_points));
+        assert!(scene.connections.iter().all(|connection| {
+            connection.line.as_ref().expect("source line").points == stale_points
+        }));
     }
 
     #[test]
@@ -23178,8 +23368,7 @@ end BoundarySig;
 
     #[test]
     fn connection_edit_preflight_validates_current_class_line_source() {
-        let source =
-            "model Test\n equation\n  connect(a, b) annotation(Line(points={{0, 0}, {100, 0}}));\nend Test;";
+        let source = "model Test\n equation\n  connect(a, b) annotation(Line(points={{0, 0}, {100, 0}}));\nend Test;";
         let line_start = source.find("Line(").expect("Line annotation");
         let line_end = source[line_start..]
             .find(')')
