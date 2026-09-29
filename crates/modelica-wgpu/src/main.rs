@@ -11035,14 +11035,16 @@ impl App {
                 present,
                 frame_total: total,
             };
-            trace_source_frame(profile, timings);
-            trace_source_fold(profile, timings, finished_at);
-            if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some() {
-                self.source_frame_stats.record(profile, timings);
-                true
+            let source_scroll_profile_enabled =
+                std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_some();
+            let sample_interval = if source_scroll_profile_enabled {
+                self.source_frame_stats.record(profile, timings)
             } else {
-                false
-            }
+                None
+            };
+            trace_source_frame(profile, timings, sample_interval);
+            trace_source_fold(profile, timings, finished_at);
+            source_scroll_profile_enabled
         } else {
             false
         };
@@ -12477,6 +12479,7 @@ struct SourcePerfFrame {
     prewarm_time: Duration,
     wheel: Option<SourceWheelSample>,
     scroll_motion: SourceScrollMotion,
+    scroll_offset_state_before: f32,
     scroll_offset: f32,
     scroll_offset_before: f32,
     scroll_offset_delta: f32,
@@ -12484,6 +12487,8 @@ struct SourcePerfFrame {
     fold_profile: Option<SourceFoldProfile>,
     cache_hits: usize,
     cache_misses: usize,
+    visible_galley_misses: usize,
+    prewarm_galley_misses: usize,
 }
 
 #[derive(Default)]
@@ -12513,7 +12518,7 @@ struct SourceFrameSample {
 }
 
 impl SourceFrameStats {
-    fn record(&mut self, profile: SourcePerfFrame, timings: FrameStageTimings) {
+    fn record(&mut self, profile: SourcePerfFrame, timings: FrameStageTimings) -> Option<Duration> {
         let now = Instant::now();
         let frame_interval = self
             .last_frame_at
@@ -12537,6 +12542,7 @@ impl SourceFrameStats {
             queue_submit: timings.queue_submit,
             present: timings.present,
         });
+        frame_interval
     }
 
     fn finish_session(&mut self) {
@@ -12919,6 +12925,7 @@ fn source_preview(
             let scroll_id = ui.make_persistent_id(egui::Id::new(scroll_id_source));
             let mut state_before =
                 egui::scroll_area::State::load(ui.ctx(), scroll_id).unwrap_or_default();
+            let scroll_offset_state_before = state_before.offset.y;
             let previous_motion = source_scroll_state.motion;
             if !source_scroll_state.initialized {
                 source_scroll_state.current_y = state_before.offset.y;
@@ -13062,6 +13069,9 @@ fn source_preview(
                         },
                     )
             };
+            let visible_galley_misses = source_highlight_cache
+                .cache_misses
+                .saturating_sub(cache_misses_before);
             let click_owner = source_click_owner(
                 scroll_output.inner_rect,
                 pointer_position,
@@ -13142,7 +13152,7 @@ fn source_preview(
                 source_scroll_state.initialized = true;
             }
             let offset_after = final_state.offset.y;
-            let scroll_offset_delta = offset_after - offset_before.y;
+            let scroll_offset_delta = offset_after - scroll_offset_state_before;
             let scroll_offset_changed = scroll_offset_delta.abs() > 0.01;
             if source_scroll_state.active {
                 frame_motion = SourceScrollMotion::SmoothWheel;
@@ -13176,6 +13186,7 @@ fn source_preview(
                 || scroll_delta != Vec2::ZERO
                 || fold_toggle_line.is_some()
                 || ui.input(|input| !input.events.is_empty());
+            let cache_misses_before_prewarm = source_highlight_cache.cache_misses;
             let (prewarm_items, prewarm_time) = if interaction_active {
                 (0, Duration::ZERO)
             } else {
@@ -13187,6 +13198,9 @@ fn source_preview(
                     Duration::from_micros(750),
                 )
             };
+            let prewarm_galley_misses = source_highlight_cache
+                .cache_misses
+                .saturating_sub(cache_misses_before_prewarm);
             let prewarm_pending = source_highlight_cache.has_prewarm_work();
             if prewarm_pending && !interaction_active {
                 ui.ctx().request_repaint_after(Duration::from_millis(32));
@@ -13260,6 +13274,7 @@ fn source_preview(
                     prewarm_time,
                     wheel: source_wheel_sample,
                     scroll_motion: frame_motion,
+                    scroll_offset_state_before,
                     scroll_offset: source_scroll_state.current_y,
                     scroll_offset_before: offset_before.y,
                     scroll_offset_delta,
@@ -13273,6 +13288,8 @@ fn source_preview(
                     cache_misses: source_highlight_cache
                         .cache_misses
                         .saturating_sub(cache_misses_before),
+                    visible_galley_misses,
+                    prewarm_galley_misses,
                 });
             }
         }
@@ -13453,7 +13470,11 @@ struct FrameStageTimings {
     frame_total: Duration,
 }
 
-fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
+fn trace_source_frame(
+    profile: SourcePerfFrame,
+    timings: FrameStageTimings,
+    sample_interval: Option<Duration>,
+) {
     if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_none() {
         return;
     }
@@ -13475,6 +13496,10 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
     let visible_row_lookup_us = profile.visible_row_lookup.as_secs_f64() * 1_000_000.0;
     let fold_splice_us = profile.fold_layout_splice_time.as_secs_f64() * 1_000_000.0;
     let prewarm_us = profile.prewarm_time.as_secs_f64() * 1_000_000.0;
+    let sample_interval_ms = sample_interval.map_or_else(
+        || "n/a".to_owned(),
+        |duration| format!("{:.2}", duration.as_secs_f64() * 1000.0),
+    );
     let cache_total = profile.cache_hits + profile.cache_misses;
     let cache_hit_rate = if cache_total == 0 {
         100.0
@@ -13482,10 +13507,11 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
         profile.cache_hits as f64 / cache_total as f64 * 100.0
     };
     eprintln!(
-        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} motion={} scroll_offset_before={:.2} scroll_offset={:.2} scroll_delta={:.2} offset_changed={} pre_ui_us={:.1} overlay_collect_us={:.1} tree_ui_us={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} prewarm_items={} prewarm_us={prewarm_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} fold_splice_count={} fold_splice_us={fold_splice_us:.1} fold_splice_removed={} fold_splice_inserted={} egui_tessellation_us={:.1} native_pass_us={:.1} egui_pass_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
+        "[SOURCE FRAME] rows={} wheel={} wheel_delta={wheel_delta:.3} motion={} scroll_state_before={:.2} scroll_area_before={:.2} scroll_offset_after={:.2} scroll_delta={:.2} offset_changed={} pre_ui_us={:.1} overlay_collect_us={:.1} tree_ui_us={:.1} egui_run_us={:.1} source_ui_us={source_ui_us:.1} highlight_us={highlight_us:.1} visible_galley_misses={} prewarm_galley_misses={} prewarm_items={} prewarm_us={prewarm_us:.1} fold_sync_us={fold_sync_us:.1} visible_map_rebuild_us={visible_map_rebuild_us:.1} visible_row_lookup_us={visible_row_lookup_us:.1} fold_layout_rebuild_count={} fold_splice_count={} fold_splice_us={fold_splice_us:.1} fold_splice_removed={} fold_splice_inserted={} egui_tessellation_us={:.1} native_pass_us={:.1} egui_pass_us={:.1} egui_update_buffers_us={:.1} texture_update_us={:.1} encode_us={:.1} submit_us={:.1} present_us={:.1} frame_ms={:.2} sample_interval_ms={sample_interval_ms} fps={:.1} galley_hits={} galley_misses={} galley_hit_rate={cache_hit_rate:.1}%",
         profile.rows,
         wheel_kind,
         profile.scroll_motion.label(),
+        profile.scroll_offset_state_before,
         profile.scroll_offset_before,
         profile.scroll_offset,
         profile.scroll_offset_delta,
@@ -13494,6 +13520,8 @@ fn trace_source_frame(profile: SourcePerfFrame, timings: FrameStageTimings) {
         profile.overlay_update.as_secs_f64() * 1_000_000.0,
         profile.tree_ui.as_secs_f64() * 1_000_000.0,
         timings.egui_run.as_secs_f64() * 1_000_000.0,
+        profile.visible_galley_misses,
+        profile.prewarm_galley_misses,
         profile.prewarm_items,
         profile.fold_layout_rebuild_count,
         profile.fold_layout_splice_count,
