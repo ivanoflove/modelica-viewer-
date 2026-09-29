@@ -11407,6 +11407,13 @@ fn configure_egui_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+fn library_panel_widths(window_width: f32) -> (f32, f32, f32) {
+    let maximum = (window_width * 0.4).clamp(160.0, 480.0);
+    let minimum = 180.0_f32.min(maximum);
+    let preferred = (window_width * 0.22).clamp(minimum, maximum);
+    (minimum, preferred, maximum)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_preview_ui(
     ctx: &egui::Context,
@@ -11472,20 +11479,23 @@ fn draw_preview_ui(
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.open = visuals.widgets.hovered;
     ctx.set_visuals(visuals);
+    let library_visibility_id = egui::Id::new("workspace-library-visible");
+    let mut library_visible =
+        ctx.data(|data| data.get_temp::<bool>(library_visibility_id).unwrap_or(true));
     egui::TopBottomPanel::top("arc_topbar")
-        .exact_height(52.0)
+        .exact_height(40.0)
         .frame(
             Frame::none()
                 .fill(theme_surface())
                 .stroke(Stroke::new(1.0_f32, theme_border(28)))
-                .inner_margin(Margin::symmetric(14.0, 0.0)),
+                .inner_margin(Margin::symmetric(10.0, 4.0)),
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Brand mark: an accent-tinted rounded square with the wave
                 // glyph, mirroring the Electron .brand-mark.
                 let (mark_rect, _) =
-                    ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
+                    ui.allocate_exact_size(Vec2::splat(26.0), egui::Sense::hover());
                 ui.painter()
                     .rect_filled(mark_rect, Rounding::same(11.0), theme_accent_soft(26));
                 ui.painter().rect_stroke(
@@ -11507,45 +11517,13 @@ fn draw_preview_ui(
                         .strong()
                         .color(theme_text_primary()),
                 );
-                if let Some(document) = document {
-                    ui.add_space(14.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{}  ·  {} classes",
-                            document.package_name,
-                            document.class_names.len()
-                        ))
-                        .size(10.0)
-                        .font(ui_mono_font(10.0))
-                        .color(theme_text_tertiary()),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(if document.dirty {
-                            "● 未保存"
-                        } else {
-                            "✓ 已保存"
-                        })
-                        .size(10.0)
-                        .font(ui_semibold_font(10.0))
-                        .color(if document.dirty {
-                            theme_rgb(190, 116, 31)
-                        } else {
-                            theme_live()
-                        }),
-                    );
-                }
-                if let Some(status) = status_message {
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new(status)
-                            .size(10.0)
-                            .color(theme_text_secondary()),
-                    );
+                ui.separator();
+                if ui.selectable_label(library_visible, "模型树").clicked() {
+                    library_visible = !library_visible;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button(
-                        RichText::new("◐  Appearance  ▾")
+                        RichText::new("◐ 外观")
                             .size(12.0)
                             .font(ui_font(13.0))
                             .color(theme_text_secondary()),
@@ -11580,7 +11558,7 @@ fn draw_preview_ui(
                         },
                     );
                     let open_library = egui::Button::new(
-                        RichText::new("打开库目录")
+                        RichText::new("打开库")
                             .size(12.0)
                             .font(ui_font(12.0))
                             .color(theme_text_secondary()),
@@ -11598,7 +11576,7 @@ fn draw_preview_ui(
                         *open_directory_requested = true;
                     }
                     let open_file = egui::Button::new(
-                        RichText::new("打开 .mo 文件")
+                        RichText::new("打开文件")
                             .size(12.0)
                             .font(ui_semibold_font(12.0))
                             .color(Color32::WHITE),
@@ -11619,125 +11597,161 @@ fn draw_preview_ui(
             });
         });
 
-    egui::SidePanel::left("library_panel")
-        .resizable(true)
-        .default_width(278.0)
-        .min_width(238.0)
-        .max_width(320.0)
+    ctx.data_mut(|data| data.insert_temp(library_visibility_id, library_visible));
+    // Status belongs outside both work areas so it cannot take space from a
+    // long model name or disappear below a scrolled library tree.
+    egui::TopBottomPanel::bottom("workspace-status")
+        .exact_height(26.0)
         .frame(
             Frame::none()
-                .fill(theme_surface_soft(255))
-                .stroke(Stroke::new(1.0_f32, theme_border(20)))
-                .inner_margin(Margin::symmetric(13.0, 12.0)),
+                .fill(theme_surface())
+                .stroke(Stroke::new(1.0_f32, theme_border(28)))
+                .inner_margin(Margin::symmetric(10.0, 3.0)),
         )
         .show(ctx, |ui| {
-            ui.add_space(18.0);
-            ui.label(
-                RichText::new("LIBRARY")
-                    .size(10.0)
-                    .font(ui_semibold_font(10.0))
-                    .strong()
-                    .color(theme_accent()),
-            );
-            ui.add_space(5.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(document.map_or("Modelica", |doc| doc.package_name.as_str()))
-                        .size(18.0)
-                        .font(ui_semibold_font(18.0))
-                        .strong()
-                        .color(theme_text_primary()),
-                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let class_count = document.map_or(70, |doc| doc.class_names.len());
                     ui.label(
-                        RichText::new(class_count.to_string())
-                            .size(11.0)
-                            .font(ui_font(12.0))
-                            .color(theme_text_tertiary()),
+                        RichText::new(if *main_view == MainView::Source {
+                            "Source · 只读"
+                        } else {
+                            main_view.label()
+                        })
+                        .size(11.0)
+                        .color(theme_text_secondary()),
                     );
+                    if let Some(document) = document {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(if document.dirty {
+                                "● 未保存"
+                            } else {
+                                "已保存"
+                            })
+                            .size(11.0)
+                            .color(if document.dirty {
+                                theme_rgb(190, 116, 31)
+                            } else {
+                                theme_live()
+                            }),
+                        );
+                    }
+                    let (message, color) = if document_loading {
+                        ("正在加载 Modelica 库…", theme_accent())
+                    } else if let Some(error) = load_error {
+                        (error, theme_rgb(190, 70, 70))
+                    } else {
+                        (status_message.unwrap_or("就绪"), theme_text_secondary())
+                    };
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(message).size(11.0).color(color))
+                                .truncate(),
+                        )
+                        .on_hover_text(message);
+                    });
                 });
             });
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(10.0);
-            if let Some(document) = document {
-                ui.label(
-                    RichText::new("BROWSE CLASSES")
-                        .size(10.0)
-                        .font(ui_semibold_font(10.0))
-                        .color(theme_text_tertiary()),
-                );
-                ui.add_space(7.0);
-                ui.horizontal(|ui| {
-                    let button_width = (ui.available_width() - 6.0) / 2.0;
-                    if ui
-                        .add_sized(
-                            [button_width, 26.0],
-                            egui::Button::new(
-                                RichText::new("Expand all")
-                                    .size(11.0)
-                                    .font(ui_semibold_font(11.0)),
-                            )
-                            .fill(theme_surface_soft(235))
-                            .rounding(Rounding::same(7.0)),
-                        )
-                        .clicked()
-                    {
-                        *expand_all_requested = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [button_width, 26.0],
-                            egui::Button::new(
-                                RichText::new("Collapse all")
-                                    .size(11.0)
-                                    .font(ui_semibold_font(11.0)),
-                            )
-                            .fill(theme_surface_soft(235))
-                            .rounding(Rounding::same(7.0)),
-                        )
-                        .clicked()
-                    {
-                        *collapse_all_requested = true;
-                    }
-                });
-                ui.add_space(6.0);
-                let tree_ui_started = std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL")
-                    .is_some()
-                    .then(Instant::now);
-                if let Some(clicked) = document_tree(
-                    ui,
-                    &document.tree,
-                    selected_class,
-                    expanded_nodes,
-                    visible_tree_rows,
-                    tree_galley_cache,
-                    window_scale_factor,
-                    trace_text_layout,
-                ) {
-                    *class_clicked = Some(clicked);
-                }
-                if let Some(started) = tree_ui_started {
-                    *tree_ui_duration += started.elapsed();
-                }
-            }
-            if document_loading {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("正在加载 Modelica 库…")
-                        .size(10.0)
-                        .color(theme_accent()),
-                );
-            } else if let Some(error) = load_error {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!("错误：{error}"))
-                        .size(10.0)
-                        .color(theme_rgb(190, 70, 70)),
-                );
-            }
         });
+
+    let (library_min, library_default, library_max) =
+        library_panel_widths(ctx.screen_rect().width());
+    if library_visible {
+        egui::SidePanel::left("library_panel")
+            .resizable(true)
+            .default_width(library_default)
+            .min_width(library_min)
+            .max_width(library_max)
+            .frame(
+                Frame::none()
+                    .fill(theme_surface_soft(255))
+                    .stroke(Stroke::new(1.0_f32, theme_border(20)))
+                    .inner_margin(Margin::symmetric(8.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "模型库 · {}",
+                        document.map_or(0, |doc| doc.class_names.len())
+                    ))
+                    .size(13.0)
+                    .font(ui_semibold_font(13.0))
+                    .strong()
+                    .color(theme_accent()),
+                );
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                document.map_or("Modelica", |doc| doc.package_name.as_str()),
+                            )
+                            .size(12.0)
+                            .font(ui_semibold_font(12.0))
+                            .strong()
+                            .color(theme_text_primary()),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(document.map_or("Modelica", |doc| doc.package_name.as_str()));
+                });
+                ui.separator();
+                if let Some(document) = document {
+                    ui.horizontal(|ui| {
+                        let button_width = (ui.available_width() - 6.0) / 2.0;
+                        if ui
+                            .add_sized(
+                                [button_width, 22.0],
+                                egui::Button::new(
+                                    RichText::new("全部展开")
+                                        .size(11.0)
+                                        .font(ui_semibold_font(11.0)),
+                                )
+                                .fill(theme_surface_soft(235))
+                                .rounding(Rounding::same(7.0)),
+                            )
+                            .clicked()
+                        {
+                            *expand_all_requested = true;
+                        }
+                        if ui
+                            .add_sized(
+                                [button_width, 22.0],
+                                egui::Button::new(
+                                    RichText::new("全部折叠")
+                                        .size(11.0)
+                                        .font(ui_semibold_font(11.0)),
+                                )
+                                .fill(theme_surface_soft(235))
+                                .rounding(Rounding::same(7.0)),
+                            )
+                            .clicked()
+                        {
+                            *collapse_all_requested = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    let tree_ui_started = std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL")
+                        .is_some()
+                        .then(Instant::now);
+                    if let Some(clicked) = document_tree(
+                        ui,
+                        &document.tree,
+                        selected_class,
+                        expanded_nodes,
+                        visible_tree_rows,
+                        tree_galley_cache,
+                        window_scale_factor,
+                        trace_text_layout,
+                    ) {
+                        *class_clicked = Some(clicked);
+                    }
+                    if let Some(started) = tree_ui_started {
+                        *tree_ui_duration += started.elapsed();
+                    }
+                }
+            });
+    }
 
     egui::CentralPanel::default()
         .frame(
@@ -11746,53 +11760,24 @@ fn draw_preview_ui(
                 // here is drawn after wgpu and washes out every icon and
                 // Diagram line; the inner glass card supplies the border.
                 .fill(Color32::TRANSPARENT)
-                .inner_margin(Margin::symmetric(16.0, 12.0)),
+                .inner_margin(Margin::same(8.0)),
         )
         .show(ctx, |ui| {
-            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
-                let title = selected_class
-                    .and_then(|class_name| class_name.rsplit('.').next())
-                    .unwrap_or(package_name);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("MODEL / PACKAGE")
-                            .size(10.0)
-                            .font(ui_semibold_font(10.0))
-                            .color(theme_accent()),
-                    );
-                    ui.label(
-                        RichText::new(title)
-                            .size(28.0)
-                            .font(ui_semibold_font(28.0))
-                            .strong()
+                let class_path = selected_class.unwrap_or(package_name);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(class_path)
+                            .size(13.0)
+                            .font(ui_semibold_font(13.0))
                             .color(theme_text_primary()),
-                    );
-                    ui.label(
-                        RichText::new(if let Some(class_name) = selected_class {
-                            format!("{}  /  {}", package_name, class_name)
-                        } else {
-                            package_name.to_owned()
-                        })
-                        .size(11.0)
-                        .font(ui_font(11.0))
-                        .color(theme_text_tertiary()),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(match document {
-                            Some(doc) => format!("READY  ·  {} CLASSES", doc.class_names.len()),
-                            None => "GPU CANVAS READY".to_owned(),
-                        })
-                        .size(9.0)
-                        .font(ui_font(12.0))
-                        .color(theme_live()),
-                    );
-                });
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(class_path);
             });
-            ui.add_space(18.0);
+            ui.add_space(4.0);
             glass_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
@@ -11953,8 +11938,8 @@ fn glass_frame() -> Frame {
     Frame::none()
         .fill(Color32::TRANSPARENT)
         .stroke(Stroke::new(1.0_f32, theme_border(23)))
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::same(10.0))
+        .rounding(Rounding::same(4.0))
+        .inner_margin(Margin::same(6.0))
 }
 
 fn tree_row_galley_position(rect: Rect, x: f32, galley_height: f32, pixels_per_point: f32) -> Pos2 {
@@ -12860,37 +12845,28 @@ fn source_preview(
     *source_scroll_rect = None;
     let frame = Frame::none()
         .fill(theme_surface())
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::same(16.0));
+        .rounding(Rounding::same(4.0))
+        .inner_margin(Margin::same(8.0));
     frame.show(ui, |ui| {
         if let Some(document) = document {
             ui.allocate_ui_with_layout(
                 Vec2::new(ui.available_width(), SOURCE_HEADER_HEIGHT),
                 Layout::left_to_right(Align::Center),
                 |ui| {
-                    ui.label(
-                        RichText::new(if document.source_name.is_empty() {
-                            "No class selected"
-                        } else {
-                            document.source_name.as_str()
-                        })
-                        .size(13.0)
-                        .font(ui_semibold_font(13.0))
-                        .color(theme_text_primary()),
-                    );
-                    ui.label(
-                        RichText::new(if document.source_name.is_empty() {
-                            "click a model in the library"
-                        } else {
-                            "read-only source"
-                        })
-                        .size(11.0)
-                        .color(if document.source_name.is_empty() {
-                            theme_text_secondary()
-                        } else {
-                            theme_live()
-                        }),
-                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if document.source_name.is_empty() {
+                                "选择左侧模型以查看源码"
+                            } else {
+                                document.source_name.as_str()
+                            })
+                            .size(13.0)
+                            .font(ui_semibold_font(13.0))
+                            .color(theme_text_primary()),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&document.source_name);
                 },
             );
         }
@@ -18925,6 +18901,114 @@ mod tests {
             source_max_line_chars: lines.iter().map(String::len).max().unwrap_or_default(),
             source_lines: lines,
             source_version: version,
+        }
+    }
+
+    fn workspace_test_rect(size: Vec2, view: MainView, library_visible: bool, dpi: f32) -> Rect {
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        context.set_pixels_per_point(dpi);
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("workspace-library-visible"), library_visible);
+        });
+        let mut document = source_folding_document("model Demo\n Real x;\nend Demo;", 1);
+        document.package_name = "LongLibraryName".repeat(15);
+        document.source_name = "LongClassName".repeat(15);
+        let class_path = "Library.Subpackage.Model".repeat(15);
+        let status = "已保存文档 / long status message ".repeat(15);
+        let mut view = view;
+        let mut source_cache = SourceHighlightCache::default();
+        let mut scroll = SourceScrollState::new();
+        let mut interaction = SourceInteractionState::default();
+        let mut source_rect = None;
+        let mut canvas_rect = None;
+        let mut tree_time = Duration::ZERO;
+        // Let egui settle its panel geometry before inspecting allocations.
+        for _ in 0..3 {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    draw_preview_ui(
+                        ctx,
+                        &mut view,
+                        &mut ThemeMode::Light,
+                        &mut AccentTheme::Violet,
+                        Some(&class_path),
+                        Some(&document),
+                        &mut HashSet::new(),
+                        &mut VisibleTreeRowsCache::default(),
+                        &mut TreeGalleyCache::default(),
+                        &mut false,
+                        &mut false,
+                        &mut None,
+                        INITIAL_ZOOM,
+                        &mut None,
+                        &mut false,
+                        &mut false,
+                        &mut canvas_rect,
+                        &mut false,
+                        &mut false,
+                        None,
+                        Some(&status),
+                        false,
+                        &mut source_cache,
+                        &mut scroll,
+                        &mut interaction,
+                        &mut source_rect,
+                        None,
+                        &mut None,
+                        &mut tree_time,
+                        None,
+                        &mut None,
+                        dpi,
+                        false,
+                    );
+                },
+            );
+        }
+        assert!(
+            context.used_rect().right() <= size.x + 1.0,
+            "{:?}",
+            context.used_rect()
+        );
+        assert!(
+            context.used_rect().bottom() <= size.y + 1.0,
+            "{:?}",
+            context.used_rect()
+        );
+        if view == MainView::Source {
+            source_rect.unwrap()
+        } else {
+            canvas_rect.unwrap()
+        }
+    }
+
+    #[test]
+    fn workspace_layout_preserves_content_area_at_window_sizes_and_dpi_scales() {
+        for size in [Vec2::new(800.0, 600.0), Vec2::new(1360.0, 860.0)] {
+            for dpi in [1.0, 1.25, 1.5, 2.0] {
+                for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
+                    let rect = workspace_test_rect(size, view, true, dpi);
+                    assert!(rect.width() > size.x * 0.5, "{view:?}: {rect:?}");
+                    assert!(rect.top() < 180.0, "{view:?}: {rect:?}");
+                    assert!(rect.bottom() <= size.y - 26.0, "{view:?}: {rect:?}");
+                    assert!(rect.height() > size.y * 0.6, "{view:?}: {rect:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hiding_library_gives_space_back_to_each_workspace_view() {
+        for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
+            let size = Vec2::new(1360.0, 860.0);
+            let shown = workspace_test_rect(size, view, true, 1.0);
+            let hidden = workspace_test_rect(size, view, false, 1.0);
+            assert!(hidden.width() > shown.width() + 180.0);
+            assert!((hidden.height() - shown.height()).abs() < 1.0);
         }
     }
 
