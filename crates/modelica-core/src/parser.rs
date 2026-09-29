@@ -192,6 +192,7 @@ impl Parser {
         self.take()
             .ok_or_else(|| ParseError("missing class kind".into()))?;
         self.expect_identifier()?;
+        let description = self.parse_string_comment();
         let qualified_name = parent.map_or_else(
             || start.name.clone(),
             |parent| format!("{parent}.{}", start.name),
@@ -200,6 +201,7 @@ impl Parser {
             kind: start.kind,
             name: start.name,
             qualified_name,
+            description,
             source_file: self.source_file.clone(),
             source_range: SourceRange::new(start.start, start.start),
             children: Vec::new(),
@@ -248,6 +250,39 @@ impl Parser {
         Ok(class)
     }
 
+    fn parse_string_comment(&mut self) -> Option<String> {
+        let token = self.peek()?.clone();
+        (token.kind == TokenKind::String).then(|| {
+            let first = self.take().expect("peeked string comment token");
+            self.parse_string_comment_from(first)
+        })
+    }
+
+    fn parse_string_comment_from(&mut self, first: Token) -> String {
+        let mut value = decode_string_literal(&first.text);
+        loop {
+            let checkpoint = self.position;
+            if self.accept("+").is_some() {
+                if let Some(token) = self.peek().cloned()
+                    && token.kind == TokenKind::String
+                {
+                    let token = self.take().expect("peeked string concatenation token");
+                    value.push_str(&decode_string_literal(&token.text));
+                    continue;
+                }
+                self.position = checkpoint;
+            } else if let Some(token) = self.peek().cloned()
+                && token.kind == TokenKind::String
+            {
+                let token = self.take().expect("peeked adjacent string comment token");
+                value.push_str(&decode_string_literal(&token.text));
+                continue;
+            }
+            break;
+        }
+        value
+    }
+
     fn parse_short_class(&mut self, class: &mut Class) -> Result<(), ParseError> {
         let mut parens = 0_i32;
         let mut braces = 0_i32;
@@ -266,6 +301,13 @@ impl Parser {
                 "}" => braces = (braces - 1).max(0),
                 "[" => brackets += 1,
                 "]" => brackets = (brackets - 1).max(0),
+                _ if token.kind == TokenKind::String
+                    && parens == 0
+                    && braces == 0
+                    && brackets == 0 =>
+                {
+                    class.description = Some(self.parse_string_comment_from(token.clone()));
+                }
                 "input" | "output" | "flow" | "stream" => prefixes.push(token.text.clone()),
                 "." if base_type.is_some() => previous_was_dot = true,
                 ";" if parens == 0 && braces == 0 && brackets == 0 => {
@@ -335,6 +377,14 @@ impl Parser {
         }
         Ok(ModelicaFile { within, classes })
     }
+}
+
+fn decode_string_literal(literal: &str) -> String {
+    let inner = literal
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(literal);
+    inner.replace("\"\"", "\"").replace("\\\"", "\"")
 }
 
 #[derive(Clone)]
@@ -412,5 +462,50 @@ mod tests {
         assert_eq!(file.classes.len(), 1);
         assert_eq!(file.classes[0].children.len(), 1);
         assert_eq!(file.classes[0].source_range.end, source.len());
+    }
+
+    #[test]
+    fn preserves_class_descriptions_and_mixed_declaration_order() {
+        let source = r#"
+            package P "root"
+              model M "model"
+              end M;
+              package Q "package"
+                connector C "connector"
+                end C;
+              end Q;
+              function F "function"
+              end F;
+              record R "record"
+              end R;
+              type T = Real "type";
+            end P;
+        "#;
+        let file = parse(source, "test.mo").expect("valid Modelica source");
+        let root = &file.classes[0];
+        assert_eq!(root.description.as_deref(), Some("root"));
+        assert_eq!(
+            root.children
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>(),
+            ["M", "Q", "F", "R", "T"]
+        );
+        assert_eq!(root.children[0].description.as_deref(), Some("model"));
+        assert_eq!(root.children[1].description.as_deref(), Some("package"));
+        assert_eq!(
+            root.children[1].children[0].description.as_deref(),
+            Some("connector")
+        );
+        assert_eq!(root.children[1].children[0].kind, ClassKind::Connector);
+        assert_eq!(root.children[4].description.as_deref(), Some("type"));
+        assert!(root.children[4].is_short);
+    }
+
+    #[test]
+    fn concatenates_modelica_string_comments() {
+        let file = parse("model M \"first\" + \" second\" end M;", "test.mo")
+            .expect("valid Modelica source");
+        assert_eq!(file.classes[0].description.as_deref(), Some("first second"));
     }
 }
