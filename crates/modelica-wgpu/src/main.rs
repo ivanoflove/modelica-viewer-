@@ -151,56 +151,80 @@ impl ThemeMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccentTheme {
-    Violet,
-    Blue,
-    Cyan,
-    Orange,
+    Sunset,
+    Twilight,
+    Aurora,
+    Lavender,
 }
 
 impl AccentTheme {
     fn label(self) -> &'static str {
         match self {
-            Self::Violet => "Violet",
-            Self::Blue => "Blue",
-            Self::Cyan => "Cyan",
-            Self::Orange => "Orange",
+            Self::Sunset => "Sunset",
+            Self::Twilight => "Twilight",
+            Self::Aurora => "Aurora",
+            Self::Lavender => "Lavender",
         }
     }
 
     fn id(self) -> u8 {
         match self {
-            Self::Violet => 0,
-            Self::Blue => 1,
-            Self::Cyan => 2,
-            Self::Orange => 3,
+            Self::Sunset => 0,
+            Self::Twilight => 1,
+            Self::Aurora => 2,
+            Self::Lavender => 3,
         }
     }
 
     fn from_id(id: u8) -> Self {
         match id {
-            1 => Self::Blue,
-            2 => Self::Cyan,
-            3 => Self::Orange,
-            _ => Self::Violet,
+            1 => Self::Twilight,
+            2 => Self::Aurora,
+            3 => Self::Lavender,
+            _ => Self::Sunset,
         }
     }
 
     fn key(self) -> &'static str {
         match self {
-            Self::Violet => "violet",
-            Self::Blue => "blue",
-            Self::Cyan => "cyan",
-            Self::Orange => "orange",
+            Self::Sunset => "sunset",
+            Self::Twilight => "twilight",
+            Self::Aurora => "aurora",
+            Self::Lavender => "lavender",
         }
     }
 
     fn from_key(value: &str) -> Option<Self> {
         match value {
-            "violet" => Some(Self::Violet),
-            "blue" => Some(Self::Blue),
-            "cyan" => Some(Self::Cyan),
-            "orange" => Some(Self::Orange),
+            "sunset" => Some(Self::Sunset),
+            "twilight" => Some(Self::Twilight),
+            "aurora" => Some(Self::Aurora),
+            "lavender" => Some(Self::Lavender),
+            // Legacy keys from the pre-Arc palette map onto the nearest theme.
+            "violet" | "blue" => Some(Self::Twilight),
+            "cyan" => Some(Self::Aurora),
+            "orange" => Some(Self::Sunset),
             _ => None,
+        }
+    }
+
+    /// Theme gradient start/end — DESIGN.md §2 primary gradients.
+    fn gradient(self) -> ([u8; 3], [u8; 3]) {
+        match self {
+            Self::Sunset => ([0xff, 0x7e, 0x5f], [0xfe, 0xb4, 0x7b]),
+            Self::Twilight => ([0x7f, 0x5a, 0xf0], [0xe8, 0x43, 0x93]),
+            Self::Aurora => ([0x16, 0xf2, 0xb3], [0x0d, 0xb4, 0xf7]),
+            Self::Lavender => ([0xb7, 0x94, 0xf4], [0x7f, 0x5a, 0xf0]),
+        }
+    }
+
+    /// Solid brand accent for text, icons and primary CTAs.
+    fn accent_rgb(self) -> [u8; 3] {
+        match self {
+            Self::Sunset => [0xff, 0x5f, 0x5f], // Arc Coral
+            Self::Twilight => [0x7f, 0x5a, 0xf0],
+            Self::Aurora => [0x0d, 0xb4, 0xf7],
+            Self::Lavender => [0xb7, 0x94, 0xf4],
         }
     }
 }
@@ -209,18 +233,24 @@ impl AccentTheme {
 // localStorage; WGPU writes an equivalent JSON sidecar so both clients can
 // share one look when they run on the same machine.
 fn appearance_settings_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
+    // `HOME` is usually unset on native Windows, so do not gate the whole
+    // lookup on it — otherwise appearance preferences never load or save there.
     let base = if cfg!(target_os = "windows") {
-        let roaming = std::env::var_os("APPDATA");
-        std::path::PathBuf::from(
-            roaming.unwrap_or_else(|| std::path::Path::new(&home).join("AppData/Roaming").into()),
-        )
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|profile| std::path::PathBuf::from(profile).join("AppData/Roaming"))
+            })?
     } else if cfg!(target_os = "macos") {
-        std::path::Path::new(&home).join("Library/Application Support")
+        std::path::Path::new(&std::env::var_os("HOME")?).join("Library/Application Support")
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::Path::new(&home).join(".config"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::Path::new(&home).join(".config"))
+            })?
     };
     Some(base.join("modelica-viewer").join("settings.json"))
 }
@@ -242,17 +272,17 @@ fn parse_appearance_json(content: &str) -> (ThemeMode, AccentTheme) {
     let accent = json_value("accent")
         .as_deref()
         .and_then(AccentTheme::from_key)
-        .unwrap_or(AccentTheme::Violet);
+        .unwrap_or(AccentTheme::Sunset);
     (theme, accent)
 }
 
 fn load_appearance() -> (ThemeMode, AccentTheme) {
     let Some(path) = appearance_settings_path() else {
-        return (ThemeMode::System, AccentTheme::Violet);
+        return (ThemeMode::System, AccentTheme::Sunset);
     };
     match fs::read_to_string(&path) {
         Ok(content) => parse_appearance_json(&content),
-        Err(_) => (ThemeMode::System, AccentTheme::Violet),
+        Err(_) => (ThemeMode::System, AccentTheme::Sunset),
     }
 }
 
@@ -1410,23 +1440,23 @@ mod appearance_tests {
     fn parse_defaults_for_empty_and_garbage_input() {
         assert_eq!(
             parse_appearance_json(""),
-            (ThemeMode::System, AccentTheme::Violet)
+            (ThemeMode::System, AccentTheme::Sunset)
         );
         assert_eq!(
             parse_appearance_json("not json at all"),
-            (ThemeMode::System, AccentTheme::Violet)
+            (ThemeMode::System, AccentTheme::Sunset)
         );
     }
 
     #[test]
     fn parse_restores_saved_theme_and_accent() {
         assert_eq!(
-            parse_appearance_json(r#"{"theme": "dark", "accent": "cyan"}"#),
-            (ThemeMode::Dark, AccentTheme::Cyan)
+            parse_appearance_json(r#"{"theme": "dark", "accent": "twilight"}"#),
+            (ThemeMode::Dark, AccentTheme::Twilight)
         );
         assert_eq!(
-            parse_appearance_json(r#"{"theme":"light","accent":"orange"}"#),
-            (ThemeMode::Light, AccentTheme::Orange)
+            parse_appearance_json(r#"{"theme":"light","accent":"aurora"}"#),
+            (ThemeMode::Light, AccentTheme::Aurora)
         );
     }
 
@@ -1434,21 +1464,70 @@ mod appearance_tests {
     fn unknown_fields_fall_back_to_defaults() {
         assert_eq!(
             parse_appearance_json(r#"{"theme": "purple", "accent": "magenta"}"#),
-            (ThemeMode::System, AccentTheme::Violet)
+            (ThemeMode::System, AccentTheme::Sunset)
         );
+    }
+
+    #[test]
+    fn legacy_accent_keys_map_to_nearest_theme() {
+        assert_eq!(AccentTheme::from_key("violet"), Some(AccentTheme::Twilight));
+        assert_eq!(AccentTheme::from_key("cyan"), Some(AccentTheme::Aurora));
+        assert_eq!(AccentTheme::from_key("orange"), Some(AccentTheme::Sunset));
     }
 
     #[test]
     fn accent_key_mapping_round_trips() {
         for accent in [
-            AccentTheme::Violet,
-            AccentTheme::Blue,
-            AccentTheme::Cyan,
-            AccentTheme::Orange,
+            AccentTheme::Sunset,
+            AccentTheme::Twilight,
+            AccentTheme::Aurora,
+            AccentTheme::Lavender,
         ] {
             assert_eq!(AccentTheme::from_key(accent.key()), Some(accent));
         }
         assert_eq!(AccentTheme::from_key("nope"), None);
+    }
+}
+
+/// Native window operations requested from the egui-drawn chrome. The OS
+/// title bar is disabled, so these are routed back to `App::render`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowAction {
+    Drag,
+    Minimize,
+    ToggleMaximize,
+    Close,
+    Resize(winit::window::ResizeDirection),
+}
+
+const WINDOW_ACTION_ID: &str = "modelica-window-action";
+
+fn request_window_action(ctx: &egui::Context, action: WindowAction) {
+    ctx.data_mut(|data| {
+        data.insert_temp(egui::Id::new(WINDOW_ACTION_ID), Some(action));
+    });
+}
+
+fn take_window_action(ctx: &egui::Context) -> Option<WindowAction> {
+    // draw_preview_ui resets the slot to `None` at the start of every frame, so
+    // simply reading it here cannot replay a stale action.
+    ctx.data(|data| data.get_temp::<Option<WindowAction>>(egui::Id::new(WINDOW_ACTION_ID)))
+        .flatten()
+}
+
+/// Move the OS window when `rect` is dragged. This must live in the panel
+/// layers: a background `Area` sits below the panels and never receives the
+/// pointer, which is why the window could not be moved before.
+fn window_drag_region(ui: &mut egui::Ui, rect: Rect, id: &str) {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    let response = ui.interact(rect, egui::Id::new(id), Sense::click_and_drag());
+    if response.drag_started() {
+        request_window_action(ui.ctx(), WindowAction::Drag);
+    }
+    if response.double_clicked() {
+        request_window_action(ui.ctx(), WindowAction::ToggleMaximize);
     }
 }
 
@@ -3903,8 +3982,28 @@ fn trace_font_fallback_role(
     );
 }
 
+// Bundled so the Arc/Inter look travels with the app on machines that do not
+// have Inter installed (OFL-1.1, see assets/fonts/LICENSE.txt).
+const BUNDLED_INTER_MEDIUM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/Inter-Medium.ttf"
+);
+const BUNDLED_INTER_SEMIBOLD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/Inter-SemiBold.ttf"
+);
+const BUNDLED_INTER_ITALIC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/Inter-Italic.ttf"
+);
+const BUNDLED_INTER_SEMIBOLD_ITALIC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/Inter-SemiBoldItalic.ttf"
+);
+
 fn install_ui_fonts(ctx: &egui::Context) {
     let medium_candidates = [
+        BUNDLED_INTER_MEDIUM,
         r"C:\Windows\Fonts\Inter-Medium.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\NotoSans-Medium.ttf",
@@ -3914,6 +4013,7 @@ fn install_ui_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/noto/NotoSans-Medium.ttf",
     ];
     let semibold_candidates = [
+        BUNDLED_INTER_SEMIBOLD,
         r"C:\Windows\Fonts\Inter-SemiBold.ttf",
         r"C:\Windows\Fonts\seguisb.ttf",
         r"C:\Windows\Fonts\segoeuib.ttf",
@@ -3924,6 +4024,7 @@ fn install_ui_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
     ];
     let italic_candidates = [
+        BUNDLED_INTER_ITALIC,
         r"C:\Windows\Fonts\Inter-Italic.ttf",
         r"C:\Windows\Fonts\segoeuii.ttf",
         r"C:\Windows\Fonts\NotoSans-Italic.ttf",
@@ -3933,6 +4034,7 @@ fn install_ui_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/noto/NotoSans-Italic.ttf",
     ];
     let semibold_italic_candidates = [
+        BUNDLED_INTER_SEMIBOLD_ITALIC,
         r"C:\Windows\Fonts\Inter-SemiBoldItalic.ttf",
         r"C:\Windows\Fonts\seguisbi.ttf",
         r"C:\Windows\Fonts\segoeuiz.ttf",
@@ -6375,7 +6477,7 @@ impl App {
         install_ui_fonts(&egui_ctx);
         set_theme(
             ThemeMode::System.is_dark(window.theme()),
-            AccentTheme::Violet,
+            AccentTheme::Sunset,
         );
         configure_egui_style(&egui_ctx);
         eprintln!("modelica-wgpu: creating egui window state");
@@ -10350,6 +10452,9 @@ impl App {
         if is_dark != self.background_is_dark {
             self.background_dirty = true;
             self.background_is_dark = is_dark;
+            // Theme colours are baked into the egui style, so re-apply it when
+            // the resolved lightness changes (e.g. the OS theme flips).
+            configure_egui_style(&self.egui_ctx);
         }
         set_theme(is_dark, self.accent_theme);
         let mut main_view = self.main_view;
@@ -10529,11 +10634,14 @@ impl App {
             self.theme_mode = theme_mode;
             self.accent_theme = accent_theme;
             let is_dark = self.theme_mode.is_dark(self.window.theme());
-            if is_dark != self.background_is_dark {
-                self.background_dirty = true;
-                self.background_is_dark = is_dark;
-            }
             set_theme(is_dark, self.accent_theme);
+            // The Arc gradient depends on both lightness *and* accent, and the
+            // egui style bakes accent colours in, so refresh both on any change
+            // (previously only the light<->dark transition re-uploaded the
+            // background, so switching accent left the gradient stale).
+            self.background_dirty = true;
+            self.background_is_dark = is_dark;
+            configure_egui_style(&self.egui_ctx);
             save_appearance(self.theme_mode, self.accent_theme);
             self.request_redraw();
         }
@@ -11056,6 +11164,22 @@ impl App {
         if let Some((fps, worst_ms)) = self.stats.record(Instant::now()) {
             self.update_title(Some((fps, worst_ms)));
         }
+        // Apply any window operation requested by the egui-drawn chrome.
+        if let Some(action) = take_window_action(&self.egui_ctx) {
+            match action {
+                WindowAction::Drag => {
+                    let _ = self.window.drag_window();
+                }
+                WindowAction::Minimize => self.window.set_minimized(true),
+                WindowAction::ToggleMaximize => {
+                    self.window.set_maximized(!self.window.is_maximized());
+                }
+                WindowAction::Close => self.request_window_close(),
+                WindowAction::Resize(direction) => {
+                    let _ = self.window.drag_resize_window(direction);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -11107,56 +11231,87 @@ fn theme_rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(red, green, blue, alpha)
 }
 
-// These tokens intentionally mirror src/renderer/src/styles.css so Electron
-// and WGPU retain the same visual hierarchy on Windows and Linux.
-fn theme_surface() -> Color32 {
-    if is_dark_theme() {
-        theme_rgb(34, 36, 43) // --surface: #22242b
-    } else {
-        theme_rgb(255, 255, 255) // --surface: #ffffff
-    }
+// ── Arc Browser design tokens ────────────────────────────────────────────
+// Mirror design-systems/arc/DESIGN.md. Light is a peach-cream canvas with
+// bright frosted panes; dark keeps the same warmth on near-black glass.
+const ARC_BG_LIGHT: [u8; 3] = [0xfd, 0xf3, 0xec]; // --bg
+const ARC_SURFACE_LIGHT: [u8; 3] = [0xff, 0xff, 0xff]; // --surface
+const ARC_WARM_LIGHT: [u8; 3] = [0xff, 0xf4, 0xea]; // --surface-warm
+const ARC_FG_LIGHT: [u8; 3] = [0x1a, 0x1a, 0x1f];
+const ARC_FG2_LIGHT: [u8; 3] = [0x54, 0x54, 0x5a];
+// Arc's Ink Muted (#8c8c93) only reaches 3.3:1 on white; darken a step so
+// tertiary chrome still clears the repo's 4.5:1 accessibility floor.
+const ARC_MUTED_LIGHT: [u8; 3] = [0x75, 0x75, 0x7d];
+const ARC_BG_DARK: [u8; 3] = [0x16, 0x16, 0x1a];
+const ARC_SURFACE_DARK: [u8; 3] = [0x1e, 0x1e, 0x24];
+const ARC_WARM_DARK: [u8; 3] = [0x24, 0x1f, 0x1e];
+const ARC_FG_DARK: [u8; 3] = [0xfa, 0xfa, 0xfa];
+const ARC_FG2_DARK: [u8; 3] = [0xb8, 0xb8, 0xbf];
+const ARC_MUTED_DARK: [u8; 3] = [0x90, 0x90, 0x9a];
+
+fn mix_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let channel = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    [
+        channel(a[0], b[0]),
+        channel(a[1], b[1]),
+        channel(a[2], b[2]),
+    ]
 }
 
+fn theme_surface() -> Color32 {
+    let c = if is_dark_theme() {
+        ARC_SURFACE_DARK
+    } else {
+        ARC_SURFACE_LIGHT
+    };
+    theme_rgb(c[0], c[1], c[2])
+}
+
+/// Translucent frosted pane — the approximation of Arc's
+/// `rgba(255,255,255,0.7)` glass, letting the gradient backdrop through.
 fn theme_surface_soft(alpha: u8) -> Color32 {
     if is_dark_theme() {
-        theme_rgba(31, 33, 40, alpha) // --surface-soft: #1f2128
+        theme_rgba(ARC_WARM_DARK[0], ARC_WARM_DARK[1], ARC_WARM_DARK[2], alpha)
     } else {
-        theme_rgba(248, 249, 252, alpha) // --surface-soft: #f8f9fc
+        theme_rgba(ARC_WARM_LIGHT[0], ARC_WARM_LIGHT[1], ARC_WARM_LIGHT[2], alpha)
     }
 }
 
 fn theme_surface_raised(alpha: u8) -> Color32 {
     if is_dark_theme() {
-        theme_rgba(37, 39, 47, alpha) // --surface-raised: #25272f
+        theme_rgba(0x26, 0x23, 0x2a, alpha)
     } else {
         theme_rgba(255, 255, 255, alpha)
     }
 }
 
 fn theme_text_primary() -> Color32 {
-    if is_dark_theme() {
-        theme_rgb(241, 241, 244) // --text-primary: #f1f1f4
+    let c = if is_dark_theme() {
+        ARC_FG_DARK
     } else {
-        theme_rgb(31, 35, 40) // --text-primary: #1f2328
-    }
+        ARC_FG_LIGHT
+    };
+    theme_rgb(c[0], c[1], c[2])
 }
 
 // Keep UI text roles opaque and separated enough to remain readable on the
 // light surface. These colors apply to UI chrome only, not Diagram graphics.
 fn theme_text_secondary() -> Color32 {
-    if is_dark_theme() {
-        theme_rgb(169, 171, 182) // --text-secondary: #a9abb6
+    let c = if is_dark_theme() {
+        ARC_FG2_DARK
     } else {
-        theme_rgb(95, 99, 104) // --text-secondary: #5f6368
-    }
+        ARC_FG2_LIGHT
+    };
+    theme_rgb(c[0], c[1], c[2])
 }
 
 #[allow(dead_code)]
 fn theme_text_disabled() -> Color32 {
     if is_dark_theme() {
-        theme_rgb(104, 108, 124)
+        theme_rgb(0x6a, 0x6a, 0x72)
     } else {
-        theme_rgb(150, 155, 163)
+        theme_rgb(0xb9, 0xb4, 0xad)
     }
 }
 
@@ -11165,11 +11320,8 @@ fn theme_text_tertiary() -> Color32 {
 }
 
 fn theme_text_tertiary_for(dark: bool) -> Color32 {
-    if dark {
-        theme_rgb(150, 153, 165) // --text-tertiary: #9699a5
-    } else {
-        theme_rgb(105, 114, 125) // --text-tertiary: #69727d
-    }
+    let c = if dark { ARC_MUTED_DARK } else { ARC_MUTED_LIGHT };
+    theme_rgb(c[0], c[1], c[2])
 }
 
 fn theme_code_keyword() -> Color32 {
@@ -11255,39 +11407,24 @@ fn theme_border(alpha: u8) -> Color32 {
 }
 
 fn theme_accent() -> Color32 {
-    let [red, green, blue]: [u8; 3] = match active_accent() {
-        AccentTheme::Violet => [108, 92, 231],
-        AccentTheme::Blue => [49, 57, 251],
-        AccentTheme::Cyan => [39, 174, 186],
-        AccentTheme::Orange => [221, 123, 57],
-    };
-    if is_dark_theme() {
-        theme_rgb(
-            red.saturating_add(24),
-            green.saturating_add(20),
-            blue.saturating_add(14),
-        )
+    let accent = active_accent().accent_rgb();
+    // Lift the accent slightly on dark glass so it keeps its punch.
+    let c = if is_dark_theme() {
+        mix_rgb(accent, [0xff, 0xff, 0xff], 0.16)
     } else {
-        theme_rgb(red, green, blue)
-    }
+        accent
+    };
+    theme_rgb(c[0], c[1], c[2])
 }
 
 fn theme_accent_strong() -> Color32 {
-    let [red, green, blue]: [u8; 3] = match active_accent() {
-        AccentTheme::Violet => [91, 75, 214],
-        AccentTheme::Blue => [0, 3, 84],
-        AccentTheme::Cyan => [22, 141, 153],
-        AccentTheme::Orange => [196, 102, 41],
-    };
-    if is_dark_theme() {
-        theme_rgb(
-            red.saturating_add(38),
-            green.saturating_add(32),
-            blue.saturating_add(30),
-        )
+    let accent = active_accent().accent_rgb();
+    let c = if is_dark_theme() {
+        mix_rgb(accent, [0xff, 0xff, 0xff], 0.34)
     } else {
-        theme_rgb(red, green, blue)
-    }
+        mix_rgb(accent, [0x00, 0x00, 0x00], 0.20)
+    };
+    theme_rgb(c[0], c[1], c[2])
 }
 
 fn theme_accent_soft(alpha: u8) -> Color32 {
@@ -11296,45 +11433,49 @@ fn theme_accent_soft(alpha: u8) -> Color32 {
 }
 
 fn background_uniform() -> BackgroundUniform {
-    // Electron's body background is #f3f4f8 with very soft accent washes;
-    // keep the GPU backdrop restrained so it does not tint the canvas content.
-    let base = if is_dark_theme() {
-        [0.090, 0.094, 0.114] // --app-background: #17181d, slightly lifted for canvas
-    } else {
-        [0.953, 0.957, 0.973] // --app-background: #f3f4f8
-    };
-    let strength = if is_dark_theme() { 0.12 } else { 0.025 };
-    let color = |factor: f32| {
+    // Arc's signature move: a saturated theme gradient blooming across a warm
+    // canvas, so frosted panes have something to sit on. Blend in sRGB byte
+    // space like CSS does, then hand the shader linear values (the surface is
+    // an sRGB target).
+    let (start, end) = active_accent().gradient();
+    let linear = |c: [u8; 3]| {
         [
-            base[0] * (1.0 - strength * factor),
-            base[1] * (1.0 - strength * factor),
-            base[2] * (1.0 - strength * factor),
+            srgb_to_linear(c[0]),
+            srgb_to_linear(c[1]),
+            srgb_to_linear(c[2]),
             1.0,
         ]
     };
+    let (base, corner, edge) = if is_dark_theme() {
+        (ARC_BG_DARK, 0.20_f32, 0.07_f32)
+    } else {
+        (ARC_BG_LIGHT, 0.34_f32, 0.14_f32)
+    };
     BackgroundUniform {
-        top_left: color(0.0),
-        top_right: color(0.25),
-        bottom_left: color(0.75),
-        bottom_right: color(0.35),
+        top_left: linear(mix_rgb(base, start, corner)),
+        top_right: linear(mix_rgb(base, end, edge)),
+        bottom_left: linear(mix_rgb(base, start, edge)),
+        bottom_right: linear(mix_rgb(base, end, corner)),
     }
 }
 
 fn theme_live() -> Color32 {
-    if is_dark_theme() {
-        theme_rgb(85, 207, 163)
+    // --success: #48bb78, lifted on dark glass.
+    let c = if is_dark_theme() {
+        mix_rgb([0x48, 0xbb, 0x78], [0xff, 0xff, 0xff], 0.18)
     } else {
-        theme_rgb(54, 174, 124)
-    }
+        [0x2f, 0x9e, 0x5f]
+    };
+    theme_rgb(c[0], c[1], c[2])
 }
 
 fn configure_egui_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(7.0, 7.0);
-    style.spacing.window_margin = Margin::same(14.0);
-    style.spacing.menu_margin = Margin::same(8.0);
-    style.spacing.button_padding = Vec2::new(11.0, 8.0);
-    style.spacing.interact_size = Vec2::new(40.0, 30.0);
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.window_margin = Margin::same(16.0);
+    style.spacing.menu_margin = Margin::same(10.0);
+    style.spacing.button_padding = Vec2::new(14.0, 8.0);
+    style.spacing.interact_size = Vec2::new(40.0, 28.0);
     style.spacing.indent = 14.0;
     style
         .text_styles
@@ -11361,20 +11502,24 @@ fn configure_egui_style(ctx: &egui::Context) {
     visuals.override_text_color = Some(theme_text_primary());
     visuals.window_rounding = Rounding::same(16.0);
     visuals.menu_rounding = Rounding::same(12.0);
-    visuals.window_fill = theme_surface_raised(245);
-    visuals.window_stroke = Stroke::new(1.0_f32, theme_border(28));
-    visuals.panel_fill = Color32::TRANSPARENT;
-    visuals.faint_bg_color = theme_surface_soft(72);
-    visuals.extreme_bg_color = theme_surface();
-    visuals.code_bg_color = if is_dark_theme() {
-        theme_surface_soft(210)
-    } else {
-        theme_rgb(248, 249, 252)
+    visuals.window_fill = theme_surface_raised(248);
+    visuals.window_stroke = Stroke::new(1.0_f32, theme_border(26));
+    // Single long-throw soft shadow — the signature Arc card lift.
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: Vec2::new(0.0, 8.0),
+        blur: 32.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(18),
     };
-    visuals.warn_fg_color = theme_rgb(154, 116, 31);
-    visuals.error_fg_color = theme_rgb(193, 72, 90);
+    visuals.popup_shadow = visuals.window_shadow;
+    visuals.panel_fill = Color32::TRANSPARENT;
+    visuals.faint_bg_color = theme_surface_raised(90);
+    visuals.extreme_bg_color = theme_surface();
+    visuals.code_bg_color = theme_surface_soft(150);
+    visuals.warn_fg_color = theme_rgb(0xf6, 0xad, 0x55);
+    visuals.error_fg_color = theme_rgb(0xf5, 0x65, 0x65);
     visuals.selection = egui::style::Selection {
-        bg_fill: theme_accent_soft(40),
+        bg_fill: theme_accent_soft(48),
         stroke: Stroke::new(1.0_f32, theme_accent()),
     };
 
@@ -11387,21 +11532,22 @@ fn configure_egui_style(ctx: &egui::Context) {
         &mut visuals.widgets.open,
     ] {
         widget.bg_stroke = border;
-        widget.rounding = Rounding::same(8.0);
+        // Squircle-soft radius-md (12px) on buttons — DESIGN.md §5.
+        widget.rounding = Rounding::same(12.0);
         widget.expansion = 0.0;
     }
-    visuals.widgets.noninteractive.bg_fill = theme_surface_soft(210);
+    visuals.widgets.noninteractive.bg_fill = theme_surface_raised(150);
     visuals.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
-    visuals.widgets.inactive.bg_fill = theme_surface();
-    visuals.widgets.inactive.weak_bg_fill = theme_surface_soft(185);
+    visuals.widgets.inactive.bg_fill = theme_surface_raised(150);
+    visuals.widgets.inactive.weak_bg_fill = theme_surface_raised(120);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
-    visuals.widgets.hovered.bg_fill = theme_accent_soft(28);
-    visuals.widgets.hovered.weak_bg_fill = theme_accent_soft(22);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_accent_soft(110));
+    visuals.widgets.hovered.bg_fill = theme_surface_raised(235);
+    visuals.widgets.hovered.weak_bg_fill = theme_surface_raised(200);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_border(30));
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, theme_accent());
     visuals.widgets.active.bg_fill = theme_accent();
-    visuals.widgets.active.weak_bg_fill = theme_accent_soft(130);
+    visuals.widgets.active.weak_bg_fill = theme_accent_soft(150);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, theme_accent());
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.open = visuals.widgets.hovered;
@@ -11481,134 +11627,21 @@ fn draw_preview_ui(
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     visuals.widgets.open = visuals.widgets.hovered;
     ctx.set_visuals(visuals);
+    ctx.data_mut(|data| {
+        data.insert_temp(egui::Id::new(WINDOW_ACTION_ID), None::<WindowAction>);
+    });
     let library_visibility_id = egui::Id::new("workspace-library-visible");
     let mut library_visible =
         ctx.data(|data| data.get_temp::<bool>(library_visibility_id).unwrap_or(true));
-    egui::TopBottomPanel::top("arc_topbar")
-        .exact_height(40.0)
-        .frame(
-            Frame::none()
-                .fill(theme_surface())
-                .stroke(Stroke::new(1.0_f32, theme_border(28)))
-                .inner_margin(Margin::symmetric(10.0, 4.0)),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Brand mark: an accent-tinted rounded square with the wave
-                // glyph, mirroring the Electron .brand-mark.
-                let (mark_rect, _) =
-                    ui.allocate_exact_size(Vec2::splat(26.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(mark_rect, Rounding::same(11.0), theme_accent_soft(26));
-                ui.painter().rect_stroke(
-                    mark_rect,
-                    Rounding::same(11.0),
-                    Stroke::new(1.0_f32, theme_accent_soft(80)),
-                );
-                ui.painter().text(
-                    mark_rect.center(),
-                    Align2::CENTER_CENTER,
-                    "∿",
-                    FontId::proportional(18.0),
-                    theme_accent(),
-                );
-                ui.add_space(9.0);
-                ui.label(
-                    RichText::new("Modelica Viewer")
-                        .size(13.0)
-                        .strong()
-                        .color(theme_text_primary()),
-                );
-                ui.separator();
-                if ui.selectable_label(library_visible, "模型树").clicked() {
-                    library_visible = !library_visible;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.menu_button(
-                        RichText::new("◐ 外观")
-                            .size(12.0)
-                            .font(ui_font(13.0))
-                            .color(theme_text_secondary()),
-                        |ui| {
-                            ui.set_min_width(180.0);
-                            ui.label(RichText::new("Theme").size(10.0).strong());
-                            for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
-                                if ui
-                                    .selectable_label(*theme_mode == mode, mode.label())
-                                    .clicked()
-                                {
-                                    *theme_mode = mode;
-                                    ui.close_menu();
-                                }
-                            }
-                            ui.separator();
-                            ui.label(RichText::new("Accent").size(10.0).strong());
-                            for accent in [
-                                AccentTheme::Violet,
-                                AccentTheme::Blue,
-                                AccentTheme::Cyan,
-                                AccentTheme::Orange,
-                            ] {
-                                if ui
-                                    .selectable_label(*accent_theme == accent, accent.label())
-                                    .clicked()
-                                {
-                                    *accent_theme = accent;
-                                    ui.close_menu();
-                                }
-                            }
-                        },
-                    );
-                    let open_library = egui::Button::new(
-                        RichText::new("打开库")
-                            .size(12.0)
-                            .font(ui_font(12.0))
-                            .color(theme_text_secondary()),
-                    )
-                    .fill(theme_surface_soft(210))
-                    .stroke(Stroke::new(1.0_f32, theme_border(26)))
-                    .rounding(Rounding::same(8.0));
-                    if ui
-                        .add_enabled(
-                            !document_loading && pending_document_action.is_none(),
-                            open_library,
-                        )
-                        .clicked()
-                    {
-                        *open_directory_requested = true;
-                    }
-                    let open_file = egui::Button::new(
-                        RichText::new("打开文件")
-                            .size(12.0)
-                            .font(ui_semibold_font(12.0))
-                            .color(Color32::WHITE),
-                    )
-                    .fill(theme_accent())
-                    .stroke(Stroke::new(1.0_f32, theme_accent()))
-                    .rounding(Rounding::same(8.0));
-                    if ui
-                        .add_enabled(
-                            !document_loading && pending_document_action.is_none(),
-                            open_file,
-                        )
-                        .clicked()
-                    {
-                        *open_requested = true;
-                    }
-                });
-            });
-        });
-
-    ctx.data_mut(|data| data.insert_temp(library_visibility_id, library_visible));
     // Status belongs outside both work areas so it cannot take space from a
     // long model name or disappear below a scrolled library tree.
     egui::TopBottomPanel::bottom("workspace-status")
         .exact_height(26.0)
         .frame(
             Frame::none()
-                .fill(theme_surface())
-                .stroke(Stroke::new(1.0_f32, theme_border(28)))
-                .inner_margin(Margin::symmetric(10.0, 3.0)),
+                .fill(theme_surface_raised(140))
+                .stroke(Stroke::new(1.0_f32, theme_border(18)))
+                .inner_margin(Margin::symmetric(12.0, 3.0)),
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -11666,22 +11699,82 @@ fn draw_preview_ui(
             .max_width(library_max)
             .frame(
                 Frame::none()
-                    .fill(theme_surface_soft(255))
-                    .stroke(Stroke::new(1.0_f32, theme_border(20)))
-                    .inner_margin(Margin::symmetric(8.0, 8.0)),
+                    .fill(theme_surface_soft(165))
+                    .stroke(Stroke::new(1.0_f32, theme_border(18)))
+                    .inner_margin(Margin::symmetric(12.0, 12.0)),
             )
             .show(ctx, |ui| {
+                // Arc keeps its own chrome inside the sidebar: the product mark,
+                // the view switcher and the actions all live here.
+                let mut collapse_left = None;
+                let brand = ui
+                    .horizontal(|ui| {
+                        let (mark_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(mark_rect, Rounding::same(9.0), theme_accent());
+                        ui.painter().text(
+                            mark_rect.center(),
+                            Align2::CENTER_CENTER,
+                            "∿",
+                            FontId::proportional(16.0),
+                            Color32::WHITE,
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Modelica Viewer")
+                                .size(13.0)
+                                .font(ui_semibold_font(13.0))
+                                .color(theme_text_primary()),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let collapse = egui::Button::new(
+                                RichText::new("⏴").size(12.0).color(theme_text_tertiary()),
+                            )
+                            .frame(false);
+                            let response = ui.add(collapse);
+                            collapse_left = Some(response.rect.left());
+                            if response.on_hover_text("收起侧栏").clicked() {
+                                library_visible = false;
+                            }
+                        });
+                    })
+                    .response;
+                // Drag the window from the empty part of the brand row.
+                let drag_right = collapse_left.unwrap_or(brand.rect.right());
+                window_drag_region(
+                    ui,
+                    Rect::from_min_max(
+                        brand.rect.min,
+                        Pos2::new(
+                            (drag_right - 6.0).max(brand.rect.left()),
+                            brand.rect.bottom(),
+                        ),
+                    ),
+                    "sidebar-titlebar-drag",
+                );
+                ui.add_space(12.0);
+                // Vertical view tabs — Arc's sidebar-first navigation.
+                for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
+                    if sidebar_view_tab(ui, view, *main_view == view).clicked() {
+                        *main_view = view;
+                        *view_changed = true;
+                    }
+                    ui.add_space(2.0);
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
                         "模型库 · {}",
                         document.map_or(0, |doc| doc.class_names.len())
                     ))
-                    .size(13.0)
-                    .font(ui_semibold_font(13.0))
-                    .strong()
+                    .size(12.0)
+                    .font(ui_semibold_font(12.0))
                     .color(theme_accent()),
                 );
-                ui.add_space(5.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(
@@ -11690,68 +11783,157 @@ fn draw_preview_ui(
                             )
                             .size(12.0)
                             .font(ui_semibold_font(12.0))
-                            .strong()
                             .color(theme_text_primary()),
                         )
                         .truncate(),
                     )
                     .on_hover_text(document.map_or("Modelica", |doc| doc.package_name.as_str()));
                 });
-                ui.separator();
+                ui.add_space(6.0);
+                // Reserve the action strip, then let the tree fill what is left.
+                const SIDEBAR_ACTIONS_HEIGHT: f32 = 112.0;
+                let tree_height = (ui.available_height() - SIDEBAR_ACTIONS_HEIGHT).max(72.0);
                 if let Some(document) = document {
-                    ui.horizontal(|ui| {
-                        let button_width = (ui.available_width() - 6.0) / 2.0;
-                        if ui
-                            .add_sized(
-                                [button_width, 22.0],
-                                egui::Button::new(
-                                    RichText::new("全部展开")
-                                        .size(11.0)
-                                        .font(ui_semibold_font(11.0)),
-                                )
-                                .fill(theme_surface_soft(235))
-                                .rounding(Rounding::same(7.0)),
-                            )
-                            .clicked()
-                        {
-                            *expand_all_requested = true;
-                        }
-                        if ui
-                            .add_sized(
-                                [button_width, 22.0],
-                                egui::Button::new(
-                                    RichText::new("全部折叠")
-                                        .size(11.0)
-                                        .font(ui_semibold_font(11.0)),
-                                )
-                                .fill(theme_surface_soft(235))
-                                .rounding(Rounding::same(7.0)),
-                            )
-                            .clicked()
-                        {
-                            *collapse_all_requested = true;
-                        }
-                    });
-                    ui.add_space(6.0);
-                    let tree_ui_started = std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL")
-                        .is_some()
-                        .then(Instant::now);
-                    if let Some(clicked) = document_tree(
-                        ui,
-                        &document.tree,
-                        selected_class,
-                        expanded_nodes,
-                        visible_tree_rows,
-                        tree_galley_cache,
-                        window_scale_factor,
-                        trace_text_layout,
-                    ) {
-                        *class_clicked = Some(clicked);
-                    }
-                    if let Some(started) = tree_ui_started {
-                        *tree_ui_duration += started.elapsed();
-                    }
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), tree_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                let button_gap = ui.spacing().item_spacing.x;
+                                let button_width = (ui.available_width() - button_gap) / 2.0;
+                                if ui
+                                    .add_sized(
+                                        [button_width, 22.0],
+                                        egui::Button::new(
+                                            RichText::new("全部展开")
+                                                .size(11.0)
+                                                .font(ui_semibold_font(11.0)),
+                                        )
+                                        .fill(theme_surface_soft(235))
+                                        .rounding(Rounding::same(8.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    *expand_all_requested = true;
+                                }
+                                if ui
+                                    .add_sized(
+                                        [button_width, 22.0],
+                                        egui::Button::new(
+                                            RichText::new("全部折叠")
+                                                .size(11.0)
+                                                .font(ui_semibold_font(11.0)),
+                                        )
+                                        .fill(theme_surface_soft(235))
+                                        .rounding(Rounding::same(8.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    *collapse_all_requested = true;
+                                }
+                            });
+                            ui.add_space(6.0);
+                            let tree_ui_started =
+                                std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL")
+                                    .is_some()
+                                    .then(Instant::now);
+                            if let Some(clicked) = document_tree(
+                                ui,
+                                &document.tree,
+                                selected_class,
+                                expanded_nodes,
+                                visible_tree_rows,
+                                tree_galley_cache,
+                                window_scale_factor,
+                                trace_text_layout,
+                            ) {
+                                *class_clicked = Some(clicked);
+                            }
+                            if let Some(started) = tree_ui_started {
+                                *tree_ui_duration += started.elapsed();
+                            }
+                        },
+                    );
                 }
+                // Actions pinned to the bottom of the sidebar.
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(8.0);
+                let open_file = egui::Button::new(
+                    RichText::new("打开文件")
+                        .size(12.0)
+                        .font(ui_semibold_font(12.0))
+                        .color(Color32::WHITE),
+                )
+                .fill(theme_accent())
+                .stroke(Stroke::new(1.0_f32, theme_accent()))
+                .rounding(Rounding::same(12.0))
+                .min_size(Vec2::new(ui.available_width(), 32.0));
+                if ui
+                    .add_enabled(
+                        !document_loading && pending_document_action.is_none(),
+                        open_file,
+                    )
+                    .clicked()
+                {
+                    *open_requested = true;
+                }
+                ui.add_space(6.0);
+                let open_library = egui::Button::new(
+                    RichText::new("打开库")
+                        .size(12.0)
+                        .font(ui_font(12.0))
+                        .color(theme_text_primary()),
+                )
+                .fill(theme_surface_raised(170))
+                .stroke(Stroke::new(1.0_f32, theme_border(26)))
+                .rounding(Rounding::same(12.0))
+                .min_size(Vec2::new(ui.available_width(), 30.0));
+                if ui
+                    .add_enabled(
+                        !document_loading && pending_document_action.is_none(),
+                        open_library,
+                    )
+                    .clicked()
+                {
+                    *open_directory_requested = true;
+                }
+                ui.add_space(6.0);
+                ui.menu_button(
+                    RichText::new("◐ 外观")
+                        .size(12.0)
+                        .font(ui_font(12.0))
+                        .color(theme_text_secondary()),
+                    |ui| {
+                        ui.set_min_width(180.0);
+                        ui.label(RichText::new("Theme").size(10.0).strong());
+                        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+                            if ui
+                                .selectable_label(*theme_mode == mode, mode.label())
+                                .clicked()
+                            {
+                                *theme_mode = mode;
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        ui.label(RichText::new("Accent").size(10.0).strong());
+                        for accent in [
+                            AccentTheme::Sunset,
+                            AccentTheme::Twilight,
+                            AccentTheme::Aurora,
+                            AccentTheme::Lavender,
+                        ] {
+                            if ui
+                                .selectable_label(*accent_theme == accent, accent.label())
+                                .clicked()
+                            {
+                                *accent_theme = accent;
+                                ui.close_menu();
+                            }
+                        }
+                    },
+                );
             });
     }
 
@@ -11760,12 +11942,27 @@ fn draw_preview_ui(
             Frame::none()
                 // Keep the GPU canvas colors untouched. A translucent panel
                 // here is drawn after wgpu and washes out every icon and
-                // Diagram line; the inner glass card supplies the border.
+                // Diagram line.
                 .fill(Color32::TRANSPARENT)
-                .inner_margin(Margin::same(8.0)),
+                .inner_margin(Margin::same(12.0)),
         )
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            let title_row = ui.horizontal(|ui| {
+                if !library_visible {
+                    let restore = egui::Button::new(
+                        RichText::new("\u{2630}  模型树")
+                            .size(12.0)
+                            .font(ui_font(12.0))
+                            .color(theme_text_primary()),
+                    )
+                    .fill(theme_surface_raised(160))
+                    .stroke(Stroke::new(1.0_f32, theme_border(24)))
+                    .rounding(Rounding::same(10.0));
+                    if ui.add(restore).clicked() {
+                        library_visible = true;
+                    }
+                    ui.add_space(4.0);
+                }
                 let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
                 let class_path = selected_class.unwrap_or(package_name);
                 ui.add(
@@ -11778,123 +11975,176 @@ fn draw_preview_ui(
                     .truncate(),
                 )
                 .on_hover_text(class_path);
+            })
+            .response;
+            // The empty span right of the title drags the window; the floating
+            // window controls sit above it on the foreground layer.
+            window_drag_region(
+                ui,
+                Rect::from_min_max(
+                    Pos2::new(title_row.rect.right() + 8.0, ui.max_rect().top()),
+                    Pos2::new(ui.max_rect().right(), title_row.rect.bottom()),
+                ),
+                "central-titlebar-drag",
+            );
+            ui.add_space(10.0);
+            let content_size = ui.available_size();
+            ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
+                match *main_view {
+                    MainView::Source => source_preview(
+                        ui,
+                        document,
+                        source_highlight_cache,
+                        source_scroll_state,
+                        source_interaction,
+                        source_scroll_rect,
+                        source_wheel_sample,
+                        source_perf_frame,
+                        window_scale_factor,
+                        trace_text_layout,
+                    ),
+                    MainView::Icon => icon_preview(ui, document, icon_clip_rect),
+                    MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
+                }
             });
-            ui.add_space(4.0);
-            glass_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
-                        let selected = *main_view == view;
-                        let button = egui::Button::new(
-                            RichText::new(view.label())
-                                .size(13.0)
-                                .font(if selected {
-                                    ui_semibold_font(13.0)
-                                } else {
-                                    ui_font(13.0)
-                                })
-                                .color(if selected {
-                                    theme_accent()
-                                } else {
-                                    theme_text_secondary()
-                                }),
-                        )
-                        .fill(if selected {
-                            theme_accent_soft(26)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .stroke(Stroke::new(
-                            1.0_f32,
-                            if selected {
-                                theme_accent_soft(70)
-                            } else {
-                                Color32::TRANSPARENT
-                            },
-                        ))
-                        .rounding(Rounding::same(8.0));
-                        if ui.add(button).clicked() {
-                            *main_view = view;
-                            *view_changed = true;
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if canvas_zoom_controls_visible_for(*main_view) {
+        });
+
+    // Arc keeps canvas actions floating over the content instead of in a bar.
+    if canvas_zoom_controls_visible_for(*main_view) {
+        egui::Area::new(egui::Id::new("canvas-zoom-controls"))
+            .order(egui::Order::Foreground)
+            // Bottom-right, clear of the window controls in the top-right.
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-18.0, -40.0))
+            .show(ctx, |ui| {
+                Frame::none()
+                    .fill(theme_surface_raised(205))
+                    .stroke(Stroke::new(1.0_f32, theme_border(24)))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(8.0, 5.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
                             let fit_button = ui.add_sized(
-                                [54.0, 28.0],
+                                [50.0, 26.0],
                                 egui::Button::new(
                                     RichText::new("Fit").size(12.0).font(ui_semibold_font(12.0)),
                                 )
-                                .fill(theme_surface_soft(230))
-                                .stroke(Stroke::new(1.0_f32, theme_border(34)))
-                                .rounding(Rounding::same(4.0)),
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
+                                .rounding(Rounding::same(8.0)),
                             );
                             if fit_button.clicked() {
                                 *fit_requested = true;
                             }
-
                             let zoom_in_button = ui.add_sized(
-                                [28.0, 28.0],
+                                [26.0, 26.0],
                                 egui::Button::new(
                                     RichText::new("+")
                                         .size(16.0)
                                         .font(ui_font(16.0))
                                         .color(theme_text_secondary()),
                                 )
-                                .fill(theme_surface_soft(230))
-                                .stroke(Stroke::new(1.0_f32, theme_border(34)))
-                                .rounding(Rounding::same(4.0)),
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
+                                .rounding(Rounding::same(8.0)),
                             );
                             if zoom_in_button.clicked() {
                                 *zoom_action = Some(ZoomAction::In);
                             }
-
                             ui.label(
                                 RichText::new(format!("{}%", zoom_percent(zoom)))
                                     .size(12.0)
                                     .font(ui_font(12.0))
-                                    .color(theme_text_tertiary()),
+                                    .color(theme_text_secondary()),
                             );
-
                             let zoom_out_button = ui.add_sized(
-                                [28.0, 28.0],
+                                [26.0, 26.0],
                                 egui::Button::new(
-                                    RichText::new("−")
+                                    RichText::new("\u{2212}")
                                         .size(16.0)
                                         .font(ui_font(16.0))
                                         .color(theme_text_secondary()),
                                 )
-                                .fill(theme_surface_soft(230))
-                                .stroke(Stroke::new(1.0_f32, theme_border(34)))
-                                .rounding(Rounding::same(4.0)),
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
+                                .rounding(Rounding::same(8.0)),
                             );
                             if zoom_out_button.clicked() {
                                 *zoom_action = Some(ZoomAction::Out);
                             }
-                        }
+                        });
                     });
-                });
-                ui.separator();
-                let content_size = ui.available_size();
-                ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
-                    match *main_view {
-                        MainView::Source => source_preview(
-                            ui,
-                            document,
-                            source_highlight_cache,
-                            source_scroll_state,
-                            source_interaction,
-                            source_scroll_rect,
-                            source_wheel_sample,
-                            source_perf_frame,
-                            window_scale_factor,
-                            trace_text_layout,
-                        ),
-                        MainView::Icon => icon_preview(ui, document, icon_clip_rect),
-                        MainView::Diagram => diagram_preview(ui, document, icon_clip_rect),
-                    }
-                });
+            });
+    }
+
+    // ── Custom window chrome (the OS title bar is disabled) ────────────────
+    // Minimise / maximise / close, top-right, flat Arc-style glyphs.
+    egui::Area::new(egui::Id::new("window-controls"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::RIGHT_TOP, Vec2::new(-10.0, 10.0))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let control = |ui: &mut egui::Ui, glyph: &str| -> bool {
+                    ui.add_sized(
+                        [26.0, 22.0],
+                        egui::Button::new(
+                            RichText::new(glyph)
+                                .size(12.0)
+                                .font(ui_font(12.0))
+                                .color(theme_text_secondary()),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
+                        .rounding(Rounding::same(6.0)),
+                    )
+                    .clicked()
+                };
+                if control(ui, "─") {
+                    request_window_action(ctx, WindowAction::Minimize);
+                }
+                if control(ui, "□") {
+                    request_window_action(ctx, WindowAction::ToggleMaximize);
+                }
+                if control(ui, "✕") {
+                    request_window_action(ctx, WindowAction::Close);
+                }
             });
         });
+
+    // Edge hit zones let an undecorated window be resized. Each zone is its own
+    // small foreground Area: a single full-screen Area would sit above the
+    // panels and swallow every pointer event, freezing the whole UI.
+    {
+        let screen = ctx.screen_rect();
+        let t = 6.0_f32;
+        let c = 12.0_f32;
+        let zones: [(&str, Align2, Vec2, winit::window::ResizeDirection, egui::CursorIcon); 8] = [
+            ("window-resize-n", Align2::CENTER_TOP, Vec2::new(screen.width(), t), winit::window::ResizeDirection::North, egui::CursorIcon::ResizeNorth),
+            ("window-resize-s", Align2::CENTER_BOTTOM, Vec2::new(screen.width(), t), winit::window::ResizeDirection::South, egui::CursorIcon::ResizeSouth),
+            ("window-resize-w", Align2::LEFT_CENTER, Vec2::new(t, screen.height()), winit::window::ResizeDirection::West, egui::CursorIcon::ResizeWest),
+            ("window-resize-e", Align2::RIGHT_CENTER, Vec2::new(t, screen.height()), winit::window::ResizeDirection::East, egui::CursorIcon::ResizeEast),
+            ("window-resize-nw", Align2::LEFT_TOP, Vec2::splat(c), winit::window::ResizeDirection::NorthWest, egui::CursorIcon::ResizeNorthWest),
+            ("window-resize-ne", Align2::RIGHT_TOP, Vec2::splat(c), winit::window::ResizeDirection::NorthEast, egui::CursorIcon::ResizeNorthEast),
+            ("window-resize-sw", Align2::LEFT_BOTTOM, Vec2::splat(c), winit::window::ResizeDirection::SouthWest, egui::CursorIcon::ResizeSouthWest),
+            ("window-resize-se", Align2::RIGHT_BOTTOM, Vec2::splat(c), winit::window::ResizeDirection::SouthEast, egui::CursorIcon::ResizeSouthEast),
+        ];
+        for (id, align, size, direction, cursor) in zones {
+            egui::Area::new(egui::Id::new(id))
+                .order(egui::Order::Foreground)
+                .anchor(align, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    let (_, response) = ui.allocate_exact_size(size, Sense::drag());
+                    if response.hovered() || response.dragged() {
+                        ui.ctx().set_cursor_icon(cursor);
+                    }
+                    if response.drag_started() {
+                        request_window_action(ui.ctx(), WindowAction::Resize(direction));
+                    }
+                });
+        }
+    }
+
+    // Persist sidebar visibility after the panels have had a chance to toggle it.
+    ctx.data_mut(|data| data.insert_temp(library_visibility_id, library_visible));
 
     if let Some(action) = pending_document_action {
         let screen_rect = ctx.screen_rect();
@@ -11906,7 +12156,10 @@ fn draw_preview_ui(
                 ui.painter()
                     .rect_filled(rect, Rounding::ZERO, theme_rgba(12, 16, 24, 105));
             });
-        egui::Window::new("未保存修改")
+        // The blocker below is `Order::Foreground`; a default (`Middle`) window
+        // would sit underneath it and none of the buttons would be clickable.
+        let dialog = egui::Window::new("未保存修改")
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -11933,15 +12186,60 @@ fn draw_preview_ui(
                     }
                 });
             });
+        if let Some(dialog) = &dialog {
+            // Clicking the full-screen blocker marks it "wants to be on top",
+            // which sorts it above this dialog and makes every button
+            // unclickable. Mark the dialog as well so the stable sort keeps it
+            // on top (later insertion wins within the same flags).
+            ctx.move_to_top(dialog.response.layer_id);
+        }
     }
 }
 
-fn glass_frame() -> Frame {
-    Frame::none()
-        .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0_f32, theme_border(23)))
-        .rounding(Rounding::same(4.0))
-        .inner_margin(Margin::same(6.0))
+/// Full-width, left-aligned sidebar tab (Arc's vertical view switcher).
+fn sidebar_view_tab(ui: &mut egui::Ui, view: MainView, selected: bool) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    let fill = if selected {
+        theme_surface_raised(235)
+    } else if response.hovered() {
+        theme_surface_raised(140)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            Rounding::same(8.0),
+            Stroke::new(1.0_f32, theme_border(30)),
+        );
+        let bar = Rect::from_min_size(
+            Pos2::new(rect.left() + 3.0, rect.top() + 8.0),
+            Vec2::new(3.0, rect.height() - 16.0),
+        );
+        ui.painter()
+            .rect_filled(bar, Rounding::same(2.0), theme_accent());
+    }
+    let color = if selected {
+        theme_accent()
+    } else {
+        theme_text_secondary()
+    };
+    let font = if selected {
+        ui_semibold_font(13.0)
+    } else {
+        ui_font(13.0)
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(view.label().to_owned(), font, color);
+    let position = Pos2::new(
+        rect.left() + 16.0,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(position, galley, color);
+    response
 }
 
 fn tree_row_galley_position(rect: Rect, x: f32, galley_height: f32, pixels_per_point: f32) -> Pos2 {
@@ -12121,18 +12419,18 @@ fn tree_row(
         Sense::click(),
     );
     let fill = if selected {
-        theme_accent_soft(42)
+        theme_surface_raised(235)
     } else if response.hovered() {
-        theme_surface_raised(115)
+        theme_surface_raised(140)
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(4.0), fill);
+    ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
     if selected {
         ui.painter().rect_stroke(
             rect,
-            Rounding::same(4.0),
-            Stroke::new(1.0_f32, theme_accent_soft(125)),
+            Rounding::same(8.0),
+            Stroke::new(1.0_f32, theme_accent_soft(130)),
         );
     }
     let pixels_per_point = ui.ctx().pixels_per_point();
@@ -12850,9 +13148,10 @@ fn source_preview(
 ) {
     *source_scroll_rect = None;
     let frame = Frame::none()
-        .fill(theme_surface())
-        .rounding(Rounding::same(4.0))
-        .inner_margin(Margin::same(8.0));
+        .fill(theme_surface_raised(200))
+        .stroke(Stroke::new(1.0_f32, theme_border(18)))
+        .rounding(Rounding::same(12.0))
+        .inner_margin(Margin::same(12.0));
     frame.show(ui, |ui| {
         if let Some(document) = document {
             ui.allocate_ui_with_layout(
@@ -18200,6 +18499,45 @@ impl RepaintSchedule {
 }
 
 #[allow(deprecated)]
+/// Windows 11 rounds framed windows, but a borderless window keeps square
+/// corners unless asked; DWMWA_WINDOW_CORNER_PREFERENCE restores the Arc-style
+/// squircle on the OS frame.
+#[cfg(target_os = "windows")]
+fn enable_rounded_window_corners(window: &winit::window::Window) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut core::ffi::c_void,
+            attribute: u32,
+            value: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: i32 = 2;
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+            let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+            let preference = DWMWCP_ROUND;
+            // Failure is harmless: the window simply stays square.
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &preference as *const i32 as *const core::ffi::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enable_rounded_window_corners(_window: &winit::window::Window) {}
+
 fn main() {
     let input = env::args_os().nth(1).map(PathBuf::from);
     let document = match input.as_deref() {
@@ -18230,10 +18568,12 @@ fn main() {
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("modelica-wgpu UI preview")
+            .with_decorations(false)
             .with_inner_size(PhysicalSize::new(1360, 860))
             .build(&event_loop)
             .expect("failed to create window"),
     );
+    enable_rounded_window_corners(&window);
     let mut app = pollster::block_on(App::new(window.clone(), document));
     let repaint_proxy = event_loop.create_proxy();
     app.egui_ctx.set_request_repaint_callback(move |request| {
@@ -18963,7 +19303,7 @@ mod tests {
                         ctx,
                         &mut view,
                         &mut ThemeMode::Light,
-                        &mut AccentTheme::Violet,
+                        &mut AccentTheme::Sunset,
                         Some(&class_path),
                         Some(&document),
                         &mut HashSet::new(),
@@ -19030,6 +19370,265 @@ mod tests {
     }
 
     #[test]
+    fn window_action_slot_round_trips() {
+        // The egui-drawn window chrome publishes one action per frame; make sure
+        // the slot carries it verbatim (including resize directions).
+        let context = egui::Context::default();
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new(WINDOW_ACTION_ID), None::<WindowAction>);
+        });
+        assert_eq!(take_window_action(&context), None);
+        request_window_action(&context, WindowAction::Minimize);
+        assert_eq!(take_window_action(&context), Some(WindowAction::Minimize));
+        request_window_action(
+            &context,
+            WindowAction::Resize(winit::window::ResizeDirection::East),
+        );
+        assert_eq!(
+            take_window_action(&context),
+            Some(WindowAction::Resize(winit::window::ResizeDirection::East))
+        );
+    }
+
+    #[test]
+    fn egui_click_simulation_sanity() {
+        use std::cell::Cell;
+        let context = egui::Context::default();
+        context.set_pixels_per_point(1.0);
+        let clicked = Cell::new(false);
+        let pos = Pos2::new(50.0, 15.0);
+        let run = |events: Vec<egui::Event>| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let (_, response) =
+                            ui.allocate_exact_size(Vec2::new(100.0, 30.0), Sense::click());
+                        if response.clicked() {
+                            clicked.set(true);
+                        }
+                    });
+                },
+            );
+        };
+        run(Vec::new());
+        run(vec![egui::Event::PointerMoved(pos)]);
+        run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        assert!(clicked.get(), "synthetic click was not detected");
+    }
+
+    #[test]
+    fn sidebar_view_tab_click_switches_view() {
+        // Regression: a full-screen foreground Area (the old resize-zone layer)
+        // used to sit above the panels and swallow every pointer event, so no
+        // control responded. A click on the sidebar "Source" tab must switch
+        // the view.
+        let size = Vec2::new(1360.0, 860.0);
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        context.set_pixels_per_point(1.0);
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("workspace-library-visible"), true);
+        });
+        let document = source_folding_document("model Demo\n Real x;\nend Demo;", 1);
+        let mut view = MainView::Icon;
+        let mut theme_mode = ThemeMode::Light;
+        let mut accent = AccentTheme::Sunset;
+        let mut source_cache = SourceHighlightCache::default();
+        let mut scroll = SourceScrollState::new();
+        let mut interaction = SourceInteractionState::default();
+        let mut source_rect = None;
+        let mut canvas_rect = None;
+        let mut tree_time = Duration::ZERO;
+        let mut run = |events: Vec<egui::Event>| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    draw_preview_ui(
+                        ctx,
+                        &mut view,
+                        &mut theme_mode,
+                        &mut accent,
+                        Some("Demo"),
+                        Some(&document),
+                        &mut HashSet::new(),
+                        &mut VisibleTreeRowsCache::default(),
+                        &mut TreeGalleyCache::default(),
+                        &mut false,
+                        &mut false,
+                        &mut None,
+                        INITIAL_ZOOM,
+                        &mut None,
+                        &mut false,
+                        &mut false,
+                        &mut canvas_rect,
+                        &mut false,
+                        &mut false,
+                        None,
+                        Some("就绪"),
+                        false,
+                        &mut source_cache,
+                        &mut scroll,
+                        &mut interaction,
+                        &mut source_rect,
+                        None,
+                        &mut None,
+                        &mut tree_time,
+                        None,
+                        &mut None,
+                        1.0,
+                        false,
+                    );
+                },
+            );
+        };
+        // The Source tab sits near the top of the sidebar; settle one frame so
+        // egui knows the widget rects before pressing.
+        let pos = Pos2::new(150.0, 72.0);
+        run(Vec::new());
+        run(vec![egui::Event::PointerMoved(pos)]);
+        run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        assert_eq!(view, MainView::Source);
+    }
+
+    #[test]
+    fn leave_prompt_buttons_receive_clicks() {
+        // Regression: the frosted "unsaved changes" blocker is on
+        // `Order::Foreground`, so the dialog must also be foreground or it ends
+        // up underneath and its buttons never respond.
+        let size = Vec2::new(1360.0, 860.0);
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        context.set_pixels_per_point(1.0);
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("workspace-library-visible"), true);
+        });
+        let document = source_folding_document("model Demo\n Real x;\nend Demo;", 1);
+        let mut view = MainView::Icon;
+        let mut theme_mode = ThemeMode::Light;
+        let mut accent = AccentTheme::Sunset;
+        let mut source_cache = SourceHighlightCache::default();
+        let mut scroll = SourceScrollState::new();
+        let mut interaction = SourceInteractionState::default();
+        let mut source_rect = None;
+        let mut canvas_rect = None;
+        let mut tree_time = Duration::ZERO;
+        let pending = PendingDocumentAction::Close;
+        let mut run = |events: Vec<egui::Event>, decision: &mut Option<LeaveDecision>| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    draw_preview_ui(
+                        ctx,
+                        &mut view,
+                        &mut theme_mode,
+                        &mut accent,
+                        Some("Demo"),
+                        Some(&document),
+                        &mut HashSet::new(),
+                        &mut VisibleTreeRowsCache::default(),
+                        &mut TreeGalleyCache::default(),
+                        &mut false,
+                        &mut false,
+                        &mut None,
+                        INITIAL_ZOOM,
+                        &mut None,
+                        &mut false,
+                        &mut false,
+                        &mut canvas_rect,
+                        &mut false,
+                        &mut false,
+                        None,
+                        Some("就绪"),
+                        false,
+                        &mut source_cache,
+                        &mut scroll,
+                        &mut interaction,
+                        &mut source_rect,
+                        None,
+                        &mut None,
+                        &mut tree_time,
+                        Some(&pending),
+                        decision,
+                        1.0,
+                        false,
+                    );
+                },
+            );
+        };
+        let mut decision = None;
+        run(Vec::new(), &mut decision);
+        // Sweep the dialog area (it is centred and min 360pt wide) for a
+        // button that responds. If the dialog were under the blocker, no point
+        // would produce a decision.
+        let mut hit = None;
+        'sweep: for y in (430..=510).step_by(10) {
+            for x in (450..=850).step_by(15) {
+                let pos = Pos2::new(x as f32, y as f32);
+                decision = None;
+                run(vec![egui::Event::PointerMoved(pos)], &mut decision);
+                run(
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    }],
+                    &mut decision,
+                );
+                run(
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    }],
+                    &mut decision,
+                );
+                if decision.is_some() {
+                    hit = Some(pos);
+                    break 'sweep;
+                }
+            }
+        }
+        assert!(hit.is_some(), "no leave-prompt button responded to a click");
+    }
+
+    #[test]
     fn hiding_library_gives_space_back_to_each_workspace_view() {
         for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
             let size = Vec2::new(1360.0, 860.0);
@@ -19040,7 +19639,102 @@ mod tests {
         }
     }
 
-    fn source_folding_state(source: &str, version: u64) -> SourceFoldState {
+    /// Regression: a row whose content exceeded the panel's available width
+    /// used to inflate the resizable `SidePanel` a couple of pixels per frame
+    /// until it hit `max_width` (the reported "模型树自动往右滑动"). The
+    /// existing layout tests could not catch it because `used_rect()` is
+    /// clamped to the screen. Assert the panel width settles instead.
+    #[test]
+    fn library_panel_width_stays_stable_across_frames() {
+        let size = Vec2::new(1360.0, 860.0);
+        let dpi = 1.0;
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        context.set_pixels_per_point(dpi);
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("workspace-library-visible"), true);
+        });
+        let mut document = source_folding_document("model Demo\n Real x;\nend Demo;", 1);
+        document.tree.children = vec![TreeNode {
+            name: "Sub".to_owned(),
+            qualified_name: "Demo.Sub".to_owned(),
+            class_name: Some("Sub".to_owned()),
+            kind: Some(ClassKind::Model),
+            description: None,
+            children: Vec::new(),
+        }];
+        let mut expanded: HashSet<String> = HashSet::new();
+        expanded.insert("Demo".to_owned());
+        let mut rows_cache = VisibleTreeRowsCache::default();
+        let mut galley_cache = TreeGalleyCache::default();
+        let mut view = MainView::Icon;
+        let mut source_cache = SourceHighlightCache::default();
+        let mut scroll = SourceScrollState::new();
+        let mut interaction = SourceInteractionState::default();
+        let mut source_rect = None;
+        let mut canvas_rect = None;
+        let mut tree_time = Duration::ZERO;
+        let mut widths = Vec::new();
+        for _ in 0..40 {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    draw_preview_ui(
+                        ctx,
+                        &mut view,
+                        &mut ThemeMode::Light,
+                        &mut AccentTheme::Sunset,
+                        Some("Demo"),
+                        Some(&document),
+                        &mut expanded,
+                        &mut rows_cache,
+                        &mut galley_cache,
+                        &mut false,
+                        &mut false,
+                        &mut None,
+                        INITIAL_ZOOM,
+                        &mut None,
+                        &mut false,
+                        &mut false,
+                        &mut canvas_rect,
+                        &mut false,
+                        &mut false,
+                        None,
+                        Some("就绪"),
+                        false,
+                        &mut source_cache,
+                        &mut scroll,
+                        &mut interaction,
+                        &mut source_rect,
+                        None,
+                        &mut None,
+                        &mut tree_time,
+                        None,
+                        &mut None,
+                        dpi,
+                        false,
+                    );
+                },
+            );
+            if let Some(rect) = canvas_rect {
+                widths.push(rect.left());
+            }
+        }
+        assert!(widths.len() >= 30, "canvas rect missing: {}", widths.len());
+        // Skip the first frames while egui settles its panel geometry.
+        let settled = widths[2];
+        for (index, width) in widths.iter().enumerate().skip(2) {
+            assert!(
+                (width - settled).abs() < 0.5,
+                "library panel width drifted at frame {index}: {settled} -> {width}"
+            );
+        }
+    }
+
+fn source_folding_state(source: &str, version: u64) -> SourceFoldState {
         let document = source_folding_document(source, version);
         let mut state = SourceFoldState::default();
         state.sync_document(&document);
