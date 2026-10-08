@@ -11769,15 +11769,36 @@ fn draw_preview_ui(
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "模型库 · {}",
-                        document.map_or(0, |doc| doc.class_names.len())
-                    ))
-                    .size(12.0)
-                    .font(ui_semibold_font(12.0))
-                    .color(theme_accent()),
-                );
+                // Tree header: section title on the left, bulk expand/collapse
+                // actions right-aligned. The actions are laid out first so the
+                // title only truncates into the width that is actually free.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if document.is_some() {
+                            if tree_bulk_action_button(ui, false) {
+                                *collapse_all_requested = true;
+                            }
+                            if tree_bulk_action_button(ui, true) {
+                                *expand_all_requested = true;
+                            }
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "模型库 · {}",
+                                        document.map_or(0, |doc| doc.class_names.len())
+                                    ))
+                                    .size(12.0)
+                                    .font(ui_semibold_font(12.0))
+                                    .color(theme_accent()),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add(
@@ -11802,15 +11823,6 @@ fn draw_preview_ui(
                         Vec2::new(ui.available_width(), tree_height),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            ui.horizontal(|ui| {
-                                if tree_bulk_action_button(ui, true) {
-                                    *expand_all_requested = true;
-                                }
-                                if tree_bulk_action_button(ui, false) {
-                                    *collapse_all_requested = true;
-                                }
-                            });
-                            ui.add_space(6.0);
                             let tree_ui_started =
                                 std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL")
                                     .is_some()
@@ -12283,7 +12295,7 @@ const TREE_ROW_HEIGHT: f32 = 29.0;
 const TREE_GALLEY_CACHE_CAPACITY: usize = 4096;
 
 fn tree_bulk_action_button(ui: &mut egui::Ui, expand_all: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(32.0, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
     let hovered = response.hovered();
     let fill = if hovered {
         theme_surface_raised(220)
