@@ -248,8 +248,7 @@ fn appearance_settings_path() -> Option<std::path::PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| std::path::Path::new(&home).join(".config"))
+                std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".config"))
             })?
     };
     Some(base.join("modelica-viewer").join("settings.json"))
@@ -3984,18 +3983,14 @@ fn trace_font_fallback_role(
 
 // Bundled so the Arc/Inter look travels with the app on machines that do not
 // have Inter installed (OFL-1.1, see assets/fonts/LICENSE.txt).
-const BUNDLED_INTER_MEDIUM: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/fonts/Inter-Medium.ttf"
-);
+const BUNDLED_INTER_MEDIUM: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Inter-Medium.ttf");
 const BUNDLED_INTER_SEMIBOLD: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/fonts/Inter-SemiBold.ttf"
 );
-const BUNDLED_INTER_ITALIC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/assets/fonts/Inter-Italic.ttf"
-);
+const BUNDLED_INTER_ITALIC: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Inter-Italic.ttf");
 const BUNDLED_INTER_SEMIBOLD_ITALIC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/assets/fonts/Inter-SemiBoldItalic.ttf"
@@ -11274,7 +11269,12 @@ fn theme_surface_soft(alpha: u8) -> Color32 {
     if is_dark_theme() {
         theme_rgba(ARC_WARM_DARK[0], ARC_WARM_DARK[1], ARC_WARM_DARK[2], alpha)
     } else {
-        theme_rgba(ARC_WARM_LIGHT[0], ARC_WARM_LIGHT[1], ARC_WARM_LIGHT[2], alpha)
+        theme_rgba(
+            ARC_WARM_LIGHT[0],
+            ARC_WARM_LIGHT[1],
+            ARC_WARM_LIGHT[2],
+            alpha,
+        )
     }
 }
 
@@ -11320,7 +11320,11 @@ fn theme_text_tertiary() -> Color32 {
 }
 
 fn theme_text_tertiary_for(dark: bool) -> Color32 {
-    let c = if dark { ARC_MUTED_DARK } else { ARC_MUTED_LIGHT };
+    let c = if dark {
+        ARC_MUTED_DARK
+    } else {
+        ARC_MUTED_LIGHT
+    };
     theme_rgb(c[0], c[1], c[2])
 }
 
@@ -11921,36 +11925,37 @@ fn draw_preview_ui(
                 .inner_margin(Margin::same(12.0)),
         )
         .show(ctx, |ui| {
-            let title_row = ui.horizontal(|ui| {
-                if !library_visible {
-                    let restore = egui::Button::new(
-                        RichText::new("\u{2630}  模型树")
-                            .size(12.0)
-                            .font(ui_font(12.0))
-                            .color(theme_text_primary()),
-                    )
-                    .fill(theme_surface_raised(160))
-                    .stroke(Stroke::new(1.0_f32, theme_border(24)))
-                    .rounding(Rounding::same(10.0));
-                    if ui.add(restore).clicked() {
-                        library_visible = true;
+            let title_row = ui
+                .horizontal(|ui| {
+                    if !library_visible {
+                        let restore = egui::Button::new(
+                            RichText::new("\u{2630}  模型树")
+                                .size(12.0)
+                                .font(ui_font(12.0))
+                                .color(theme_text_primary()),
+                        )
+                        .fill(theme_surface_raised(160))
+                        .stroke(Stroke::new(1.0_f32, theme_border(24)))
+                        .rounding(Rounding::same(10.0));
+                        if ui.add(restore).clicked() {
+                            library_visible = true;
+                        }
+                        ui.add_space(4.0);
                     }
-                    ui.add_space(4.0);
-                }
-                let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
-                let class_path = selected_class.unwrap_or(package_name);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(class_path)
-                            .size(13.0)
-                            .font(ui_semibold_font(13.0))
-                            .color(theme_text_primary()),
+                    let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
+                    let class_path = selected_class.unwrap_or(package_name);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(class_path)
+                                .size(13.0)
+                                .font(ui_semibold_font(13.0))
+                                .color(theme_text_primary()),
+                        )
+                        .truncate(),
                     )
-                    .truncate(),
-                )
-                .on_hover_text(class_path);
-            })
-            .response;
+                    .on_hover_text(class_path);
+                })
+                .response;
             // The empty span right of the title drags the window; the floating
             // window controls sit above it on the foreground layer.
             window_drag_region(
@@ -12091,15 +12096,69 @@ fn draw_preview_ui(
         let screen = ctx.screen_rect();
         let t = 6.0_f32;
         let c = 12.0_f32;
-        let zones: [(&str, Align2, Vec2, winit::window::ResizeDirection, egui::CursorIcon); 8] = [
-            ("window-resize-n", Align2::CENTER_TOP, Vec2::new(screen.width(), t), winit::window::ResizeDirection::North, egui::CursorIcon::ResizeNorth),
-            ("window-resize-s", Align2::CENTER_BOTTOM, Vec2::new(screen.width(), t), winit::window::ResizeDirection::South, egui::CursorIcon::ResizeSouth),
-            ("window-resize-w", Align2::LEFT_CENTER, Vec2::new(t, screen.height()), winit::window::ResizeDirection::West, egui::CursorIcon::ResizeWest),
-            ("window-resize-e", Align2::RIGHT_CENTER, Vec2::new(t, screen.height()), winit::window::ResizeDirection::East, egui::CursorIcon::ResizeEast),
-            ("window-resize-nw", Align2::LEFT_TOP, Vec2::splat(c), winit::window::ResizeDirection::NorthWest, egui::CursorIcon::ResizeNorthWest),
-            ("window-resize-ne", Align2::RIGHT_TOP, Vec2::splat(c), winit::window::ResizeDirection::NorthEast, egui::CursorIcon::ResizeNorthEast),
-            ("window-resize-sw", Align2::LEFT_BOTTOM, Vec2::splat(c), winit::window::ResizeDirection::SouthWest, egui::CursorIcon::ResizeSouthWest),
-            ("window-resize-se", Align2::RIGHT_BOTTOM, Vec2::splat(c), winit::window::ResizeDirection::SouthEast, egui::CursorIcon::ResizeSouthEast),
+        let zones: [(
+            &str,
+            Align2,
+            Vec2,
+            winit::window::ResizeDirection,
+            egui::CursorIcon,
+        ); 8] = [
+            (
+                "window-resize-n",
+                Align2::CENTER_TOP,
+                Vec2::new(screen.width(), t),
+                winit::window::ResizeDirection::North,
+                egui::CursorIcon::ResizeNorth,
+            ),
+            (
+                "window-resize-s",
+                Align2::CENTER_BOTTOM,
+                Vec2::new(screen.width(), t),
+                winit::window::ResizeDirection::South,
+                egui::CursorIcon::ResizeSouth,
+            ),
+            (
+                "window-resize-w",
+                Align2::LEFT_CENTER,
+                Vec2::new(t, screen.height()),
+                winit::window::ResizeDirection::West,
+                egui::CursorIcon::ResizeWest,
+            ),
+            (
+                "window-resize-e",
+                Align2::RIGHT_CENTER,
+                Vec2::new(t, screen.height()),
+                winit::window::ResizeDirection::East,
+                egui::CursorIcon::ResizeEast,
+            ),
+            (
+                "window-resize-nw",
+                Align2::LEFT_TOP,
+                Vec2::splat(c),
+                winit::window::ResizeDirection::NorthWest,
+                egui::CursorIcon::ResizeNorthWest,
+            ),
+            (
+                "window-resize-ne",
+                Align2::RIGHT_TOP,
+                Vec2::splat(c),
+                winit::window::ResizeDirection::NorthEast,
+                egui::CursorIcon::ResizeNorthEast,
+            ),
+            (
+                "window-resize-sw",
+                Align2::LEFT_BOTTOM,
+                Vec2::splat(c),
+                winit::window::ResizeDirection::SouthWest,
+                egui::CursorIcon::ResizeSouthWest,
+            ),
+            (
+                "window-resize-se",
+                Align2::RIGHT_BOTTOM,
+                Vec2::splat(c),
+                winit::window::ResizeDirection::SouthEast,
+                egui::CursorIcon::ResizeSouthEast,
+            ),
         ];
         for (id, align, size, direction, cursor) in zones {
             egui::Area::new(egui::Id::new(id))
@@ -12208,10 +12267,7 @@ fn sidebar_view_tab(ui: &mut egui::Ui, view: MainView, selected: bool) -> egui::
     let galley = ui
         .painter()
         .layout_no_wrap(view.label().to_owned(), font, color);
-    let position = Pos2::new(
-        rect.left() + 16.0,
-        rect.center().y - galley.size().y * 0.5,
-    );
+    let position = Pos2::new(rect.left() + 16.0, rect.center().y - galley.size().y * 0.5);
     ui.painter().galley(position, galley, color);
     response
 }
@@ -19717,7 +19773,7 @@ mod tests {
         }
     }
 
-fn source_folding_state(source: &str, version: u64) -> SourceFoldState {
+    fn source_folding_state(source: &str, version: u64) -> SourceFoldState {
         let document = source_folding_document(source, version);
         let mut state = SourceFoldState::default();
         state.sync_document(&document);
