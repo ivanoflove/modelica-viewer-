@@ -11799,36 +11799,10 @@ fn draw_preview_ui(
                         Layout::top_down(Align::Min),
                         |ui| {
                             ui.horizontal(|ui| {
-                                let button_gap = ui.spacing().item_spacing.x;
-                                let button_width = (ui.available_width() - button_gap) / 2.0;
-                                if ui
-                                    .add_sized(
-                                        [button_width, 22.0],
-                                        egui::Button::new(
-                                            RichText::new("全部展开")
-                                                .size(11.0)
-                                                .font(ui_semibold_font(11.0)),
-                                        )
-                                        .fill(theme_surface_soft(235))
-                                        .rounding(Rounding::same(8.0)),
-                                    )
-                                    .clicked()
-                                {
+                                if tree_bulk_action_button(ui, true) {
                                     *expand_all_requested = true;
                                 }
-                                if ui
-                                    .add_sized(
-                                        [button_width, 22.0],
-                                        egui::Button::new(
-                                            RichText::new("全部折叠")
-                                                .size(11.0)
-                                                .font(ui_semibold_font(11.0)),
-                                        )
-                                        .fill(theme_surface_soft(235))
-                                        .rounding(Rounding::same(8.0)),
-                                    )
-                                    .clicked()
-                                {
+                                if tree_bulk_action_button(ui, false) {
                                     *collapse_all_requested = true;
                                 }
                             });
@@ -12252,12 +12226,56 @@ fn tree_row_galley_position(rect: Rect, x: f32, galley_height: f32, pixels_per_p
 const TREE_ROW_HEIGHT: f32 = 29.0;
 const TREE_GALLEY_CACHE_CAPACITY: usize = 4096;
 
+fn tree_bulk_action_button(ui: &mut egui::Ui, expand_all: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(32.0, 28.0), Sense::click());
+    let hovered = response.hovered();
+    let fill = if hovered {
+        theme_surface_raised(220)
+    } else {
+        theme_surface_soft(235)
+    };
+    let border = theme_border(if hovered { 40 } else { 26 });
+    let icon_color = if hovered {
+        theme_accent_strong()
+    } else {
+        theme_text_secondary()
+    };
+    ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0_f32, border));
+
+    let center = rect.center();
+    let icon_rect = Rect::from_center_size(center, Vec2::splat(13.0));
+    ui.painter().rect_stroke(
+        icon_rect,
+        Rounding::same(2.5),
+        Stroke::new(1.3_f32, icon_color),
+    );
+    ui.painter().line_segment(
+        [center + Vec2::new(-3.5, 0.0), center + Vec2::new(3.5, 0.0)],
+        Stroke::new(1.3_f32, icon_color),
+    );
+    if expand_all {
+        ui.painter().line_segment(
+            [center + Vec2::new(0.0, -3.5), center + Vec2::new(0.0, 3.5)],
+            Stroke::new(1.3_f32, icon_color),
+        );
+    }
+
+    response
+        .on_hover_text(if expand_all {
+            "全部展开"
+        } else {
+            "全部折叠"
+        })
+        .clicked()
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TreeTextRole {
     Marker,
     Label,
     SelectedLabel,
-    Kind,
 }
 
 impl TreeTextRole {
@@ -12266,7 +12284,6 @@ impl TreeTextRole {
             Self::Marker => ui_font(12.0),
             Self::Label => ui_font(13.0),
             Self::SelectedLabel => ui_semibold_font(13.0),
-            Self::Kind => ui_mono_font(9.0),
         }
     }
 }
@@ -12398,7 +12415,6 @@ fn tree_row(
     icon: &str,
     label: &str,
     identity: &str,
-    kind: &str,
     selected: bool,
     indent: f32,
     text_cache: &mut TreeGalleyCache,
@@ -12465,21 +12481,7 @@ fn tree_row(
     } else {
         theme_text_primary()
     };
-    let kind_color = if selected {
-        theme_accent_strong()
-    } else {
-        theme_text_tertiary()
-    };
-    let kind_galley = text_cache.galley(
-        ui.painter(),
-        kind.to_owned(),
-        TreeTextRole::Kind,
-        kind_color,
-        0.0,
-        pixels_per_point,
-    );
-    let label_max_width =
-        (rect.right() - 8.0 - kind_galley.size().x - 8.0 - text_position.x).max(24.0);
+    let label_max_width = (rect.right() - 8.0 - text_position.x).max(24.0);
     let label_galley = text_cache.label_galley(
         ui.painter(),
         icon,
@@ -12508,14 +12510,8 @@ fn tree_row(
             window_scale_factor,
         );
     }
-    let label_width = label_galley.size().x;
     ui.painter()
         .galley(label_position, label_galley, label_color);
-    let kind_x =
-        (rect.right() - 8.0 - kind_galley.size().x).max(label_position.x + label_width + 6.0);
-    let kind_position =
-        tree_row_galley_position(rect, kind_x, kind_galley.size().y, pixels_per_point);
-    ui.painter().galley(kind_position, kind_galley, kind_color);
     (response, marker_response)
 }
 
@@ -12574,21 +12570,6 @@ fn ellipsize_tree_label(
     )
 }
 
-fn tree_node_kind_label(kind: Option<ClassKind>) -> &'static str {
-    match kind {
-        Some(ClassKind::Package) => "package",
-        Some(ClassKind::Model) => "model",
-        Some(ClassKind::Block) => "block",
-        Some(ClassKind::Connector | ClassKind::ExpandableConnector) => "connector",
-        Some(ClassKind::Record | ClassKind::OperatorRecord) => "record",
-        Some(ClassKind::Function | ClassKind::OperatorFunction) => "function",
-        Some(ClassKind::Type) => "type",
-        Some(ClassKind::Class) => "class",
-        Some(ClassKind::Operator) => "operator",
-        None => "",
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn document_tree(
     ui: &mut egui::Ui,
@@ -12628,7 +12609,6 @@ fn document_tree(
                     tree_node_icon(row.kind),
                     &row.name,
                     &row.qualified_name,
-                    tree_node_kind_label(row.kind),
                     selected,
                     depth as f32,
                     text_cache,
@@ -19011,18 +18991,21 @@ mod tests {
     }
 
     #[test]
-    fn tree_rows_expose_kind_without_description_text() {
-        assert_eq!(tree_node_kind_label(Some(ClassKind::Block)), "block");
-        assert_eq!(
-            tree_node_kind_label(Some(ClassKind::Connector)),
-            "connector"
-        );
-        assert_eq!(tree_node_kind_label(Some(ClassKind::Package)), "package");
-        assert_eq!(tree_node_kind_label(None), "");
+    fn tree_row_keeps_kind_metadata_without_showing_kind_text() {
+        let node = TreeNode {
+            name: "Demo".to_owned(),
+            qualified_name: "Demo".to_owned(),
+            kind: Some(ClassKind::Package),
+            ..TreeNode::default()
+        };
+        let mut rows = Vec::new();
+        collect_visible_tree_rows(&node, 0, &HashSet::new(), &mut rows);
 
-        let visible_text = tree_row_label("□", "Heater");
-        assert_eq!(visible_text, "□  Heater");
-        assert!(!visible_text.contains("等温"));
+        assert_eq!(rows[0].kind, Some(ClassKind::Package));
+        let visible_text = tree_row_label(tree_node_icon(rows[0].kind), &rows[0].name);
+        assert_eq!(visible_text, "▱  Demo");
+        assert!(!visible_text.contains("package"));
+        assert!(!visible_text.contains("model"));
     }
 
     #[test]
