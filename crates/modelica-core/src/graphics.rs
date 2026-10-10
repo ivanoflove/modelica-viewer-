@@ -45,6 +45,7 @@ pub fn resolve_icon_call(icon: &AnnotationCall) -> IconScene {
                 qualified_name: "<unresolved>".into(),
                 kind: GraphicOwnerKind::Own,
                 instance_name: None,
+                dimensions: Vec::new(),
             },
             transform: Transform2D::identity(),
             editable: true,
