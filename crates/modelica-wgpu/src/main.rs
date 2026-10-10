@@ -20925,6 +20925,389 @@ mod tests {
     use super::*;
     use modelica_core::scene::{ConnectorRef, DiagramConnection, GraphicOwnerKind};
 
+    fn workspace_test_directory(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let crate_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_directory
+            .parent()
+            .and_then(FsPath::parent)
+            .expect("workspace root");
+        let path = workspace_root.join("target").join(format!(
+            "modelica-wgpu-workspace-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create workspace test directory");
+        path
+    }
+
+    fn workspace_model(path: &FsPath, source: &str) -> LoadedDocument {
+        fs::write(path, source).expect("write workspace model");
+        LoadedDocument::load(path).expect("load workspace model")
+    }
+
+    #[test]
+    fn workspace_keeps_independent_models_dirty_state_history_and_saves_isolated() {
+        let directory = workspace_test_directory("independent-models");
+        let path_a = directory.join("IEH_CPP.mo");
+        let path_b = directory.join("Model1.mo");
+        let source_a = "model IEH_CPP\n  Real value;\nend IEH_CPP;\n";
+        let source_b = "model Model1\n  Real value;\nend Model1;\n";
+        let mut workspace = Workspace::default();
+        let id_a = workspace
+            .add_document(workspace_model(&path_a, source_a))
+            .expect("add existing document");
+        let updated_a = "model IEH_CPP\n  Real value = 1;\nend IEH_CPP;\n";
+        workspace
+            .active_document_mut()
+            .expect("active A")
+            .set_class_text("IEH_CPP", updated_a.to_owned());
+        let history_a = vec![sample_create_command()];
+        workspace.store_active_session(
+            Some("IEH_CPP".to_owned()),
+            &history_a,
+            &[],
+            MainView::Diagram,
+        );
+
+        let id_b = workspace
+            .add_document(workspace_model(&path_b, source_b))
+            .expect("add independent file while A is dirty");
+        assert_ne!(id_a, id_b);
+        assert_eq!(workspace.documents.len(), 2);
+        assert!(path_a.is_file());
+        assert!(path_b.is_file());
+        assert!(workspace
+            .document(&id_a)
+            .unwrap()
+            .document
+            .has_unsaved_changes());
+        assert!(!workspace
+            .document(&id_b)
+            .unwrap()
+            .document
+            .has_unsaved_changes());
+
+        let tree = workspace.tree();
+        assert_eq!(tree.name, "WORKSPACE");
+        assert_eq!(tree.children.len(), 1);
+        let files = &tree.children[0].children;
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|node| node.name == "IEH_CPP  •"));
+        assert!(files.iter().any(|node| node.name == "Model1"));
+
+        workspace.store_active_session(None, &[], &[], MainView::Source);
+        assert!(workspace.activate(&id_a));
+        let (selected, history, _, view) = workspace.session(&id_a).expect("A session");
+        assert_eq!(selected.as_deref(), Some("IEH_CPP"));
+        assert_eq!(history.len(), 1);
+        assert_eq!(view, MainView::Diagram);
+        assert_eq!(
+            workspace
+                .active_document()
+                .unwrap()
+                .class_source("IEH_CPP")
+                .unwrap()
+                .1,
+            updated_a
+        );
+
+        assert!(workspace.activate(&id_b));
+        let updated_b = "model Model1\n  Real value = 2;\nend Model1;";
+        workspace
+            .active_document_mut()
+            .unwrap()
+            .set_class_text("Model1", updated_b.to_owned());
+        assert_eq!(
+            save_edited_classes(workspace.active_document_mut().unwrap()).unwrap(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(&path_b).unwrap(),
+            format!("{updated_b}\n")
+        );
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), source_a);
+        assert!(workspace
+            .document(&id_a)
+            .unwrap()
+            .document
+            .has_unsaved_changes());
+
+        workspace.remove_document(&id_b).expect("close only B");
+        assert_eq!(workspace.documents.len(), 1);
+        assert_eq!(workspace.active_id(), Some(id_a.as_str()));
+        assert!(workspace
+            .document(&id_a)
+            .unwrap()
+            .document
+            .has_unsaved_changes());
+
+        let (reopened_workspace, errors) = load_workspace_paths([path_a.clone(), path_b.clone()]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(reopened_workspace.documents.len(), 2);
+        assert_eq!(reopened_workspace.active_document().unwrap().path, path_b);
+        assert_eq!(
+            reopened_workspace
+                .documents
+                .iter()
+                .find(|entry| entry.document.path == path_b)
+                .unwrap()
+                .document
+                .class_source("Model1")
+                .unwrap()
+                .1,
+            updated_b
+        );
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn creating_standalone_class_adds_document_without_replacing_dirty_workspace_entry() {
+        let directory = workspace_test_directory("create-beside-open-file");
+        let existing_path = directory.join("IEH_CPP.mo");
+        let existing_source = "model IEH_CPP\n  Real value;\nend IEH_CPP;\n";
+        let mut workspace = Workspace::default();
+        let existing_id = workspace
+            .add_document(workspace_model(&existing_path, existing_source))
+            .expect("load current model");
+        workspace.active_document_mut().unwrap().set_class_text(
+            "IEH_CPP",
+            "model IEH_CPP\n  Real value = 7;\nend IEH_CPP;\n".to_owned(),
+        );
+        let new_request = NewClassRequest {
+            name: "Model1".to_owned(),
+            kind: ClassKind::Model,
+            description: None,
+            partial: false,
+            base_class: None,
+            storage: NewClassStorageMode::SingleFile {
+                directory: directory.clone(),
+                within: None,
+                package_order_file: None,
+                package_order_before: None,
+            },
+        };
+        let plan = plan_new_class(&new_request, &NewClassContext::default()).expect("plan");
+        let new_path = apply_new_class_plan(&plan).expect("create independent class file");
+        let new_id = workspace
+            .add_document(LoadedDocument::load(&new_path).expect("load new model"))
+            .expect("add new document without closing current one");
+
+        assert_ne!(existing_id, new_id);
+        assert_eq!(workspace.documents.len(), 2);
+        assert_eq!(fs::read_to_string(&existing_path).unwrap(), existing_source);
+        assert!(workspace
+            .document(&existing_id)
+            .unwrap()
+            .document
+            .has_unsaved_changes());
+        assert!(workspace
+            .document(&new_id)
+            .unwrap()
+            .document
+            .class_names
+            .contains(&"Model1".to_owned()));
+        assert!(workspace
+            .tree()
+            .children
+            .iter()
+            .flat_map(|folder| &folder.children)
+            .any(|node| node.name == "Model1"));
+        assert!(workspace
+            .documents
+            .iter()
+            .all(|entry| entry.document.path.is_file()));
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn workspace_rejects_duplicate_top_level_names_but_allows_package_scopes() {
+        let directory = workspace_test_directory("name-conflicts");
+        let mut workspace = Workspace::default();
+        let first = workspace_model(&directory.join("First.mo"), "model Shared\nend Shared;\n");
+        workspace
+            .add_document(first)
+            .expect("add first declaration");
+        let duplicate = workspace_model(
+            &directory.join("Second.mo"),
+            "model Shared\n  Real other;\nend Shared;\n",
+        );
+        let error = workspace
+            .add_document(duplicate)
+            .expect_err("same top-level FQN must be rejected");
+        assert!(error.contains("Shared"));
+        assert_eq!(workspace.documents.len(), 1);
+
+        let package_p = workspace_model(
+            &directory.join("P.mo"),
+            "within P;\nmodel Shared\nend Shared;\n",
+        );
+        let package_q = workspace_model(
+            &directory.join("Q.mo"),
+            "within Q;\nmodel Shared\nend Shared;\n",
+        );
+        workspace.add_document(package_p).expect("add P.Shared");
+        workspace.add_document(package_q).expect("add Q.Shared");
+        assert_eq!(workspace.documents.len(), 3);
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn new_class_context_resolves_classes_from_non_active_workspace_documents() {
+        let directory = workspace_test_directory("new-class-workspace-context");
+        let mut workspace = Workspace::default();
+        workspace
+            .add_document(workspace_model(
+                &directory.join("Base.mo"),
+                "model Base\nend Base;\n",
+            ))
+            .expect("add base class document");
+        workspace
+            .add_document(workspace_model(
+                &directory.join("Other.mo"),
+                "model Other\nend Other;\n",
+            ))
+            .expect("activate another document");
+        let mut context = NewClassContext::default();
+
+        add_workspace_classes_to_new_class_context(&mut context, &workspace);
+
+        assert_eq!(context.class_kinds.get("Base"), Some(&ClassKind::Model));
+        assert!(context.scope_class_names.contains("Base"));
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn workspace_loads_directory_package_and_independent_file_together() {
+        let directory = workspace_test_directory("package-and-file");
+        let package_directory = directory.join("IEH_CPP");
+        fs::create_dir_all(&package_directory).expect("create directory package");
+        fs::write(
+            package_directory.join("package.mo"),
+            "package IEH_CPP\nend IEH_CPP;\n",
+        )
+        .expect("write package source");
+        fs::write(
+            package_directory.join("Heater.mo"),
+            "within IEH_CPP;\nmodel Heater\nend Heater;\n",
+        )
+        .expect("write package member");
+        let independent_path = directory.join("Model1.mo");
+        let independent_source = "model Model1\nend Model1;\n";
+        fs::write(&independent_path, independent_source).expect("write independent model");
+
+        let mut workspace = Workspace::default();
+        let package = LoadedDocument::load(&package_directory).expect("load directory package");
+        let standalone = LoadedDocument::load(&independent_path).expect("load independent model");
+        workspace
+            .add_document(package)
+            .expect("add directory package");
+        workspace
+            .add_document(standalone)
+            .expect("add independent model");
+        assert_eq!(workspace.documents.len(), 2);
+        assert!(workspace.documents.iter().any(|entry| {
+            entry
+                .document
+                .class_names
+                .iter()
+                .any(|name| name == "IEH_CPP.Heater")
+        }));
+        assert!(workspace.documents.iter().any(|entry| {
+            entry
+                .document
+                .class_names
+                .iter()
+                .any(|name| name == "Model1")
+        }));
+        assert_eq!(workspace.tree().children.len(), 2);
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn workspace_keeps_single_file_and_directory_packages_separate() {
+        let directory = workspace_test_directory("package-layouts");
+        let single_file = directory.join("SinglePkg.mo");
+        let directory_package = directory.join("DirPkg");
+        fs::write(
+            &single_file,
+            "package SinglePkg\n  model Part\n  end Part;\nend SinglePkg;\n",
+        )
+        .expect("write single-file package");
+        fs::create_dir_all(&directory_package).expect("create directory package");
+        fs::write(
+            directory_package.join("package.mo"),
+            "package DirPkg\nend DirPkg;\n",
+        )
+        .expect("write directory package root");
+        fs::write(
+            directory_package.join("Part.mo"),
+            "within DirPkg;\nmodel Part\nend Part;\n",
+        )
+        .expect("write directory package member");
+        let standalone_path = directory.join("Model1.mo");
+        fs::write(&standalone_path, "model Model1\nend Model1;\n")
+            .expect("write independent top-level model next to package");
+
+        let mut workspace = Workspace::default();
+        workspace
+            .add_document(LoadedDocument::load(&single_file).unwrap())
+            .expect("add single-file package");
+        workspace
+            .add_document(LoadedDocument::load(&directory_package).unwrap())
+            .expect("add directory package");
+        workspace
+            .add_document(LoadedDocument::load(&standalone_path).unwrap())
+            .expect("add top-level model next to packages");
+        assert_eq!(workspace.documents.len(), 3);
+        assert!(workspace.documents.iter().any(|entry| {
+            entry
+                .document
+                .class_names
+                .iter()
+                .any(|name| name == "SinglePkg.Part")
+        }));
+        assert!(workspace.documents.iter().any(|entry| {
+            entry
+                .document
+                .class_names
+                .iter()
+                .any(|name| name == "DirPkg.Part")
+        }));
+        let tree = workspace.tree();
+        assert_eq!(tree.children.len(), 2);
+        let sibling_files = tree
+            .children
+            .iter()
+            .find(|node| node.children.len() == 2)
+            .expect("single-file package and independent model share their folder");
+        assert!(sibling_files
+            .children
+            .iter()
+            .any(|node| node.class_name.as_deref() == Some("SinglePkg")));
+        assert!(sibling_files
+            .children
+            .iter()
+            .any(|node| node.class_name.as_deref() == Some("Model1")));
+        let standalone_id = workspace
+            .documents
+            .iter()
+            .find(|entry| entry.document.path == standalone_path)
+            .map(|entry| entry.id.clone());
+        assert_eq!(workspace.path_owner(&standalone_path), standalone_id);
+        assert_eq!(
+            workspace.path_owner(&directory_package.join("Part.mo")),
+            workspace
+                .documents
+                .iter()
+                .find(|entry| entry.document.path == directory_package)
+                .map(|entry| entry.id.clone())
+        );
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
     fn relative_luminance(color: Color32) -> f32 {
         let linearize = |channel: u8| {
             let value = f32::from(channel) / 255.0;
