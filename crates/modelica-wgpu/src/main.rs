@@ -1,3 +1,5 @@
+mod source_editor;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -51,6 +53,7 @@ use modelica_render::{
     ORTHOGONAL_EPSILON,
 };
 use rfd::FileDialog;
+use source_editor::{EditImpact, SourceEditorState, TextBuffer, TextPosition};
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -628,6 +631,44 @@ fn build_save_plan(document: &LoadedDocument) -> Result<Vec<PendingFileSave>, St
 fn save_edited_classes(document: &mut LoadedDocument) -> Result<usize, String> {
     let plan = build_save_plan(document)?;
     apply_save_plan(document, plan, write_file_atomic)
+}
+
+fn validate_source_editor_snapshot(
+    document_id: &str,
+    document: &LoadedDocument,
+    editor: &SourceEditorState,
+) -> Result<(String, String), String> {
+    if editor.document_id.as_deref() != Some(document_id) {
+        return Err("源码编辑缓冲区属于其他文档，已拒绝保存".to_owned());
+    }
+    let class_name = editor
+        .class_name
+        .clone()
+        .ok_or_else(|| "源码编辑缓冲区没有关联的 Modelica 类".to_owned())?;
+    if document.source_version(&class_name) != editor.source_version {
+        return Err(format!("{} 的源码版本已变化，已拒绝覆盖", class_name));
+    }
+    let text = editor.buffer.text();
+    let source_path = document
+        .class_sources
+        .iter()
+        .find(|source| source.qualified_name == class_name)
+        .map(|source| source.source_file.clone())
+        .unwrap_or_else(|| PathBuf::from("<source-editor>"));
+    let parsed = parse(&text, &source_path).map_err(|error| {
+        format!("{class_name} 存在 Modelica 语法错误，编辑内容仍保留且未保存：{error}")
+    })?;
+    let expected_name = class_name.rsplit('.').next().unwrap_or(&class_name);
+    if !parsed
+        .classes
+        .iter()
+        .any(|class| class.name == expected_name)
+    {
+        return Err(format!(
+            "源码中未找到顶层类 {expected_name}，编辑内容仍保留且未保存"
+        ));
+    }
+    Ok((class_name, text))
 }
 
 fn apply_save_plan<F>(
@@ -3237,8 +3278,8 @@ struct UiDocument {
     diagram_unresolved_bases: usize,
     diagram_connections: usize,
     source_name: String,
+    #[cfg(test)]
     source_lines: Vec<String>,
-    source_max_line_chars: usize,
     source_version: u64,
 }
 
@@ -3249,6 +3290,7 @@ struct WorkspaceDocument {
     history: Vec<EditCommand>,
     redo_history: Vec<EditCommand>,
     main_view: MainView,
+    source_editors: HashMap<String, SourceEditorState>,
 }
 
 type WorkspaceSession = (Option<String>, Vec<EditCommand>, Vec<EditCommand>, MainView);
@@ -3429,6 +3471,7 @@ impl Workspace {
             history: Vec::new(),
             redo_history: Vec::new(),
             main_view: MainView::Icon,
+            source_editors: HashMap::new(),
         });
         self.active_document_id = Some(id.clone());
         Ok(id)
@@ -3469,9 +3512,13 @@ impl Workspace {
     }
 
     fn has_unsaved_changes(&self) -> bool {
-        self.documents
-            .iter()
-            .any(|entry| entry.document.has_unsaved_changes())
+        self.documents.iter().any(|entry| {
+            entry.document.has_unsaved_changes()
+                || entry
+                    .source_editors
+                    .values()
+                    .any(SourceEditorState::is_dirty)
+        })
     }
 
     fn tree(&self) -> TreeNode {
@@ -3644,8 +3691,10 @@ struct VisibleSourceRows {
 
 #[derive(Default)]
 struct SourceFoldState {
+    active_document_id: Option<String>,
     selected_class: Option<String>,
     source_version: u64,
+    editor_fold_revision: u64,
     initialized: bool,
     ranges: Vec<SourceFoldRange>,
     collapsed: HashSet<FoldId>,
@@ -3663,27 +3712,58 @@ struct SourceFoldState {
     last_splice_inserted_rows: usize,
     last_toggle_expanded: Option<bool>,
     fold_sync_time: Duration,
+    saved_fold_states: HashMap<SourceFoldStateKey, HashSet<SourceFoldSignature>>,
 }
 
+type SourceFoldStateKey = (Option<String>, Option<String>);
+type SourceFoldSignature = (usize, FoldDelimiter);
+
 impl SourceFoldState {
+    #[cfg(test)]
     fn sync_document(&mut self, document: &UiDocument) {
+        self.sync_source(document, &document.source_lines, 0);
+    }
+
+    fn sync_source(&mut self, document: &UiDocument, source_lines: &[String], fold_revision: u64) {
+        let active_document_id = document.active_document_id.clone();
         let selected_class = document.selected_class.clone();
-        let new_class = !self.initialized || self.selected_class != selected_class;
+        let new_class = !self.initialized
+            || self.active_document_id != active_document_id
+            || self.selected_class != selected_class;
         if self.initialized
+            && self.active_document_id == active_document_id
             && self.selected_class == selected_class
             && self.source_version == document.source_version
+            && self.editor_fold_revision == fold_revision
         {
             return;
         }
 
         let sync_started = Instant::now();
-        let previous_collapsed = std::mem::take(&mut self.collapsed);
+        let previous_collapsed = self
+            .ranges
+            .iter()
+            .filter(|range| self.collapsed.contains(&range.id))
+            .map(|range| (range.start_line, range.open_token))
+            .collect::<HashSet<_>>();
+        if self.initialized {
+            self.saved_fold_states.insert(
+                (self.active_document_id.clone(), self.selected_class.clone()),
+                previous_collapsed.clone(),
+            );
+        }
+        let restored_collapsed = self
+            .saved_fold_states
+            .get(&(active_document_id.clone(), selected_class.clone()))
+            .cloned();
+        self.active_document_id = active_document_id;
         self.selected_class = selected_class;
         self.source_version = document.source_version;
+        self.editor_fold_revision = fold_revision;
         self.ranges = discover_source_fold_ranges(
             self.selected_class.as_deref(),
             self.source_version,
-            &document.source_lines,
+            source_lines,
         );
         let current_ids = self
             .ranges
@@ -3691,15 +3771,23 @@ impl SourceFoldState {
             .map(|range| range.id.clone())
             .collect::<HashSet<_>>();
         self.collapsed = if new_class {
-            current_ids
+            restored_collapsed.map_or(current_ids.clone(), |signatures| {
+                self.ranges
+                    .iter()
+                    .filter(|range| signatures.contains(&(range.start_line, range.open_token)))
+                    .map(|range| range.id.clone())
+                    .collect()
+            })
         } else {
-            previous_collapsed
-                .into_iter()
+            self.ranges
+                .iter()
+                .filter(|range| previous_collapsed.contains(&(range.start_line, range.open_token)))
+                .map(|range| range.id.clone())
                 .filter(|id| current_ids.contains(id))
                 .collect()
         };
         self.initialized = true;
-        self.rebuild_fold_layout(document.source_lines.len());
+        self.rebuild_fold_layout(source_lines.len());
         self.fold_sync_time += sync_started.elapsed();
     }
 
@@ -3826,6 +3914,34 @@ impl SourceFoldState {
         self.last_splice_inserted_rows = inserted_count;
         self.last_toggle_expanded = Some(expanding);
         true
+    }
+
+    fn expand_line_if_hidden(&mut self, line: usize, line_count: usize) -> bool {
+        let mut expanded = false;
+        while self
+            .visible_rows
+            .rows
+            .binary_search_by_key(&line, |row| row.original_line)
+            .is_err()
+        {
+            let Some(range) = self
+                .ranges
+                .iter()
+                .filter(|range| {
+                    self.collapsed.contains(&range.id)
+                        && range.start_line <= line
+                        && line <= range.end_line
+                })
+                .min_by_key(|range| range.end_line.saturating_sub(range.start_line))
+            else {
+                break;
+            };
+            if !self.toggle_line(range.start_line, line_count) {
+                break;
+            }
+            expanded = true;
+        }
+        expanded
     }
 }
 
@@ -3964,7 +4080,7 @@ struct SourceHighlightCache {
 }
 
 impl SourceHighlightCache {
-    fn prepare(&mut self, document: &UiDocument, pixels_per_point: f32) {
+    fn prepare(&mut self, document: &UiDocument, source_line_count: usize, pixels_per_point: f32) {
         let key = SourceHighlightCacheKey {
             selected_class: document.selected_class.clone(),
             source_version: document.source_version,
@@ -3972,9 +4088,9 @@ impl SourceHighlightCache {
             accent_theme: active_accent(),
             pixels_per_point_bits: pixels_per_point.to_bits(),
         };
-        if self.key.as_ref() != Some(&key) || self.lines.len() != document.source_lines.len() {
+        if self.key.as_ref() != Some(&key) {
             self.key = Some(key);
-            self.lines = (0..document.source_lines.len())
+            self.lines = (0..source_line_count)
                 .map(|_| SourceLineCache::default())
                 .collect();
             self.collapsed_lines.clear();
@@ -3984,7 +4100,39 @@ impl SourceHighlightCache {
             self.cache_misses = 0;
             self.priority_prewarm_rows.clear();
             self.prewarm_window = None;
+        } else if self.lines.len() != source_line_count {
+            self.lines
+                .resize_with(source_line_count, SourceLineCache::default);
         }
+    }
+
+    fn invalidate_edit(&mut self, impact: EditImpact, new_line_count: usize) {
+        if impact.full_reset {
+            self.lines = (0..new_line_count)
+                .map(|_| SourceLineCache::default())
+                .collect();
+        } else {
+            let start = impact.start_line.min(self.lines.len());
+            let end = start
+                .saturating_add(impact.old_line_count)
+                .min(self.lines.len());
+            self.lines.splice(
+                start..end,
+                (0..impact.new_line_count).map(|_| SourceLineCache::default()),
+            );
+            self.lines
+                .resize_with(new_line_count, SourceLineCache::default);
+            if impact.old_line_count != impact.new_line_count {
+                for line in self.lines.iter_mut().skip(start) {
+                    line.number_galley = None;
+                }
+            }
+        }
+        if impact.affects_folding || impact.old_line_count != impact.new_line_count {
+            self.collapsed_lines.clear();
+        }
+        self.priority_prewarm_rows.clear();
+        self.prewarm_window = None;
     }
 
     fn prioritize_visible_rows(
@@ -4028,6 +4176,7 @@ impl SourceHighlightCache {
         &mut self,
         ui: &egui::Ui,
         document: &UiDocument,
+        source_buffer: &TextBuffer,
         fold_state: &SourceFoldState,
         max_items: usize,
         time_budget: Duration,
@@ -4039,7 +4188,7 @@ impl SourceHighlightCache {
                 break;
             };
             // Count attempts too: cache hits/skips must not cause an unbounded scan.
-            self.warm_source_line(ui, document, fold_state, line);
+            self.warm_source_line(ui, document, source_buffer, fold_state, line);
             items += 1;
         }
         (items, started.elapsed())
@@ -4055,6 +4204,7 @@ impl SourceHighlightCache {
         &mut self,
         ui: &egui::Ui,
         document: &UiDocument,
+        source_buffer: &TextBuffer,
         fold_state: &SourceFoldState,
         line: usize,
     ) -> bool {
@@ -4069,21 +4219,19 @@ impl SourceHighlightCache {
             if self.collapsed_lines.contains_key(&range.id) {
                 return false;
             }
-            let source = &document.source_lines[line];
+            let source = source_buffer.line(line);
             let prefix = &source[..range.open_end_column.min(source.len())];
             if !source_idle_layout_allowed(prefix) {
                 return false;
             }
             let _ = self.number_galley(ui, line);
-            let _ = self.collapsed_galley(ui, document, range);
+            let _ = self.collapsed_galley(ui, document, source_buffer, range);
             return true;
         }
-        if self.source_line_is_warm(line)
-            || !source_idle_layout_allowed(&document.source_lines[line])
-        {
+        if self.source_line_is_warm(line) || !source_idle_layout_allowed(source_buffer.line(line)) {
             return false;
         }
-        let _ = self.galleys(ui, document, line);
+        let _ = self.galleys(ui, document, source_buffer, line);
         true
     }
 
@@ -4100,8 +4248,17 @@ impl SourceHighlightCache {
             .clone()
     }
 
-    fn content_width(&mut self, ui: &egui::Ui, document: &UiDocument) -> f32 {
-        self.prepare(document, ui.ctx().pixels_per_point());
+    fn content_width(
+        &mut self,
+        ui: &egui::Ui,
+        document: &UiDocument,
+        source_buffer: &TextBuffer,
+    ) -> f32 {
+        self.prepare(
+            document,
+            source_buffer.line_count(),
+            ui.ctx().pixels_per_point(),
+        );
         if self.max_line_width == 0.0 {
             let probe = ui.painter().layout_no_wrap(
                 "M".to_owned(),
@@ -4111,7 +4268,7 @@ impl SourceHighlightCache {
             // Keep the horizontal extent stable before long or Unicode rows
             // become visible during a virtualized scroll.
             self.max_line_width =
-                document.source_max_line_chars as f32 * probe.size().x * 1.25 + 8.0;
+                source_buffer.max_line_chars() as f32 * probe.size().x * 1.25 + 8.0;
         }
         (SOURCE_FOLD_GUTTER_WIDTH
             + SOURCE_LINE_NUMBER_WIDTH
@@ -4124,6 +4281,7 @@ impl SourceHighlightCache {
         &mut self,
         ui: &egui::Ui,
         document: &UiDocument,
+        source_buffer: &TextBuffer,
         row: usize,
     ) -> (Arc<egui::Galley>, Arc<egui::Galley>, Duration) {
         if let Some(line) = self.lines.get(row) {
@@ -4136,7 +4294,7 @@ impl SourceHighlightCache {
         }
         let started = Instant::now();
         let job = modelica_layout_job(
-            &document.source_lines[row],
+            source_buffer.line(row),
             &document.full_class_names,
             &document.short_class_names,
         );
@@ -4156,6 +4314,7 @@ impl SourceHighlightCache {
         &mut self,
         ui: &egui::Ui,
         document: &UiDocument,
+        source_buffer: &TextBuffer,
         range: &SourceFoldRange,
     ) -> (Arc<egui::Galley>, Duration) {
         if let Some(galley) = self.collapsed_lines.get(&range.id) {
@@ -4163,10 +4322,7 @@ impl SourceHighlightCache {
             return (galley.clone(), Duration::ZERO);
         }
         let started = Instant::now();
-        let line = document
-            .source_lines
-            .get(range.start_line)
-            .map_or("", String::as_str);
+        let line = source_buffer.line(range.start_line);
         let display_line = collapsed_source_line(line, range);
         let job = modelica_layout_job(
             &display_line,
@@ -4553,16 +4709,12 @@ impl LoadedDocument {
             .filter_map(|name| name.rsplit('.').next())
             .map(str::to_owned)
             .collect::<HashSet<_>>();
-        let (source_name, source) = selected_class
+        let (source_name, _source) = selected_class
             .as_deref()
             .and_then(|class_name| self.class_source(class_name))
             .unwrap_or_default();
-        let source_lines = source.lines().map(str::to_owned).collect::<Vec<_>>();
-        let source_max_line_chars = source_lines
-            .iter()
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or_default();
+        #[cfg(test)]
+        let source_lines = _source.lines().map(str::to_owned).collect::<Vec<_>>();
         let icon_graphics = selected_class
             .as_deref()
             .and_then(|class_name| self.icon(class_name))
@@ -4611,8 +4763,8 @@ impl LoadedDocument {
             diagram_unresolved_bases,
             diagram_connections,
             source_name,
+            #[cfg(test)]
             source_lines,
-            source_max_line_chars,
             source_version,
         }
     }
@@ -6970,6 +7122,7 @@ struct App {
     source_highlight_cache: SourceHighlightCache,
     source_scroll_state: SourceScrollState,
     source_interaction: SourceInteractionState,
+    source_editor: SourceEditorState,
     source_scroll_rect: Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: Option<SourcePerfFrame>,
@@ -7394,6 +7547,7 @@ impl App {
             source_highlight_cache: SourceHighlightCache::default(),
             source_scroll_state: SourceScrollState::new(),
             source_interaction: SourceInteractionState::default(),
+            source_editor: SourceEditorState::default(),
             source_scroll_rect: None,
             source_wheel_sample: None,
             source_perf_frame: None,
@@ -7506,12 +7660,22 @@ impl App {
     }
 
     fn save_active_workspace_session(&mut self) {
+        let active_id = self.workspace.active_id().map(str::to_owned);
         self.workspace.store_active_session(
             self.selected_class.clone(),
             &self.history,
             &self.redo_history,
             self.main_view,
         );
+        if let (Some(document_id), Some(class_name)) =
+            (active_id, self.source_editor.class_name.clone())
+        {
+            if let Some(entry) = self.workspace.document_mut(&document_id) {
+                entry
+                    .source_editors
+                    .insert(class_name, self.source_editor.clone());
+            }
+        }
     }
 
     fn reset_workspace_interactions(&mut self) {
@@ -7652,6 +7816,7 @@ impl App {
     }
 
     fn refresh_ui_document(&mut self) {
+        self.sync_active_source_editor();
         self.ui_document = self.active_document().map(|document| {
             let mut summary = document.ui_summary(self.selected_class.as_deref());
             summary.tree = self.workspace.tree();
@@ -7660,6 +7825,83 @@ impl App {
         });
         self.visible_tree_rows.invalidate();
         self.tree_galley_cache.clear();
+    }
+
+    fn sync_active_source_editor(&mut self) {
+        let document_id = self.workspace.active_id().map(str::to_owned);
+        let class_name = self.selected_class.clone();
+        let source = class_name.as_deref().and_then(|class_name| {
+            self.active_document().and_then(|document| {
+                document
+                    .class_text(class_name)
+                    .map(|text| (text, document.source_version(class_name)))
+            })
+        });
+
+        if self.source_editor.document_id == document_id
+            && self.source_editor.class_name == class_name
+        {
+            let Some((text, version)) = source else {
+                return;
+            };
+            if self.source_editor.source_version != version {
+                if self.source_editor.is_dirty() {
+                    self.source_editor.diagnostic = Some(
+                        "该类源码已通过其他编辑操作更新；当前编辑缓冲区仍保留，请先复制或撤销后再保存。"
+                            .to_owned(),
+                    );
+                } else {
+                    self.source_editor
+                        .reset(document_id, class_name, version, &text);
+                }
+            }
+            return;
+        }
+
+        if let (Some(previous_document), Some(previous_class)) = (
+            self.source_editor.document_id.clone(),
+            self.source_editor.class_name.clone(),
+        ) {
+            if let Some(entry) = self.workspace.document_mut(&previous_document) {
+                entry
+                    .source_editors
+                    .insert(previous_class, self.source_editor.clone());
+            }
+        }
+
+        let Some((document_id, class_name, (text, version))) = document_id
+            .zip(class_name)
+            .zip(source)
+            .map(|((document_id, class_name), source)| (document_id, class_name, source))
+        else {
+            self.source_editor = SourceEditorState::default();
+            return;
+        };
+        let restored = self
+            .workspace
+            .document_mut(&document_id)
+            .and_then(|entry| entry.source_editors.remove(&class_name));
+        let mut editor = restored.unwrap_or_else(|| {
+            SourceEditorState::new(
+                Some(document_id.clone()),
+                Some(class_name.clone()),
+                version,
+                &text,
+            )
+        });
+        if editor.source_version != version {
+            if editor.is_dirty() {
+                editor.diagnostic = Some(
+                    "磁盘/语义源码版本已变化；未保存的编辑缓冲区已保留，保存前请处理冲突。"
+                        .to_owned(),
+                );
+            } else {
+                editor.reset(Some(document_id), Some(class_name), version, &text);
+            }
+        }
+        editor.focused = false;
+        editor.dragging_selection = false;
+        self.source_editor = editor;
     }
 
     fn selected_connection_id(&self) -> Option<&str> {
@@ -11098,7 +11340,172 @@ impl App {
         }
     }
 
+    fn save_source_editor(&mut self) -> Result<usize, String> {
+        let Some(document_id) = self.workspace.active_id().map(str::to_owned) else {
+            return Err("没有打开的文档".to_owned());
+        };
+        let Some(entry) = self.workspace.document(&document_id) else {
+            return Err("当前文档已关闭".to_owned());
+        };
+        let mut dirty_snapshots = entry
+            .source_editors
+            .values()
+            .filter(|editor| editor.is_dirty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.source_editor.is_dirty() {
+            dirty_snapshots.push(self.source_editor.clone());
+        }
+        for editor in &dirty_snapshots {
+            if let Err(error) =
+                validate_source_editor_snapshot(&document_id, &entry.document, editor)
+            {
+                if self.source_editor.class_name == editor.class_name {
+                    self.source_editor.diagnostic = Some(error.clone());
+                }
+                return Err(error);
+            }
+        }
+
+        let result = {
+            let entry = self
+                .workspace
+                .document_mut(&document_id)
+                .ok_or_else(|| "当前文档已关闭".to_owned())?;
+            for editor in dirty_snapshots {
+                let (class_name, text) =
+                    validate_source_editor_snapshot(&document_id, &entry.document, &editor)?;
+                entry.document.set_class_text(&class_name, text);
+            }
+            save_edited_classes(&mut entry.document)
+        };
+        match result {
+            Ok(saved) => {
+                if self.source_editor.document_id.as_deref() == Some(document_id.as_str()) {
+                    if let Some(class_name) = self.source_editor.class_name.as_deref() {
+                        if let Some(document) = self.active_document() {
+                            let version = document.source_version(class_name);
+                            if self.source_editor.is_dirty() {
+                                self.source_editor.mark_saved(version);
+                            } else if self.source_editor.source_version != version {
+                                if let Some(text) = document.class_text(class_name) {
+                                    self.source_editor.reset(
+                                        Some(document_id.clone()),
+                                        Some(class_name.to_owned()),
+                                        version,
+                                        &text,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(entry) = self.workspace.document_mut(&document_id) {
+                    for (class_name, editor) in &mut entry.source_editors {
+                        if let Some(text) = entry.document.class_text(class_name) {
+                            let version = entry.document.source_version(class_name);
+                            if editor.is_dirty() {
+                                editor.mark_saved(version);
+                            } else if editor.source_version != version {
+                                editor.reset(
+                                    Some(document_id.clone()),
+                                    Some(class_name.clone()),
+                                    version,
+                                    &text,
+                                );
+                            }
+                        }
+                    }
+                }
+                if saved > 0 {
+                    if let Err(error) = self.reload_active_document_semantics(&document_id) {
+                        let message = format!(
+                            "源码已写入磁盘，但语义模型刷新失败；现有画面和编辑缓冲区已保留：{error}"
+                        );
+                        self.source_editor.diagnostic = Some(message.clone());
+                        self.load_error = Some(message.clone());
+                        self.refresh_ui_document();
+                        self.update_title(None);
+                        return Err(message);
+                    }
+                }
+                self.source_editor.diagnostic = None;
+                self.rebuild_selected_scenes();
+                self.update_title(None);
+                Ok(saved)
+            }
+            Err(error) => {
+                if self.source_editor.document_id.as_deref() == Some(document_id.as_str()) {
+                    if let (Some(class_name), Some(document)) = (
+                        self.source_editor.class_name.as_deref(),
+                        self.active_document(),
+                    ) {
+                        self.source_editor.source_version = document.source_version(class_name);
+                    }
+                }
+                let versions = self
+                    .active_document()
+                    .map(|document| document.source_versions.clone())
+                    .unwrap_or_default();
+                if let Some(entry) = self.workspace.document_mut(&document_id) {
+                    for (class_name, editor) in &mut entry.source_editors {
+                        if let Some(version) = versions.get(class_name) {
+                            editor.source_version = *version;
+                        }
+                    }
+                }
+                self.source_editor.diagnostic = Some(error.clone());
+                self.refresh_ui_document();
+                self.update_title(None);
+                Err(error)
+            }
+        }
+    }
+
+    fn reload_active_document_semantics(&mut self, document_id: &str) -> Result<(), String> {
+        let (path, source_versions) = self
+            .workspace
+            .document(document_id)
+            .map(|entry| {
+                (
+                    entry.document.path.clone(),
+                    entry.document.source_versions.clone(),
+                )
+            })
+            .ok_or_else(|| format!("工作区文档已关闭：{document_id}"))?;
+        let mut reloaded = LoadedDocument::load(&path)?;
+        reloaded.source_versions = source_versions;
+        if let Some(conflict) = self
+            .workspace
+            .conflicting_class(&reloaded, Some(document_id))
+        {
+            return Err(conflict);
+        }
+        let entry = self
+            .workspace
+            .document_mut(document_id)
+            .ok_or_else(|| format!("工作区文档已关闭：{document_id}"))?;
+        entry.document = reloaded;
+        self.source_highlight_cache = SourceHighlightCache::default();
+        self.source_interaction.fold_state.editor_fold_revision = !self.source_editor.fold_revision;
+        Ok(())
+    }
+
     fn persist_edits(&mut self) -> Result<usize, String> {
+        let source_editors_dirty = self.source_editor.is_dirty()
+            || self
+                .workspace
+                .active_id()
+                .and_then(|id| self.workspace.document(id))
+                .is_some_and(|entry| {
+                    entry
+                        .source_editors
+                        .values()
+                        .any(SourceEditorState::is_dirty)
+                });
+        if source_editors_dirty {
+            return self.save_source_editor();
+        }
         let result = match self.active_document_mut() {
             Some(document) => save_edited_classes(document),
             None => Err("no Modelica document is open".to_owned()),
@@ -11109,9 +11516,27 @@ impl App {
     }
 
     fn discard_unsaved_changes(&mut self) {
+        let active_id = self.workspace.active_id().map(str::to_owned);
         if let Some(document) = self.active_document_mut() {
             document.discard_unsaved_changes();
         }
+        if let Some(id) = active_id.as_deref() {
+            if let Some(entry) = self.workspace.document_mut(id) {
+                for (class_name, editor) in &mut entry.source_editors {
+                    if editor.is_dirty() {
+                        if let Some(text) = entry.document.class_text(class_name) {
+                            editor.reset(
+                                Some(id.to_owned()),
+                                Some(class_name.clone()),
+                                entry.document.source_version(class_name),
+                                &text,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.reset_active_source_editor_from_document();
         self.rebuild_selected_scenes();
         self.update_title(None);
     }
@@ -11119,18 +11544,94 @@ impl App {
     fn discard_all_workspace_changes(&mut self) {
         for entry in &mut self.workspace.documents {
             entry.document.discard_unsaved_changes();
+            for (class_name, editor) in &mut entry.source_editors {
+                if editor.is_dirty() {
+                    if let Some(text) = entry.document.class_text(class_name) {
+                        editor.reset(
+                            Some(entry.id.clone()),
+                            Some(class_name.clone()),
+                            entry.document.source_version(class_name),
+                            &text,
+                        );
+                    }
+                }
+            }
         }
+        self.reset_active_source_editor_from_document();
         self.rebuild_selected_scenes();
         self.refresh_ui_document();
         self.update_title(None);
     }
 
+    fn reset_active_source_editor_from_document(&mut self) {
+        let (Some(document_id), Some(class_name)) = (
+            self.workspace.active_id().map(str::to_owned),
+            self.selected_class.clone(),
+        ) else {
+            return;
+        };
+        let Some(document) = self.active_document() else {
+            return;
+        };
+        let Some(text) = document.class_text(&class_name) else {
+            return;
+        };
+        self.source_editor.reset(
+            Some(document_id),
+            Some(class_name.clone()),
+            document.source_version(&class_name),
+            &text,
+        );
+    }
+
     fn persist_all_workspace_documents(&mut self) -> Result<usize, String> {
         let mut saved = 0;
         let total = self.workspace.documents.len();
+        if self.source_editor.is_dirty() {
+            saved += self.save_source_editor()?;
+        }
         for entry in &mut self.workspace.documents {
+            let dirty_editors = entry
+                .source_editors
+                .values()
+                .filter(|editor| editor.is_dirty())
+                .cloned()
+                .collect::<Vec<_>>();
+            let staged = dirty_editors
+                .iter()
+                .map(|editor| validate_source_editor_snapshot(&entry.id, &entry.document, editor))
+                .collect::<Result<Vec<_>, _>>();
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(error) if saved > 0 => {
+                    return Err(format!(
+                        "工作区部分保存：已写入 {saved} 个文件；后续文档未写入：{error}"
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            for (class_name, text) in staged {
+                entry.document.set_class_text(&class_name, text);
+            }
             match save_edited_classes(&mut entry.document) {
-                Ok(count) => saved += count,
+                Ok(count) => {
+                    saved += count;
+                    for (class_name, editor) in &mut entry.source_editors {
+                        let version = entry.document.source_version(class_name);
+                        if editor.is_dirty() {
+                            editor.mark_saved(version);
+                        } else if editor.source_version != version {
+                            if let Some(text) = entry.document.class_text(class_name) {
+                                editor.reset(
+                                    Some(entry.id.clone()),
+                                    Some(class_name.clone()),
+                                    version,
+                                    &text,
+                                );
+                            }
+                        }
+                    }
+                }
                 Err(error) => {
                     self.refresh_ui_document();
                     self.update_title(None);
@@ -11185,6 +11686,22 @@ impl App {
     fn has_unsaved_changes(&self) -> bool {
         self.active_document()
             .is_some_and(LoadedDocument::has_unsaved_changes)
+            || self.source_editor.is_dirty()
+    }
+
+    fn document_has_unsaved_changes(&self, document_id: &str) -> bool {
+        self.workspace.document(document_id).is_some_and(|entry| {
+            entry.document.has_unsaved_changes()
+                || entry
+                    .source_editors
+                    .values()
+                    .any(SourceEditorState::is_dirty)
+        }) || (self.source_editor.document_id.as_deref() == Some(document_id)
+            && self.source_editor.is_dirty())
+    }
+
+    fn workspace_has_unsaved_changes(&self) -> bool {
+        self.workspace.has_unsaved_changes() || self.source_editor.is_dirty()
     }
 
     fn open_new_class_dialog(&mut self) {
@@ -11202,11 +11719,10 @@ impl App {
             return;
         }
         let affected_document = self.target_workspace_document_id(&request);
-        if let Some(id) = affected_document.as_deref().filter(|id| {
-            self.workspace
-                .document(id)
-                .is_some_and(|entry| entry.document.has_unsaved_changes())
-        }) {
+        if let Some(id) = affected_document
+            .as_deref()
+            .filter(|id| self.document_has_unsaved_changes(id))
+        {
             self.activate_workspace_document(id);
             self.pending_document_action = Some(PendingDocumentAction::CreateClass(request));
             self.status_message = Some("目标文档有未保存修改".to_owned());
@@ -11452,7 +11968,7 @@ impl App {
         if self.pending_document_action.is_some() {
             return;
         }
-        if self.workspace.has_unsaved_changes() {
+        if self.workspace_has_unsaved_changes() {
             self.pending_document_action = Some(PendingDocumentAction::Close);
             self.status_message = Some("关闭前需要处理未保存修改".to_owned());
             self.request_redraw();
@@ -11468,11 +11984,7 @@ impl App {
         let Some(id) = self.workspace.active_id().map(str::to_owned) else {
             return;
         };
-        if self
-            .workspace
-            .active_document()
-            .is_some_and(LoadedDocument::has_unsaved_changes)
-        {
+        if self.document_has_unsaved_changes(&id) {
             self.pending_document_action = Some(PendingDocumentAction::CloseDocument(id));
             self.status_message = Some("关闭此文档前需要处理它的未保存修改".to_owned());
             self.request_redraw();
@@ -11521,11 +12033,10 @@ impl App {
                     | PendingDocumentAction::CreateClass(_) => self.persist_edits(),
                 };
                 let clean = match &action {
-                    PendingDocumentAction::Close => !self.workspace.has_unsaved_changes(),
-                    PendingDocumentAction::CloseDocument(id) => self
-                        .workspace
-                        .document(id)
-                        .is_none_or(|entry| !entry.document.has_unsaved_changes()),
+                    PendingDocumentAction::Close => !self.workspace_has_unsaved_changes(),
+                    PendingDocumentAction::CloseDocument(id) => {
+                        !self.document_has_unsaved_changes(id)
+                    }
                     PendingDocumentAction::CreateClass(_) => !self.has_unsaved_changes(),
                 };
                 match result {
@@ -11562,7 +12073,11 @@ impl App {
 
     fn update_title(&self, fps: Option<(f32, f32)>) {
         if let Some(document) = self.active_document() {
-            self.window.set_title(&document.title(fps));
+            let mut title = document.title(fps);
+            if self.workspace_has_unsaved_changes() && !document.has_unsaved_changes() {
+                title.push_str(" | 有未保存修改");
+            }
+            self.window.set_title(&title);
         } else {
             let performance = fps
                 .map(|(fps, worst_ms)| format!(" | {:.1} FPS | worst {:.1} ms", fps, worst_ms))
@@ -11889,6 +12404,8 @@ impl App {
         let mut source_scroll_state =
             std::mem::replace(&mut self.source_scroll_state, SourceScrollState::new());
         let mut source_interaction = std::mem::take(&mut self.source_interaction);
+        let source_dirty_before = self.source_editor.is_dirty();
+        let mut source_editor = std::mem::take(&mut self.source_editor);
         let mut source_scroll_rect = self.source_scroll_rect;
         let source_wheel_sample = self.source_wheel_sample;
         let mut visible_tree_rows = std::mem::take(&mut self.visible_tree_rows);
@@ -11961,6 +12478,7 @@ impl App {
                 &mut source_highlight_cache,
                 &mut source_scroll_state,
                 &mut source_interaction,
+                &mut source_editor,
                 &mut source_scroll_rect,
                 source_wheel_sample,
                 &mut source_perf_frame,
@@ -12045,11 +12563,15 @@ impl App {
         self.source_highlight_cache = source_highlight_cache;
         self.source_scroll_state = source_scroll_state;
         self.source_interaction = source_interaction;
+        self.source_editor = source_editor;
         self.source_scroll_rect = source_scroll_rect;
         self.source_perf_frame = source_perf_frame;
         self.visible_tree_rows = visible_tree_rows;
         self.tree_galley_cache = tree_galley_cache;
         self.new_class_dialog = new_class_dialog;
+        if source_dirty_before != self.source_editor.is_dirty() {
+            self.update_title(None);
+        }
         let ui_build = ui_build_started.elapsed();
         if theme_mode != self.theme_mode || accent_theme != self.accent_theme {
             self.theme_mode = theme_mode;
@@ -12424,6 +12946,19 @@ impl App {
         let present_started = Instant::now();
         frame.present();
         let present = present_started.elapsed();
+        if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_EDIT").is_some() {
+            if let Some(input_at) = self.source_editor.pending_input_at.take() {
+                eprintln!(
+                    "[SOURCE EDIT] input_to_present_ms={:.2} revision={} line={} column_byte={}",
+                    input_at.elapsed().as_secs_f64() * 1000.0,
+                    self.source_editor.revision,
+                    self.source_editor.cursor.line + 1,
+                    self.source_editor.cursor.column,
+                );
+            }
+        } else {
+            self.source_editor.pending_input_at = None;
+        }
 
         let total = frame_started.elapsed();
         let finished_at = Instant::now();
@@ -13456,6 +13991,7 @@ fn draw_preview_ui(
     source_highlight_cache: &mut SourceHighlightCache,
     source_scroll_state: &mut SourceScrollState,
     source_interaction: &mut SourceInteractionState,
+    source_editor: &mut SourceEditorState,
     source_scroll_rect: &mut Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: &mut Option<SourcePerfFrame>,
@@ -13894,6 +14430,7 @@ fn draw_preview_ui(
                         source_highlight_cache,
                         source_scroll_state,
                         source_interaction,
+                        source_editor,
                         source_scroll_rect,
                         source_wheel_sample,
                         source_perf_frame,
@@ -15061,9 +15598,10 @@ impl SourceInteractionState {
         self.pending_fold_profile = None;
     }
 
-    fn sync_document(&mut self, document: &UiDocument) {
+    fn sync_editor_document(&mut self, document: &UiDocument, editor: &SourceEditorState) {
         self.sync_class(document.selected_class.as_deref());
-        self.fold_state.sync_document(document);
+        self.fold_state
+            .sync_source(document, editor.buffer.lines(), editor.fold_revision);
     }
 
     fn focus_for_click_owner(&mut self, owner: SourceClickOwner) {
@@ -15074,8 +15612,186 @@ impl SourceInteractionState {
     }
 }
 
+#[cfg(test)]
 fn source_copy_text(lines: &[String]) -> String {
     lines.join("\n")
+}
+
+fn process_source_editor_input(
+    ui: &mut egui::Ui,
+    editor: &mut SourceEditorState,
+    highlight_cache: &mut SourceHighlightCache,
+    page_lines: isize,
+) {
+    let events = ui.input(|input| input.events.clone());
+    for event in events {
+        let event_started = Instant::now();
+        let mut changed = false;
+        let mut copied_text = None;
+        if !editor.focused {
+            continue;
+        }
+        let cursor_before = editor.cursor;
+        let anchor_before = editor.selection_anchor;
+        match event {
+            egui::Event::Text(text) => {
+                if !text
+                    .chars()
+                    .any(|character| matches!(character, '\n' | '\r' | '\t'))
+                {
+                    changed = editor.insert_text(&text);
+                }
+            }
+            egui::Event::Paste(text) => changed = editor.insert_text(&text),
+            egui::Event::Copy => copied_text = editor.selected_text(),
+            egui::Event::Cut => {
+                copied_text = editor.selected_text();
+                changed = editor.backspace();
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                let extend = modifiers.shift;
+                if modifiers.command {
+                    match key {
+                        egui::Key::A => editor.select_all(),
+                        egui::Key::C => copied_text = editor.selected_text(),
+                        egui::Key::X => {
+                            copied_text = editor.selected_text();
+                            changed = editor.backspace();
+                        }
+                        egui::Key::Z if modifiers.shift => changed = editor.redo(),
+                        egui::Key::Z => changed = editor.undo(),
+                        egui::Key::Y => changed = editor.redo(),
+                        _ => {}
+                    }
+                } else {
+                    match key {
+                        egui::Key::ArrowLeft => editor.move_horizontal(-1, extend),
+                        egui::Key::ArrowRight => editor.move_horizontal(1, extend),
+                        egui::Key::ArrowUp => editor.move_vertical(-1, extend),
+                        egui::Key::ArrowDown => editor.move_vertical(1, extend),
+                        egui::Key::Home => editor.move_line_edge(false, extend),
+                        egui::Key::End => editor.move_line_edge(true, extend),
+                        egui::Key::PageUp => editor.move_vertical(-page_lines, extend),
+                        egui::Key::PageDown => editor.move_vertical(page_lines, extend),
+                        egui::Key::Backspace => changed = editor.backspace(),
+                        egui::Key::Delete => changed = editor.delete_forward(),
+                        egui::Key::Enter => changed = editor.insert_newline(),
+                        egui::Key::Tab => changed = editor.indent(extend),
+                        egui::Key::Escape => {
+                            editor.focused = false;
+                            editor.dragging_selection = false;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(text) = copied_text {
+            ui.output_mut(|output| output.copied_text = text);
+        }
+        let caret_changed =
+            editor.cursor != cursor_before || editor.selection_anchor != anchor_before;
+        if changed || caret_changed {
+            editor.pending_input_at = Some(event_started);
+        }
+        if changed {
+            if let Some(impact) = editor.take_edit_impact() {
+                highlight_cache.invalidate_edit(impact, editor.buffer.line_count());
+            }
+        }
+        if changed || caret_changed {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn diagnose_source_editor(ui: &egui::Ui, editor: &mut SourceEditorState) {
+    if !editor.is_dirty() || editor.checked_revision == Some(editor.revision) {
+        return;
+    }
+    let Some(last_edit) = editor.last_edit_at else {
+        return;
+    };
+    let debounce = Duration::from_millis(350);
+    let elapsed = last_edit.elapsed();
+    if elapsed < debounce {
+        ui.ctx().request_repaint_after(debounce - elapsed);
+        return;
+    }
+    let source = editor.buffer.text();
+    let started = Instant::now();
+    editor.diagnostic = parse(&source, "<source-editor>")
+        .err()
+        .map(|diagnostic| format!("语法诊断：{diagnostic}"));
+    editor.checked_revision = Some(editor.revision);
+    if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_EDIT").is_some() {
+        eprintln!(
+            "source-edit: parse_us={:.1} revision={} lines={}",
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+            editor.revision,
+            editor.buffer.line_count(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_editor_position_at_pointer(
+    ui: &egui::Ui,
+    document: &UiDocument,
+    editor: &SourceEditorState,
+    highlight_cache: &mut SourceHighlightCache,
+    fold_state: &SourceFoldState,
+    viewport: Rect,
+    scroll_offset: Vec2,
+    pointer: Pos2,
+) -> Option<(TextPosition, Option<usize>)> {
+    let rows = &fold_state.visible_rows.rows;
+    if rows.is_empty() || viewport.height() <= 0.0 {
+        return None;
+    }
+    let y = pointer
+        .y
+        .clamp(viewport.top(), viewport.bottom() - f32::EPSILON);
+    let content_y = (y - viewport.top() + scroll_offset.y).max(0.0);
+    let visible_index = ((content_y / SOURCE_ROW_HEIGHT).floor() as usize).min(rows.len() - 1);
+    let visible_row = &rows[visible_index];
+    let line = visible_row.original_line;
+    if let Some(range) = visible_row
+        .fold_range_index
+        .and_then(|index| fold_state.ranges.get(index))
+    {
+        return Some((
+            TextPosition {
+                line,
+                column: range.open_end_column,
+            },
+            Some(line),
+        ));
+    }
+
+    let (_, galley, _) = highlight_cache.galleys(ui, document, &editor.buffer, line);
+    let code_left =
+        viewport.left() + SOURCE_FOLD_GUTTER_WIDTH + SOURCE_LINE_NUMBER_WIDTH + SOURCE_LINE_GAP
+            - scroll_offset.x;
+    let local_x = (pointer.x - code_left).max(0.0);
+    let local_y = (pointer.y - viewport.top() + scroll_offset.y
+        - visible_index as f32 * SOURCE_ROW_HEIGHT
+        - (SOURCE_ROW_HEIGHT - galley.size().y) * 0.5)
+        .max(0.0);
+    let char_column = galley
+        .cursor_from_pos(Vec2::new(local_x, local_y))
+        .ccursor
+        .index;
+    Some((
+        editor.buffer.position_at_char_column(line, char_column),
+        None,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15085,6 +15801,7 @@ fn source_preview(
     source_highlight_cache: &mut SourceHighlightCache,
     source_scroll_state: &mut SourceScrollState,
     source_interaction: &mut SourceInteractionState,
+    source_editor: &mut SourceEditorState,
     source_scroll_rect: &mut Option<egui::Rect>,
     source_wheel_sample: Option<SourceWheelSample>,
     source_perf_frame: &mut Option<SourcePerfFrame>,
@@ -15103,21 +15820,40 @@ fn source_preview(
                 Vec2::new(ui.available_width(), SOURCE_HEADER_HEIGHT),
                 Layout::left_to_right(Align::Center),
                 |ui| {
+                    let title = format!(
+                        "{}{}",
+                        if document.source_name.is_empty() {
+                            "选择左侧模型以查看源码"
+                        } else {
+                            document.source_name.as_str()
+                        },
+                        if source_editor.is_dirty() {
+                            "  • 未保存"
+                        } else {
+                            ""
+                        }
+                    );
                     ui.add(
                         egui::Label::new(
-                            RichText::new(if document.source_name.is_empty() {
-                                "选择左侧模型以查看源码"
-                            } else {
-                                document.source_name.as_str()
-                            })
-                            .size(13.0)
-                            .font(ui_semibold_font(13.0))
-                            .color(theme_text_primary()),
+                            RichText::new(title)
+                                .size(13.0)
+                                .font(ui_semibold_font(13.0))
+                                .color(theme_text_primary()),
                         )
                         .truncate(),
                     )
                     .on_hover_text(&document.source_name);
                 },
+            );
+        }
+        if let Some(diagnostic) = source_editor.diagnostic.as_deref() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(diagnostic)
+                        .size(12.0)
+                        .color(Color32::from_rgb(190, 55, 48)),
+                )
+                .truncate(),
             );
         }
         ui.add_space(8.0);
@@ -15132,24 +15868,24 @@ fn source_preview(
             let fold_splice_time_before = source_interaction.fold_state.fold_layout_splice_time;
             let fold_splice_count_before = source_interaction.fold_state.fold_layout_splice_count;
             source_scroll_state.sync_class(document.selected_class.as_deref());
-            source_interaction.sync_document(document);
+            let page_lines = (ui.available_height() / SOURCE_ROW_HEIGHT).floor().max(1.0) as isize;
+            process_source_editor_input(ui, source_editor, source_highlight_cache, page_lines);
+            diagnose_source_editor(ui, source_editor);
+            source_interaction.sync_editor_document(document, source_editor);
+            if source_editor.focused
+                && source_interaction.fold_state.expand_line_if_hidden(
+                    source_editor.cursor.line,
+                    source_editor.buffer.line_count(),
+                )
+            {
+                ui.ctx().request_repaint();
+            }
             let fold_index_rebuild_time_before =
                 source_interaction.fold_state.fold_index_rebuild_time;
             let fold_profile_for_present = source_interaction.pending_fold_profile.take();
             source_interaction.fold_pointer_line = None;
-            if source_interaction.focused
-                && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::A))
-            {
-                source_interaction.all_selected = true;
-            }
-            if source_interaction.focused
-                && source_interaction.all_selected
-                && ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::C))
-            {
-                ui.output_mut(|output| {
-                    output.copied_text = source_copy_text(&document.source_lines);
-                });
-            }
+            source_interaction.focused = source_editor.focused;
+            source_interaction.all_selected = false;
             let scroll_height = ui.available_height().max(0.0);
             let scroll_width = ui.available_width().max(0.0);
             let scroll_area_rect = ui.available_rect_before_wrap();
@@ -15157,11 +15893,21 @@ fn source_preview(
             let pointer_position = ui.ctx().pointer_latest_pos();
             let primary_down =
                 ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+            let primary_pressed =
+                ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+            let primary_released =
+                ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
             let pixels_per_point = ui.ctx().pixels_per_point();
             let scroll_id_source = ("modelica-source-scroll", document.selected_class.as_deref());
             // Prepare/validate the source cache once; all per-visible-row
             // lookups below reuse this class/version/theme key.
-            let source_content_width = source_highlight_cache.content_width(ui, document);
+            let source_line_count = if document.selected_class.is_some() {
+                source_editor.buffer.line_count()
+            } else {
+                0
+            };
+            let source_content_width =
+                source_highlight_cache.content_width(ui, document, &source_editor.buffer);
             let (expanded_marker_galley, collapsed_marker_galley) =
                 source_highlight_cache.fold_marker_galleys(ui);
             let cache_hits_before = source_highlight_cache.cache_hits;
@@ -15232,7 +15978,9 @@ fn source_preview(
             let mut fold_line_under_pointer = None;
             let primary_clicked =
                 ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Primary));
-            let source_all_selected = source_interaction.all_selected;
+            let editor_selection = source_editor
+                .buffer
+                .selected_range(source_editor.cursor, source_editor.selection_anchor);
             let scroll_output = {
                 let fold_state = &source_interaction.fold_state;
                 let visible_source_rows = &fold_state.visible_rows.rows;
@@ -15271,16 +16019,49 @@ fn source_preview(
                                 let (number_galley, code_galley, elapsed) =
                                     if let Some(range) = range {
                                         let (code_galley, elapsed) = source_highlight_cache
-                                            .collapsed_galley(ui, document, range);
+                                            .collapsed_galley(
+                                                ui,
+                                                document,
+                                                &source_editor.buffer,
+                                                range,
+                                            );
                                         let number_started = Instant::now();
                                         let number_galley =
                                             source_highlight_cache.number_galley(ui, original_line);
                                         let number_elapsed = number_started.elapsed();
                                         (number_galley, code_galley, elapsed + number_elapsed)
                                     } else {
-                                        source_highlight_cache.galleys(ui, document, original_line)
+                                        source_highlight_cache.galleys(
+                                            ui,
+                                            document,
+                                            &source_editor.buffer,
+                                            original_line,
+                                        )
                                     };
                                 highlight_time += elapsed;
+                                let selection = editor_selection.and_then(|selection| {
+                                    if original_line < selection.start.line
+                                        || original_line > selection.end.line
+                                    {
+                                        return None;
+                                    }
+                                    let start = if original_line == selection.start.line {
+                                        source_editor.buffer.char_column(selection.start)
+                                    } else {
+                                        0
+                                    };
+                                    let end = if original_line == selection.end.line {
+                                        source_editor.buffer.char_column(selection.end)
+                                    } else {
+                                        source_editor.buffer.line(original_line).chars().count()
+                                    };
+                                    Some((start, end))
+                                });
+                                let cursor_column = (source_editor.focused
+                                    && source_editor.cursor.line == original_line)
+                                    .then(|| {
+                                        source_editor.buffer.char_column(source_editor.cursor)
+                                    });
                                 let fold_response = render_source_line(
                                     ui,
                                     number_galley,
@@ -15288,7 +16069,8 @@ fn source_preview(
                                     source_content_width,
                                     original_line,
                                     marker,
-                                    source_all_selected,
+                                    selection,
+                                    cursor_column,
                                     source_scroll_state.current_y,
                                     source_text_positions_should_snap(
                                         frame_motion,
@@ -15321,6 +16103,59 @@ fn source_preview(
                 pointer_position,
                 fold_gutter_rect_under_pointer,
             );
+            let editor_focus_id =
+                ui.make_persistent_id(("modelica-source-editor", scroll_id_source));
+            if primary_pressed && click_owner == SourceClickOwner::Viewport {
+                ui.memory_mut(|memory| memory.request_focus(editor_focus_id));
+                source_editor.focused = true;
+                source_editor.dragging_selection = true;
+                if let Some(pointer) = pointer_position {
+                    if let Some((position, collapsed_line)) = source_editor_position_at_pointer(
+                        ui,
+                        document,
+                        source_editor,
+                        source_highlight_cache,
+                        &source_interaction.fold_state,
+                        scroll_output.inner_rect,
+                        scroll_output.state.offset,
+                        pointer,
+                    ) {
+                        if let Some(line) = collapsed_line {
+                            source_interaction
+                                .fold_state
+                                .toggle_line(line, source_line_count);
+                            source_editor.set_cursor(position, false);
+                        } else {
+                            source_editor.set_cursor(position, false);
+                            source_editor.selection_anchor = Some(position);
+                        }
+                    }
+                }
+                ui.ctx().request_repaint();
+            } else if primary_pressed {
+                source_editor.focused = false;
+                source_editor.dragging_selection = false;
+                ui.memory_mut(|memory| memory.surrender_focus(editor_focus_id));
+            } else if source_editor.dragging_selection && primary_down {
+                if let Some(pointer) = pointer_position {
+                    if let Some((position, _)) = source_editor_position_at_pointer(
+                        ui,
+                        document,
+                        source_editor,
+                        source_highlight_cache,
+                        &source_interaction.fold_state,
+                        scroll_output.inner_rect,
+                        scroll_output.state.offset,
+                        pointer,
+                    ) {
+                        source_editor.set_cursor(position, true);
+                    }
+                }
+                ui.ctx().request_repaint();
+            }
+            if primary_released {
+                source_editor.dragging_selection = false;
+            }
             source_interaction.fold_pointer_line = fold_line_under_pointer;
             if let Some(line) = fold_toggle_line {
                 let fold_metadata =
@@ -15342,7 +16177,7 @@ fn source_preview(
                 let splice_time_before = source_interaction.fold_state.fold_layout_splice_time;
                 if source_interaction
                     .fold_state
-                    .toggle_line(line, document.source_lines.len())
+                    .toggle_line(line, source_line_count)
                 {
                     if let (Some(input_started_at), Some((range_lines, was_collapsed))) =
                         (input_started_at, fold_metadata)
@@ -15395,6 +16230,54 @@ fn source_preview(
                 source_scroll_state.target_y = final_state.offset.y;
                 source_scroll_state.initialized = true;
             }
+            if source_editor.dragging_selection && primary_down {
+                if let Some(pointer) = pointer_position {
+                    let edge_delta = if pointer.y < scroll_output.inner_rect.top() {
+                        -(scroll_output.inner_rect.top() - pointer.y)
+                            .mul_add(0.45, 4.0)
+                            .min(36.0)
+                    } else if pointer.y > scroll_output.inner_rect.bottom() {
+                        (pointer.y - scroll_output.inner_rect.bottom())
+                            .mul_add(0.45, 4.0)
+                            .min(36.0)
+                    } else {
+                        0.0
+                    };
+                    if edge_delta != 0.0 {
+                        final_state.offset.y =
+                            (final_state.offset.y + edge_delta).clamp(0.0, max_scroll_y);
+                        source_scroll_state.current_y = final_state.offset.y;
+                        source_scroll_state.target_y = final_state.offset.y;
+                        final_state.store(ui.ctx(), scroll_id);
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+            if source_editor.focused {
+                if let Ok(visible_index) = source_interaction
+                    .fold_state
+                    .visible_rows
+                    .rows
+                    .binary_search_by_key(&source_editor.cursor.line, |row| row.original_line)
+                {
+                    let line_top = visible_index as f32 * SOURCE_ROW_HEIGHT;
+                    let line_bottom = line_top + SOURCE_ROW_HEIGHT;
+                    let viewport_height = scroll_output.inner_rect.height();
+                    let mut caret_offset = final_state.offset.y;
+                    if line_top < caret_offset {
+                        caret_offset = line_top;
+                    } else if line_bottom > caret_offset + viewport_height {
+                        caret_offset = line_bottom - viewport_height;
+                    }
+                    caret_offset = caret_offset.clamp(0.0, max_scroll_y);
+                    if (caret_offset - final_state.offset.y).abs() > 0.1 {
+                        final_state.offset.y = caret_offset;
+                        final_state.store(ui.ctx(), scroll_id);
+                        source_scroll_state.current_y = caret_offset;
+                        source_scroll_state.target_y = caret_offset;
+                    }
+                }
+            }
             let offset_after = final_state.offset.y;
             let scroll_offset_delta = offset_after - scroll_offset_state_before;
             let scroll_offset_changed = scroll_offset_delta.abs() > 0.01;
@@ -15437,6 +16320,7 @@ fn source_preview(
                 source_highlight_cache.warm_idle_batch(
                     ui,
                     document,
+                    &source_editor.buffer,
                     &source_interaction.fold_state,
                     12,
                     Duration::from_micros(750),
@@ -15457,7 +16341,7 @@ fn source_preview(
                 &scroll_output,
                 scroll_height,
             );
-            if document.source_lines.is_empty() {
+            if source_line_count == 0 {
                 ui.add_space(32.0);
                 ui.vertical_centered(|ui| {
                     ui.label(
@@ -15479,7 +16363,10 @@ fn source_preview(
                     || prewarm_items > 0);
             let should_profile_fold =
                 source_fold_profile_enabled && fold_profile_for_present.is_some();
-            if should_profile_scroll || should_profile_fold {
+            let should_profile_edit = std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_EDIT")
+                .is_some()
+                && source_editor.pending_input_at.is_some();
+            if should_profile_scroll || should_profile_fold || should_profile_edit {
                 *source_perf_frame = Some(SourcePerfFrame {
                     rows: rendered_rows,
                     pre_ui_prepare: Duration::ZERO,
@@ -15548,7 +16435,8 @@ fn render_source_line(
     content_width: f32,
     original_line: usize,
     fold_marker: Option<Arc<egui::Galley>>,
-    selected: bool,
+    selection: Option<(usize, usize)>,
+    cursor_column: Option<usize>,
     scroll_offset: f32,
     snap_text_positions: bool,
     window_scale_factor: f32,
@@ -15559,9 +16447,6 @@ fn render_source_line(
         Sense::hover(),
     );
     let painter = ui.painter();
-    if selected {
-        painter.rect_filled(rect, Rounding::ZERO, theme_accent_soft(30));
-    }
     let fold_rect =
         Rect::from_min_size(rect.min, Vec2::new(SOURCE_FOLD_GUTTER_WIDTH, rect.height()));
     let fold_response = fold_marker.map(|marker_galley| {
@@ -15596,6 +16481,21 @@ fn render_source_line(
         pixels_per_point,
         snap_text_positions,
     );
+    if let Some((start, end)) = selection.filter(|(start, end)| start < end) {
+        let start_rect = code_galley.pos_from_ccursor(egui::text::CCursor::new(start));
+        let end_rect = code_galley.pos_from_ccursor(egui::text::CCursor::new(end));
+        let selection_rect = Rect::from_min_max(
+            Pos2::new(
+                (code_position.x + start_rect.left()).min(code_position.x + end_rect.left()),
+                rect.top(),
+            ),
+            Pos2::new(
+                (code_position.x + start_rect.right()).max(code_position.x + end_rect.right()),
+                rect.bottom(),
+            ),
+        );
+        painter.rect_filled(selection_rect, Rounding::ZERO, theme_accent_soft(82));
+    }
     if trace_sample {
         trace_text_layout_sample(
             true,
@@ -15621,7 +16521,19 @@ fn render_source_line(
         );
     }
     painter.galley(number_position, number_galley, theme_text_tertiary());
+    let caret_rect = cursor_column
+        .map(|cursor_column| code_galley.pos_from_ccursor(egui::text::CCursor::new(cursor_column)));
     painter.galley(code_position, code_galley, theme_text_primary());
+    if let Some(cursor_rect) = caret_rect {
+        let x = code_position.x + cursor_rect.left();
+        painter.line_segment(
+            [
+                Pos2::new(x, code_position.y + cursor_rect.top()),
+                Pos2::new(x, code_position.y + cursor_rect.bottom()),
+            ],
+            Stroke::new(1.25_f32, theme_accent()),
+        );
+    }
     fold_response
 }
 
@@ -15719,7 +16631,9 @@ fn trace_source_frame(
     timings: FrameStageTimings,
     sample_interval: Option<Duration>,
 ) {
-    if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_none() {
+    if std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_SCROLL").is_none()
+        && std::env::var_os("MODELICA_WGPU_PROFILE_SOURCE_EDIT").is_none()
+    {
         return;
     }
     let (wheel_kind, wheel_delta) = match profile.wheel {
@@ -20566,12 +21480,12 @@ fn main() {
                             }
                             app.process_pending_waypoint();
                             match app.render(cancel_redraw, deselect_redraw) {
-                            Ok(()) => {}
-                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                app.resize(app.window.inner_size())
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                            Err(wgpu::SurfaceError::Timeout) => {}
+                                Ok(()) => {}
+                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                    app.resize(app.window.inner_size())
+                                }
+                                Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                                Err(wgpu::SurfaceError::Timeout) => {}
                             }
                         }
                         WindowEvent::ModifiersChanged(modifiers) => {
@@ -20584,7 +21498,32 @@ fn main() {
                         WindowEvent::KeyboardInput { event, .. }
                             if event.state == ElementState::Pressed && !event.repeat =>
                         {
-                            if !egui_consumed && app.pending_document_action.is_none() {
+                            if app.pending_document_action.is_none()
+                                && app.modifiers.control_key()
+                                && event.physical_key == PhysicalKey::Code(KeyCode::KeyS)
+                            {
+                                let result = if app.source_editor.is_dirty() {
+                                    app.save_source_editor()
+                                } else {
+                                    app.persist_edits()
+                                };
+                                match result {
+                                    Ok(0) => {
+                                        app.status_message = Some("没有待保存的修改".to_owned());
+                                        app.load_error = None;
+                                    }
+                                    Ok(saved) => {
+                                        app.status_message =
+                                            Some(format!("保存成功：已写入 {saved} 个文件"));
+                                        app.load_error = None;
+                                    }
+                                    Err(error) => {
+                                        app.status_message =
+                                            Some("保存失败：当前修改已保留".to_owned());
+                                        app.load_error = Some(error);
+                                    }
+                                }
+                            } else if !egui_consumed && app.pending_document_action.is_none() {
                                 match event.physical_key {
                                     PhysicalKey::Code(KeyCode::KeyN)
                                         if app.modifiers.control_key()
@@ -20603,46 +21542,22 @@ fn main() {
                                     PhysicalKey::Code(KeyCode::KeyZ)
                                         if app.modifiers.control_key() =>
                                     {
-                                        if app.modifiers.shift_key() {
-                                            app.redo();
-                                        } else {
-                                            app.undo();
+                                        if app.main_view != MainView::Source
+                                            || !app.source_editor.focused
+                                        {
+                                            if app.modifiers.shift_key() {
+                                                app.redo();
+                                            } else {
+                                                app.undo();
+                                            }
                                         }
                                     }
                                     PhysicalKey::Code(KeyCode::KeyY)
-                                        if app.modifiers.control_key() =>
+                                        if app.modifiers.control_key()
+                                            && (app.main_view != MainView::Source
+                                                || !app.source_editor.focused) =>
                                     {
                                         app.redo();
-                                    }
-                                    PhysicalKey::Code(KeyCode::KeyS)
-                                        if app.modifiers.control_key() =>
-                                    {
-                                        match app.persist_edits() {
-                                            Ok(0) => {
-                                                app.status_message =
-                                                    Some("没有待保存的修改".to_owned());
-                                                eprintln!("modelica-wgpu: nothing to save");
-                                            }
-                                            Ok(saved) => {
-                                                app.status_message = Some(format!(
-                                                    "保存成功：已写入 {saved} 个文件"
-                                                ));
-                                                eprintln!(
-                                                    "modelica-wgpu: saved {saved} edited file(s) to disk"
-                                                );
-                                                app.load_error = None;
-                                            }
-                                            Err(error) => {
-                                                app.status_message = Some(
-                                                    if error.contains("save partially completed") {
-                                                        "保存部分成功：仍有修改未写入".to_owned()
-                                                    } else {
-                                                        "保存失败：当前修改已保留".to_owned()
-                                                    },
-                                                );
-                                                app.load_error = Some(error);
-                                            }
-                                        }
                                     }
                                     _ => {}
                                 }
@@ -20666,7 +21581,11 @@ fn main() {
                             } else {
                                 let hover_changed = app.update_hovered_diagram_port();
                                 let drag_changed = app.update_model_drag_preview(position);
-                                if egui_consumed || hover_changed || drag_changed {
+                                if egui_consumed
+                                    || hover_changed
+                                    || drag_changed
+                                    || app.source_editor.dragging_selection
+                                {
                                     app.request_redraw();
                                 }
                             }
@@ -20689,15 +21608,17 @@ fn main() {
                             // current selection before entering its hot path.
                             let selection_before = (!app.connection_creation_active())
                                 .then(|| app.diagram_selection.clone());
-                            let inert_pointer_release =
-                                if state == ElementState::Released {
-                                    let suppress = app.suppress_next_pointer_release_redraw;
-                                    app.suppress_next_pointer_release_redraw = false;
-                                    suppress
-                                } else {
-                                    false
-                                };
+                            let inert_pointer_release = if state == ElementState::Released {
+                                let suppress = app.suppress_next_pointer_release_redraw;
+                                app.suppress_next_pointer_release_redraw = false;
+                                suppress
+                            } else {
+                                false
+                            };
                             let mut interaction_changed = false;
+                            let source_selection_release = state == ElementState::Released
+                                && button == MouseButton::Left
+                                && app.source_editor.dragging_selection;
                             if state == ElementState::Released {
                                 if button == MouseButton::Left
                                     && app.interactive_drag_active()
@@ -20707,7 +21628,8 @@ fn main() {
                                     // taking the route that the user actually saw on screen.
                                     app.flush_drag_preview();
                                 }
-                                if app.connection_creation_active() && button == MouseButton::Right {
+                                if app.connection_creation_active() && button == MouseButton::Right
+                                {
                                     app.cancel_connection_creation();
                                 } else if app.connection_creation_active()
                                     && button == MouseButton::Left
@@ -20752,8 +21674,10 @@ fn main() {
                             {
                                 app.suppress_next_pointer_release_redraw = true;
                             }
-                            let selection_changed = selection_before
-                                .is_some_and(|selection_before| app.diagram_selection != selection_before);
+                            let selection_changed =
+                                selection_before.is_some_and(|selection_before| {
+                                    app.diagram_selection != selection_before
+                                });
                             if state == ElementState::Pressed
                                 && button == MouseButton::Left
                                 && !app.pointer_interaction_active()
@@ -20765,6 +21689,7 @@ fn main() {
                                 || (state == ElementState::Released && !inert_pointer_release)
                                 || selection_changed
                                 || interaction_changed
+                                || source_selection_release
                             {
                                 app.request_redraw();
                             }
@@ -20772,7 +21697,8 @@ fn main() {
                         WindowEvent::MouseWheel { delta, .. } => {
                             let wheel_sample = wheel_delta_sample(delta);
                             let amount = wheel_sample.delta_y;
-                            let source_line_scroll = wheel_sample.kind == SourceWheelKind::LineDelta
+                            let source_line_scroll = wheel_sample.kind
+                                == SourceWheelKind::LineDelta
                                 && !app.modifiers.control_key()
                                 && app.pointer_over_source_scroll();
                             if source_line_scroll {
@@ -21755,7 +22681,6 @@ mod tests {
             diagram_unresolved_bases: 0,
             diagram_connections: 0,
             source_name: "Demo".to_owned(),
-            source_max_line_chars: lines.iter().map(String::len).max().unwrap_or_default(),
             source_lines: lines,
             source_version: version,
         }
@@ -21816,6 +22741,7 @@ mod tests {
                         &mut source_cache,
                         &mut scroll,
                         &mut interaction,
+                        &mut SourceEditorState::default(),
                         &mut source_rect,
                         None,
                         &mut None,
@@ -21982,6 +22908,7 @@ mod tests {
                         &mut source_cache,
                         &mut scroll,
                         &mut interaction,
+                        &mut SourceEditorState::default(),
                         &mut source_rect,
                         None,
                         &mut None,
@@ -22073,6 +23000,7 @@ mod tests {
                         &mut source_cache,
                         &mut scroll,
                         &mut interaction,
+                        &mut SourceEditorState::default(),
                         &mut source_rect,
                         None,
                         &mut None,
@@ -22206,6 +23134,7 @@ mod tests {
                         &mut source_cache,
                         &mut scroll,
                         &mut interaction,
+                        &mut SourceEditorState::default(),
                         &mut source_rect,
                         None,
                         &mut None,
@@ -22312,6 +23241,54 @@ mod tests {
             "model Demo\n  String text = \"fake annotation( { [ ) } ]\";\nend Demo;",
         );
         assert!(discover_source_fold_ranges(Some("Demo"), 1, &lines).is_empty());
+    }
+
+    #[test]
+    fn editing_a_hidden_fold_line_expands_source_without_removing_text() {
+        let source =
+            "model Demo\n  annotation(\n    Icon(\n      graphics={}\n    )\n  );\nend Demo;";
+        let document = source_folding_document(source, 1);
+        let mut state = source_folding_state(source, 1);
+        assert!(state
+            .visible_rows
+            .rows
+            .binary_search_by_key(&3, |row| row.original_line)
+            .is_err());
+
+        assert!(state.expand_line_if_hidden(3, document.source_lines.len()));
+        assert!(state
+            .visible_rows
+            .rows
+            .binary_search_by_key(&3, |row| row.original_line)
+            .is_ok());
+        assert_eq!(document.source_lines.join("\n"), source);
+    }
+
+    #[test]
+    fn source_fold_expansion_state_is_restored_per_workspace_document() {
+        let source =
+            "model Demo\n  annotation(\n    Icon(\n      graphics={}\n    )\n  );\nend Demo;";
+        let mut document_a = source_folding_document(source, 1);
+        document_a.active_document_id = Some("doc-a".to_owned());
+        let mut document_b = document_a.clone();
+        document_b.active_document_id = Some("doc-b".to_owned());
+        let mut state = SourceFoldState::default();
+
+        state.sync_document(&document_a);
+        assert!(state.toggle_line(1, document_a.source_lines.len()));
+        assert!(!state
+            .collapsed
+            .contains(&state.range_starting_at(1).unwrap().id));
+
+        state.sync_document(&document_b);
+        assert!(state
+            .collapsed
+            .contains(&state.range_starting_at(1).unwrap().id));
+
+        state.sync_document(&document_a);
+        assert!(!state
+            .collapsed
+            .contains(&state.range_starting_at(1).unwrap().id));
     }
 
     #[test]
@@ -22438,16 +23415,24 @@ mod tests {
             .join("\n");
         let document = source_folding_document(&source, 1);
         let fold_state = source_folding_state(&source, 1);
+        let source_buffer = TextBuffer::new(&source);
         let mut cache = SourceHighlightCache::default();
         let context = egui::Context::default();
         install_ui_fonts(&context);
         let mut processed = 0;
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                cache.content_width(ui, &document);
+                cache.content_width(ui, &document, &source_buffer);
                 cache.plan_viewport_prewarm(&fold_state, 0, 20);
                 processed = cache
-                    .warm_idle_batch(ui, &document, &fold_state, 8, Duration::from_secs(1))
+                    .warm_idle_batch(
+                        ui,
+                        &document,
+                        &source_buffer,
+                        &fold_state,
+                        8,
+                        Duration::from_secs(1),
+                    )
                     .0;
             });
         });
@@ -22466,14 +23451,22 @@ mod tests {
         );
         let document = source_folding_document(&source, 1);
         let folds = source_folding_state(&source, 1);
+        let source_buffer = TextBuffer::new(&source);
         let mut cache = SourceHighlightCache::default();
         let context = egui::Context::default();
         install_ui_fonts(&context);
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                cache.content_width(ui, &document);
+                cache.content_width(ui, &document, &source_buffer);
                 cache.plan_viewport_prewarm(&folds, 0, 10);
-                cache.warm_idle_batch(ui, &document, &folds, 12, Duration::from_secs(1));
+                cache.warm_idle_batch(
+                    ui,
+                    &document,
+                    &source_buffer,
+                    &folds,
+                    12,
+                    Duration::from_secs(1),
+                );
                 assert!(!cache.has_prewarm_work());
                 // An unchanged viewport must not restart exhausted/skipped work.
                 cache.plan_viewport_prewarm(&folds, 0, 10);
@@ -22757,7 +23750,6 @@ mod tests {
             diagram_unresolved_bases: 0,
             diagram_connections: 0,
             source_name: "Demo".to_owned(),
-            source_max_line_chars: 32,
             source_lines: lines,
             source_version: 1,
         };
