@@ -550,6 +550,9 @@ mod tests {
         .expect("quoted identifiers and escaped description are valid");
         assert_eq!(file.classes[0].qualified_name, "'A B'.'12H'");
         assert_eq!(file.classes[0].name, "'12H'");
-        assert_eq!(file.classes[0].description.as_deref(), Some("say \"hi\"\nnext"));
+        assert_eq!(
+            file.classes[0].description.as_deref(),
+            Some("say \"hi\"\nnext")
+        );
     }
 }

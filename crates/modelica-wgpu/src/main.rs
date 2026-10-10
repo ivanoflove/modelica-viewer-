@@ -35,13 +35,13 @@ use modelica_core::scene::{
     ResolvedGraphic, Transform2D,
 };
 use modelica_core::{
-    apply_source_transaction,
+    apply_new_class_plan, apply_source_transaction, generate_modelica_source,
     lexer::{tokenize, Token, TokenKind},
-    parse, parse_component_declaration, resolve_diagram, resolve_modelica_text, Class, ClassKind,
-    apply_new_class_plan, generate_modelica_source, plan_new_class, validate_modelica_identifier,
-    validate_new_class, IconResolver, Library, LibraryKind, LibraryRegistry, ModelTextContext,
-    ModelicaFile, NewClassContext, NewClassRequest, NewClassStorageMode, PackageLoader,
-    PackageMember, PackageNode, SourceEdit, SourceRange, SourceTransaction,
+    parse, parse_component_declaration, plan_new_class, resolve_diagram, resolve_modelica_text,
+    validate_modelica_identifier, validate_new_class, Class, ClassKind, IconResolver, Library,
+    LibraryKind, LibraryRegistry, ModelTextContext, ModelicaFile, NewClassContext, NewClassRequest,
+    NewClassStorageMode, PackageLoader, PackageMember, PackageNode, SourceEdit, SourceRange,
+    SourceTransaction,
 };
 use modelica_render::{
     canonicalize_orthogonal_points, connector_anchor_hit_distance, connector_anchors,
@@ -1670,12 +1670,15 @@ impl NewClassDialogState {
                 {
                     continue;
                 }
-                let directory = directory_package_for(&node.qualified_name, &class_source.source_file);
+                let directory =
+                    directory_package_for(&node.qualified_name, &class_source.source_file);
                 let package_order_file = directory
                     .as_ref()
                     .map(|path| path.join("package.order"))
                     .filter(|path| path.is_file());
-                if directory.as_ref().is_some_and(|path| path_is_read_only(path))
+                if directory
+                    .as_ref()
+                    .is_some_and(|path| path_is_read_only(path))
                     || package_order_file
                         .as_ref()
                         .is_some_and(|path| path_is_read_only(path))
@@ -1701,7 +1704,11 @@ impl NewClassDialogState {
                     directory,
                     package_order_file,
                     package_order_entries,
-                    children: node.children.iter().map(|child| child.name.clone()).collect(),
+                    children: node
+                        .children
+                        .iter()
+                        .map(|child| child.name.clone())
+                        .collect(),
                 });
             }
             for class_source in &document.class_sources {
@@ -1719,14 +1726,12 @@ impl NewClassDialogState {
                     kind,
                 });
             }
-            state.insert_targets.sort_by(|left, right| {
-                left.qualified_name.cmp(&right.qualified_name)
-            });
-            if let Some(package) = state
-                .packages
-                .iter()
-                .find(|package| package.qualified_name == document.package_name && package.directory.is_some())
-            {
+            state
+                .insert_targets
+                .sort_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+            if let Some(package) = state.packages.iter().find(|package| {
+                package.qualified_name == document.package_name && package.directory.is_some()
+            }) {
                 state.within_package = Some(package.qualified_name.clone());
                 state.directory = package.directory.clone().unwrap_or(state.directory);
             }
@@ -1736,23 +1741,23 @@ impl NewClassDialogState {
 
     fn selected_package(&self) -> Option<&NewClassPackageTarget> {
         self.within_package.as_deref().and_then(|name| {
-            self.packages.iter().find(|package| {
-                package.qualified_name == name && package.directory.is_some()
-            })
+            self.packages
+                .iter()
+                .find(|package| package.qualified_name == name && package.directory.is_some())
         })
     }
 
     fn selected_insert_package(&self) -> Option<&NewClassPackageTarget> {
         self.insert_parent.as_deref().and_then(|name| {
-            self.packages.iter().find(|package| {
-                package.qualified_name == name && package.directory.is_some()
-            })
+            self.packages
+                .iter()
+                .find(|package| package.qualified_name == name && package.directory.is_some())
         })
     }
 
     fn request(&self) -> Result<NewClassRequest, String> {
-        let base_class = (!self.base_class.trim().is_empty())
-            .then(|| self.base_class.trim().to_owned());
+        let base_class =
+            (!self.base_class.trim().is_empty()).then(|| self.base_class.trim().to_owned());
         let description = (!self.description.is_empty()).then(|| self.description.clone());
         let storage = match self.storage {
             NewClassStorageChoice::SingleFile => {
@@ -1761,7 +1766,8 @@ impl NewClassDialogState {
                     .and_then(|package| package.directory.clone())
                     .unwrap_or_else(|| self.directory.clone());
                 let within = package.map(|package| package.qualified_name.clone());
-                let package_order_file = package.and_then(|package| package.package_order_file.clone());
+                let package_order_file =
+                    package.and_then(|package| package.package_order_file.clone());
                 let package_order_before = package
                     .and_then(|package| package.package_order_file.as_ref())
                     .and(self.package_order_before.clone());
@@ -1778,7 +1784,8 @@ impl NewClassDialogState {
                     .and_then(|package| package.directory.clone())
                     .unwrap_or_else(|| self.directory.clone());
                 let within = package.map(|package| package.qualified_name.clone());
-                let package_order_file = package.and_then(|package| package.package_order_file.clone());
+                let package_order_file =
+                    package.and_then(|package| package.package_order_file.clone());
                 let package_order_before = package
                     .and_then(|package| package.package_order_file.as_ref())
                     .and(self.package_order_before.clone());
@@ -1793,10 +1800,15 @@ impl NewClassDialogState {
                 let target = self
                     .insert_parent
                     .as_deref()
-                    .and_then(|name| self.insert_targets.iter().find(|target| target.qualified_name == name))
+                    .and_then(|name| {
+                        self.insert_targets
+                            .iter()
+                            .find(|target| target.qualified_name == name)
+                    })
                     .ok_or_else(|| "请选择要插入的父类".to_owned())?;
                 let package = self.selected_insert_package();
-                let package_order_file = package.and_then(|package| package.package_order_file.clone());
+                let package_order_file =
+                    package.and_then(|package| package.package_order_file.clone());
                 let package_order_before = package
                     .and_then(|package| package.package_order_file.as_ref())
                     .and(self.package_order_before.clone());
@@ -1825,18 +1837,25 @@ impl NewClassDialogState {
             Some(NewClassStorageMode::SingleFile { directory, .. }) => {
                 directory.join(format!("{}.mo", filename_component(&self.name)))
             }
-            Some(NewClassStorageMode::DirectoryPackage { parent_directory, .. }) => {
-                parent_directory
-                    .join(filename_component(&self.name))
-                    .join("package.mo")
-            }
+            Some(NewClassStorageMode::DirectoryPackage {
+                parent_directory, ..
+            }) => parent_directory
+                .join(filename_component(&self.name))
+                .join("package.mo"),
             Some(NewClassStorageMode::InsertIntoExistingFile { file, .. }) => file.clone(),
             None if self.storage == NewClassStorageChoice::InsertIntoFile => self
                 .insert_parent
                 .as_deref()
-                .and_then(|name| self.insert_targets.iter().find(|target| target.qualified_name == name))
+                .and_then(|name| {
+                    self.insert_targets
+                        .iter()
+                        .find(|target| target.qualified_name == name)
+                })
                 .map_or_else(
-                    || self.directory.join(format!("{}.mo", filename_component(&self.name))),
+                    || {
+                        self.directory
+                            .join(format!("{}.mo", filename_component(&self.name)))
+                    },
                     |target| target.source_file.clone(),
                 ),
             None => self
@@ -1922,9 +1941,12 @@ impl NewClassDialogState {
     fn qualified_name_preview(&self, request: Option<&NewClassRequest>) -> String {
         match request.map(|request| &request.storage) {
             Some(NewClassStorageMode::SingleFile { within, .. })
-            | Some(NewClassStorageMode::DirectoryPackage { within, .. }) => within
-                .as_ref()
-                .map_or_else(|| self.name.trim().to_owned(), |parent| format!("{parent}.{}", self.name.trim())),
+            | Some(NewClassStorageMode::DirectoryPackage { within, .. }) => {
+                within.as_ref().map_or_else(
+                    || self.name.trim().to_owned(),
+                    |parent| format!("{parent}.{}", self.name.trim()),
+                )
+            }
             Some(NewClassStorageMode::InsertIntoExistingFile { parent_class, .. }) => {
                 format!("{parent_class}.{}", self.name.trim())
             }
@@ -4327,7 +4349,11 @@ fn collect_class_kinds_from_ast(class: &Class, output: &mut HashMap<String, Clas
     }
 }
 
-fn expand_tree_to_class(node: &TreeNode, qualified_name: &str, expanded: &mut HashSet<String>) -> bool {
+fn expand_tree_to_class(
+    node: &TreeNode,
+    qualified_name: &str,
+    expanded: &mut HashSet<String>,
+) -> bool {
     if node.qualified_name == qualified_name {
         return true;
     }
@@ -10636,11 +10662,9 @@ impl App {
     }
 
     fn create_modelica_class(&mut self, request: NewClassRequest) {
-        let plan_result = self
-            .build_new_class_context(&request)
-            .and_then(|context| {
-                plan_new_class(&request, &context).map_err(|error| error.to_string())
-            });
+        let plan_result = self.build_new_class_context(&request).and_then(|context| {
+            plan_new_class(&request, &context).map_err(|error| error.to_string())
+        });
         let plan = match plan_result {
             Ok(plan) => plan,
             Err(error) => {
@@ -10673,7 +10697,10 @@ impl App {
                         == Some("package.mo")
                         && plan.primary_file.parent() == document.path.parent())
             })
-            .map_or_else(|| plan.reload_path.clone(), |document| document.path.clone());
+            .map_or_else(
+                || plan.reload_path.clone(),
+                |document| document.path.clone(),
+            );
         self.pending_class_selection = Some((plan.qualified_name.clone(), created_path.clone()));
         self.new_class_dialog.open = false;
         self.new_class_dialog.operation_error = None;
@@ -10686,7 +10713,10 @@ impl App {
         self.begin_document_load(reload_path);
     }
 
-    fn build_new_class_context(&self, request: &NewClassRequest) -> Result<NewClassContext, String> {
+    fn build_new_class_context(
+        &self,
+        request: &NewClassRequest,
+    ) -> Result<NewClassContext, String> {
         let mut context = self.new_class_dialog.context.clone();
         context.scope_is_explicit = true;
         context.scope_class_names.clear();
@@ -10748,8 +10778,9 @@ impl App {
                 let source = fs::read_to_string(&path).map_err(|error| {
                     format!("无法读取已有 Modelica 文件 {}：{error}", path.display())
                 })?;
-                let parsed = parse(&source, &path)
-                    .map_err(|error| format!("已有 Modelica 文件解析失败 {}：{error}", path.display()))?;
+                let parsed = parse(&source, &path).map_err(|error| {
+                    format!("已有 Modelica 文件解析失败 {}：{error}", path.display())
+                })?;
                 for class in &parsed.classes {
                     if let Some(scope) = scope {
                         if parsed.within.as_deref() == Some(scope) {
@@ -10775,9 +10806,8 @@ impl App {
         }
 
         if let Some(package_order_file) = package_order_file {
-            let content = fs::read_to_string(package_order_file).map_err(|error| {
-                format!("无法读取 {}：{error}", package_order_file.display())
-            })?;
+            let content = fs::read_to_string(package_order_file)
+                .map_err(|error| format!("无法读取 {}：{error}", package_order_file.display()))?;
             context
                 .package_order_files
                 .insert(package_order_file.to_path_buf(), content);
@@ -10785,9 +10815,10 @@ impl App {
 
         if let Some(file) = insert_file {
             if path_is_read_only(file)
-                || self.document.as_ref().is_some_and(|document| {
-                    document.registry.borrow().is_read_only(file)
-                })
+                || self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.registry.borrow().is_read_only(file))
             {
                 return Err(format!("目标文件只读，不能插入：{}", file.display()));
             }
@@ -11106,10 +11137,8 @@ impl App {
                         .is_some_and(|document| document.class_names.contains(&qualified_name))
                     {
                         self.select_created_class(&qualified_name);
-                        self.status_message = Some(format!(
-                            "已创建并加载 {qualified_name}：{}",
-                            path.display()
-                        ));
+                        self.status_message =
+                            Some(format!("已创建并加载 {qualified_name}：{}", path.display()));
                     } else {
                         self.status_message = Some(format!(
                             "文件已创建：{}；重新加载后未在模型树中找到 {qualified_name}",
@@ -11193,7 +11222,11 @@ impl App {
     fn select_created_class(&mut self, qualified_name: &str) {
         self.selected_class = Some(qualified_name.to_owned());
         if let Some(document) = self.document.as_ref() {
-            expand_tree_to_class(&document.model_tree, qualified_name, &mut self.expanded_nodes);
+            expand_tree_to_class(
+                &document.model_tree,
+                qualified_name,
+                &mut self.expanded_nodes,
+            );
         }
         self.main_view = MainView::Source;
         self.rebuild_selected_scenes();
@@ -12424,7 +12457,10 @@ fn new_class_location_error(request: &NewClassRequest) -> Option<String> {
             parent_directory,
             package_order_file,
             ..
-        } => (Some(parent_directory.as_path()), package_order_file.as_deref()),
+        } => (
+            Some(parent_directory.as_path()),
+            package_order_file.as_deref(),
+        ),
         NewClassStorageMode::InsertIntoExistingFile { file, .. } => {
             if !file.is_file() {
                 return Some(format!("父类文件不存在：{}", file.display()));
@@ -12518,9 +12554,7 @@ fn draw_new_class_dialog(
                                             .iter()
                                             .find(|target| target.qualified_name == name)
                                     })
-                                    .is_some_and(|target| {
-                                        target.kind == ClassKind::OperatorRecord
-                                    });
+                                    .is_some_and(|target| target.kind == ClassKind::OperatorRecord);
                                 let enabled = kind != ClassKind::OperatorFunction
                                     || (state.storage == NewClassStorageChoice::InsertIntoFile
                                         && operator_function_parent_selected);
@@ -12561,12 +12595,13 @@ fn draw_new_class_dialog(
                         });
                         ui.add_sized(
                             [ui.available_width(), 28.0],
-                            egui::TextEdit::singleline(&mut state.base_class)
-                                .hint_text(if state.kind == ClassKind::Type {
+                            egui::TextEdit::singleline(&mut state.base_class).hint_text(
+                                if state.kind == ClassKind::Type {
                                     "Real / Integer / Boolean / String / 已加载类型"
                                 } else {
                                     "可选，例如 Modelica.Blocks.Icons.Block"
-                                }),
+                                },
+                            ),
                         );
                         ui.end_row();
                     }
@@ -12646,9 +12681,11 @@ fn draw_new_class_dialog(
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(state.target_directory().display().to_string())
-                                            .size(11.0)
-                                            .color(theme_text_secondary()),
+                                        RichText::new(
+                                            state.target_directory().display().to_string(),
+                                        )
+                                        .size(11.0)
+                                        .color(theme_text_secondary()),
                                     )
                                     .truncate(),
                                 );
@@ -12663,9 +12700,11 @@ fn draw_new_class_dialog(
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(state.target_directory().display().to_string())
-                                            .size(11.0)
-                                            .color(theme_text_secondary()),
+                                        RichText::new(
+                                            state.target_directory().display().to_string(),
+                                        )
+                                        .size(11.0)
+                                        .color(theme_text_secondary()),
                                     )
                                     .truncate(),
                                 );
@@ -12679,24 +12718,24 @@ fn draw_new_class_dialog(
                             ui.label("父类");
                             egui::ComboBox::from_id_source("new-class-insert-parent")
                                 .selected_text(
-                                    state
-                                        .insert_parent
-                                        .as_deref()
-                                        .unwrap_or("请选择父类"),
+                                    state.insert_parent.as_deref().unwrap_or("请选择父类"),
                                 )
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
                                     for target in &state.insert_targets {
-                                        if ui.selectable_value(
-                                            &mut state.insert_parent,
-                                            Some(target.qualified_name.clone()),
-                                            format!(
-                                                "{} · {} · {}",
-                                                target.qualified_name,
-                                                new_class_kind_label(target.kind),
-                                                target.source_file.display()
-                                            ),
-                                        ).clicked() {
+                                        if ui
+                                            .selectable_value(
+                                                &mut state.insert_parent,
+                                                Some(target.qualified_name.clone()),
+                                                format!(
+                                                    "{} · {} · {}",
+                                                    target.qualified_name,
+                                                    new_class_kind_label(target.kind),
+                                                    target.source_file.display()
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
                                             state.package_order_before = None;
                                         }
                                     }
@@ -12760,9 +12799,10 @@ fn draw_new_class_dialog(
                 state.last_request = request.clone();
             }
             let qname = state.qualified_name_preview(request.as_ref());
-            let file_path = request
-                .as_ref()
-                .map_or_else(|| state.path_preview(None), |_| state.path_preview(request.as_ref()));
+            let file_path = request.as_ref().map_or_else(
+                || state.path_preview(None),
+                |_| state.path_preview(request.as_ref()),
+            );
             ui.add_space(8.0);
             ui.label(RichText::new(format!("全限定名：{qname}")).size(12.0));
             ui.label(
@@ -12771,20 +12811,28 @@ fn draw_new_class_dialog(
                     .color(theme_text_secondary()),
             );
 
-            let validation_error = request_error.or_else(|| {
-                request
-                    .as_ref()
-                    .and_then(|request| validate_new_class(request, &state.context).err())
-                    .map(|error| error.to_string())
-            }).or_else(|| request.as_ref().and_then(new_class_location_error));
+            let validation_error = request_error
+                .or_else(|| {
+                    request
+                        .as_ref()
+                        .and_then(|request| validate_new_class(request, &state.context).err())
+                        .map(|error| error.to_string())
+                })
+                .or_else(|| request.as_ref().and_then(new_class_location_error));
             let path_conflict = request.as_ref().is_some_and(|request| {
-                !matches!(request.storage, NewClassStorageMode::InsertIntoExistingFile { .. })
-                    && state.path_preview(Some(request)).exists()
+                !matches!(
+                    request.storage,
+                    NewClassStorageMode::InsertIntoExistingFile { .. }
+                ) && state.path_preview(Some(request)).exists()
             });
             let validation_error = validation_error
                 .or_else(|| path_conflict.then(|| "目标文件或目录已存在，不能覆盖".to_owned()));
             state.validation_error = validation_error.clone();
-            if let Some(error) = state.operation_error.as_deref().or(validation_error.as_deref()) {
+            if let Some(error) = state
+                .operation_error
+                .as_deref()
+                .or(validation_error.as_deref())
+            {
                 ui.colored_label(Color32::from_rgb(190, 55, 55), error);
             }
 
@@ -12793,7 +12841,8 @@ fn draw_new_class_dialog(
             });
             ui.add_space(6.0);
             ui.label(RichText::new("生成内容预览").size(11.0).strong());
-            let mut preview = preview.unwrap_or_else(|| "（请先填写有效的类名和必要字段）".to_owned());
+            let mut preview =
+                preview.unwrap_or_else(|| "（请先填写有效的类名和必要字段）".to_owned());
             ui.add_sized(
                 [ui.available_width(), 112.0],
                 egui::TextEdit::multiline(&mut preview)
@@ -13223,11 +13272,9 @@ fn draw_preview_ui(
                     let class_path = selected_class.unwrap_or(package_name);
                     let new_button_width = 78.0_f32;
                     let window_controls_reserve = 92.0_f32;
-                    let class_label_width = (ui.available_width()
-                        - new_button_width
-                        - window_controls_reserve
-                        - 16.0)
-                        .max(0.0);
+                    let class_label_width =
+                        (ui.available_width() - new_button_width - window_controls_reserve - 16.0)
+                            .max(0.0);
                     ui.add_sized(
                         [class_label_width, 26.0],
                         egui::Label::new(
@@ -26018,7 +26065,10 @@ end BoundarySig;
             directory: directory.clone(),
             ..NewClassDialogState::default()
         };
-        dialog.context.class_kinds.insert("Library".into(), ClassKind::Package);
+        dialog
+            .context
+            .class_kinds
+            .insert("Library".into(), ClassKind::Package);
         dialog.packages.push(NewClassPackageTarget {
             qualified_name: "Library".into(),
             source_file: package_file,
@@ -26036,8 +26086,14 @@ end BoundarySig;
             NewClassStorageMode::SingleFile { directory: target, within: Some(within), .. }
                 if target == &directory && within == "Library"
         ));
-        assert_eq!(dialog.qualified_name_preview(Some(&single)), "Library.HeatXNTU");
-        assert_eq!(dialog.path_preview(Some(&single)), directory.join("HeatXNTU.mo"));
+        assert_eq!(
+            dialog.qualified_name_preview(Some(&single)),
+            "Library.HeatXNTU"
+        );
+        assert_eq!(
+            dialog.path_preview(Some(&single)),
+            directory.join("HeatXNTU.mo")
+        );
 
         dialog.kind = ClassKind::Package;
         dialog.storage = NewClassStorageChoice::DirectoryPackage;
@@ -26048,8 +26104,8 @@ end BoundarySig;
             dialog.path_preview(Some(&package)),
             directory.join("HeatXNTU/package.mo")
         );
-        let preview = generate_modelica_source(&package, Some("Library"))
-            .expect("package preview source");
+        let preview =
+            generate_modelica_source(&package, Some("Library")).expect("package preview source");
         assert!(preview.starts_with("within Library;\npackage HeatXNTU\n"));
         assert!(!directory.join("HeatXNTU").exists());
         fs::remove_dir_all(directory).expect("cleanup");
@@ -26109,6 +26165,91 @@ end BoundarySig;
                 && order == order_file
                 && before == "Later"
         ));
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn new_class_dialog_creation_reloads_package_tree_and_source_location() {
+        let directory = std::env::temp_dir().join(format!(
+            "modelica-wgpu-new-class-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create package directory");
+        let package_file = directory.join("package.mo");
+        let order_file = directory.join("package.order");
+        let existing_file = directory.join("Existing.mo");
+        fs::write(&package_file, "package Library\nend Library;\n").expect("write package");
+        fs::write(&order_file, "Existing\n").expect("write package order");
+        fs::write(
+            &existing_file,
+            "within Library;\nmodel Existing\nend Existing;\n",
+        )
+        .expect("write existing member");
+
+        let mut dialog = NewClassDialogState {
+            directory: directory.clone(),
+            name: "Created".into(),
+            kind: ClassKind::Model,
+            within_package: Some("Library".into()),
+            package_order_before: Some("Existing".into()),
+            ..NewClassDialogState::default()
+        };
+        dialog
+            .context
+            .class_kinds
+            .insert("Library".into(), ClassKind::Package);
+        dialog
+            .context
+            .class_kinds
+            .insert("Library.Existing".into(), ClassKind::Model);
+        dialog.packages.push(NewClassPackageTarget {
+            qualified_name: "Library".into(),
+            source_file: package_file,
+            directory: Some(directory.clone()),
+            package_order_file: Some(order_file.clone()),
+            package_order_entries: vec!["Existing".into()],
+            children: vec!["Existing".into()],
+        });
+        dialog.refresh_destination_scope();
+
+        let request = dialog.request().expect("valid form request");
+        let mut context = dialog.context.clone();
+        context.scope_is_explicit = true;
+        context.scope_class_names.insert("Library.Existing".into());
+        context
+            .package_order_files
+            .insert(order_file.clone(), "Existing\n".into());
+        let plan = plan_new_class(&request, &context).expect("plan from dialog request");
+        assert_eq!(plan.qualified_name, "Library.Created");
+        let created_file = apply_new_class_plan(&plan).expect("write class and package order");
+
+        let loaded = PackageLoader
+            .load(&directory)
+            .expect("reload created package");
+        assert_eq!(
+            loaded
+                .ordered_members
+                .iter()
+                .map(PackageMember::name)
+                .collect::<Vec<_>>(),
+            ["Created", "Existing"]
+        );
+        let created = loaded.ordered_members[0].as_class();
+        assert_eq!(created.qualified_name, "Library.Created");
+        assert_eq!(created.source_file, created_file);
+        assert!(created.source_range.end > created.source_range.start);
+        let source = fs::read_to_string(&created_file).expect("read generated source");
+        let parsed = parse(&source, &created_file).expect("reparse generated source");
+        assert_eq!(parsed.within.as_deref(), Some("Library"));
+        assert_eq!(parsed.classes[0].kind, ClassKind::Model);
+        assert_eq!(
+            fs::read_to_string(order_file).unwrap(),
+            "Created\nExisting\n"
+        );
         fs::remove_dir_all(directory).expect("cleanup");
     }
 }

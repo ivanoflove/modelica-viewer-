@@ -244,7 +244,10 @@ fn is_reserved_identifier(value: &str) -> bool {
     )
 }
 
-fn validate_qualified_name(value: &str, field: NewClassField) -> Result<(), NewClassValidationError> {
+fn validate_qualified_name(
+    value: &str,
+    field: NewClassField,
+) -> Result<(), NewClassValidationError> {
     if value.is_empty() {
         return Err(NewClassValidationError::new(field, "名称不能为空"));
     }
@@ -336,14 +339,37 @@ fn file_component(identifier: &str) -> Result<String, NewClassValidationError> {
         identifier.to_owned()
     };
     let invalid = name.chars().any(|character| {
-        character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
     });
     let stem = name.split('.').next().unwrap_or_default();
     let windows_device = matches!(
         stem.to_ascii_uppercase().as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
-            | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
-            | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     );
     if name.ends_with([' ', '.']) || windows_device || invalid {
         return Err(NewClassValidationError::new(
@@ -401,7 +427,9 @@ fn base_kind_compatible(target: ClassKind, base: ClassKind) -> bool {
         ClassKind::Package => base == ClassKind::Package,
         ClassKind::Model => base == ClassKind::Model,
         ClassKind::Block => base == ClassKind::Block,
-        ClassKind::Connector => matches!(base, ClassKind::Connector | ClassKind::ExpandableConnector),
+        ClassKind::Connector => {
+            matches!(base, ClassKind::Connector | ClassKind::ExpandableConnector)
+        }
         ClassKind::ExpandableConnector => {
             matches!(base, ClassKind::Connector | ClassKind::ExpandableConnector)
         }
@@ -437,7 +465,10 @@ pub fn validate_new_class(
     if let Some(description) = &request.description
         && description.chars().any(|character| {
             character.is_control()
-                && !matches!(character, '\n' | '\r' | '\t' | '\u{0007}' | '\u{0008}' | '\u{000b}' | '\u{000c}')
+                && !matches!(
+                    character,
+                    '\n' | '\r' | '\t' | '\u{0007}' | '\u{0008}' | '\u{000b}' | '\u{000c}'
+                )
         })
     {
         return Err(NewClassValidationError::new(
@@ -446,7 +477,11 @@ pub fn validate_new_class(
         ));
     }
 
-    if let Some(base) = request.base_class.as_deref().filter(|base| !base.trim().is_empty()) {
+    if let Some(base) = request
+        .base_class
+        .as_deref()
+        .filter(|base| !base.trim().is_empty())
+    {
         if !matches!(base, "Real" | "Integer" | "Boolean" | "String") {
             validate_qualified_name(base, NewClassField::BaseClass)?;
         }
@@ -469,7 +504,8 @@ pub fn validate_new_class(
     }
 
     if request.kind == ClassKind::OperatorFunction {
-        let NewClassStorageMode::InsertIntoExistingFile { parent_class, .. } = &request.storage else {
+        let NewClassStorageMode::InsertIntoExistingFile { parent_class, .. } = &request.storage
+        else {
             return Err(NewClassValidationError::new(
                 NewClassField::Storage,
                 "Operator Function 必须直接插入现有 Operator Record 中",
@@ -482,8 +518,13 @@ pub fn validate_new_class(
             ));
         }
     }
-    if matches!(request.kind, ClassKind::Operator | ClassKind::OperatorFunction)
-        && request.base_class.as_deref().is_some_and(|base| !base.trim().is_empty())
+    if matches!(
+        request.kind,
+        ClassKind::Operator | ClassKind::OperatorFunction
+    ) && request
+        .base_class
+        .as_deref()
+        .is_some_and(|base| !base.trim().is_empty())
     {
         return Err(NewClassValidationError::new(
             NewClassField::BaseClass,
@@ -513,7 +554,10 @@ pub fn validate_new_class(
         ));
     }
 
-    if !matches!(request.storage, NewClassStorageMode::InsertIntoExistingFile { .. }) {
+    if !matches!(
+        request.storage,
+        NewClassStorageMode::InsertIntoExistingFile { .. }
+    ) {
         file_component(&request.name)?;
     }
     let qualified_name = qualified_name_for(request)?;
@@ -560,16 +604,23 @@ pub fn generate_modelica_source(
             .as_deref()
             .filter(|base| !base.trim().is_empty())
             .ok_or_else(|| {
-                NewClassValidationError::new(
-                    NewClassField::BaseClass,
-                    "Type 必须指定基类",
-                )
+                NewClassValidationError::new(NewClassField::BaseClass, "Type 必须指定基类")
             })?;
-        source.push_str(&format!("{partial}type {} = {base}{description};\n", request.name));
+        source.push_str(&format!(
+            "{partial}type {} = {base}{description};\n",
+            request.name
+        ));
         return Ok(source);
     }
-    source.push_str(&format!("{partial}{class_keyword} {}{description}\n", request.name));
-    if let Some(base) = request.base_class.as_deref().filter(|base| !base.trim().is_empty()) {
+    source.push_str(&format!(
+        "{partial}{class_keyword} {}{description}\n",
+        request.name
+    ));
+    if let Some(base) = request
+        .base_class
+        .as_deref()
+        .filter(|base| !base.trim().is_empty())
+    {
         source.push_str(&format!("  extends {base};\n"));
     }
     source.push_str(&format!("end {};\n", request.name));
@@ -613,7 +664,11 @@ fn package_order_contents(
     member: &str,
     before: Option<&str>,
 ) -> Result<String, NewClassValidationError> {
-    let line_ending = if original.contains("\r\n") { "\r\n" } else { "\n" };
+    let line_ending = if original.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut lines = original
         .split_inclusive('\n')
         .map(str::to_owned)
@@ -758,7 +813,11 @@ pub fn plan_new_class(
                     "不能向 short class definition 插入嵌套类",
                 ));
             }
-            if class.children.iter().any(|child| child.name == request.name) {
+            if class
+                .children
+                .iter()
+                .any(|child| child.name == request.name)
+            {
                 return Err(NewClassValidationError::new(
                     NewClassField::Name,
                     format!("父类中已经存在成员 `{}`", request.name),
@@ -883,7 +942,9 @@ fn class_end_line_start(
                 && !matches!(token.kind, TokenKind::Whitespace | TokenKind::Comment)
         })
         .collect::<Vec<_>>();
-    let suffix = tokens.get(tokens.len().saturating_sub(3)..).unwrap_or_default();
+    let suffix = tokens
+        .get(tokens.len().saturating_sub(3)..)
+        .unwrap_or_default();
     if suffix.len() != 3
         || suffix[0].text != "end"
         || suffix[1].text != class.name
@@ -895,12 +956,10 @@ fn class_end_line_start(
         ));
     }
     let end_start = suffix[0].start;
-    let line_start = source[..end_start]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let prefix = source.get(line_start..end_start).ok_or_else(|| {
-        NewClassValidationError::new(NewClassField::Storage, "父类源码范围无效")
-    })?;
+    let line_start = source[..end_start].rfind('\n').map_or(0, |index| index + 1);
+    let prefix = source
+        .get(line_start..end_start)
+        .ok_or_else(|| NewClassValidationError::new(NewClassField::Storage, "父类源码范围无效"))?;
     let at_line_start = prefix.chars().all(char::is_whitespace);
     let (position, indent) = if at_line_start {
         (line_start, prefix.to_owned())
@@ -943,10 +1002,7 @@ pub fn apply_new_class_plan(plan: &NewClassPlan) -> Result<PathBuf, String> {
     })
 }
 
-fn apply_new_class_plan_with<F>(
-    plan: &NewClassPlan,
-    mut write_change: F,
-) -> Result<PathBuf, String>
+fn apply_new_class_plan_with<F>(plan: &NewClassPlan, mut write_change: F) -> Result<PathBuf, String>
 where
     F: FnMut(&NewClassFileChange) -> Result<(), String>,
 {
@@ -954,7 +1010,10 @@ where
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| format!("目标目录不可访问：{}: {error}", root.display()))?;
     if root_metadata.file_type().is_symlink() {
-        return Err(format!("拒绝使用符号链接作为授权目标目录：{}", root.display()));
+        return Err(format!(
+            "拒绝使用符号链接作为授权目标目录：{}",
+            root.display()
+        ));
     }
     if !root_metadata.is_dir() {
         return Err(format!("目标不是目录：{}", root.display()));
@@ -967,13 +1026,15 @@ where
                 return Err(format!("拒绝覆盖已有文件：{}", change.path.display()));
             }
             Some(expected) => {
-                let metadata = fs::metadata(&change.path)
-                    .map_err(|error| format!("读取目标文件失败 {}: {error}", change.path.display()))?;
+                let metadata = fs::metadata(&change.path).map_err(|error| {
+                    format!("读取目标文件失败 {}: {error}", change.path.display())
+                })?;
                 if metadata.permissions().readonly() {
                     return Err(format!("目标文件为只读：{}", change.path.display()));
                 }
-                let current = fs::read_to_string(&change.path)
-                    .map_err(|error| format!("读取目标文件失败 {}: {error}", change.path.display()))?;
+                let current = fs::read_to_string(&change.path).map_err(|error| {
+                    format!("读取目标文件失败 {}: {error}", change.path.display())
+                })?;
                 if &current != expected {
                     return Err(format!(
                         "目标文件已被外部修改，拒绝覆盖：{}",
@@ -991,7 +1052,8 @@ where
     let mut replaced_files: Vec<(PathBuf, String, String)> = Vec::new();
     for change in &validated {
         if let Some(parent) = change.path.parent()
-            && let Err(error) = create_directories_under_root(root, parent, &mut created_directories)
+            && let Err(error) =
+                create_directories_under_root(root, parent, &mut created_directories)
         {
             return rollback_new_files(
                 error,
@@ -1006,10 +1068,7 @@ where
                 && fs::read_to_string(&change.path)
                     .is_ok_and(|contents| contents == change.replacement_contents)
             {
-                created_files.push((
-                    change.path.clone(),
-                    change.replacement_contents.clone(),
-                ));
+                created_files.push((change.path.clone(), change.replacement_contents.clone()));
             } else if let Some(expected) = &change.expected_contents
                 && fs::read_to_string(&change.path)
                     .is_ok_and(|contents| contents == change.replacement_contents)
@@ -1029,10 +1088,7 @@ where
             );
         }
         if change.expected_contents.is_none() {
-            created_files.push((
-                change.path.clone(),
-                change.replacement_contents.clone(),
-            ));
+            created_files.push((change.path.clone(), change.replacement_contents.clone()));
         } else if let Some(expected) = &change.expected_contents {
             replaced_files.push((
                 change.path.clone(),
@@ -1048,7 +1104,10 @@ fn validate_path_under_root(root: &Path, path: &Path) -> Result<(), String> {
     if !path.is_absolute() || !path.starts_with(root) {
         return Err(format!("拒绝授权目录之外的路径：{}", path.display()));
     }
-    if path.components().any(|component| matches!(component, Component::ParentDir)) {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
         return Err(format!("路径不能包含 `..`：{}", path.display()));
     }
     let relative = path
@@ -1086,7 +1145,10 @@ fn create_directories_under_root(
         create_directories_under_root(root, parent, created)?;
     }
     if !directory.starts_with(root) {
-        return Err(format!("拒绝创建授权目录之外的目录：{}", directory.display()));
+        return Err(format!(
+            "拒绝创建授权目录之外的目录：{}",
+            directory.display()
+        ));
     }
     fs::create_dir(directory)
         .map_err(|error| format!("创建目录失败 {}: {error}", directory.display()))?;
@@ -1119,7 +1181,10 @@ fn write_temp(path: &Path, contents: &str) -> Result<PathBuf, String> {
         .create_new(true)
         .open(&temporary)
         .map_err(|error| format!("创建临时文件失败 {}: {error}", temporary.display()))?;
-    if let Err(error) = file.write_all(contents.as_bytes()).and_then(|()| file.sync_all()) {
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
         let _ = fs::remove_file(&temporary);
         return Err(format!("写临时文件失败 {}: {error}", temporary.display()));
     }
@@ -1131,7 +1196,10 @@ fn create_new_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     match fs::hard_link(&temporary, path) {
         Ok(()) => {
             fs::remove_file(&temporary).map_err(|error| {
-                format!("新文件已建立，但临时文件清理失败 {}: {error}", temporary.display())
+                format!(
+                    "新文件已建立，但临时文件清理失败 {}: {error}",
+                    temporary.display()
+                )
             })?;
             Ok(())
         }
@@ -1158,15 +1226,18 @@ fn create_new_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
-fn atomic_replace_if_unchanged(path: &Path, expected: &str, replacement: &str) -> Result<(), String> {
-    let current = fs::read_to_string(path)
-        .map_err(|error| format!("读取现有文件失败：{error}"))?;
+fn atomic_replace_if_unchanged(
+    path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), String> {
+    let current = fs::read_to_string(path).map_err(|error| format!("读取现有文件失败：{error}"))?;
     if current != expected {
         return Err("目标文件内容已变化，拒绝覆盖".to_owned());
     }
     let temporary = write_temp(path, replacement)?;
-    let latest = fs::read_to_string(path)
-        .map_err(|error| format!("再次检查现有文件失败：{error}"))?;
+    let latest =
+        fs::read_to_string(path).map_err(|error| format!("再次检查现有文件失败：{error}"))?;
     if latest != expected {
         let _ = fs::remove_file(&temporary);
         return Err("目标文件在写入期间被外部修改，拒绝覆盖".to_owned());
@@ -1208,7 +1279,10 @@ fn rollback_new_files(
                     recovery.push(format!("无法回滚已创建文件 {}: {error}", path.display()));
                 }
             }
-            Ok(_) => recovery.push(format!("文件在回滚前已被外部修改，保留：{}", path.display())),
+            Ok(_) => recovery.push(format!(
+                "文件在回滚前已被外部修改，保留：{}",
+                path.display()
+            )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => recovery.push(format!("检查回滚文件失败 {}: {error}", path.display())),
         }
@@ -1345,7 +1419,9 @@ mod tests {
         context
             .class_kinds
             .insert("Operations".to_owned(), ClassKind::OperatorRecord);
-        context.source_files.insert(file.clone(), original.to_owned());
+        context
+            .source_files
+            .insert(file.clone(), original.to_owned());
         let function = request(
             "compare",
             ClassKind::OperatorFunction,
@@ -1381,7 +1457,9 @@ mod tests {
     #[test]
     fn generates_type_as_short_definition_and_escapes_description() {
         let mut context = NewClassContext::default();
-        context.class_kinds.insert("Real".to_owned(), ClassKind::Type);
+        context
+            .class_kinds
+            .insert("Real".to_owned(), ClassKind::Type);
         let mut class = request(
             "Temperature",
             ClassKind::Type,
@@ -1396,7 +1474,11 @@ mod tests {
         class.partial = true;
         class.description = Some("hot \"water\"\\line\n中文".to_owned());
         let source = generate_modelica_source(&class, None).expect("generate type");
-        assert!(source.starts_with("partial type Temperature = Real \"hot \\\"water\\\"\\\\line\\n中文\";"));
+        assert!(
+            source.starts_with(
+                "partial type Temperature = Real \"hot \\\"water\\\"\\\\line\\n中文\";"
+            )
+        );
         let parsed = parse(&source, "Temperature.mo").expect("type roundtrip");
         assert_eq!(parsed.classes[0].kind, ClassKind::Type);
         assert!(parsed.classes[0].is_short);
@@ -1411,7 +1493,9 @@ mod tests {
     fn planner_builds_within_and_directory_package_files() {
         let root = PathBuf::from("/tmp/Library");
         let mut context = NewClassContext::default();
-        context.class_kinds.insert("Library".into(), ClassKind::Package);
+        context
+            .class_kinds
+            .insert("Library".into(), ClassKind::Package);
         context
             .class_kinds
             .insert("Library.FluidUnits".into(), ClassKind::Package);
@@ -1427,7 +1511,11 @@ mod tests {
         );
         let single_plan = plan_new_class(&single, &context).expect("single-file plan");
         assert_eq!(single_plan.primary_file, root.join("FluidUnits/HeatX.mo"));
-        assert!(single_plan.source_preview.starts_with("within Library.FluidUnits;\n"));
+        assert!(
+            single_plan
+                .source_preview
+                .starts_with("within Library.FluidUnits;\n")
+        );
 
         let directory_package = request(
             "NewPackage",
@@ -1440,8 +1528,15 @@ mod tests {
             },
         );
         let package_plan = plan_new_class(&directory_package, &context).expect("package plan");
-        assert_eq!(package_plan.primary_file, root.join("FluidUnits/NewPackage/package.mo"));
-        assert!(package_plan.source_preview.starts_with("within Library.FluidUnits;\n"));
+        assert_eq!(
+            package_plan.primary_file,
+            root.join("FluidUnits/NewPackage/package.mo")
+        );
+        assert!(
+            package_plan
+                .source_preview
+                .starts_with("within Library.FluidUnits;\n")
+        );
     }
 
     #[test]
@@ -1514,7 +1609,10 @@ mod tests {
         let plan = plan_new_class(&class, &NewClassContext::default()).expect("plan");
         let file = apply_new_class_plan(&plan).expect("write files");
         assert_eq!(file, directory.join("Created.mo"));
-        assert_eq!(fs::read_to_string(&file).unwrap(), "model Created\nend Created;\n");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "model Created\nend Created;\n"
+        );
         let error = apply_new_class_plan(&plan).expect_err("second apply must not overwrite");
         assert!(error.contains("拒绝覆盖已有文件"));
         fs::remove_dir_all(directory).expect("cleanup");
@@ -1523,10 +1621,12 @@ mod tests {
     #[test]
     fn directory_package_creation_updates_order_and_reloads_members() {
         let directory = temporary_directory("directory-package");
-        fs::write(directory.join("package.mo"), "package Library end Library;\n")
-            .expect("write root package");
-        fs::write(directory.join("package.order"), "Old\n")
-            .expect("write package order");
+        fs::write(
+            directory.join("package.mo"),
+            "package Library end Library;\n",
+        )
+        .expect("write root package");
+        fs::write(directory.join("package.order"), "Old\n").expect("write package order");
         fs::write(
             directory.join("Old.mo"),
             "within Library; model Old end Old;\n",
@@ -1601,7 +1701,9 @@ mod tests {
         let plan = plan_new_class(&class, &context).expect("insertion plan");
         apply_new_class_plan(&plan).expect("insert nested class");
 
-        let loaded = PackageLoader.load(&file).expect("reload monolithic package");
+        let loaded = PackageLoader
+            .load(&file)
+            .expect("reload monolithic package");
         let created = loaded
             .ordered_members
             .iter()
@@ -1649,7 +1751,9 @@ mod tests {
         let plan = plan_new_class(&class, &context).expect("plan nested package member");
         apply_new_class_plan(&plan).expect("write nested member and package order");
 
-        let loaded = PackageLoader.load(&directory).expect("reload directory package");
+        let loaded = PackageLoader
+            .load(&directory)
+            .expect("reload directory package");
         let created = loaded
             .ordered_members
             .iter()
