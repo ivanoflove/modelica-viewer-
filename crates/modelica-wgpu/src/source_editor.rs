@@ -304,8 +304,11 @@ pub struct SourceEditorState {
     pub preferred_column: Option<usize>,
     pub focused: bool,
     pub dragging_selection: bool,
+    pub ime_preedit: String,
     pub checked_revision: Option<u64>,
     pub buffer: TextBuffer,
+    lexical_line_states: Vec<Option<bool>>,
+    caret_blink_epoch: Instant,
     current_state_id: u64,
     saved_state_id: u64,
     next_state_id: u64,
@@ -330,6 +333,11 @@ impl SourceEditorState {
         version: u64,
         text: &str,
     ) -> Self {
+        let buffer = TextBuffer::new(text);
+        let mut lexical_line_states = vec![None; buffer.line_count()];
+        if let Some(first) = lexical_line_states.first_mut() {
+            *first = Some(false);
+        }
         Self {
             document_id,
             class_name,
@@ -341,8 +349,11 @@ impl SourceEditorState {
             preferred_column: None,
             focused: false,
             dragging_selection: false,
+            ime_preedit: String::new(),
             checked_revision: None,
-            buffer: TextBuffer::new(text),
+            buffer,
+            lexical_line_states,
+            caret_blink_epoch: Instant::now(),
             current_state_id: 0,
             saved_state_id: 0,
             next_state_id: 1,
@@ -390,12 +401,86 @@ impl SourceEditorState {
             .map(|range| self.buffer.text_in_range(range))
     }
 
+    pub fn replace_text_range_with_cursor(
+        &mut self,
+        range: TextRange,
+        text: &str,
+        cursor_offset: Option<usize>,
+    ) -> bool {
+        if !self.apply_edit(range, text) {
+            return false;
+        }
+        if let Some(offset) = cursor_offset.filter(|offset| text.is_char_boundary(*offset)) {
+            let caret = position_after_fragment(range.start, &text[..offset]);
+            self.cursor = self.buffer.clamp_position(caret);
+            if let Some(operation) = self.undo.last_mut() {
+                operation.after_cursor = self.cursor;
+            }
+        }
+        true
+    }
+
+    pub fn set_ime_preedit(&mut self, text: String) {
+        self.ime_preedit = text;
+        self.caret_blink_epoch = Instant::now();
+    }
+
+    pub fn reset_caret_blink(&mut self) {
+        self.caret_blink_epoch = Instant::now();
+    }
+
+    pub fn caret_visible_at(&self, now: Instant) -> bool {
+        self.focused
+            && now
+                .saturating_duration_since(self.caret_blink_epoch)
+                .as_millis()
+                .rem_euclid(1_000)
+                < 520
+    }
+
+    pub fn caret_next_blink_in(&self, now: Instant) -> std::time::Duration {
+        let phase_ms = now
+            .saturating_duration_since(self.caret_blink_epoch)
+            .as_millis()
+            .rem_euclid(1_000);
+        let next_ms = if phase_ms < 520 {
+            520 - phase_ms
+        } else {
+            1_000 - phase_ms
+        };
+        std::time::Duration::from_millis(next_ms.max(1) as u64)
+    }
+
+    /// Returns whether a block comment is open at the start of `line`.
+    /// Cached states before the edit point survive local text changes.
+    pub fn block_comment_open_at_line(&mut self, line: usize) -> bool {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.lexical_line_states
+            .resize(self.buffer.line_count(), None);
+        if let Some(state) = self.lexical_line_states[line] {
+            return state;
+        }
+        let start = (0..line)
+            .rev()
+            .find(|index| self.lexical_line_states[*index].is_some())
+            .unwrap_or(0);
+        let mut in_comment = self.lexical_line_states[start].unwrap_or(false);
+        for index in start..line {
+            in_comment = block_comment_state_after_line(self.buffer.line(index), in_comment);
+            if let Some(next) = self.lexical_line_states.get_mut(index + 1) {
+                *next = Some(in_comment);
+            }
+        }
+        in_comment
+    }
+
     pub fn select_all(&mut self) {
         self.selection_anchor = Some(self.buffer.line_start(0));
         self.cursor = self
             .buffer
             .line_end(self.buffer.line_count().saturating_sub(1));
         self.preferred_column = None;
+        self.caret_blink_epoch = Instant::now();
     }
 
     pub fn move_horizontal(&mut self, direction: isize, extend: bool) {
@@ -443,12 +528,16 @@ impl SourceEditorState {
 
     fn move_cursor(&mut self, position: TextPosition, extend: bool) {
         let position = self.buffer.clamp_position(position);
+        let moved = position != self.cursor;
         if extend {
             self.selection_anchor.get_or_insert(self.cursor);
         } else {
             self.selection_anchor = None;
         }
         self.cursor = position;
+        if moved {
+            self.caret_blink_epoch = Instant::now();
+        }
     }
 
     pub fn insert_text(&mut self, text: &str) -> bool {
@@ -460,6 +549,63 @@ impl SourceEditorState {
                 end: self.cursor,
             });
         self.apply_edit(range, text)
+    }
+
+    pub fn insert_typed_text(&mut self, text: &str) -> bool {
+        let mut chars = text.chars();
+        let Some(character) = chars.next() else {
+            return false;
+        };
+        if chars.next().is_some() || !matches!(character, '(' | '[' | '{' | '"' | ')' | ']' | '}') {
+            return self.insert_text(text);
+        }
+
+        if self
+            .buffer
+            .selected_range(self.cursor, self.selection_anchor)
+            .is_none()
+            && matches!(character, ')' | ']' | '}' | '"')
+            && self.buffer.line(self.cursor.line)[self.cursor.column..].starts_with(character)
+        {
+            self.move_cursor(self.buffer.next_char(self.cursor), false);
+            return false;
+        }
+        if !matches!(character, '(' | '[' | '{' | '"') {
+            return self.insert_text(text);
+        }
+
+        let closer = match character {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '"' => '"',
+            _ => unreachable!(),
+        };
+        let selected_range = self
+            .buffer
+            .selected_range(self.cursor, self.selection_anchor);
+        let selected_text = selected_range.map(|range| self.buffer.text_in_range(range));
+        let range = selected_range.unwrap_or(TextRange {
+            start: self.cursor,
+            end: self.cursor,
+        });
+        let inserted = match selected_text.as_deref() {
+            Some(selected) => format!("{character}{selected}{closer}"),
+            None => format!("{character}{closer}"),
+        };
+        if !self.apply_edit(range, &inserted) {
+            return false;
+        }
+        let fragment = match selected_text {
+            Some(selected) => format!("{character}{selected}"),
+            None => character.to_string(),
+        };
+        let caret = position_after_fragment(range.start, &fragment);
+        self.cursor = self.buffer.clamp_position(caret);
+        if let Some(operation) = self.undo.last_mut() {
+            operation.after_cursor = self.cursor;
+        }
+        true
     }
 
     pub fn backspace(&mut self) -> bool {
@@ -507,7 +653,24 @@ impl SourceEditorState {
             .buffer
             .line_ending_for_insert(self.cursor.line)
             .to_owned();
-        self.insert_text(&ending)
+        let line = self.buffer.line(self.cursor.line);
+        let leading = line
+            .chars()
+            .take_while(|character| matches!(character, ' ' | '\t'))
+            .collect::<String>();
+        let before_cursor = &line[..self.cursor.column];
+        let trimmed = before_cursor.trim();
+        let mut indentation = leading;
+        if starts_with_word(trimmed, "end")
+            || starts_with_word(trimmed, "else")
+            || starts_with_word(trimmed, "elseif")
+        {
+            remove_one_indent(&mut indentation);
+        }
+        if opens_modelica_block(trimmed) {
+            indentation.push_str("    ");
+        }
+        self.insert_text(&format!("{ending}{indentation}"))
     }
 
     pub fn indent(&mut self, outdent: bool) -> bool {
@@ -603,6 +766,7 @@ impl SourceEditorState {
         let inserted_end = self
             .buffer
             .replace_range(TextRange { start, end }, inserted);
+        self.invalidate_lexical_states_from(start.line);
         let impact = EditImpact {
             start_line: start.line,
             old_line_count,
@@ -647,6 +811,7 @@ impl SourceEditorState {
         self.selection_anchor = None;
         self.preferred_column = None;
         self.last_edit_at = Some(Instant::now());
+        self.caret_blink_epoch = Instant::now();
         self.diagnostic = None;
         self.checked_revision = None;
         true
@@ -663,6 +828,7 @@ impl SourceEditorState {
             },
             &operation.removed,
         );
+        self.reset_lexical_states();
         self.cursor = self.buffer.clamp_position(operation.before_cursor);
         self.selection_anchor = operation
             .before_anchor
@@ -678,6 +844,7 @@ impl SourceEditorState {
             full_reset: true,
         });
         self.last_edit_at = Some(Instant::now());
+        self.caret_blink_epoch = Instant::now();
         self.checked_revision = None;
         self.diagnostic = None;
         self.redo.push(operation);
@@ -695,11 +862,11 @@ impl SourceEditorState {
             },
             &operation.inserted,
         );
-        self.cursor = inserted_end;
+        self.reset_lexical_states();
+        self.cursor = self.buffer.clamp_position(operation.after_cursor);
         self.selection_anchor = operation.after_anchor;
         let mut operation = operation;
         operation.inserted_end = inserted_end;
-        operation.after_cursor = inserted_end;
         self.current_state_id = operation.after_state_id;
         self.undo.push(operation);
         self.revision = self.revision.saturating_add(1);
@@ -712,10 +879,125 @@ impl SourceEditorState {
             full_reset: true,
         });
         self.last_edit_at = Some(Instant::now());
+        self.caret_blink_epoch = Instant::now();
         self.checked_revision = None;
         self.diagnostic = None;
         true
     }
+
+    fn invalidate_lexical_states_from(&mut self, line: usize) {
+        self.lexical_line_states
+            .resize(self.buffer.line_count(), None);
+        for state in self
+            .lexical_line_states
+            .iter_mut()
+            .skip(line.saturating_add(1))
+        {
+            *state = None;
+        }
+        if line == 0 {
+            if let Some(first) = self.lexical_line_states.first_mut() {
+                *first = Some(false);
+            }
+        }
+    }
+
+    fn reset_lexical_states(&mut self) {
+        self.lexical_line_states = vec![None; self.buffer.line_count()];
+        if let Some(first) = self.lexical_line_states.first_mut() {
+            *first = Some(false);
+        }
+    }
+}
+
+fn position_after_fragment(start: TextPosition, fragment: &str) -> TextPosition {
+    let (lines, _) = split_lines(fragment);
+    let last_line = lines.len().saturating_sub(1);
+    TextPosition {
+        line: start.line + last_line,
+        column: if last_line == 0 {
+            start.column + lines[0].len()
+        } else {
+            lines[last_line].len()
+        },
+    }
+}
+
+fn block_comment_state_after_line(line: &str, mut in_comment: bool) -> bool {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut in_string = false;
+    while index < bytes.len() {
+        if in_comment {
+            if bytes.get(index..index + 2) == Some(b"*/") {
+                in_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else if in_string {
+            if bytes[index] == b'\\' {
+                index = (index + 2).min(bytes.len());
+            } else if bytes[index] == b'"' {
+                if bytes.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                } else {
+                    in_string = false;
+                    index += 1;
+                }
+            } else {
+                index += line[index..].chars().next().map_or(1, char::len_utf8);
+            }
+        } else if bytes.get(index..index + 2) == Some(b"//") {
+            break;
+        } else if bytes.get(index..index + 2) == Some(b"/*") {
+            in_comment = true;
+            index += 2;
+        } else if bytes[index] == b'"' {
+            in_string = true;
+            index += 1;
+        } else {
+            index += line[index..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    in_comment
+}
+
+fn starts_with_word(source: &str, word: &str) -> bool {
+    source
+        .strip_prefix(word)
+        .is_some_and(|tail| tail.is_empty() || !tail.as_bytes()[0].is_ascii_alphanumeric())
+}
+
+fn remove_one_indent(indentation: &mut String) {
+    if indentation.ends_with("    ") {
+        indentation.truncate(indentation.len() - 4);
+    } else if indentation.ends_with('\t') {
+        indentation.pop();
+    }
+}
+
+fn opens_modelica_block(source: &str) -> bool {
+    let source = source.trim();
+    if source.is_empty() {
+        return false;
+    }
+    let lower = source.to_ascii_lowercase();
+    let last = lower.split_whitespace().last().unwrap_or_default();
+    if matches!(
+        last,
+        "equation" | "algorithm" | "then" | "loop" | "else" | "elsewhen"
+    ) {
+        return true;
+    }
+    if lower.starts_with("end ") || lower.starts_with("end;") {
+        return false;
+    }
+    let first = lower.split_whitespace().next().unwrap_or_default();
+    matches!(
+        first,
+        "model" | "block" | "class" | "package" | "record" | "connector" | "function"
+    ) && source.split_whitespace().count() >= 2
 }
 
 #[cfg(test)]
@@ -839,6 +1121,91 @@ mod tests {
         assert_eq!(model2.undo_len(), 1);
         assert!(restored.undo());
         assert_eq!(model2.buffer.line(0), "model Model2 // other");
+    }
+
+    #[test]
+    fn caret_blinks_only_while_focused_and_uses_a_stable_period() {
+        let mut editor = SourceEditorState::new(None, None, 0, "model A;");
+        let epoch = Instant::now();
+        editor.caret_blink_epoch = epoch;
+        assert!(!editor.caret_visible_at(epoch));
+        editor.focused = true;
+        assert!(editor.caret_visible_at(epoch + std::time::Duration::from_millis(100)));
+        assert!(!editor.caret_visible_at(epoch + std::time::Duration::from_millis(600)));
+        assert!(editor.caret_visible_at(epoch + std::time::Duration::from_millis(1_050)));
+        editor.focused = false;
+        assert!(!editor.caret_visible_at(epoch + std::time::Duration::from_millis(100)));
+        assert!(editor.caret_next_blink_in(epoch).as_millis() > 0);
+    }
+
+    #[test]
+    fn ime_preedit_is_transient_and_commit_inserts_utf8_text_once() {
+        let mut editor = SourceEditorState::new(None, None, 0, "model A;");
+        editor.cursor = editor.buffer.position_at_char_column(0, 6);
+        editor.set_ime_preedit("温度".to_owned());
+        assert_eq!(editor.buffer.line(0), "model A;");
+        assert_eq!(editor.ime_preedit, "温度");
+
+        editor.set_ime_preedit(String::new());
+        assert!(editor.insert_text("温度"));
+        assert_eq!(editor.buffer.line(0), "model 温度A;");
+        assert!(editor.buffer.line(0).is_char_boundary(editor.cursor.column));
+    }
+
+    #[test]
+    fn paired_delimiters_wrap_selection_and_skip_existing_closer() {
+        let mut editor = SourceEditorState::new(None, None, 0, "value");
+        editor.selection_anchor = Some(TextPosition { line: 0, column: 0 });
+        editor.cursor = editor.buffer.line_end(0);
+        assert!(editor.insert_typed_text("("));
+        assert_eq!(editor.buffer.line(0), "(value)");
+        assert_eq!(editor.cursor, TextPosition { line: 0, column: 6 });
+
+        editor.selection_anchor = None;
+        editor.cursor = TextPosition { line: 0, column: 6 };
+        assert!(!editor.insert_typed_text(")"));
+        assert_eq!(editor.cursor, TextPosition { line: 0, column: 7 });
+        assert_eq!(editor.buffer.line(0), "(value)");
+    }
+
+    #[test]
+    fn newline_indents_modelica_blocks_and_dedents_after_end_clause() {
+        let mut editor =
+            SourceEditorState::new(None, None, 0, "model Demo\n    equation\n        end Demo;");
+        editor.cursor = editor.buffer.line_end(1);
+        assert!(editor.insert_newline());
+        assert_eq!(editor.buffer.line(2), "        ");
+
+        editor.cursor = editor.buffer.line_end(3);
+        assert!(editor.insert_newline());
+        assert_eq!(editor.buffer.line(4), "    ");
+    }
+
+    #[test]
+    fn block_comment_state_is_cached_and_invalidated_from_edited_line() {
+        let mut editor = SourceEditorState::new(None, None, 0, "/* open\ncomment\n*/ code\nmod");
+        assert!(editor.block_comment_open_at_line(1));
+        assert!(!editor.block_comment_open_at_line(3));
+
+        editor.cursor = TextPosition { line: 0, column: 1 };
+        editor.insert_text(" ");
+        assert!(!editor.block_comment_open_at_line(1));
+    }
+
+    #[test]
+    fn redo_restores_completion_cursor_inside_inserted_call() {
+        let mut editor = SourceEditorState::new(None, None, 0, "der");
+        let range = TextRange {
+            start: TextPosition { line: 0, column: 0 },
+            end: TextPosition { line: 0, column: 3 },
+        };
+        assert!(editor.replace_text_range_with_cursor(range, "der()", Some(4)));
+        assert_eq!(editor.cursor, TextPosition { line: 0, column: 4 });
+        assert!(editor.undo());
+        assert_eq!(editor.buffer.line(0), "der");
+        assert!(editor.redo());
+        assert_eq!(editor.buffer.line(0), "der()");
+        assert_eq!(editor.cursor, TextPosition { line: 0, column: 4 });
     }
 
     #[test]

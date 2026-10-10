@@ -37,7 +37,9 @@ use modelica_core::scene::{
     ResolvedGraphic, Transform2D,
 };
 use modelica_core::{
-    apply_new_class_plan, apply_source_transaction, generate_modelica_source,
+    analyze_completion_context, apply_new_class_plan, apply_source_transaction,
+    completion::{CompletionContext, CompletionItem, ModelicaCompletionIndex},
+    generate_modelica_source,
     lexer::{tokenize, Token, TokenKind},
     parse, parse_component_declaration, plan_new_class, resolve_diagram, resolve_modelica_text,
     validate_modelica_identifier, validate_new_class, Class, ClassKind, IconResolver, Library,
@@ -3262,6 +3264,7 @@ struct TreeNode {
 struct UiDocument {
     package_name: String,
     class_names: Vec<String>,
+    completion_class_names: Vec<String>,
     full_class_names: HashSet<String>,
     short_class_names: HashSet<String>,
     dirty: bool,
@@ -4709,6 +4712,7 @@ impl LoadedDocument {
             .filter_map(|name| name.rsplit('.').next())
             .map(str::to_owned)
             .collect::<HashSet<_>>();
+        let completion_class_names = self.registry.borrow().class_names();
         let (source_name, _source) = selected_class
             .as_deref()
             .and_then(|class_name| self.class_source(class_name))
@@ -4747,6 +4751,7 @@ impl LoadedDocument {
         UiDocument {
             package_name: self.package_name.clone(),
             class_names: self.class_names.clone(),
+            completion_class_names,
             full_class_names,
             short_class_names,
             dirty: self.has_unsaved_changes(),
@@ -11486,6 +11491,7 @@ impl App {
             .document_mut(document_id)
             .ok_or_else(|| format!("工作区文档已关闭：{document_id}"))?;
         entry.document = reloaded;
+        self.source_interaction.completion.invalidate();
         self.source_highlight_cache = SourceHighlightCache::default();
         self.source_interaction.fold_state.editor_fold_revision = !self.source_editor.fold_revision;
         Ok(())
@@ -15574,6 +15580,166 @@ struct SourceFoldProfile {
 }
 
 #[derive(Default)]
+struct SourceCompletionState {
+    document_id: Option<String>,
+    index_initialized: bool,
+    index: ModelicaCompletionIndex,
+    query_key: Option<(u64, TextPosition, Option<TextPosition>, bool)>,
+    context: Option<CompletionContext>,
+    items: Vec<CompletionItem>,
+    selected: usize,
+    forced: bool,
+    open: bool,
+    popup_rect: Option<Rect>,
+    suppress_revision: Option<u64>,
+}
+
+impl SourceCompletionState {
+    fn invalidate(&mut self) {
+        self.document_id = None;
+        self.index_initialized = false;
+        self.index = ModelicaCompletionIndex::default();
+        self.query_key = None;
+        self.context = None;
+        self.items.clear();
+        self.selected = 0;
+        self.forced = false;
+        self.open = false;
+        self.popup_rect = None;
+        self.suppress_revision = None;
+    }
+
+    fn invalidate_query(&mut self) {
+        self.query_key = None;
+        self.context = None;
+        self.items.clear();
+        self.selected = 0;
+        self.forced = false;
+        self.open = false;
+        self.popup_rect = None;
+    }
+
+    fn update(&mut self, document: &UiDocument, editor: &mut SourceEditorState) {
+        let active_document_id = document.active_document_id.clone();
+        if !self.index_initialized || self.document_id != active_document_id {
+            self.document_id.clone_from(&active_document_id);
+            self.index = ModelicaCompletionIndex::new(document.completion_class_names.clone());
+            self.index_initialized = true;
+            let forced = self.forced;
+            self.invalidate_query();
+            self.forced = forced;
+        }
+        if !editor.focused {
+            self.open = false;
+            self.forced = false;
+            self.items.clear();
+            self.query_key = None;
+            return;
+        }
+        if !editor.ime_preedit.is_empty() {
+            self.open = false;
+            self.items.clear();
+            self.query_key = Some((
+                editor.revision,
+                editor.cursor,
+                editor.selection_anchor,
+                false,
+            ));
+            return;
+        }
+        if self.suppress_revision == Some(editor.revision) {
+            self.query_key = Some((
+                editor.revision,
+                editor.cursor,
+                editor.selection_anchor,
+                false,
+            ));
+            self.forced = false;
+            self.open = false;
+            self.items.clear();
+            return;
+        }
+        let key = (
+            editor.revision,
+            editor.cursor,
+            editor.selection_anchor,
+            self.forced,
+        );
+        if self.query_key == Some(key) {
+            return;
+        }
+        self.query_key = Some(key);
+        self.context = None;
+        self.items.clear();
+        self.selected = 0;
+        if editor
+            .buffer
+            .selected_range(editor.cursor, editor.selection_anchor)
+            .is_none()
+        {
+            let block_comment_open = editor.block_comment_open_at_line(editor.cursor.line);
+            self.context = analyze_completion_context(
+                editor.buffer.line(editor.cursor.line),
+                editor.cursor.column,
+                block_comment_open,
+            );
+        }
+        if let Some(context) = &self.context {
+            let should_show =
+                self.forced || !context.prefix.is_empty() || context.qualifier.is_some();
+            if should_show {
+                self.items = self.index.complete(context, self.forced, 120);
+                self.open = !self.items.is_empty();
+            } else {
+                self.open = false;
+            }
+        } else {
+            self.open = false;
+        }
+        self.forced = false;
+        if let Some((revision, cursor, anchor, _)) = self.query_key {
+            self.query_key = Some((revision, cursor, anchor, false));
+        }
+    }
+
+    fn select_next(&mut self, delta: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let count = self.items.len() as isize;
+        self.selected = (self.selected as isize + delta).rem_euclid(count) as usize;
+    }
+
+    fn accept_selected(&mut self, editor: &mut SourceEditorState) -> bool {
+        let (Some(item), Some(context)) = (self.items.get(self.selected), self.context.as_ref())
+        else {
+            return false;
+        };
+        let insert_text = item.insert_text.clone();
+        let cursor_offset = item.cursor_offset;
+        let line = editor.cursor.line;
+        let range = source_editor::TextRange {
+            start: TextPosition {
+                line,
+                column: context.replace_start,
+            },
+            end: TextPosition {
+                line,
+                column: context.replace_end,
+            },
+        };
+        let changed = editor.replace_text_range_with_cursor(range, &insert_text, cursor_offset);
+        if changed {
+            self.suppress_revision = Some(editor.revision);
+        }
+        self.open = false;
+        self.items.clear();
+        self.query_key = None;
+        changed
+    }
+}
+
+#[derive(Default)]
 struct SourceInteractionState {
     selected_class: Option<String>,
     focused: bool,
@@ -15582,6 +15748,8 @@ struct SourceInteractionState {
     fold_pointer_line: Option<usize>,
     fold_click_started_at: Option<(usize, Instant)>,
     pending_fold_profile: Option<SourceFoldProfile>,
+    completion: SourceCompletionState,
+    ime_allowed: bool,
 }
 
 impl SourceInteractionState {
@@ -15596,6 +15764,7 @@ impl SourceInteractionState {
         self.fold_pointer_line = None;
         self.fold_click_started_at = None;
         self.pending_fold_profile = None;
+        self.completion.invalidate_query();
     }
 
     fn sync_editor_document(&mut self, document: &UiDocument, editor: &SourceEditorState) {
@@ -15622,6 +15791,8 @@ fn process_source_editor_input(
     editor: &mut SourceEditorState,
     highlight_cache: &mut SourceHighlightCache,
     page_lines: isize,
+    document: &UiDocument,
+    completion: &mut SourceCompletionState,
 ) {
     let events = ui.input(|input| input.events.clone());
     for event in events {
@@ -15633,16 +15804,31 @@ fn process_source_editor_input(
         }
         let cursor_before = editor.cursor;
         let anchor_before = editor.selection_anchor;
+        let revision_before = editor.revision;
         match event {
             egui::Event::Text(text) => {
-                if !text
-                    .chars()
-                    .any(|character| matches!(character, '\n' | '\r' | '\t'))
+                if editor.ime_preedit.is_empty()
+                    && !text
+                        .chars()
+                        .any(|character| matches!(character, '\n' | '\r' | '\t'))
                 {
-                    changed = editor.insert_text(&text);
+                    changed = editor.insert_typed_text(&text);
                 }
             }
             egui::Event::Paste(text) => changed = editor.insert_text(&text),
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                editor.set_ime_preedit(text);
+                ui.ctx().request_repaint();
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                editor.set_ime_preedit(String::new());
+                changed = editor.insert_text(&text);
+            }
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                editor.set_ime_preedit(String::new());
+                ui.ctx().request_repaint();
+            }
+            egui::Event::Ime(egui::ImeEvent::Enabled) => {}
             egui::Event::Copy => copied_text = editor.selected_text(),
             egui::Event::Cut => {
                 copied_text = editor.selected_text();
@@ -15655,7 +15841,10 @@ fn process_source_editor_input(
                 ..
             } => {
                 let extend = modifiers.shift;
-                if modifiers.command {
+                if modifiers.command && key == egui::Key::Space {
+                    completion.forced = true;
+                    completion.query_key = None;
+                } else if modifiers.command {
                     match key {
                         egui::Key::A => editor.select_all(),
                         egui::Key::C => copied_text = editor.selected_text(),
@@ -15667,6 +15856,32 @@ fn process_source_editor_input(
                         egui::Key::Z => changed = editor.undo(),
                         egui::Key::Y => changed = editor.redo(),
                         _ => {}
+                    }
+                } else if completion.open {
+                    match key {
+                        egui::Key::ArrowUp => completion.select_next(-1),
+                        egui::Key::ArrowDown => completion.select_next(1),
+                        egui::Key::Enter | egui::Key::Tab => {
+                            let _ = completion.accept_selected(editor);
+                            changed = editor.revision != revision_before;
+                        }
+                        egui::Key::Escape => {
+                            completion.open = false;
+                            completion.items.clear();
+                        }
+                        _ => match key {
+                            egui::Key::ArrowLeft => editor.move_horizontal(-1, extend),
+                            egui::Key::ArrowRight => editor.move_horizontal(1, extend),
+                            egui::Key::ArrowUp => editor.move_vertical(-1, extend),
+                            egui::Key::ArrowDown => editor.move_vertical(1, extend),
+                            egui::Key::Home => editor.move_line_edge(false, extend),
+                            egui::Key::End => editor.move_line_edge(true, extend),
+                            egui::Key::PageUp => editor.move_vertical(-page_lines, extend),
+                            egui::Key::PageDown => editor.move_vertical(page_lines, extend),
+                            egui::Key::Backspace => changed = editor.backspace(),
+                            egui::Key::Delete => changed = editor.delete_forward(),
+                            _ => {}
+                        },
                     }
                 } else {
                     match key {
@@ -15685,6 +15900,7 @@ fn process_source_editor_input(
                         egui::Key::Escape => {
                             editor.focused = false;
                             editor.dragging_selection = false;
+                            editor.ime_preedit.clear();
                         }
                         _ => {}
                     }
@@ -15708,6 +15924,96 @@ fn process_source_editor_input(
         if changed || caret_changed {
             ui.ctx().request_repaint();
         }
+    }
+    completion.update(document, editor);
+}
+
+fn draw_source_completion_popup(
+    ctx: &egui::Context,
+    caret_rect: Rect,
+    completion: &mut SourceCompletionState,
+) -> (Rect, Option<usize>) {
+    let screen = ctx.input(|input| input.screen_rect());
+    let width = screen.width().clamp(1.0, 380.0);
+    let content_width = (width - 16.0).max(1.0);
+    let max_popup_height = screen.height().clamp(1.0, 320.0);
+    let expected_height =
+        (completion.items.len().min(8) as f32 * 34.0 + 10.0).min(max_popup_height);
+    let mut position = Pos2::new(caret_rect.left(), caret_rect.bottom() + 2.0);
+    if position.y + expected_height > screen.bottom() {
+        position.y = caret_rect.top() - expected_height - 2.0;
+    }
+    position.x = position
+        .x
+        .clamp(screen.left(), (screen.right() - width).max(screen.left()));
+    position.y = position.y.clamp(
+        screen.top(),
+        (screen.bottom() - expected_height).max(screen.top()),
+    );
+    let mut clicked = None;
+    let area = egui::Area::new(egui::Id::new("modelica-source-completion"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(position)
+        .show(ctx, |ui| {
+            ui.set_width(content_width);
+            Frame::popup(ui.style()).show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_source("modelica-source-completion-scroll")
+                    .max_height((max_popup_height - 16.0).max(1.0))
+                    .show(ui, |ui| {
+                        for (index, item) in completion.items.iter().enumerate() {
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::new((content_width - 8.0).max(1.0), 34.0),
+                                Sense::click(),
+                            );
+                            if response.hovered() {
+                                completion.selected = index;
+                            }
+                            if response.clicked() {
+                                clicked = Some(index);
+                            }
+                            if completion.selected == index {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    Rounding::same(3.0),
+                                    theme_accent_soft(38),
+                                );
+                            }
+                            let clipped = ui.painter().with_clip_rect(rect.shrink(3.0));
+                            clipped.text(
+                                Pos2::new(rect.left() + 6.0, rect.top() + 9.0),
+                                Align2::LEFT_CENTER,
+                                &item.label,
+                                ui_semibold_font(12.5),
+                                theme_text_primary(),
+                            );
+                            clipped.text(
+                                Pos2::new(rect.right() - 6.0, rect.top() + 9.0),
+                                Align2::RIGHT_CENTER,
+                                completion_kind_label(item.kind),
+                                ui_mono_font(9.5),
+                                theme_accent(),
+                            );
+                            clipped.text(
+                                Pos2::new(rect.left() + 6.0, rect.top() + 25.0),
+                                Align2::LEFT_CENTER,
+                                &item.detail,
+                                ui_mono_font(9.5),
+                                theme_text_secondary(),
+                            );
+                        }
+                    });
+            });
+        });
+    (area.response.rect, clicked)
+}
+
+fn completion_kind_label(kind: modelica_core::CompletionKind) -> &'static str {
+    match kind {
+        modelica_core::CompletionKind::Keyword => "关键字",
+        modelica_core::CompletionKind::BuiltinType => "内建类型",
+        modelica_core::CompletionKind::BuiltinFunction => "内建函数",
+        modelica_core::CompletionKind::Class => "类",
     }
 }
 
@@ -15869,7 +16175,21 @@ fn source_preview(
             let fold_splice_count_before = source_interaction.fold_state.fold_layout_splice_count;
             source_scroll_state.sync_class(document.selected_class.as_deref());
             let page_lines = (ui.available_height() / SOURCE_ROW_HEIGHT).floor().max(1.0) as isize;
-            process_source_editor_input(ui, source_editor, source_highlight_cache, page_lines);
+            if source_interaction.ime_allowed != source_editor.focused {
+                source_interaction.ime_allowed = source_editor.focused;
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(
+                        source_interaction.ime_allowed,
+                    ));
+            }
+            process_source_editor_input(
+                ui,
+                source_editor,
+                source_highlight_cache,
+                page_lines,
+                document,
+                &mut source_interaction.completion,
+            );
             diagnose_source_editor(ui, source_editor);
             source_interaction.sync_editor_document(document, source_editor);
             if source_editor.focused
@@ -15981,6 +16301,13 @@ fn source_preview(
             let editor_selection = source_editor
                 .buffer
                 .selected_range(source_editor.cursor, source_editor.selection_anchor);
+            let now = Instant::now();
+            let caret_visible = source_editor.caret_visible_at(now);
+            if source_editor.focused {
+                ui.ctx()
+                    .request_repaint_after(source_editor.caret_next_blink_in(now));
+            }
+            let mut caret_screen_rect = None;
             let scroll_output = {
                 let fold_state = &source_interaction.fold_state;
                 let visible_source_rows = &fold_state.visible_rows.rows;
@@ -16071,6 +16398,10 @@ fn source_preview(
                                     marker,
                                     selection,
                                     cursor_column,
+                                    caret_visible,
+                                    (!source_editor.ime_preedit.is_empty())
+                                        .then_some(source_editor.ime_preedit.as_str()),
+                                    &mut caret_screen_rect,
                                     source_scroll_state.current_y,
                                     source_text_positions_should_snap(
                                         frame_motion,
@@ -16098,6 +16429,36 @@ fn source_preview(
             let visible_galley_misses = source_highlight_cache
                 .cache_misses
                 .saturating_sub(cache_misses_before);
+            if source_interaction.completion.open {
+                if let Some(caret_rect) = caret_screen_rect {
+                    let (popup_rect, clicked) = draw_source_completion_popup(
+                        ui.ctx(),
+                        caret_rect,
+                        &mut source_interaction.completion,
+                    );
+                    source_interaction.completion.popup_rect = Some(popup_rect);
+                    if let Some(index) = clicked {
+                        source_interaction.completion.selected = index;
+                        let _ = source_interaction.completion.accept_selected(source_editor);
+                        if let Some(impact) = source_editor.take_edit_impact() {
+                            source_highlight_cache
+                                .invalidate_edit(impact, source_editor.buffer.line_count());
+                        }
+                        source_interaction.sync_editor_document(document, source_editor);
+                        source_interaction
+                            .completion
+                            .update(document, source_editor);
+                    }
+                } else {
+                    source_interaction.completion.popup_rect = None;
+                }
+            } else {
+                source_interaction.completion.popup_rect = None;
+            }
+            let pointer_in_completion = source_interaction
+                .completion
+                .popup_rect
+                .is_some_and(|rect| pointer_position.is_some_and(|pointer| rect.contains(pointer)));
             let click_owner = source_click_owner(
                 scroll_output.inner_rect,
                 pointer_position,
@@ -16105,10 +16466,15 @@ fn source_preview(
             );
             let editor_focus_id =
                 ui.make_persistent_id(("modelica-source-editor", scroll_id_source));
-            if primary_pressed && click_owner == SourceClickOwner::Viewport {
+            if primary_pressed && pointer_in_completion {
+                // Completion rows own their pointer presses; do not move the
+                // source caret under the popup or drop IME focus.
+            } else if primary_pressed && click_owner == SourceClickOwner::Viewport {
                 ui.memory_mut(|memory| memory.request_focus(editor_focus_id));
                 source_editor.focused = true;
+                source_editor.reset_caret_blink();
                 source_editor.dragging_selection = true;
+                source_interaction.completion.invalidate_query();
                 if let Some(pointer) = pointer_position {
                     if let Some((position, collapsed_line)) = source_editor_position_at_pointer(
                         ui,
@@ -16135,6 +16501,8 @@ fn source_preview(
             } else if primary_pressed {
                 source_editor.focused = false;
                 source_editor.dragging_selection = false;
+                source_editor.ime_preedit.clear();
+                source_interaction.completion.invalidate_query();
                 ui.memory_mut(|memory| memory.surrender_focus(editor_focus_id));
             } else if source_editor.dragging_selection && primary_down {
                 if let Some(pointer) = pointer_position {
@@ -16214,6 +16582,8 @@ fn source_preview(
             *source_scroll_rect = Some(scroll_output.inner_rect);
             let max_scroll_y =
                 (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
+            let max_scroll_x =
+                (scroll_output.content_size.x - scroll_output.inner_rect.width()).max(0.0);
             source_scroll_state.set_bounds(max_scroll_y);
             if settled_this_frame {
                 source_scroll_state.snap_to_stable_pixel(pixels_per_point);
@@ -16275,6 +16645,18 @@ fn source_preview(
                         final_state.store(ui.ctx(), scroll_id);
                         source_scroll_state.current_y = caret_offset;
                         source_scroll_state.target_y = caret_offset;
+                    }
+                }
+                if let Some(caret_rect) = caret_screen_rect {
+                    let next_x = source_horizontal_scroll_to_reveal_caret(
+                        final_state.offset.x,
+                        caret_rect,
+                        scroll_output.inner_rect,
+                        max_scroll_x,
+                    );
+                    if (next_x - final_state.offset.x).abs() > 0.1 {
+                        final_state.offset.x = next_x;
+                        final_state.store(ui.ctx(), scroll_id);
                     }
                 }
             }
@@ -16437,6 +16819,9 @@ fn render_source_line(
     fold_marker: Option<Arc<egui::Galley>>,
     selection: Option<(usize, usize)>,
     cursor_column: Option<usize>,
+    caret_visible: bool,
+    ime_preedit: Option<&str>,
+    caret_screen_rect: &mut Option<Rect>,
     scroll_offset: f32,
     snap_text_positions: bool,
     window_scale_factor: f32,
@@ -16525,14 +16910,32 @@ fn render_source_line(
         .map(|cursor_column| code_galley.pos_from_ccursor(egui::text::CCursor::new(cursor_column)));
     painter.galley(code_position, code_galley, theme_text_primary());
     if let Some(cursor_rect) = caret_rect {
-        let x = code_position.x + cursor_rect.left();
-        painter.line_segment(
-            [
-                Pos2::new(x, code_position.y + cursor_rect.top()),
-                Pos2::new(x, code_position.y + cursor_rect.bottom()),
-            ],
-            Stroke::new(1.25_f32, theme_accent()),
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let ime_rect = source_caret_screen_rect(
+            code_position,
+            cursor_rect,
+            pixels_per_point,
+            snap_text_positions,
         );
+        *caret_screen_rect = Some(ime_rect);
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::IMERect(ime_rect.expand(1.0)));
+        if caret_visible {
+            painter.rect_filled(ime_rect, Rounding::ZERO, theme_accent());
+        }
+        if let Some(preedit) = ime_preedit.filter(|text| !text.is_empty()) {
+            let galley =
+                painter.layout_no_wrap(preedit.to_owned(), ui_mono_font(12.0), theme_accent());
+            let position = ime_rect.min;
+            painter.galley(position, galley.clone(), theme_accent());
+            let underline_y =
+                ((position.y + galley.size().y) * pixels_per_point).round() / pixels_per_point;
+            let underline_rect = Rect::from_min_size(
+                Pos2::new(position.x, underline_y),
+                Vec2::new(galley.size().x, 1.0 / pixels_per_point),
+            );
+            painter.rect_filled(underline_rect, Rounding::ZERO, theme_accent());
+        }
     }
     fold_response
 }
@@ -16551,6 +16954,43 @@ fn source_line_galley_position(
     } else {
         position
     }
+}
+
+fn source_caret_screen_rect(
+    code_position: Pos2,
+    local_cursor_rect: Rect,
+    pixels_per_point: f32,
+    snap_to_pixel: bool,
+) -> Rect {
+    let width = 1.0 / pixels_per_point;
+    let x = ((code_position.x + local_cursor_rect.left()) * pixels_per_point).round()
+        / pixels_per_point;
+    let mut top = code_position.y + local_cursor_rect.top();
+    let mut bottom = code_position.y + local_cursor_rect.bottom();
+    if snap_to_pixel {
+        top = snap_y_to_physical_pixel(Pos2::new(0.0, top), pixels_per_point).y;
+        bottom = snap_y_to_physical_pixel(Pos2::new(0.0, bottom), pixels_per_point).y;
+    }
+    bottom = bottom.max(top + width);
+    Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + width, bottom))
+}
+
+fn source_horizontal_scroll_to_reveal_caret(
+    current_x: f32,
+    caret_rect: Rect,
+    viewport: Rect,
+    max_x: f32,
+) -> f32 {
+    let left = viewport.left() + 4.0;
+    let right = viewport.right() - 4.0;
+    let next_x = if caret_rect.left() < left {
+        current_x - (left - caret_rect.left())
+    } else if caret_rect.right() > right {
+        current_x + (caret_rect.right() - right)
+    } else {
+        current_x
+    };
+    next_x.clamp(0.0, max_x.max(0.0))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22648,6 +23088,82 @@ mod tests {
         assert_eq!(source_copy_text(&lines), "model Demo\nend Demo;");
     }
 
+    #[test]
+    fn source_horizontal_scroll_keeps_caret_inside_viewport() {
+        let viewport = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(110.0, 90.0));
+        let off_right = Rect::from_min_size(Pos2::new(120.0, 30.0), Vec2::new(1.0, 16.0));
+        assert_eq!(
+            source_horizontal_scroll_to_reveal_caret(20.0, off_right, viewport, 200.0),
+            35.0
+        );
+
+        let off_left = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(1.0, 16.0));
+        assert_eq!(
+            source_horizontal_scroll_to_reveal_caret(20.0, off_left, viewport, 200.0),
+            6.0
+        );
+    }
+
+    #[test]
+    fn source_caret_geometry_is_one_physical_pixel_at_fractional_dpi() {
+        let local = Rect::from_min_max(Pos2::new(3.25, 1.5), Pos2::new(4.0, 16.25));
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let caret = source_caret_screen_rect(Pos2::new(12.3, 8.7), local, scale, true);
+            assert!((caret.left() * scale - (caret.left() * scale).round()).abs() < 1e-4);
+            assert!((caret.top() * scale - (caret.top() * scale).round()).abs() < 1e-4);
+            assert!(((caret.width() * scale) - 1.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn source_completion_accepts_loaded_namespace_class_at_the_utf8_caret() {
+        let mut document = source_folding_document("Modelica.Blocks.Sources.Con", 1);
+        document.completion_class_names = vec![
+            "Modelica.Blocks.Sources.Constant".to_owned(),
+            "Modelica.Blocks.Math.Gain".to_owned(),
+        ];
+        let mut editor = SourceEditorState::new(
+            Some("document-a".to_owned()),
+            Some("Demo".to_owned()),
+            1,
+            "Modelica.Blocks.Sources.Con",
+        );
+        editor.cursor = editor.buffer.line_end(0);
+        editor.focused = true;
+        let mut completion = SourceCompletionState::default();
+
+        completion.update(&document, &mut editor);
+
+        assert!(completion.open);
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(completion.items[0].label, "Constant");
+        assert_eq!(completion_kind_label(completion.items[0].kind), "类");
+        assert!(completion.accept_selected(&mut editor));
+        assert_eq!(editor.buffer.line(0), "Modelica.Blocks.Sources.Constant");
+    }
+
+    #[test]
+    fn source_completion_forced_open_and_suppressed_in_comments() {
+        let document = source_folding_document("", 1);
+        let mut editor = SourceEditorState::new(None, None, 0, "");
+        editor.focused = true;
+        let mut completion = SourceCompletionState {
+            forced: true,
+            ..Default::default()
+        };
+        completion.update(&document, &mut editor);
+        assert!(completion.open);
+        assert!(!completion.items.is_empty());
+
+        editor.reset(None, None, 0, "// mod");
+        editor.cursor = editor.buffer.line_end(0);
+        editor.focused = true;
+        completion.invalidate_query();
+        completion.update(&document, &mut editor);
+        assert!(!completion.open);
+        assert!(completion.items.is_empty());
+    }
+
     fn source_folding_lines(source: &str) -> Vec<String> {
         source.lines().map(str::to_owned).collect()
     }
@@ -22657,6 +23173,7 @@ mod tests {
         UiDocument {
             package_name: "Demo".to_owned(),
             class_names: vec!["Demo".to_owned()],
+            completion_class_names: vec!["Demo".to_owned()],
             full_class_names: HashSet::new(),
             short_class_names: HashSet::new(),
             dirty: false,
@@ -23726,6 +24243,7 @@ mod tests {
         let document = UiDocument {
             package_name: String::new(),
             class_names: Vec::new(),
+            completion_class_names: Vec::new(),
             full_class_names: HashSet::new(),
             short_class_names: HashSet::new(),
             dirty: false,
