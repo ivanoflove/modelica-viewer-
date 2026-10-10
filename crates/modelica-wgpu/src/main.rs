@@ -3476,51 +3476,10 @@ impl Workspace {
 
     fn tree(&self) -> TreeNode {
         let root_id = "workspace::root".to_owned();
-        let mut groups = Vec::<(String, PathBuf, Vec<TreeNode>)>::new();
-        for entry in &self.documents {
-            let directory = if entry.document.path.is_dir() {
-                entry.document.path.clone()
-            } else {
-                entry
-                    .document
-                    .path
-                    .parent()
-                    .unwrap_or(&entry.document.path)
-                    .to_owned()
-            };
-            let directory_id = Self::document_id(&directory);
-            let doc_node = workspace_document_tree_node(entry);
-            if let Some((_, _, children)) = groups.iter_mut().find(|(id, _, _)| *id == directory_id)
-            {
-                children.push(doc_node);
-            } else {
-                groups.push((directory_id, directory, vec![doc_node]));
-            }
-        }
-        let children = groups
-            .into_iter()
-            .map(|(directory_id, directory, mut documents)| {
-                if documents.len() == 1 {
-                    return documents.pop().expect("one workspace document");
-                }
-                let name = directory
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .unwrap_or("Workspace")
-                    .to_owned();
-                let qualified_name = format!("workspace::folder::{directory_id}");
-                for document in &mut documents {
-                    let document_id = document.workspace_document_id.clone().unwrap_or_default();
-                    prefix_workspace_tree(document, &qualified_name, &document_id);
-                }
-                TreeNode {
-                    name,
-                    qualified_name,
-                    workspace_document_id: None,
-                    children: documents,
-                    ..TreeNode::default()
-                }
-            })
+        let children = self
+            .documents
+            .iter()
+            .map(workspace_document_tree_node)
             .collect();
         TreeNode {
             name: "WORKSPACE".to_owned(),
@@ -3540,54 +3499,42 @@ impl Workspace {
 }
 
 fn workspace_document_tree_node(entry: &WorkspaceDocument) -> TreeNode {
-    let path_name = if entry
-        .document
-        .path
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("package.mo"))
-    {
-        entry.document.path.parent().unwrap_or(&entry.document.path)
-    } else {
-        entry.document.path.as_path()
-    };
-    let name = path_name
-        .file_stem()
-        .or_else(|| path_name.file_name())
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or(&entry.document.package_name)
-        .to_owned();
-    let name = if entry.document.has_unsaved_changes() {
-        format!("{name}  •")
-    } else {
-        name
-    };
-    let group_id = format!("workspace::{}", entry.id);
+    let model_tree = &entry.document.model_tree;
     let root_is_declared = entry.document.class_sources.iter().any(|source| {
-        source.qualified_name == entry.document.model_tree.qualified_name
+        source.qualified_name == model_tree.qualified_name
             && source.source_range.end > source.source_range.start
     });
-    let children = entry
-        .document
-        .model_tree
-        .children
-        .iter()
-        .cloned()
-        .map(|mut child| {
-            prefix_workspace_tree(&mut child, &group_id, &entry.id);
-            child
-        })
-        .collect();
-    TreeNode {
-        name,
-        qualified_name: group_id,
-        class_name: root_is_declared.then(|| entry.document.model_tree.qualified_name.clone()),
-        kind: root_is_declared
-            .then_some(entry.document.model_tree.kind)
-            .flatten(),
-        workspace_document_id: Some(entry.id.clone()),
-        description: None,
-        children,
+    // PackageLoader represents a standalone class file as a synthetic package
+    // whose only child is the actual class. Show that class directly instead
+    // of rendering both the file/document wrapper and the class node.
+    let is_standalone_class_file = entry.document.path.is_file()
+        && !entry
+            .document
+            .path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("package.mo"));
+    let is_single_class_file = is_standalone_class_file
+        && model_tree.children.len() == 1
+        && (!root_is_declared
+            || model_tree.children[0].qualified_name == model_tree.qualified_name);
+    let prefix = format!("workspace::{}", entry.id);
+    let mut node = if is_single_class_file {
+        model_tree.children[0].clone()
+    } else {
+        let mut group = model_tree.clone();
+        // A file containing multiple top-level classes needs a non-class
+        // grouping row; its children retain the real class identities.
+        if !root_is_declared {
+            group.class_name = None;
+            group.kind = None;
+        }
+        group
+    };
+    if entry.document.has_unsaved_changes() {
+        node.name.push_str("  •");
     }
+    prefix_workspace_tree(&mut node, &prefix, &entry.id);
+    node
 }
 
 fn prefix_workspace_tree(node: &mut TreeNode, prefix: &str, document_id: &str) {
@@ -13719,16 +13666,14 @@ fn draw_preview_ui(
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(
-                                document.map_or("Modelica", |doc| doc.package_name.as_str()),
-                            )
-                            .size(12.0)
-                            .font(ui_semibold_font(12.0))
-                            .color(theme_text_primary()),
+                            RichText::new("WORKSPACE")
+                                .size(12.0)
+                                .font(ui_semibold_font(12.0))
+                                .color(theme_text_primary()),
                         )
                         .truncate(),
                     )
-                    .on_hover_text(document.map_or("Modelica", |doc| doc.package_name.as_str()));
+                    .on_hover_text("工作区中的 Modelica 文件与 Package");
                 });
                 ui.add_space(6.0);
                 // Reserve the action strip, then let the tree fill what is left.
@@ -14367,7 +14312,6 @@ impl TreeGalleyCache {
     fn label_galley(
         &mut self,
         painter: &egui::Painter,
-        icon: &str,
         label: &str,
         role: TreeTextRole,
         color: Color32,
@@ -14375,7 +14319,7 @@ impl TreeGalleyCache {
         pixels_per_point: f32,
     ) -> Arc<egui::Galley> {
         let key = TreeGalleyKey {
-            text: tree_row_label(icon, label),
+            text: tree_row_label(label),
             role,
             color: color.to_array(),
             max_width_bits: max_width.to_bits(),
@@ -14386,8 +14330,7 @@ impl TreeGalleyCache {
         }
 
         let font = role.font();
-        let visible_text =
-            ellipsize_tree_label(painter, icon, label, font.clone(), color, max_width);
+        let visible_text = ellipsize_tree_label(painter, label, font.clone(), color, max_width);
         let galley = painter.layout_no_wrap(visible_text, font, color);
         self.insert(key, Arc::clone(&galley));
         galley
@@ -14410,7 +14353,6 @@ struct VisibleTreeRow {
     qualified_name: String,
     class_name: Option<String>,
     workspace_document_id: Option<String>,
-    kind: Option<ClassKind>,
     depth: usize,
     has_children: bool,
 }
@@ -14433,7 +14375,11 @@ impl VisibleTreeRowsCache {
 
     fn rebuild(&mut self, root: &TreeNode, expanded_nodes: &HashSet<String>) {
         let mut rows = Vec::new();
-        collect_visible_tree_rows(root, 0, expanded_nodes, &mut rows);
+        // The workspace root is a section heading, not an interactive row.
+        // Documents/classes start at depth zero directly below that heading.
+        for child in &root.children {
+            collect_visible_tree_rows(child, 0, expanded_nodes, &mut rows);
+        }
         self.rows = Some(rows);
     }
 }
@@ -14442,7 +14388,6 @@ impl VisibleTreeRowsCache {
 fn tree_row(
     ui: &mut egui::Ui,
     marker: &str,
-    icon: &str,
     label: &str,
     identity: &str,
     selected: bool,
@@ -14480,23 +14425,25 @@ fn tree_row(
         );
     }
     let pixels_per_point = ui.ctx().pixels_per_point();
-    let marker_color = theme_text_tertiary();
-    let marker_galley = text_cache.galley(
-        ui.painter(),
-        marker.to_owned(),
-        TreeTextRole::Marker,
-        marker_color,
-        0.0,
-        pixels_per_point,
-    );
-    let marker_position = tree_row_galley_position(
-        rect,
-        rect.left() + indent * 12.0 + 8.0,
-        marker_galley.size().y,
-        pixels_per_point,
-    );
-    ui.painter()
-        .galley(marker_position, marker_galley, marker_color);
+    if !marker.is_empty() {
+        let marker_color = theme_text_tertiary();
+        let marker_galley = text_cache.galley(
+            ui.painter(),
+            marker.to_owned(),
+            TreeTextRole::Marker,
+            marker_color,
+            0.0,
+            pixels_per_point,
+        );
+        let marker_position = tree_row_galley_position(
+            rect,
+            rect.left() + indent * 12.0 + 8.0,
+            marker_galley.size().y,
+            pixels_per_point,
+        );
+        ui.painter()
+            .galley(marker_position, marker_galley, marker_color);
+    }
     let text_position = snap_point_to_physical_pixel(
         Pos2::new(rect.left() + indent * 12.0 + 30.0, rect.center().y),
         pixels_per_point,
@@ -14514,7 +14461,6 @@ fn tree_row(
     let label_max_width = (rect.right() - 8.0 - text_position.x).max(24.0);
     let label_galley = text_cache.label_galley(
         ui.painter(),
-        icon,
         label,
         label_role,
         label_color,
@@ -14545,8 +14491,18 @@ fn tree_row(
     (response, marker_response)
 }
 
-fn tree_row_label(icon: &str, label: &str) -> String {
-    format!("{icon}  {label}")
+fn tree_row_label(label: &str) -> String {
+    label.to_owned()
+}
+
+fn tree_row_marker(has_children: bool, expanded: bool) -> &'static str {
+    if !has_children {
+        ""
+    } else if expanded {
+        "▾"
+    } else {
+        "▸"
+    }
 }
 
 fn theme_code_annotation() -> Color32 {
@@ -14559,13 +14515,12 @@ fn theme_code_annotation() -> Color32 {
 
 fn ellipsize_tree_label(
     painter: &egui::Painter,
-    icon: &str,
     label: &str,
     font: FontId,
     color: Color32,
     max_width: f32,
 ) -> String {
-    let full = tree_row_label(icon, label);
+    let full = tree_row_label(label);
     if painter
         .layout_no_wrap(full.clone(), font.clone(), color)
         .size()
@@ -14579,7 +14534,7 @@ fn ellipsize_tree_label(
     let fits = |count: usize| {
         let prefix = characters[..count].iter().collect::<String>();
         painter
-            .layout_no_wrap(format!("{icon}  {prefix}{ellipsis}"), font.clone(), color)
+            .layout_no_wrap(format!("{prefix}{ellipsis}"), font.clone(), color)
             .size()
             .x
             <= max_width
@@ -14594,10 +14549,7 @@ fn ellipsize_tree_label(
             high = middle - 1;
         }
     }
-    format!(
-        "{icon}  {}{ellipsis}",
-        characters[..low].iter().collect::<String>()
-    )
+    format!("{}{ellipsis}", characters[..low].iter().collect::<String>())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14622,15 +14574,7 @@ fn document_tree(
         .show_rows(ui, TREE_ROW_HEIGHT, rows.len(), |ui, row_range| {
             for row in &rows[row_range] {
                 let expanded = expanded_nodes.contains(&row.qualified_name);
-                let marker = if row.has_children {
-                    if expanded {
-                        "▾"
-                    } else {
-                        "▸"
-                    }
-                } else {
-                    "□"
-                };
+                let marker = tree_row_marker(row.has_children, expanded);
                 let selected = selected_class.is_some()
                     && row.class_name.as_deref() == selected_class
                     && row.workspace_document_id.as_deref() == active_document_id;
@@ -14638,7 +14582,6 @@ fn document_tree(
                 let (response, marker_response) = tree_row(
                     ui,
                     marker,
-                    tree_node_icon(row.kind),
                     &row.name,
                     &row.qualified_name,
                     selected,
@@ -14651,16 +14594,14 @@ fn document_tree(
                 if trace_text_layout && depth > 0 && !trace_sample_emitted {
                     trace_sample_emitted = true;
                 }
-                if marker_response.clicked() {
-                    if row.has_children {
-                        if expanded {
-                            expanded_nodes.remove(&row.qualified_name);
-                        } else {
-                            expanded_nodes.insert(row.qualified_name.clone());
-                        }
-                        expanded_changed = true;
+                if marker_response.clicked() && row.has_children {
+                    if expanded {
+                        expanded_nodes.remove(&row.qualified_name);
+                    } else {
+                        expanded_nodes.insert(row.qualified_name.clone());
                     }
-                } else if response.clicked() {
+                    expanded_changed = true;
+                } else if response.clicked() || marker_response.clicked() {
                     if let Some(document_id) = &row.workspace_document_id {
                         clicked = Some(WorkspaceTreeClick {
                             document_id: document_id.clone(),
@@ -14688,7 +14629,6 @@ fn collect_visible_tree_rows(
         qualified_name: node.qualified_name.clone(),
         class_name: node.class_name.clone(),
         workspace_document_id: node.workspace_document_id.clone(),
-        kind: node.kind,
         depth,
         has_children: !node.children.is_empty(),
     });
@@ -20434,21 +20374,6 @@ fn apply_validated_source_edits(
     Ok(apply_validated_source_edits_with_parsed(source, edits, version)?.source)
 }
 
-fn tree_node_icon(kind: Option<ClassKind>) -> &'static str {
-    match kind {
-        Some(ClassKind::Package) => "▱",
-        Some(ClassKind::Model) => "◇",
-        Some(ClassKind::Block) => "■",
-        Some(ClassKind::Connector | ClassKind::ExpandableConnector) => "●",
-        Some(ClassKind::Record | ClassKind::OperatorRecord) => "▤",
-        Some(ClassKind::Function | ClassKind::OperatorFunction) => "ƒ",
-        Some(ClassKind::Type) => "T",
-        Some(ClassKind::Operator) => "◈",
-        Some(ClassKind::Class) => "◆",
-        None => "·",
-    }
-}
-
 fn apply_validated_source_edits_with_parsed(
     source: &str,
     edits: Vec<SourceEdit>,
@@ -20992,11 +20917,33 @@ mod tests {
 
         let tree = workspace.tree();
         assert_eq!(tree.name, "WORKSPACE");
-        assert_eq!(tree.children.len(), 1);
-        let files = &tree.children[0].children;
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|node| node.name == "IEH_CPP  •"));
-        assert!(files.iter().any(|node| node.name == "Model1"));
+        assert_eq!(tree.children.len(), 2);
+        let node_a = tree
+            .children
+            .iter()
+            .find(|node| node.class_name.as_deref() == Some("IEH_CPP"))
+            .expect("standalone class A is shown directly");
+        let node_b = tree
+            .children
+            .iter()
+            .find(|node| node.class_name.as_deref() == Some("Model1"))
+            .expect("standalone class B is shown directly");
+        assert_eq!(node_a.name, "IEH_CPP  •");
+        assert_eq!(node_a.workspace_document_id.as_deref(), Some(id_a.as_str()));
+        assert!(node_a.children.is_empty());
+        assert_eq!(node_b.workspace_document_id.as_deref(), Some(id_b.as_str()));
+        assert!(node_b.children.is_empty());
+        let mut visible_rows = VisibleTreeRowsCache::default();
+        visible_rows.ensure(&tree, &HashSet::new());
+        let visible_rows = visible_rows.rows.as_ref().unwrap();
+        assert_eq!(
+            visible_rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["IEH_CPP  •", "Model1"],
+            "the workspace heading is not a tree row and standalone classes are not duplicated"
+        );
 
         workspace.store_active_session(None, &[], &[], MainView::Source);
         assert!(workspace.activate(&id_a));
@@ -21109,12 +21056,13 @@ mod tests {
             .document
             .class_names
             .contains(&"Model1".to_owned()));
-        assert!(workspace
-            .tree()
-            .children
-            .iter()
-            .flat_map(|folder| &folder.children)
-            .any(|node| node.name == "Model1"));
+        let tree = workspace.tree();
+        assert_eq!(tree.children.len(), 2);
+        assert!(tree.children.iter().any(|node| {
+            node.name == "Model1"
+                && node.class_name.as_deref() == Some("Model1")
+                && node.workspace_document_id.as_deref() == Some(new_id.as_str())
+        }));
         assert!(workspace
             .documents
             .iter()
@@ -21277,20 +21225,27 @@ mod tests {
                 .any(|name| name == "DirPkg.Part")
         }));
         let tree = workspace.tree();
-        assert_eq!(tree.children.len(), 2);
-        let sibling_files = tree
+        assert_eq!(tree.children.len(), 3);
+        let single_file_package = tree
             .children
             .iter()
-            .find(|node| node.children.len() == 2)
-            .expect("single-file package and independent model share their folder");
-        assert!(sibling_files
+            .find(|node| node.class_name.as_deref() == Some("SinglePkg"))
+            .expect("single-file package is a direct workspace entry");
+        assert_eq!(single_file_package.kind, Some(ClassKind::Package));
+        assert_eq!(single_file_package.children[0].name, "Part");
+        let directory_package_node = tree
             .children
             .iter()
-            .any(|node| node.class_name.as_deref() == Some("SinglePkg")));
-        assert!(sibling_files
+            .find(|node| node.class_name.as_deref() == Some("DirPkg"))
+            .expect("directory package is a direct workspace entry");
+        assert_eq!(directory_package_node.children[0].name, "Part");
+        let standalone_model = tree
             .children
             .iter()
-            .any(|node| node.class_name.as_deref() == Some("Model1")));
+            .find(|node| node.class_name.as_deref() == Some("Model1"))
+            .expect("independent model is a direct workspace entry");
+        assert_eq!(standalone_model.name, "Model1");
+        assert!(standalone_model.children.is_empty());
         let standalone_id = workspace
             .documents
             .iter()
@@ -21305,6 +21260,151 @@ mod tests {
                 .find(|entry| entry.document.path == directory_package)
                 .map(|entry| entry.id.clone())
         );
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn workspace_tree_flattens_single_class_files_and_groups_multiple_top_level_classes() {
+        let directory = workspace_test_directory("tree-file-shapes");
+        let single_path = directory.join("Model1.mo");
+        let multiple_path = directory.join("Multiple.mo");
+        let mismatched_path = directory.join("FileNameDiffers.mo");
+        let mut workspace = Workspace::default();
+        let single_id = workspace
+            .add_document(workspace_model(&single_path, "model Model1\nend Model1;\n"))
+            .expect("add single-class file");
+        let multiple_id = workspace
+            .add_document(workspace_model(
+                &multiple_path,
+                "model ModelA\nend ModelA;\nmodel ModelB\nend ModelB;\n",
+            ))
+            .expect("add multi-class file");
+        let mismatched_id = workspace
+            .add_document(workspace_model(
+                &mismatched_path,
+                "model ActualName\nend ActualName;\n",
+            ))
+            .expect("add class whose name differs from its file name");
+
+        let tree = workspace.tree();
+        assert_eq!(tree.name, "WORKSPACE");
+        assert_eq!(tree.children.len(), 3);
+        let single = tree
+            .children
+            .iter()
+            .find(|node| node.class_name.as_deref() == Some("Model1"))
+            .expect("single class is direct");
+        assert_eq!(single.name, "Model1");
+        assert_eq!(
+            single.workspace_document_id.as_deref(),
+            Some(single_id.as_str())
+        );
+        assert!(single.children.is_empty());
+
+        let mismatched = tree
+            .children
+            .iter()
+            .find(|node| node.class_name.as_deref() == Some("ActualName"))
+            .expect("single class is not replaced by its file name");
+        assert_eq!(mismatched.name, "ActualName");
+        assert_eq!(
+            mismatched.workspace_document_id.as_deref(),
+            Some(mismatched_id.as_str())
+        );
+
+        let group = tree
+            .children
+            .iter()
+            .find(|node| node.name == "Multiple")
+            .expect("multi-class file remains grouped");
+        assert_eq!(group.class_name, None);
+        assert_eq!(group.kind, None);
+        assert_eq!(
+            group.workspace_document_id.as_deref(),
+            Some(multiple_id.as_str())
+        );
+        assert_eq!(
+            group
+                .children
+                .iter()
+                .map(|node| node.class_name.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("ModelA"), Some("ModelB")]
+        );
+        assert!(group
+            .children
+            .iter()
+            .all(|node| { node.workspace_document_id.as_deref() == Some(multiple_id.as_str()) }));
+
+        let mut visible_cache = VisibleTreeRowsCache::default();
+        visible_cache.ensure(&tree, &HashSet::new());
+        assert_eq!(
+            visible_cache
+                .rows
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Model1", "Multiple", "ActualName"]
+        );
+        let expanded = HashSet::from([group.qualified_name.clone()]);
+        visible_cache.invalidate();
+        visible_cache.ensure(&tree, &expanded);
+        assert_eq!(
+            visible_cache
+                .rows
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Model1", "Multiple", "ModelA", "ModelB", "ActualName"]
+        );
+
+        fs::remove_dir_all(directory).expect("cleanup workspace fixture");
+    }
+
+    #[test]
+    fn workspace_tree_preserves_nested_package_namespace_and_class_bindings() {
+        let directory = workspace_test_directory("tree-nested-package");
+        let package_directory = directory.join("NestedPkg");
+        fs::create_dir_all(&package_directory).expect("create package directory");
+        fs::write(
+            package_directory.join("package.mo"),
+            "package NestedPkg\n  package Sub\n    model Heater\n    end Heater;\n  end Sub;\nend NestedPkg;\n",
+        )
+        .expect("write nested package source");
+        let mut workspace = Workspace::default();
+        let package_id = workspace
+            .add_document(LoadedDocument::load(&package_directory).expect("load nested package"))
+            .expect("add nested package");
+
+        let tree = workspace.tree();
+        assert_eq!(tree.children.len(), 1);
+        let root_package = &tree.children[0];
+        assert_eq!(root_package.name, "NestedPkg");
+        assert_eq!(root_package.class_name.as_deref(), Some("NestedPkg"));
+        assert_eq!(
+            root_package.workspace_document_id.as_deref(),
+            Some(package_id.as_str())
+        );
+        assert_eq!(root_package.children.len(), 1);
+        let subpackage = &root_package.children[0];
+        assert_eq!(subpackage.name, "Sub");
+        assert_eq!(subpackage.class_name.as_deref(), Some("NestedPkg.Sub"));
+        assert_eq!(
+            subpackage.workspace_document_id.as_deref(),
+            Some(package_id.as_str())
+        );
+        let heater = &subpackage.children[0];
+        assert_eq!(heater.name, "Heater");
+        assert_eq!(heater.class_name.as_deref(), Some("NestedPkg.Sub.Heater"));
+        assert_eq!(
+            heater.workspace_document_id.as_deref(),
+            Some(package_id.as_str())
+        );
+
         fs::remove_dir_all(directory).expect("cleanup workspace fixture");
     }
 
@@ -21389,11 +21489,8 @@ mod tests {
         ];
 
         for node in nodes {
-            let visible_text = tree_row_label(tree_node_icon(node.kind), &node.name);
-            assert_eq!(
-                visible_text,
-                format!("{}  {}", tree_node_icon(node.kind), node.name)
-            );
+            let visible_text = tree_row_label(&node.name);
+            assert_eq!(visible_text, node.name);
             assert!(!visible_text.contains('—'));
             assert!(!visible_text.contains("干燥器"));
             if node.name == "Heater" {
@@ -21406,7 +21503,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_row_keeps_kind_metadata_without_showing_kind_text() {
+    fn tree_row_keeps_kind_metadata_without_rendering_kind_icons() {
         let node = TreeNode {
             name: "Demo".to_owned(),
             qualified_name: "Demo".to_owned(),
@@ -21416,25 +21513,28 @@ mod tests {
         let mut rows = Vec::new();
         collect_visible_tree_rows(&node, 0, &HashSet::new(), &mut rows);
 
-        assert_eq!(rows[0].kind, Some(ClassKind::Package));
-        let visible_text = tree_row_label(tree_node_icon(rows[0].kind), &rows[0].name);
-        assert_eq!(visible_text, "▱  Demo");
+        assert_eq!(node.kind, Some(ClassKind::Package));
+        let visible_text = tree_row_label(&rows[0].name);
+        assert_eq!(visible_text, "Demo");
         assert!(!visible_text.contains("package"));
         assert!(!visible_text.contains("model"));
+        assert_eq!(tree_row_marker(false, false), "");
+        assert_eq!(tree_row_marker(true, false), "▸");
+        assert_eq!(tree_row_marker(true, true), "▾");
     }
 
     #[test]
     fn visible_tree_rows_follow_expanded_paths_and_cache_invalidation() {
         let root = TreeNode {
-            name: "Demo".to_owned(),
-            qualified_name: "Demo".to_owned(),
+            name: "WORKSPACE".to_owned(),
+            qualified_name: "workspace::root".to_owned(),
             children: vec![TreeNode {
                 name: "Package".to_owned(),
-                qualified_name: "Demo.Package".to_owned(),
+                qualified_name: "workspace::package".to_owned(),
                 children: vec![TreeNode {
                     name: "Heater".to_owned(),
-                    qualified_name: "Demo.Package.Heater".to_owned(),
-                    class_name: Some("Demo.Package.Heater".to_owned()),
+                    qualified_name: "workspace::package::Heater".to_owned(),
+                    class_name: Some("Package.Heater".to_owned()),
                     kind: Some(ClassKind::Block),
                     ..TreeNode::default()
                 }],
@@ -21448,36 +21548,29 @@ mod tests {
         cache.ensure(&root, &expanded);
         assert_eq!(cache.rows.as_ref().unwrap().len(), 1);
 
-        expanded.insert("Demo".to_owned());
+        expanded.insert("workspace::package".to_owned());
         cache.invalidate();
         cache.ensure(&root, &expanded);
         let rows = cache.rows.as_ref().unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].qualified_name, "Demo.Package");
+        assert_eq!(rows[0].qualified_name, "workspace::package");
+        assert_eq!(rows[1].name, "Heater");
         assert_eq!(rows[1].depth, 1);
 
-        expanded.insert("Demo.Package".to_owned());
-        cache.invalidate();
-        cache.ensure(&root, &expanded);
-        let rows = cache.rows.as_ref().unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].name, "Heater");
-        assert_eq!(rows[2].depth, 2);
-
-        expanded.remove("Demo");
+        expanded.remove("workspace::package");
         cache.invalidate();
         cache.ensure(&root, &expanded);
         assert_eq!(cache.rows.as_ref().unwrap().len(), 1);
     }
 
     #[test]
-    fn tree_marker_name_and_kind_positions_snap_at_common_dpi_scales() {
+    fn tree_marker_and_name_positions_snap_at_common_dpi_scales() {
         let rect = Rect::from_min_size(Pos2::new(13.25, 29.4), Vec2::new(260.0, 29.0));
         let original_rect = rect;
-        let cases = [(0.0, 13.0, 17.3, 14.1), (3.0, 13.4, 17.6, 14.4)];
+        let cases = [(0.0, 13.0, 17.3), (3.0, 13.4, 17.6)];
 
         for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
-            for (indent, marker_height, label_height, kind_height) in cases {
+            for (indent, marker_height, label_height) in cases {
                 let marker_x = rect.left() + indent * 12.0 + 8.0;
                 let marker =
                     tree_row_galley_position(rect, marker_x, marker_height, pixels_per_point);
@@ -21490,11 +21583,7 @@ mod tests {
                 let label =
                     tree_row_galley_position(rect, label_anchor.x, label_height, pixels_per_point);
 
-                let kind_x = rect.right() - 8.0 - 31.0;
-                let kind = tree_row_galley_position(rect, kind_x, kind_height, pixels_per_point);
-
-                for (position, expected_x) in [(marker, marker_x), (label, label_x), (kind, kind_x)]
-                {
+                for (position, expected_x) in [(marker, marker_x), (label, label_x)] {
                     for coordinate in [position.x, position.y] {
                         let physical = coordinate * pixels_per_point;
                         assert!((physical - physical.round()).abs() < 0.0001);
