@@ -909,6 +909,22 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// later package.order update fails, newly-created files and empty directories
 /// are compensated where safe, and the error reports any leftovers.
 pub fn apply_new_class_plan(plan: &NewClassPlan) -> Result<PathBuf, String> {
+    apply_new_class_plan_with(plan, |change| {
+        if let Some(expected) = &change.expected_contents {
+            atomic_replace_if_unchanged(&change.path, expected, &change.replacement_contents)
+        } else {
+            create_new_file_atomic(&change.path, &change.replacement_contents)
+        }
+    })
+}
+
+fn apply_new_class_plan_with<F>(
+    plan: &NewClassPlan,
+    mut write_change: F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(&NewClassFileChange) -> Result<(), String>,
+{
     let root = &plan.authorized_root;
     let root_metadata = fs::symlink_metadata(root)
         .map_err(|error| format!("目标目录不可访问：{}: {error}", root.display()))?;
@@ -958,12 +974,16 @@ pub fn apply_new_class_plan(plan: &NewClassPlan) -> Result<PathBuf, String> {
                 &plan.primary_file,
             );
         }
-        let result = if let Some(expected) = &change.expected_contents {
-            atomic_replace_if_unchanged(&change.path, expected, &change.replacement_contents)
-        } else {
-            create_new_file_atomic(&change.path, &change.replacement_contents)
-        };
-        if let Err(error) = result {
+        if let Err(error) = write_change(change) {
+            if change.expected_contents.is_none()
+                && fs::read_to_string(&change.path)
+                    .is_ok_and(|contents| contents == change.replacement_contents)
+            {
+                created_files.push((
+                    change.path.clone(),
+                    change.replacement_contents.clone(),
+                ));
+            }
             return rollback_new_files(
                 format!("{}: {error}", change.path.display()),
                 &created_files,
@@ -1155,6 +1175,7 @@ fn rollback_new_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::{PackageLoader, PackageMember};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn request(name: &str, kind: ClassKind, storage: NewClassStorageMode) -> NewClassRequest {
@@ -1322,6 +1343,9 @@ mod tests {
     fn package_order_update_preserves_comments_and_selected_position() {
         let path = PathBuf::from("/tmp/Library/package.order");
         let mut context = NewClassContext::default();
+        context
+            .class_kinds
+            .insert("Library".to_owned(), ClassKind::Package);
         context.package_order_files.insert(
             path.clone(),
             "// library order\r\nFirst // keep\r\nLast\r\n// trailing note\r\n".to_owned(),
@@ -1363,6 +1387,161 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "model Created\nend Created;\n");
         let error = apply_new_class_plan(&plan).expect_err("second apply must not overwrite");
         assert!(error.contains("拒绝覆盖已有文件"));
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn directory_package_creation_updates_order_and_reloads_members() {
+        let directory = temporary_directory("directory-package");
+        fs::write(directory.join("package.mo"), "package Library end Library;\n")
+            .expect("write root package");
+        fs::write(directory.join("package.order"), "Old\n")
+            .expect("write package order");
+        fs::write(
+            directory.join("Old.mo"),
+            "within Library; model Old end Old;\n",
+        )
+        .expect("write existing class");
+        let mut context = NewClassContext::default();
+        context
+            .class_kinds
+            .insert("Library".to_owned(), ClassKind::Package);
+        context
+            .class_kinds
+            .insert("Library.Old".to_owned(), ClassKind::Model);
+        let order_path = directory.join("package.order");
+        context
+            .package_order_files
+            .insert(order_path.clone(), "Old\n".to_owned());
+        let class = request(
+            "FluidUnits",
+            ClassKind::Package,
+            NewClassStorageMode::DirectoryPackage {
+                parent_directory: directory.clone(),
+                within: Some("Library".to_owned()),
+                package_order_file: Some(order_path),
+                package_order_before: None,
+            },
+        );
+        let plan = plan_new_class(&class, &context).expect("directory package plan");
+        apply_new_class_plan(&plan).expect("write package and order");
+
+        let loaded = PackageLoader.load(&directory).expect("reload package tree");
+        assert_eq!(loaded.qualified_name, "Library");
+        let member = loaded
+            .ordered_members
+            .iter()
+            .find(|member| member.name() == "FluidUnits")
+            .expect("created package appears in tree");
+        assert!(matches!(member, PackageMember::Package(_)));
+        assert_eq!(member.qualified_name(), "Library.FluidUnits");
+        assert_eq!(
+            fs::read_to_string(directory.join("package.order")).unwrap(),
+            "Old\nFluidUnits\n"
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn inserting_into_existing_package_file_preserves_and_indexes_classes() {
+        let directory = temporary_directory("insert-existing");
+        let file = directory.join("Library.mo");
+        let original = "package Library\n  model Existing end Existing;\nend Library;\n";
+        fs::write(&file, original).expect("write package source");
+        let mut context = NewClassContext::default();
+        context
+            .class_kinds
+            .insert("Library".to_owned(), ClassKind::Package);
+        context
+            .class_kinds
+            .insert("Library.Existing".to_owned(), ClassKind::Model);
+        context
+            .source_files
+            .insert(file.clone(), original.to_owned());
+        let class = request(
+            "Created",
+            ClassKind::Block,
+            NewClassStorageMode::InsertIntoExistingFile {
+                file: file.clone(),
+                parent_class: "Library".to_owned(),
+            },
+        );
+        let plan = plan_new_class(&class, &context).expect("insertion plan");
+        apply_new_class_plan(&plan).expect("insert nested class");
+
+        let loaded = PackageLoader.load(&file).expect("reload monolithic package");
+        let created = loaded
+            .ordered_members
+            .iter()
+            .find(|member| member.name() == "Created")
+            .expect("created class appears in tree")
+            .as_class();
+        assert_eq!(created.kind, ClassKind::Block);
+        assert_eq!(created.qualified_name, "Library.Created");
+        assert_eq!(created.source_file, file);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn package_order_failure_compensates_the_new_class_file() {
+        let directory = temporary_directory("rollback");
+        fs::write(directory.join("package.order"), "Old\n").expect("write order");
+        let order_path = directory.join("package.order");
+        let mut context = NewClassContext::default();
+        context
+            .package_order_files
+            .insert(order_path.clone(), "Old\n".to_owned());
+        let class = request(
+            "NewModel",
+            ClassKind::Model,
+            NewClassStorageMode::SingleFile {
+                directory: directory.clone(),
+                within: None,
+                package_order_file: Some(order_path.clone()),
+                package_order_before: None,
+            },
+        );
+        let plan = plan_new_class(&class, &context).expect("plan");
+        let mut writes = 0;
+        let error = apply_new_class_plan_with(&plan, |change| {
+            writes += 1;
+            if writes == 2 {
+                Err("injected package.order write failure".to_owned())
+            } else {
+                create_new_file_atomic(&change.path, &change.replacement_contents)
+            }
+        })
+        .expect_err("second-file failure must fail the transaction");
+        assert!(error.contains("已回滚"));
+        assert!(!directory.join("NewModel.mo").exists());
+        assert_eq!(fs::read_to_string(order_path).unwrap(), "Old\n");
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn refuses_external_modification_before_creating_any_file() {
+        let directory = temporary_directory("external-conflict");
+        let order_path = directory.join("package.order");
+        fs::write(&order_path, "Old\n").expect("write order");
+        let mut context = NewClassContext::default();
+        context
+            .package_order_files
+            .insert(order_path.clone(), "Old\n".to_owned());
+        let class = request(
+            "NewModel",
+            ClassKind::Model,
+            NewClassStorageMode::SingleFile {
+                directory: directory.clone(),
+                within: None,
+                package_order_file: Some(order_path.clone()),
+                package_order_before: None,
+            },
+        );
+        let plan = plan_new_class(&class, &context).expect("plan");
+        fs::write(&order_path, "Externally changed\n").expect("simulate external writer");
+        let error = apply_new_class_plan(&plan).expect_err("stale order must be rejected");
+        assert!(error.contains("已被外部修改"));
+        assert!(!directory.join("NewModel.mo").exists());
         fs::remove_dir_all(directory).expect("cleanup");
     }
 }
