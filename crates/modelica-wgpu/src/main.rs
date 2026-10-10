@@ -23164,6 +23164,41 @@ mod tests {
         assert!(completion.items.is_empty());
     }
 
+    #[test]
+    fn source_completion_popup_stays_inside_small_window_bounds() {
+        let context = egui::Context::default();
+        install_ui_fonts(&context);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 100.0));
+        let mut completion = SourceCompletionState {
+            items: ModelicaCompletionIndex::new(Vec::<String>::new()).complete(
+                &CompletionContext {
+                    prefix: "mod".to_owned(),
+                    replace_start: 0,
+                    replace_end: 3,
+                    qualifier: None,
+                },
+                false,
+                120,
+            ),
+            open: true,
+            ..Default::default()
+        };
+        let caret = Rect::from_min_size(Pos2::new(170.0, 92.0), Vec2::new(1.0, 16.0));
+        let mut popup_rect = None;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                popup_rect = Some(draw_source_completion_popup(ctx, caret, &mut completion).0);
+            },
+        );
+
+        let popup_rect = popup_rect.expect("completion popup was drawn");
+        assert!(screen.contains_rect(popup_rect));
+    }
+
     fn source_folding_lines(source: &str) -> Vec<String> {
         source.lines().map(str::to_owned).collect()
     }
