@@ -1164,63 +1164,142 @@ fn temporary_file_path(path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .ok_or_else(|| format!("目标路径不是文件：{}", path.display()))?
         .to_string_lossy();
-    for _ in 0..32 {
-        let serial = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{file_name}.modelica-viewer-{serial}.tmp"));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(format!("无法为 {} 分配临时文件名", path.display()))
+    let serial = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Do not preflight with `exists()`: the subsequent create_new would still
+    // race another process, and Windows can report ACCESS_DENIED rather than
+    // ALREADY_EXISTS when the colliding path is a directory. The exclusive
+    // open in `write_temp_with` is the source of truth.
+    Ok(parent.join(format!(".{file_name}.modelica-viewer-{serial}.tmp")))
 }
 
 fn write_temp(path: &Path, contents: &str) -> Result<PathBuf, String> {
-    let temporary = temporary_file_path(path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| format!("创建临时文件失败 {}: {error}", temporary.display()))?;
-    if let Err(error) = file
-        .write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all())
-    {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("写临时文件失败 {}: {error}", temporary.display()));
+    write_temp_with(path, contents, || temporary_file_path(path))
+}
+
+fn write_temp_with<F>(path: &Path, contents: &str, mut next_path: F) -> Result<PathBuf, String>
+where
+    F: FnMut() -> Result<PathBuf, String>,
+{
+    for _ in 0..32 {
+        let temporary = next_path()?;
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || (error.kind() == std::io::ErrorKind::PermissionDenied
+                        && temporary.exists()) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "创建临时文件失败 {}（{}，OS 错误码 {:?}）：请检查目标目录写入权限以及 Windows 受控文件夹/安全软件是否拦截；未修改目标文件",
+                    temporary.display(),
+                    error,
+                    error.raw_os_error()
+                ));
+            }
+        };
+        if let Err(error) = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let cleanup = fs::remove_file(&temporary).err();
+            return Err(match cleanup {
+                Some(cleanup) => format!(
+                    "写临时文件失败 {}: {error}；临时文件清理也失败: {cleanup}",
+                    temporary.display()
+                ),
+                None => format!("写临时文件失败 {}: {error}", temporary.display()),
+            });
+        }
+        return Ok(temporary);
     }
-    Ok(temporary)
+    Err(format!(
+        "无法为 {} 分配独占临时文件名（连续发生 32 次名称冲突）",
+        path.display()
+    ))
 }
 
 fn create_new_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    create_new_file_atomic_with(path, contents, |from, to| fs::hard_link(from, to))
+}
+
+fn create_new_file_atomic_with<F>(path: &Path, contents: &str, hard_link: F) -> Result<(), String>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     let temporary = write_temp(path, contents)?;
-    match fs::hard_link(&temporary, path) {
+    match hard_link(&temporary, path) {
         Ok(()) => {
-            fs::remove_file(&temporary).map_err(|error| {
-                format!(
-                    "新文件已建立，但临时文件清理失败 {}: {error}",
+            if let Err(error) = fs::remove_file(&temporary) {
+                let rollback = match fs::read(path) {
+                    Ok(actual) if actual == contents.as_bytes() => fs::remove_file(path).err(),
+                    Ok(_) => Some(std::io::Error::other("新文件内容已被外部修改，未执行回滚")),
+                    Err(read_error) => Some(read_error),
+                };
+                let rollback = rollback
+                    .map(|rollback| format!("；目标回滚失败: {rollback}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "临时文件清理失败 {}: {error}{rollback}",
                     temporary.display()
-                )
-            })?;
+                ));
+            }
             Ok(())
         }
         Err(link_error) => {
             let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(file) => file,
                 Err(error) => {
-                    let _ = fs::remove_file(&temporary);
+                    let cleanup = fs::remove_file(&temporary).err();
                     return Err(format!(
-                        "无法以原子方式创建文件 ({link_error})，且独占创建失败：{error}"
+                        "硬链接创建不可用 ({link_error})，独占创建目标失败 {}: {error}{}",
+                        path.display(),
+                        cleanup.map_or_else(String::new, |cleanup| {
+                            format!("；临时文件清理失败 {}: {cleanup}", temporary.display())
+                        })
                     ));
                 }
             };
             let copy_result = fs::read(&temporary)
                 .and_then(|bytes| file.write_all(&bytes))
                 .and_then(|()| file.sync_all());
-            let _ = fs::remove_file(&temporary);
             if let Err(error) = copy_result {
-                let _ = fs::remove_file(path);
-                return Err(format!("写入新文件失败：{error}"));
+                drop(file);
+                let target_cleanup = fs::remove_file(path).err();
+                let temp_cleanup = fs::remove_file(&temporary).err();
+                return Err(format!(
+                    "写入新文件失败 {}: {error}{}{}",
+                    path.display(),
+                    target_cleanup.map_or_else(String::new, |cleanup| {
+                        format!("；部分目标文件回滚失败: {cleanup}")
+                    }),
+                    temp_cleanup.map_or_else(String::new, |cleanup| {
+                        format!("；临时文件清理失败 {}: {cleanup}", temporary.display())
+                    })
+                ));
             }
+            drop(file);
+            fs::remove_file(&temporary).map_err(|error| {
+                let target_cleanup = match fs::read(path) {
+                    Ok(actual) if actual == contents.as_bytes() => fs::remove_file(path).err(),
+                    Ok(_) => Some(std::io::Error::other("新文件内容已被外部修改，未执行回滚")),
+                    Err(read_error) => Some(read_error),
+                };
+                format!(
+                    "新文件写入成功但临时文件清理失败 {}: {error}{}",
+                    temporary.display(),
+                    target_cleanup.map_or_else(String::new, |cleanup| {
+                        format!("；目标回滚失败: {cleanup}")
+                    })
+                )
+            })?;
             Ok(())
         }
     }
@@ -1615,6 +1694,101 @@ mod tests {
         );
         let error = apply_new_class_plan(&plan).expect_err("second apply must not overwrite");
         assert!(error.contains("拒绝覆盖已有文件"));
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn temporary_file_name_collision_retries_without_touching_existing_file() {
+        let directory = temporary_directory("temp-collision");
+        let target = directory.join("Model1.mo");
+        let occupied = directory.join("occupied.tmp");
+        let available = directory.join("available.tmp");
+        fs::write(&occupied, "owned by another operation").expect("reserve first temp name");
+        let mut paths = [occupied.clone(), available.clone()].into_iter();
+
+        let temporary = write_temp_with(&target, "model Model1\nend Model1;\n", || {
+            Ok(paths.next().expect("two candidate names"))
+        })
+        .expect("collision must be retried");
+
+        assert_eq!(temporary, available);
+        assert_eq!(
+            fs::read_to_string(occupied).unwrap(),
+            "owned by another operation"
+        );
+        assert_eq!(
+            fs::read_to_string(&temporary).unwrap(),
+            "model Model1\nend Model1;\n"
+        );
+        assert!(!target.exists());
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn unsupported_hard_link_falls_back_to_exclusive_file_creation() {
+        let directory = temporary_directory("no-hard-link");
+        let target = directory.join("Model1.mo");
+        create_new_file_atomic_with(&target, "model Model1\nend Model1;\n", |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "hard links are unavailable",
+            ))
+        })
+        .expect("exclusive create fallback should work");
+
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "model Model1\nend Model1;\n"
+        );
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "successful creation must remove the temporary file"
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn temporary_write_failure_reports_path_and_os_error_without_target_changes() {
+        let directory = temporary_directory("temp-write-error");
+        let target = directory.join("Model1.mo");
+        let blocking_parent = directory.join("not-a-directory");
+        fs::write(&blocking_parent, "block").expect("create non-directory parent");
+        let error = write_temp_with(&target, "contents", || {
+            Ok(blocking_parent.join("temporary.tmp"))
+        })
+        .expect_err("invalid parent should fail before target changes");
+
+        assert!(error.contains("创建临时文件失败"), "{error}");
+        assert!(error.contains("temporary.tmp"), "{error}");
+        assert!(error.contains("OS 错误码"), "{error}");
+        assert!(!target.exists());
+        assert_eq!(fs::read_to_string(&blocking_parent).unwrap(), "block");
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_collision_is_retried_and_target_creation_succeeds() {
+        let directory = temporary_directory("windows-temp-collision");
+        let target = directory.join("Model1.mo");
+        let occupied = directory.join("Model1.mo.modelica-viewer-collision.tmp");
+        let available = directory.join("Model1.mo.modelica-viewer-retry.tmp");
+        fs::create_dir(&occupied).expect("occupy temporary path with a directory");
+        let mut paths = [occupied.clone(), available.clone()].into_iter();
+
+        let temporary = write_temp_with(&target, "model Model1\nend Model1;\n", || {
+            Ok(paths.next().expect("two candidate names"))
+        })
+        .expect("Windows directory collisions may report ACCESS_DENIED and must retry");
+        assert_eq!(temporary, available);
+        create_new_file_atomic(&target, "model Model1\nend Model1;\n")
+            .expect("Windows file creation should not require hard links");
+        assert!(target.exists());
+        assert!(occupied.is_dir());
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
