@@ -384,7 +384,39 @@ fn decode_string_literal(literal: &str) -> String {
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
         .unwrap_or(literal);
-    inner.replace("\"\"", "\"").replace("\\\"", "\"")
+    let mut decoded = String::with_capacity(inner.len());
+    let mut characters = inner.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let Some(escaped) = characters.next() else {
+                decoded.push('\\');
+                break;
+            };
+            match escaped {
+                '\'' => decoded.push('\''),
+                '"' => decoded.push('"'),
+                '?' => decoded.push('?'),
+                '\\' => decoded.push('\\'),
+                'a' => decoded.push('\u{0007}'),
+                'b' => decoded.push('\u{0008}'),
+                'f' => decoded.push('\u{000c}'),
+                'n' => decoded.push('\n'),
+                'r' => decoded.push('\r'),
+                't' => decoded.push('\t'),
+                'v' => decoded.push('\u{000b}'),
+                other => {
+                    decoded.push('\\');
+                    decoded.push(other);
+                }
+            }
+        } else if character == '"' && characters.peek() == Some(&'"') {
+            characters.next();
+            decoded.push('"');
+        } else {
+            decoded.push(character);
+        }
+    }
+    decoded
 }
 
 #[derive(Clone)]
@@ -507,5 +539,17 @@ mod tests {
         let file = parse("model M \"first\" + \" second\" end M;", "test.mo")
             .expect("valid Modelica source");
         assert_eq!(file.classes[0].description.as_deref(), Some("first second"));
+    }
+
+    #[test]
+    fn parses_quoted_identifiers_and_decodes_modelica_string_escapes() {
+        let file = parse(
+            "within 'A B'; model '12H' \"say \\\"hi\\\"\\nnext\" end '12H';",
+            "test.mo",
+        )
+        .expect("quoted identifiers and escaped description are valid");
+        assert_eq!(file.classes[0].qualified_name, "'A B'.'12H'");
+        assert_eq!(file.classes[0].name, "'12H'");
+        assert_eq!(file.classes[0].description.as_deref(), Some("say \"hi\"\nnext"));
     }
 }

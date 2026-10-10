@@ -14,6 +14,7 @@ pub mod icon;
 pub mod lexer;
 pub mod library;
 pub mod modelica_text;
+pub mod new_class;
 pub mod parser;
 pub mod resolver;
 pub mod scene;
@@ -29,6 +30,11 @@ pub use library::{
     Library, LibraryKind, LibraryRegistry, PackageLoader, PackageMember, PackageNode,
 };
 pub use modelica_text::{ModelTextContext, resolve_modelica_text};
+pub use new_class::{
+    NewClassContext, NewClassField, NewClassFileChange, NewClassPlan, NewClassRequest,
+    NewClassStorageMode, NewClassValidationError, apply_new_class_plan, generate_modelica_source,
+    plan_new_class, validate_modelica_identifier, validate_new_class,
+};
 pub use parser::{ParseError, parse, requalify_class_tree};
 pub use scene::{
     ConnectionKey, ConnectorRef, DiagramDebugStats, DiagramScene, Graphic, GraphicId, GraphicOwner,
