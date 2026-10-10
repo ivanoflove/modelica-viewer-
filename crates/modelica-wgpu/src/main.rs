@@ -3614,6 +3614,24 @@ fn load_workspace_paths(paths: impl IntoIterator<Item = PathBuf>) -> (Workspace,
     (workspace, errors)
 }
 
+fn add_workspace_classes_to_new_class_context(
+    context: &mut NewClassContext,
+    workspace: &Workspace,
+) {
+    for entry in &workspace.documents {
+        let class_names = entry.document.declared_class_names();
+        context
+            .scope_class_names
+            .extend(class_names.iter().cloned());
+        let mut registry = entry.document.registry.borrow_mut();
+        for name in class_names {
+            if let Some((class, _)) = registry.resolve_class(&name) {
+                context.class_kinds.insert(class.qualified_name, class.kind);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceHighlightCacheKey {
     selected_class: Option<String>,
@@ -11322,11 +11340,7 @@ impl App {
         let mut context = self.new_class_dialog.context.clone();
         context.scope_is_explicit = true;
         context.scope_class_names.clear();
-        for entry in &self.workspace.documents {
-            context
-                .scope_class_names
-                .extend(entry.document.declared_class_names());
-        }
+        add_workspace_classes_to_new_class_context(&mut context, &self.workspace);
         let (directory, package_order_file, insert_file, scope) = match &request.storage {
             NewClassStorageMode::SingleFile {
                 directory,
