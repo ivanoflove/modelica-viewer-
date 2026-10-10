@@ -6,6 +6,7 @@
 
 pub mod annotation;
 pub mod ast;
+pub mod completion;
 pub mod component;
 pub mod diagnostics;
 pub mod diagram;
@@ -21,6 +22,10 @@ pub mod scene;
 pub mod source;
 
 pub use ast::{Class, ClassKind, ClassLocation, ModelicaFile, SourceRange};
+pub use completion::{
+    CompletionContext, CompletionItem, CompletionKind, ModelicaCompletionIndex,
+    analyze_completion_context,
+};
 pub use component::{ComponentDeclaration, parse_component_declaration};
 pub use diagnostics::{Diagnostic, Severity};
 pub use diagram::{DiagramResolver, resolve_diagram};

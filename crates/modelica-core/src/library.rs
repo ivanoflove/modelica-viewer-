@@ -521,6 +521,15 @@ impl LibraryRegistry {
         self.classes.get(qualified_name)
     }
 
+    /// Names already present in this registry's class index. This is a
+    /// snapshot only: it does not search the filesystem or load missing
+    /// packages, which keeps editor completion predictable and bounded.
+    pub fn class_names(&self) -> Vec<String> {
+        let mut names = self.classes.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     pub fn is_read_only(&self, file: &Path) -> bool {
         self.libraries
             .iter()
@@ -613,6 +622,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{LibraryRegistry, PackageLoader, PackageMember};
+
+    #[test]
+    fn completion_class_names_only_include_indexed_classes() {
+        let root = fixture_root();
+        let package = PackageLoader.load(&root).expect("load package");
+        let mut registry = LibraryRegistry::default();
+        registry.index_package(&package);
+        let names = registry.class_names();
+        assert!(names.contains(&"Modelica.Electrical.Analog.Basic.Resistor".to_owned()));
+        assert!(names.contains(&"Modelica.Electrical.Analog.Basic.Pin".to_owned()));
+        assert!(!names.contains(&"Modelica.Unloaded.NotPresent".to_owned()));
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
 
     fn fixture_root() -> std::path::PathBuf {
         let nonce = SystemTime::now()
