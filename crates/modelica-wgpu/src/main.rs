@@ -1556,17 +1556,17 @@ enum MainView {
 
 #[derive(Clone, Debug)]
 enum PendingDocumentAction {
-    Open(PathBuf),
     CreateClass(NewClassRequest),
     Close,
+    CloseDocument(String),
 }
 
 impl PendingDocumentAction {
     fn description(&self) -> &'static str {
         match self {
-            Self::Open(_) => "打开另一个文档",
             Self::CreateClass(_) => "新建 Modelica 类",
             Self::Close => "关闭窗口",
+            Self::CloseDocument(_) => "关闭当前文档",
         }
     }
 }
@@ -3209,6 +3209,7 @@ struct TreeNode {
     qualified_name: String,
     class_name: Option<String>,
     kind: Option<ClassKind>,
+    workspace_document_id: Option<String>,
     // Kept as model metadata for future properties, tooltip, search, or docs
     // views; the model tree intentionally does not render it inline.
     #[allow(dead_code)]
@@ -3224,6 +3225,7 @@ struct UiDocument {
     short_class_names: HashSet<String>,
     dirty: bool,
     tree: TreeNode,
+    active_document_id: Option<String>,
     selected_class: Option<String>,
     icon_graphics: usize,
     diagram_background: usize,
@@ -3238,6 +3240,378 @@ struct UiDocument {
     source_lines: Vec<String>,
     source_max_line_chars: usize,
     source_version: u64,
+}
+
+struct WorkspaceDocument {
+    id: String,
+    document: LoadedDocument,
+    selected_class: Option<String>,
+    history: Vec<EditCommand>,
+    redo_history: Vec<EditCommand>,
+    main_view: MainView,
+}
+
+type WorkspaceSession = (Option<String>, Vec<EditCommand>, Vec<EditCommand>, MainView);
+
+#[derive(Default)]
+struct Workspace {
+    documents: Vec<WorkspaceDocument>,
+    active_document_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceTreeClick {
+    document_id: String,
+    class_name: Option<String>,
+}
+
+impl Workspace {
+    fn document_id(path: &FsPath) -> String {
+        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        let value = normalized.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            value.to_lowercase()
+        } else {
+            value
+        }
+    }
+
+    fn active_document(&self) -> Option<&LoadedDocument> {
+        let active_id = self.active_document_id.as_deref()?;
+        self.documents
+            .iter()
+            .find(|entry| entry.id == active_id)
+            .map(|entry| &entry.document)
+    }
+
+    fn active_document_mut(&mut self) -> Option<&mut LoadedDocument> {
+        let active_id = self.active_document_id.as_deref()?;
+        self.documents
+            .iter_mut()
+            .find(|entry| entry.id == active_id)
+            .map(|entry| &mut entry.document)
+    }
+
+    fn active_id(&self) -> Option<&str> {
+        self.active_document_id.as_deref()
+    }
+
+    fn store_active_session(
+        &mut self,
+        selected_class: Option<String>,
+        history: &[EditCommand],
+        redo_history: &[EditCommand],
+        main_view: MainView,
+    ) {
+        let Some(active_id) = self.active_document_id.clone() else {
+            return;
+        };
+        if let Some(entry) = self
+            .documents
+            .iter_mut()
+            .find(|entry| entry.id == active_id)
+        {
+            entry.selected_class = selected_class;
+            entry.history = history.to_vec();
+            entry.redo_history = redo_history.to_vec();
+            entry.main_view = main_view;
+        }
+    }
+
+    fn session(&self, id: &str) -> Option<WorkspaceSession> {
+        let entry = self.document(id)?;
+        Some((
+            entry.selected_class.clone(),
+            entry.history.clone(),
+            entry.redo_history.clone(),
+            entry.main_view,
+        ))
+    }
+
+    fn document(&self, id: &str) -> Option<&WorkspaceDocument> {
+        self.documents.iter().find(|entry| entry.id == id)
+    }
+
+    fn document_mut(&mut self, id: &str) -> Option<&mut WorkspaceDocument> {
+        self.documents.iter_mut().find(|entry| entry.id == id)
+    }
+
+    fn path_owner(&self, path: &FsPath) -> Option<String> {
+        let wanted = Self::document_id(path);
+        self.documents
+            .iter()
+            .find(|entry| {
+                if Self::document_id(&entry.document.path) == wanted {
+                    return true;
+                }
+                let document_path = &entry.document.path;
+                let is_package = entry
+                    .document
+                    .registry
+                    .borrow_mut()
+                    .resolve_class(&entry.document.package_name)
+                    .is_some_and(|(class, _)| class.kind == ClassKind::Package);
+                if !is_package {
+                    return false;
+                }
+                if document_path.is_dir() && !path.starts_with(document_path) {
+                    return false;
+                }
+                if document_path.is_dir()
+                    && path.parent() == Some(document_path.as_path())
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("package.mo"))
+                {
+                    return true;
+                }
+                if !document_path.is_dir() && path.parent() != document_path.parent() {
+                    return false;
+                }
+                let Ok(source) = fs::read_to_string(path) else {
+                    return false;
+                };
+                let Ok(parsed) = parse(&source, path) else {
+                    return false;
+                };
+                parsed.within.as_deref().is_some_and(|within| {
+                    within == entry.document.package_name
+                        || within.starts_with(&format!("{}.", entry.document.package_name))
+                })
+            })
+            .map(|entry| entry.id.clone())
+    }
+
+    fn class_owner(&self, qualified_name: &str) -> Option<String> {
+        let source_file = self.documents.iter().find_map(|entry| {
+            entry
+                .document
+                .class_sources
+                .iter()
+                .find(|source| source.qualified_name == qualified_name)
+                .map(|source| source.source_file.clone())
+        })?;
+        self.path_owner(&source_file)
+    }
+
+    fn conflicting_class(
+        &self,
+        document: &LoadedDocument,
+        except_id: Option<&str>,
+    ) -> Option<String> {
+        for candidate in document.declared_class_names() {
+            if let Some(existing) = self.documents.iter().find(|entry| {
+                Some(entry.id.as_str()) != except_id
+                    && entry.document.declared_class_names().contains(&candidate)
+            }) {
+                return Some(format!(
+                    "全限定类名 `{candidate}` 已存在于工作区文档 {}",
+                    existing.document.path.display()
+                ));
+            }
+        }
+        None
+    }
+
+    fn add_document(&mut self, document: LoadedDocument) -> Result<String, String> {
+        let id = Self::document_id(&document.path);
+        if self.document(&id).is_some() {
+            self.active_document_id = Some(id.clone());
+            return Ok(id);
+        }
+        if let Some(conflict) = self.conflicting_class(&document, None) {
+            return Err(conflict);
+        }
+        self.documents.push(WorkspaceDocument {
+            id: id.clone(),
+            document,
+            selected_class: None,
+            history: Vec::new(),
+            redo_history: Vec::new(),
+            main_view: MainView::Icon,
+        });
+        self.active_document_id = Some(id.clone());
+        Ok(id)
+    }
+
+    fn replace_document(&mut self, id: &str, document: LoadedDocument) -> Result<(), String> {
+        if let Some(conflict) = self.conflicting_class(&document, Some(id)) {
+            return Err(conflict);
+        }
+        let Some(entry) = self.document_mut(id) else {
+            return Err(format!("工作区文档已关闭，无法刷新：{id}"));
+        };
+        entry.document = document;
+        entry.selected_class = None;
+        reset_edit_history(&mut entry.history, &mut entry.redo_history);
+        Ok(())
+    }
+
+    fn activate(&mut self, id: &str) -> bool {
+        if self.document(id).is_none() {
+            return false;
+        }
+        self.active_document_id = Some(id.to_owned());
+        true
+    }
+
+    fn remove_document(&mut self, id: &str) -> Option<WorkspaceDocument> {
+        let index = self.documents.iter().position(|entry| entry.id == id)?;
+        let removed = self.documents.remove(index);
+        if self.active_document_id.as_deref() == Some(id) {
+            self.active_document_id = self
+                .documents
+                .get(index.min(self.documents.len().saturating_sub(1)))
+                .or_else(|| self.documents.last())
+                .map(|entry| entry.id.clone());
+        }
+        Some(removed)
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.documents
+            .iter()
+            .any(|entry| entry.document.has_unsaved_changes())
+    }
+
+    fn tree(&self) -> TreeNode {
+        let root_id = "workspace::root".to_owned();
+        let mut groups = Vec::<(String, PathBuf, Vec<TreeNode>)>::new();
+        for entry in &self.documents {
+            let directory = if entry.document.path.is_dir() {
+                entry.document.path.clone()
+            } else {
+                entry
+                    .document
+                    .path
+                    .parent()
+                    .unwrap_or(&entry.document.path)
+                    .to_owned()
+            };
+            let directory_id = Self::document_id(&directory);
+            let doc_node = workspace_document_tree_node(entry);
+            if let Some((_, _, children)) = groups.iter_mut().find(|(id, _, _)| *id == directory_id)
+            {
+                children.push(doc_node);
+            } else {
+                groups.push((directory_id, directory, vec![doc_node]));
+            }
+        }
+        let children = groups
+            .into_iter()
+            .map(|(directory_id, directory, mut documents)| {
+                if documents.len() == 1 {
+                    return documents.pop().expect("one workspace document");
+                }
+                let name = directory
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("Workspace")
+                    .to_owned();
+                let qualified_name = format!("workspace::folder::{directory_id}");
+                for document in &mut documents {
+                    let document_id = document.workspace_document_id.clone().unwrap_or_default();
+                    prefix_workspace_tree(document, &qualified_name, &document_id);
+                }
+                TreeNode {
+                    name,
+                    qualified_name,
+                    workspace_document_id: None,
+                    children: documents,
+                    ..TreeNode::default()
+                }
+            })
+            .collect();
+        TreeNode {
+            name: "WORKSPACE".to_owned(),
+            qualified_name: root_id,
+            workspace_document_id: None,
+            children,
+            ..TreeNode::default()
+        }
+    }
+
+    fn top_level_expansion_paths(&self) -> HashSet<String> {
+        let tree = self.tree();
+        let mut paths = HashSet::new();
+        collect_expandable_paths(&tree, &mut paths);
+        paths
+    }
+}
+
+fn workspace_document_tree_node(entry: &WorkspaceDocument) -> TreeNode {
+    let path_name = if entry
+        .document
+        .path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("package.mo"))
+    {
+        entry.document.path.parent().unwrap_or(&entry.document.path)
+    } else {
+        entry.document.path.as_path()
+    };
+    let name = path_name
+        .file_stem()
+        .or_else(|| path_name.file_name())
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(&entry.document.package_name)
+        .to_owned();
+    let name = if entry.document.has_unsaved_changes() {
+        format!("{name}  •")
+    } else {
+        name
+    };
+    let group_id = format!("workspace::{}", entry.id);
+    let root_is_declared = entry.document.class_sources.iter().any(|source| {
+        source.qualified_name == entry.document.model_tree.qualified_name
+            && source.source_range.end > source.source_range.start
+    });
+    let children = entry
+        .document
+        .model_tree
+        .children
+        .iter()
+        .cloned()
+        .map(|mut child| {
+            prefix_workspace_tree(&mut child, &group_id, &entry.id);
+            child
+        })
+        .collect();
+    TreeNode {
+        name,
+        qualified_name: group_id,
+        class_name: root_is_declared.then(|| entry.document.model_tree.qualified_name.clone()),
+        kind: root_is_declared
+            .then_some(entry.document.model_tree.kind)
+            .flatten(),
+        workspace_document_id: Some(entry.id.clone()),
+        description: None,
+        children,
+    }
+}
+
+fn prefix_workspace_tree(node: &mut TreeNode, prefix: &str, document_id: &str) {
+    node.qualified_name = format!("{prefix}::{}", node.qualified_name);
+    node.workspace_document_id = Some(document_id.to_owned());
+    for child in &mut node.children {
+        prefix_workspace_tree(child, prefix, document_id);
+    }
+}
+
+fn load_workspace_paths(paths: impl IntoIterator<Item = PathBuf>) -> (Workspace, Vec<String>) {
+    let mut workspace = Workspace::default();
+    let mut errors = Vec::new();
+    for path in paths {
+        match LoadedDocument::load(&path) {
+            Ok(document) => {
+                if let Err(error) = workspace.add_document(document) {
+                    errors.push(error);
+                }
+            }
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    (workspace, errors)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3860,6 +4234,14 @@ impl SourceHighlightCache {
 }
 
 impl LoadedDocument {
+    fn declared_class_names(&self) -> Vec<String> {
+        self.class_sources
+            .iter()
+            .filter(|source| source.source_range.end > source.source_range.start)
+            .map(|source| source.qualified_name.clone())
+            .collect()
+    }
+
     fn load(path: &FsPath) -> Result<Self, String> {
         let load_started = Instant::now();
         let package_started = Instant::now();
@@ -4252,6 +4634,7 @@ impl LoadedDocument {
             short_class_names,
             dirty: self.has_unsaved_changes(),
             tree: self.model_tree.clone(),
+            active_document_id: None,
             selected_class,
             icon_graphics,
             diagram_background,
@@ -4354,7 +4737,7 @@ fn expand_tree_to_class(
     qualified_name: &str,
     expanded: &mut HashSet<String>,
 ) -> bool {
-    if node.qualified_name == qualified_name {
+    if node.qualified_name == qualified_name || node.class_name.as_deref() == Some(qualified_name) {
         return true;
     }
     if node
@@ -4376,11 +4759,13 @@ fn collect_class_names_from_class(class: &Class, output: &mut Vec<String>) {
 }
 
 fn collect_class_sources(package: &PackageNode, output: &mut Vec<ClassSource>) {
-    output.push(ClassSource {
-        qualified_name: package.qualified_name.clone(),
-        source_file: package.source_file.clone(),
-        source_range: package.source_range.unwrap_or(SourceRange::new(0, 0)),
-    });
+    if let Some(source_range) = package.source_range {
+        output.push(ClassSource {
+            qualified_name: package.qualified_name.clone(),
+            source_file: package.source_file.clone(),
+            source_range,
+        });
+    }
     for member in &package.ordered_members {
         match member {
             PackageMember::Package(child) => collect_class_sources(child, output),
@@ -4427,6 +4812,7 @@ fn build_model_tree(package: &PackageNode) -> TreeNode {
         qualified_name: package.qualified_name.clone(),
         class_name: Some(package.qualified_name.clone()),
         kind: Some(ClassKind::Package),
+        workspace_document_id: None,
         description: package.description.clone(),
         children: package
             .ordered_members
@@ -4444,6 +4830,7 @@ fn build_model_tree_member(member: &PackageMember) -> TreeNode {
             qualified_name: class.qualified_name.clone(),
             class_name: Some(class.qualified_name.clone()),
             kind: Some(class.kind),
+            workspace_document_id: None,
             description: class.description.clone(),
             children: class
                 .children
@@ -6604,8 +6991,9 @@ struct App {
     view_bind_group: wgpu::BindGroup,
     scene: GpuIconScene,
     style_layout: wgpu::BindGroupLayout,
-    document: Option<LoadedDocument>,
+    workspace: Workspace,
     loading_document: Option<JoinHandle<Result<LoadedDocument, String>>>,
+    loading_document_target: Option<String>,
     load_error: Option<String>,
     status_message: Option<String>,
     pending_document_action: Option<PendingDocumentAction>,
@@ -6756,7 +7144,8 @@ fn create_background_pipeline(
 }
 
 impl App {
-    async fn new(window: Arc<Window>, document: Option<LoadedDocument>) -> Self {
+    async fn new(window: Arc<Window>, workspace: Workspace) -> Self {
+        let document = workspace.active_document();
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -6978,20 +7367,9 @@ impl App {
             multiview: None,
         });
 
-        let scene = build_scene(
-            &device,
-            &style_layout,
-            document.as_ref(),
-            None,
-            INITIAL_ZOOM,
-        );
-        let diagram_scene = build_diagram_scene(
-            &device,
-            &style_layout,
-            document.as_ref(),
-            None,
-            INITIAL_ZOOM,
-        );
+        let scene = build_scene(&device, &style_layout, document, None, INITIAL_ZOOM);
+        let diagram_scene =
+            build_diagram_scene(&device, &style_layout, document, None, INITIAL_ZOOM);
         let msaa_view = create_msaa_view(&device, &config, msaa_samples);
         let egui_ctx = egui::Context::default();
         install_ui_fonts(&egui_ctx);
@@ -7037,8 +7415,9 @@ impl App {
             view_bind_group,
             scene,
             style_layout,
-            document,
+            workspace,
             loading_document: None,
+            loading_document_target: None,
             load_error: None,
             status_message: None,
             pending_document_action: None,
@@ -7153,11 +7532,167 @@ impl App {
         self.selected_class.as_deref()
     }
 
+    fn active_document(&self) -> Option<&LoadedDocument> {
+        self.workspace.active_document()
+    }
+
+    fn active_document_mut(&mut self) -> Option<&mut LoadedDocument> {
+        self.workspace.active_document_mut()
+    }
+
+    fn save_active_workspace_session(&mut self) {
+        self.workspace.store_active_session(
+            self.selected_class.clone(),
+            &self.history,
+            &self.redo_history,
+            self.main_view,
+        );
+    }
+
+    fn reset_workspace_interactions(&mut self) {
+        self.pointer_interaction = PointerInteraction::None;
+        self.connection_preview = None;
+        self.component_connection_previews = None;
+        self.connection_creation_preview = None;
+        self.pending_drag_position = None;
+        self.pending_waypoint = false;
+        self.pending_waypoint_queued_at = None;
+        self.waypoint_frame_pending = false;
+        self.waypoint_profile_frames_remaining = 0;
+        self.suppress_next_pointer_release_redraw = false;
+        self.diagram_selection = DiagramSelection::None;
+        self.hovered_port = None;
+        self.diagram_hit_cache = DiagramHitCache::default();
+        self.canvas_rect = None;
+    }
+
+    fn activate_workspace_document(&mut self, id: &str) -> bool {
+        if self.workspace.active_id() == Some(id) {
+            return true;
+        }
+        self.save_active_workspace_session();
+        if !self.workspace.activate(id) {
+            return false;
+        }
+        let Some((selected_class, history, redo_history, main_view)) = self.workspace.session(id)
+        else {
+            return false;
+        };
+        self.selected_class = selected_class;
+        self.history = history;
+        self.redo_history = redo_history;
+        self.main_view = main_view;
+        self.reset_workspace_interactions();
+        self.rebuild_selected_scenes();
+        self.refresh_ui_document();
+        self.update_title(None);
+        self.request_redraw();
+        true
+    }
+
+    fn activate_loaded_document(
+        &mut self,
+        document: LoadedDocument,
+        replace_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.save_active_workspace_session();
+        let id = if let Some(replace_id) = replace_id {
+            self.workspace.replace_document(replace_id, document)?;
+            replace_id.to_owned()
+        } else {
+            self.workspace.add_document(document)?
+        };
+        if !self.workspace.activate(&id) {
+            return Err(format!("无法激活工作区文档：{id}"));
+        }
+        let (selected_class, history, redo_history, main_view) = self
+            .workspace
+            .session(&id)
+            .ok_or_else(|| format!("工作区文档不存在：{id}"))?;
+        self.selected_class = selected_class;
+        self.history = history;
+        self.redo_history = redo_history;
+        self.main_view = main_view;
+        self.expanded_nodes
+            .extend(self.workspace.top_level_expansion_paths());
+        self.reset_workspace_interactions();
+        self.rebuild_selected_scenes();
+        self.refresh_ui_document();
+        self.update_title(None);
+        Ok(id)
+    }
+
+    fn select_workspace_class(&mut self, class_name: String) {
+        let class_open_started = Instant::now();
+        let (icon_cache_hit, diagram_cache_hit, before_resolution) = self
+            .active_document()
+            .map(|document| {
+                (
+                    document.icon_cache_hit(&class_name),
+                    document.diagram_cache_hit(&class_name),
+                    document.scene_resolution_stats(),
+                )
+            })
+            .unwrap_or((false, false, SceneResolutionStats::default()));
+        let has_visual = self.active_document().is_some_and(|document| {
+            document.icon(&class_name).is_some() || document.diagram(&class_name).is_some()
+        });
+        let gpu_scene_build_started = Instant::now();
+        self.scene = build_scene(
+            &self.device,
+            &self.style_layout,
+            self.active_document(),
+            has_visual.then_some(class_name.as_str()),
+            self.zoom,
+        );
+        self.diagram_scene = build_diagram_scene(
+            &self.device,
+            &self.style_layout,
+            self.active_document(),
+            Some(&class_name),
+            self.zoom,
+        );
+        let gpu_scene_build_time = gpu_scene_build_started.elapsed();
+        let after_resolution = self
+            .active_document()
+            .map_or_else(SceneResolutionStats::default, |document| {
+                document.scene_resolution_stats()
+            });
+        trace_class_open(
+            &class_name,
+            icon_cache_hit,
+            diagram_cache_hit,
+            before_resolution,
+            after_resolution,
+            gpu_scene_build_time,
+            class_open_started.elapsed(),
+        );
+        self.selected_class = Some(class_name);
+        self.main_view = MainView::Source;
+        self.refresh_ui_document();
+        self.canvas_rect = None;
+        self.pointer_interaction = PointerInteraction::None;
+        self.connection_preview = None;
+        self.component_connection_previews = None;
+        self.connection_creation_preview = None;
+        self.suppress_next_pointer_release_redraw = false;
+        self.diagram_selection = DiagramSelection::None;
+        self.hovered_port = None;
+        self.diagram_hit_cache =
+            build_diagram_hit_cache(self.active_document(), self.selected_class.as_deref());
+        self.fit_scene();
+        self.save_active_workspace_session();
+        self.update_title(None);
+        self.request_redraw();
+    }
+
     fn refresh_ui_document(&mut self) {
-        self.ui_document = self
-            .document
-            .as_ref()
-            .map(|document| document.ui_summary(self.selected_class.as_deref()));
+        self.ui_document = self.active_document().map(|document| {
+            let mut summary = document.ui_summary(self.selected_class.as_deref());
+            summary.tree = self.workspace.tree();
+            summary.active_document_id = self.workspace.active_id().map(str::to_owned);
+            summary
+        });
         self.visible_tree_rows.invalidate();
         self.tree_galley_cache.clear();
     }
@@ -7184,7 +7719,7 @@ impl App {
     ) -> Option<ConnectionHit> {
         let started = Instant::now();
         let class_name = self.selected_class_name()?;
-        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let scene = self.active_document()?.diagram(class_name)?;
         let query_started = Instant::now();
         let candidates = self
             .diagram_hit_cache
@@ -7342,7 +7877,7 @@ impl App {
     ) -> Option<(String, String, CorePoint)> {
         let started = Instant::now();
         let class_name = self.selected_class_name()?;
-        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let scene = self.active_document()?.diagram(class_name)?;
         let query_started = Instant::now();
         let candidates = self
             .diagram_hit_cache
@@ -7443,7 +7978,7 @@ impl App {
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
             return;
         };
-        let Some(document) = self.document.as_ref() else {
+        let Some(document) = self.active_document() else {
             return;
         };
         let edit_data = (|| -> Result<
@@ -7664,7 +8199,7 @@ impl App {
     fn selected_connection_overlay_points(&self) -> Option<Vec<CorePoint>> {
         let connection_id = self.selected_connection_id()?;
         let class_name = self.selected_class_name()?;
-        let scene = self.document.as_ref()?.diagram(class_name)?;
+        let scene = self.active_document()?.diagram(class_name)?;
         let connection = scene
             .connections
             .iter()
@@ -7732,8 +8267,7 @@ impl App {
         };
         let class_name = self.selected_class_name()?;
         let component = self
-            .document
-            .as_ref()?
+            .active_document()?
             .diagram(class_name)?
             .components
             .iter()
@@ -7749,8 +8283,7 @@ impl App {
         };
         let class_name = self.selected_class_name()?;
         let component = self
-            .document
-            .as_ref()?
+            .active_document()?
             .diagram(class_name)?
             .components
             .iter()
@@ -7798,8 +8331,7 @@ impl App {
         };
         let class_name = self.selected_class_name()?;
         let component = self
-            .document
-            .as_ref()?
+            .active_document()?
             .diagram(class_name)?
             .components
             .iter()
@@ -7841,8 +8373,7 @@ impl App {
         };
         let class_name = self.selected_class_name()?;
         let component_id = self
-            .document
-            .as_ref()?
+            .active_document()?
             .diagram(class_name)?
             .components
             .iter()
@@ -7855,7 +8386,8 @@ impl App {
         let Some(class_name) = self.selected_class_name().map(str::to_owned) else {
             return;
         };
-        let Some(document) = self.document.as_ref() else {
+        self.component_connection_previews = None;
+        let Some(document) = self.active_document() else {
             return;
         };
         let Some(component) = document.diagram(&class_name).and_then(|scene| {
@@ -7876,7 +8408,6 @@ impl App {
         let original_extent = component
             .placement_extent
             .unwrap_or(default_component_extent());
-        self.component_connection_previews = None;
         let Some(scene) = document.diagram(&class_name) else {
             return;
         };
@@ -7904,7 +8435,7 @@ impl App {
         let port_tolerance = component_drag_port_tolerance(self.zoom);
         match self.main_view {
             MainView::Icon => {
-                let Some(document) = self.document.as_ref() else {
+                let Some(document) = self.active_document() else {
                     return;
                 };
                 let Some((graphic_id, original_geometry)) =
@@ -7940,7 +8471,7 @@ impl App {
             }
             MainView::Diagram => {
                 let hit_test_started = Instant::now();
-                let Some(document) = self.document.as_ref() else {
+                let Some(document) = self.active_document() else {
                     return;
                 };
                 let spatial_query_started = Instant::now();
@@ -8171,8 +8702,7 @@ impl App {
 
         let component = match &self.diagram_selection {
             DiagramSelection::Component(component_name) => self
-                .document
-                .as_ref()
+                .active_document()
                 .and_then(|document| {
                     self.selected_class_name()
                         .and_then(|class_name| document.diagram(class_name))
@@ -8184,8 +8714,7 @@ impl App {
                         .find(|component| component.name == *component_name)
                 }),
             DiagramSelection::Port(key) => self
-                .document
-                .as_ref()
+                .active_document()
                 .and_then(|document| {
                     self.selected_class_name()
                         .and_then(|class_name| document.diagram(class_name))
@@ -8734,7 +9263,7 @@ impl App {
                         placement,
                     ),
                 );
-                if let Some(document) = self.document.as_ref() {
+                if let Some(document) = self.active_document() {
                     if let Some(class_name) = self.selected_class_name() {
                         if let Some(scene) = document.diagram(class_name) {
                             let mut preview_scene = scene.clone();
@@ -8793,7 +9322,7 @@ impl App {
         self.scene = build_scene(
             &self.device,
             &self.style_layout,
-            self.document.as_ref(),
+            self.active_document(),
             self.selected_class.as_deref(),
             self.zoom,
         );
@@ -8802,12 +9331,12 @@ impl App {
         self.diagram_scene = build_diagram_scene(
             &self.device,
             &self.style_layout,
-            self.document.as_ref(),
+            self.active_document(),
             self.selected_class.as_deref(),
             self.zoom,
         );
         self.diagram_hit_cache =
-            build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
+            build_diagram_hit_cache(self.active_document(), self.selected_class.as_deref());
         self.refresh_ui_document();
     }
 
@@ -9296,7 +9825,7 @@ impl App {
             return;
         };
         let Some((source_before, version, occurrence)) =
-            self.document.as_ref().and_then(|document| {
+            self.active_document().and_then(|document| {
                 let source_before = document.class_text(&class_name)?;
                 let scene = document.diagram(&class_name)?;
                 let occurrence = scene
@@ -9345,7 +9874,7 @@ impl App {
                 return;
             }
         };
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.active_document().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -9371,7 +9900,7 @@ impl App {
         }
         let connection_id = connection.id.clone();
         let connection_key = connection.key.clone();
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active_document_mut() else {
             return;
         };
         document.set_class_text(&class_name, candidate.clone());
@@ -9413,8 +9942,7 @@ impl App {
             return;
         };
         let Some(version) = self
-            .document
-            .as_ref()
+            .active_document()
             .map(|document| document.source_version(&class_name))
         else {
             self.rebuild_selected_scenes();
@@ -9434,7 +9962,7 @@ impl App {
                 return;
             }
         };
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.active_document().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -9446,7 +9974,7 @@ impl App {
                 return;
             }
         };
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active_document_mut() else {
             self.rebuild_selected_scenes();
             return;
         };
@@ -9502,8 +10030,7 @@ impl App {
             return;
         };
         let Some(version) = self
-            .document
-            .as_ref()
+            .active_document()
             .map(|document| document.source_version(&class_name))
         else {
             self.load_error = Some("Diagram edit has no source version".into());
@@ -9511,8 +10038,7 @@ impl App {
             return;
         };
         let Some(current_scene) = self
-            .document
-            .as_ref()
+            .active_document()
             .and_then(|document| document.diagram(&class_name))
             .cloned()
         else {
@@ -9590,7 +10116,7 @@ impl App {
         let candidate = validated.source;
         let resolve_started = Instant::now();
         profile.resolve_count += 1;
-        let scenes = self.document.as_ref().and_then(|document| {
+        let scenes = self.active_document().and_then(|document| {
             document
                 .resolve_candidate_scenes_from_parsed(&class_name, &candidate, &validated.parsed)
                 .ok()
@@ -9712,7 +10238,7 @@ impl App {
         }
 
         let component_transform = {
-            let Some(document) = self.document.as_mut() else {
+            let Some(document) = self.active_document_mut() else {
                 let _ = self.rollback_component_preview(&component_id, &connected_connections);
                 return;
             };
@@ -9784,7 +10310,7 @@ impl App {
         self.status_message = None;
         let hit_cache_started = Instant::now();
         self.diagram_hit_cache =
-            build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
+            build_diagram_hit_cache(self.active_document(), self.selected_class.as_deref());
         profile.hit_cache = hit_cache_started.elapsed();
         let ui_refresh_started = Instant::now();
         self.refresh_ui_document();
@@ -9824,16 +10350,14 @@ impl App {
             return;
         };
         let Some(version) = self
-            .document
-            .as_ref()
+            .active_document()
             .map(|document| document.source_version(&class_name))
         else {
             self.load_error = Some("Connection edit has no source version".into());
             return;
         };
         let Some(current_scene) = self
-            .document
-            .as_ref()
+            .active_document()
             .and_then(|document| document.diagram(&class_name))
         else {
             self.load_error = Some("Connection edit has no selected Diagram".into());
@@ -9953,7 +10477,7 @@ impl App {
             profile.source_patch = patch_started.elapsed();
         }
         let resolve_started = Instant::now();
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.active_document().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -10068,7 +10592,7 @@ impl App {
             profile.semantic_validation = validation_started.elapsed();
         }
         let document_started = Instant::now();
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active_document_mut() else {
             self.load_error = Some("Connection edit lost its document".into());
             return;
         };
@@ -10137,16 +10661,14 @@ impl App {
             return;
         };
         let Some(version) = self
-            .document
-            .as_ref()
+            .active_document()
             .map(|document| document.source_version(&class_name))
         else {
             self.rebuild_selected_scenes();
             return;
         };
         let Some(current_scene) = self
-            .document
-            .as_ref()
+            .active_document()
             .and_then(|document| document.diagram(&class_name))
         else {
             self.rebuild_selected_scenes();
@@ -10236,7 +10758,7 @@ impl App {
                 return;
             }
         };
-        let (resolved_icon, resolved_diagram) = match self.document.as_ref().and_then(|document| {
+        let (resolved_icon, resolved_diagram) = match self.active_document().and_then(|document| {
             document
                 .resolve_candidate_scenes(&class_name, &candidate)
                 .ok()
@@ -10284,7 +10806,7 @@ impl App {
                 return;
             }
         }
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.active_document_mut() else {
             self.rebuild_selected_scenes();
             return;
         };
@@ -10326,8 +10848,7 @@ impl App {
                     before_geometry
                 };
                 let document = self
-                    .document
-                    .as_ref()
+                    .active_document()
                     .ok_or_else(|| "icon undo/redo failed: no document is open".to_owned())?;
                 let (resolved_icon, resolved_diagram) = document
                     .resolve_candidate_scenes(class_name, source)
@@ -10339,7 +10860,7 @@ impl App {
                         "icon undo/redo failed: graphic `{graphic_id}` no longer matches"
                     ));
                 }
-                let Some(document) = self.document.as_mut() else {
+                let Some(document) = self.active_document_mut() else {
                     return Err("icon undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, source.clone());
@@ -10358,8 +10879,7 @@ impl App {
                 let source = if after { after_source } else { before_source };
                 let expected_origin = if after { *after_origin } else { *before_origin };
                 let document = self
-                    .document
-                    .as_ref()
+                    .active_document()
                     .ok_or_else(|| "component undo/redo failed: no document is open".to_owned())?;
                 let (resolved_icon, resolved_diagram) = document
                     .resolve_candidate_scenes(class_name, source)
@@ -10407,7 +10927,7 @@ impl App {
                         ));
                     }
                 }
-                let Some(document) = self.document.as_mut() else {
+                let Some(document) = self.active_document_mut() else {
                     return Err("component undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, source.clone());
@@ -10422,7 +10942,7 @@ impl App {
                 endpoint_constraint,
             } => {
                 let expected_points = if after { after_points } else { before_points };
-                let Some(document) = self.document.as_ref() else {
+                let Some(document) = self.active_document() else {
                     return Err("connection undo/redo failed: no document is open".to_owned());
                 };
                 let Some(source) = document.class_text(class_name) else {
@@ -10468,7 +10988,7 @@ impl App {
                         "connection undo/redo failed: geometry validation failed: {reason}"
                     ));
                 }
-                let Some(document) = self.document.as_mut() else {
+                let Some(document) = self.active_document_mut() else {
                     return Err("connection undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, candidate);
@@ -10482,7 +11002,7 @@ impl App {
                 after_source,
             } => {
                 let source = if after { after_source } else { before_source };
-                let document = self.document.as_ref().ok_or_else(|| {
+                let document = self.active_document().ok_or_else(|| {
                     "connection creation undo/redo failed: no document is open".to_owned()
                 })?;
                 let (resolved_icon, resolved_diagram) = document
@@ -10500,7 +11020,7 @@ impl App {
                         connection_key
                     ));
                 }
-                let Some(document) = self.document.as_mut() else {
+                let Some(document) = self.active_document_mut() else {
                     return Err(
                         "connection creation undo/redo failed: document disappeared".to_owned()
                     );
@@ -10521,8 +11041,7 @@ impl App {
                 let source = if after { after_source } else { before_source };
                 let expected_extent = if after { after_extent } else { before_extent };
                 let document = self
-                    .document
-                    .as_ref()
+                    .active_document()
                     .ok_or_else(|| "resize undo/redo failed: no document is open".to_owned())?;
                 let (resolved_icon, resolved_diagram) = document
                     .resolve_candidate_scenes(class_name, source)
@@ -10570,7 +11089,7 @@ impl App {
                         ));
                     }
                 }
-                let Some(document) = self.document.as_mut() else {
+                let Some(document) = self.active_document_mut() else {
                     return Err("resize undo/redo failed: document disappeared".to_owned());
                 };
                 document.set_class_text(class_name, source.clone());
@@ -10615,7 +11134,7 @@ impl App {
     }
 
     fn persist_edits(&mut self) -> Result<usize, String> {
-        let result = match self.document.as_mut() {
+        let result = match self.active_document_mut() {
             Some(document) => save_edited_classes(document),
             None => Err("no Modelica document is open".to_owned()),
         };
@@ -10625,16 +11144,81 @@ impl App {
     }
 
     fn discard_unsaved_changes(&mut self) {
-        if let Some(document) = self.document.as_mut() {
+        if let Some(document) = self.active_document_mut() {
             document.discard_unsaved_changes();
         }
         self.rebuild_selected_scenes();
         self.update_title(None);
     }
 
+    fn discard_all_workspace_changes(&mut self) {
+        for entry in &mut self.workspace.documents {
+            entry.document.discard_unsaved_changes();
+        }
+        self.rebuild_selected_scenes();
+        self.refresh_ui_document();
+        self.update_title(None);
+    }
+
+    fn persist_all_workspace_documents(&mut self) -> Result<usize, String> {
+        let mut saved = 0;
+        let total = self.workspace.documents.len();
+        for entry in &mut self.workspace.documents {
+            match save_edited_classes(&mut entry.document) {
+                Ok(count) => saved += count,
+                Err(error) => {
+                    self.refresh_ui_document();
+                    self.update_title(None);
+                    return Err(format!(
+                        "工作区部分保存：已完成 {saved}/{total} 个文档；{}",
+                        error
+                    ));
+                }
+            }
+        }
+        self.refresh_ui_document();
+        self.update_title(None);
+        Ok(saved)
+    }
+
+    fn close_workspace_document(&mut self, id: &str) {
+        let was_active = self.workspace.active_id() == Some(id);
+        self.save_active_workspace_session();
+        if self.workspace.remove_document(id).is_none() {
+            return;
+        }
+        if was_active {
+            if let Some(next_id) = self.workspace.active_id().map(str::to_owned) {
+                if let Some(entry) = self.workspace.document(&next_id) {
+                    self.selected_class.clone_from(&entry.selected_class);
+                    self.history.clone_from(&entry.history);
+                    self.redo_history.clone_from(&entry.redo_history);
+                    self.main_view = entry.main_view;
+                }
+            } else {
+                self.selected_class = None;
+                self.history.clear();
+                self.redo_history.clear();
+                self.main_view = MainView::Icon;
+            }
+            self.pointer_interaction = PointerInteraction::None;
+            self.connection_preview = None;
+            self.component_connection_previews = None;
+            self.connection_creation_preview = None;
+            self.diagram_selection = DiagramSelection::None;
+            self.hovered_port = None;
+            self.diagram_hit_cache = DiagramHitCache::default();
+            self.canvas_rect = None;
+            self.rebuild_selected_scenes();
+        }
+        self.refresh_ui_document();
+        self.update_title(None);
+        self.status_message = Some("已关闭工作区文档".to_owned());
+        self.request_redraw();
+    }
+
     fn has_unsaved_changes(&self) -> bool {
-        self.document
-            .as_ref()
+        self.active_document()
             .is_some_and(LoadedDocument::has_unsaved_changes)
     }
 
@@ -10642,7 +11226,7 @@ impl App {
         if self.loading_document.is_some() || self.pending_document_action.is_some() {
             return;
         }
-        self.new_class_dialog = NewClassDialogState::from_document(self.document.as_ref());
+        self.new_class_dialog = NewClassDialogState::from_document(self.active_document());
         self.new_class_dialog.open = true;
         self.new_class_dialog.refresh_destination_scope();
         self.request_redraw();
@@ -10652,9 +11236,15 @@ impl App {
         if self.loading_document.is_some() || self.pending_document_action.is_some() {
             return;
         }
-        if self.has_unsaved_changes() {
+        let affected_document = self.target_workspace_document_id(&request);
+        if let Some(id) = affected_document.as_deref().filter(|id| {
+            self.workspace
+                .document(id)
+                .is_some_and(|entry| entry.document.has_unsaved_changes())
+        }) {
+            self.activate_workspace_document(id);
             self.pending_document_action = Some(PendingDocumentAction::CreateClass(request));
-            self.status_message = Some("新建前需要处理当前文档的未保存修改".to_owned());
+            self.status_message = Some("目标文档有未保存修改".to_owned());
             self.request_redraw();
         } else {
             self.create_modelica_class(request);
@@ -10687,19 +11277,13 @@ impl App {
             }
         };
 
-        let reload_path = self
-            .document
-            .as_ref()
-            .filter(|document| {
-                plan.primary_file == document.path
-                    || (document.path.is_dir() && plan.primary_file.starts_with(&document.path))
-                    || (document.path.file_name().and_then(std::ffi::OsStr::to_str)
-                        == Some("package.mo")
-                        && plan.primary_file.parent() == document.path.parent())
-            })
+        let reload_document_id = self.target_workspace_document_id(&request);
+        let reload_path = reload_document_id
+            .as_deref()
+            .and_then(|id| self.workspace.document(id))
             .map_or_else(
                 || plan.reload_path.clone(),
-                |document| document.path.clone(),
+                |entry| entry.document.path.clone(),
             );
         self.pending_class_selection = Some((plan.qualified_name.clone(), created_path.clone()));
         self.new_class_dialog.open = false;
@@ -10710,7 +11294,25 @@ impl App {
             plan.qualified_name,
             created_path.display()
         ));
-        self.begin_document_load(reload_path);
+        self.begin_document_load(reload_path, reload_document_id);
+    }
+
+    fn target_workspace_document_id(&self, request: &NewClassRequest) -> Option<String> {
+        match &request.storage {
+            NewClassStorageMode::SingleFile {
+                within: Some(within),
+                ..
+            } => self.workspace.class_owner(within),
+            NewClassStorageMode::DirectoryPackage {
+                within: Some(within),
+                ..
+            } => self.workspace.class_owner(within),
+            NewClassStorageMode::InsertIntoExistingFile { file, .. } => {
+                self.workspace.path_owner(file)
+            }
+            NewClassStorageMode::SingleFile { within: None, .. }
+            | NewClassStorageMode::DirectoryPackage { within: None, .. } => None,
+        }
     }
 
     fn build_new_class_context(
@@ -10720,6 +11322,11 @@ impl App {
         let mut context = self.new_class_dialog.context.clone();
         context.scope_is_explicit = true;
         context.scope_class_names.clear();
+        for entry in &self.workspace.documents {
+            context
+                .scope_class_names
+                .extend(entry.document.declared_class_names());
+        }
         let (directory, package_order_file, insert_file, scope) = match &request.storage {
             NewClassStorageMode::SingleFile {
                 directory,
@@ -10816,8 +11423,7 @@ impl App {
         if let Some(file) = insert_file {
             if path_is_read_only(file)
                 || self
-                    .document
-                    .as_ref()
+                    .active_document()
                     .is_some_and(|document| document.registry.borrow().is_read_only(file))
             {
                 return Err(format!("目标文件只读，不能插入：{}", file.display()));
@@ -10841,7 +11447,7 @@ impl App {
 
         if let Some(base) = request.base_class.as_deref() {
             if !context.class_kinds.contains_key(base) {
-                if let Some(document) = self.document.as_ref() {
+                if let Some(document) = self.active_document() {
                     if let Some((class, _)) = document.registry.borrow_mut().resolve_class(base) {
                         context.class_kinds.insert(class.qualified_name, class.kind);
                     }
@@ -10855,20 +11461,37 @@ impl App {
         if self.loading_document.is_some() || self.pending_document_action.is_some() {
             return;
         }
-        if self.has_unsaved_changes() {
-            self.pending_document_action = Some(PendingDocumentAction::Open(path));
-            self.status_message = Some("当前文档有未保存修改".to_owned());
+        if let Some(id) = self.workspace.path_owner(&path) {
+            self.activate_workspace_document(&id);
+            let class_name = self.workspace.document(&id).and_then(|entry| {
+                entry
+                    .document
+                    .class_sources
+                    .iter()
+                    .find(|source| {
+                        Workspace::document_id(&source.source_file) == Workspace::document_id(&path)
+                    })
+                    .map(|source| source.qualified_name.clone())
+            });
+            if let Some(class_name) = class_name {
+                self.selected_class = Some(class_name);
+                self.main_view = MainView::Source;
+                self.rebuild_selected_scenes();
+                self.refresh_ui_document();
+                self.update_title(None);
+            }
+            self.status_message = Some("已切换到工作区中的文档".to_owned());
             self.request_redraw();
-        } else {
-            self.begin_document_load(path);
+            return;
         }
+        self.begin_document_load(path, None);
     }
 
     fn request_window_close(&mut self) {
         if self.pending_document_action.is_some() {
             return;
         }
-        if self.has_unsaved_changes() {
+        if self.workspace.has_unsaved_changes() {
             self.pending_document_action = Some(PendingDocumentAction::Close);
             self.status_message = Some("关闭前需要处理未保存修改".to_owned());
             self.request_redraw();
@@ -10877,11 +11500,31 @@ impl App {
         }
     }
 
+    fn request_close_active_document(&mut self) {
+        if self.pending_document_action.is_some() || self.loading_document.is_some() {
+            return;
+        }
+        let Some(id) = self.workspace.active_id().map(str::to_owned) else {
+            return;
+        };
+        if self
+            .workspace
+            .active_document()
+            .is_some_and(LoadedDocument::has_unsaved_changes)
+        {
+            self.pending_document_action = Some(PendingDocumentAction::CloseDocument(id));
+            self.status_message = Some("关闭此文档前需要处理它的未保存修改".to_owned());
+            self.request_redraw();
+        } else {
+            self.close_workspace_document(&id);
+        }
+    }
+
     fn execute_document_action(&mut self, action: PendingDocumentAction) {
         match action {
-            PendingDocumentAction::Open(path) => self.begin_document_load(path),
             PendingDocumentAction::CreateClass(request) => self.create_modelica_class(request),
             PendingDocumentAction::Close => self.exit_requested = true,
+            PendingDocumentAction::CloseDocument(id) => self.close_workspace_document(&id),
         }
     }
 
@@ -10895,40 +11538,69 @@ impl App {
                 self.status_message = Some("已取消离开操作".to_owned());
             }
             LeaveDecision::Discard => {
-                self.discard_unsaved_changes();
+                match &action {
+                    PendingDocumentAction::Close => self.discard_all_workspace_changes(),
+                    PendingDocumentAction::CloseDocument(id) => {
+                        self.activate_workspace_document(id);
+                        self.discard_unsaved_changes();
+                    }
+                    PendingDocumentAction::CreateClass(_) => self.discard_unsaved_changes(),
+                }
                 self.pending_document_action = None;
                 self.status_message = Some("已放弃本次未保存修改".to_owned());
                 self.execute_document_action(action);
             }
-            LeaveDecision::Save => match self.persist_edits() {
-                Ok(saved) if !self.has_unsaved_changes() => {
-                    self.pending_document_action = None;
-                    self.status_message = Some(if saved == 0 {
-                        "没有待保存的修改".to_owned()
-                    } else {
-                        format!("保存成功：已写入 {saved} 个文件")
-                    });
-                    self.load_error = None;
-                    self.execute_document_action(action);
+            LeaveDecision::Save => {
+                if let PendingDocumentAction::CloseDocument(id) = &action {
+                    self.activate_workspace_document(id);
                 }
-                Ok(_) => {
-                    self.status_message = Some("保存部分成功：仍有修改未写入".to_owned());
+                let result = match &action {
+                    PendingDocumentAction::Close => self.persist_all_workspace_documents(),
+                    PendingDocumentAction::CloseDocument(_)
+                    | PendingDocumentAction::CreateClass(_) => self.persist_edits(),
+                };
+                let clean = match &action {
+                    PendingDocumentAction::Close => !self.workspace.has_unsaved_changes(),
+                    PendingDocumentAction::CloseDocument(id) => self
+                        .workspace
+                        .document(id)
+                        .is_none_or(|entry| !entry.document.has_unsaved_changes()),
+                    PendingDocumentAction::CreateClass(_) => !self.has_unsaved_changes(),
+                };
+                match result {
+                    Ok(saved) if clean => {
+                        self.pending_document_action = None;
+                        self.status_message = Some(if saved == 0 {
+                            "没有待保存的修改".to_owned()
+                        } else {
+                            format!("保存成功：已写入 {saved} 个文件/文档")
+                        });
+                        self.load_error = None;
+                        self.execute_document_action(action);
+                    }
+                    Ok(_) => {
+                        self.status_message = Some("保存部分成功：仍有修改未写入".to_owned());
+                    }
+                    Err(error) => {
+                        self.status_message = Some(
+                            if error.contains("部分保存")
+                                || error.contains("save partially completed")
+                            {
+                                "保存部分成功：仍有修改未写入".to_owned()
+                            } else {
+                                "保存失败：当前修改已保留".to_owned()
+                            },
+                        );
+                        self.load_error = Some(error);
+                    }
                 }
-                Err(error) => {
-                    self.status_message = Some(if error.contains("save partially completed") {
-                        "保存部分成功：仍有修改未写入".to_owned()
-                    } else {
-                        "保存失败：当前修改已保留".to_owned()
-                    });
-                    self.load_error = Some(error);
-                }
-            },
+            }
         }
         self.request_redraw();
     }
 
     fn update_title(&self, fps: Option<(f32, f32)>) {
-        if let Some(document) = &self.document {
+        if let Some(document) = self.active_document() {
             self.window.set_title(&document.title(fps));
         } else {
             let performance = fps
@@ -11002,7 +11674,7 @@ impl App {
 
     fn rebuild_scene_geometry_for_zoom(&mut self) {
         let selected_class = self.selected_class.clone();
-        let document = self.document.as_ref();
+        let document = self.active_document();
         match self.main_view {
             MainView::Icon => {
                 self.scene = build_scene(
@@ -11086,8 +11758,8 @@ impl App {
 
     /// Install a freshly parsed document into the viewer state and reset all
     /// per-class editing/selection state for the new library.
-    fn begin_document_load(&mut self, path: PathBuf) {
-        if self.loading_document.is_some() || self.has_unsaved_changes() {
+    fn begin_document_load(&mut self, path: PathBuf, replace_id: Option<String>) {
+        if self.loading_document.is_some() {
             return;
         }
         eprintln!(
@@ -11097,6 +11769,7 @@ impl App {
         self.load_error = None;
         self.status_message = Some("正在加载新文档…".to_owned());
         self.loading_document = Some(std::thread::spawn(move || LoadedDocument::load(&path)));
+        self.loading_document_target = replace_id;
         self.request_redraw();
     }
 
@@ -11112,39 +11785,59 @@ impl App {
             .loading_document
             .take()
             .expect("document load handle still present");
+        let replace_id = self.loading_document_target.take();
         match handle.join() {
-            Ok(Ok(document)) if self.has_unsaved_changes() => {
-                self.status_message =
-                    Some("新文档加载期间当前文档发生了修改，已保留当前文档".to_owned());
-                self.load_error =
-                    Some("新文档未打开：当前文档在加载期间产生了未保存修改".to_owned());
-                if let Some((qualified_name, path)) = self.pending_class_selection.take() {
-                    self.status_message = Some(format!(
-                        "类已创建于 {}，但刷新期间当前文档产生了未保存修改；当前文档已保留",
-                        path.display()
-                    ));
-                    self.load_error = Some(format!("无法自动选中新类 {qualified_name}"));
-                }
-                drop(document);
-            }
             Ok(Ok(document)) => {
                 let created_class = self.pending_class_selection.take();
-                self.adopt_loaded_document(document);
-                if let Some((qualified_name, path)) = created_class {
-                    if self
-                        .document
-                        .as_ref()
-                        .is_some_and(|document| document.class_names.contains(&qualified_name))
-                    {
-                        self.select_created_class(&qualified_name);
-                        self.status_message =
-                            Some(format!("已创建并加载 {qualified_name}：{}", path.display()));
-                    } else {
+                if replace_id.as_deref().is_some_and(|id| {
+                    self.workspace
+                        .document(id)
+                        .is_some_and(|entry| entry.document.has_unsaved_changes())
+                }) {
+                    self.status_message =
+                        Some("刷新期间目标文档产生了修改，已保留原文档和工作区".to_owned());
+                    self.load_error = Some(
+                        "新类文件已写入，但刷新未应用：目标文档在加载期间变为未保存状态".to_owned(),
+                    );
+                    drop(document);
+                    if let Some((qualified_name, path)) = created_class {
                         self.status_message = Some(format!(
-                            "文件已创建：{}；重新加载后未在模型树中找到 {qualified_name}",
+                            "类已创建于 {}，但文档刷新被取消以保留未保存修改",
                             path.display()
                         ));
-                        self.load_error = Some(format!("重新加载未发现新类 {qualified_name}"));
+                        self.load_error = Some(format!("无法自动选中新类 {qualified_name}"));
+                    }
+                } else {
+                    match self.activate_loaded_document(document, replace_id.as_deref()) {
+                        Ok(loaded_id) => {
+                            if let Some((qualified_name, path)) = created_class {
+                                if self.workspace.active_id() == Some(loaded_id.as_str())
+                                    && self.active_document().is_some_and(|document| {
+                                        document.class_names.contains(&qualified_name)
+                                    })
+                                {
+                                    self.select_created_class(&qualified_name);
+                                    self.status_message = Some(format!(
+                                        "已创建并加载 {qualified_name}：{}",
+                                        path.display()
+                                    ));
+                                } else {
+                                    self.status_message = Some(format!(
+                                        "文件已创建：{}；重新加载后未在模型树中找到 {qualified_name}",
+                                        path.display()
+                                    ));
+                                    self.load_error =
+                                        Some(format!("重新加载未发现新类 {qualified_name}"));
+                                }
+                            } else {
+                                self.status_message = Some("文档已加入工作区".to_owned());
+                            }
+                        }
+                        Err(error) => {
+                            self.status_message =
+                                Some("文档未加入工作区；现有文档已保留".to_owned());
+                            self.load_error = Some(error);
+                        }
                     }
                 }
             }
@@ -11177,59 +11870,15 @@ impl App {
         self.request_redraw();
     }
 
-    /// Install a freshly parsed document into the viewer state and reset all
-    /// per-class editing/selection state for the new library.
-    fn adopt_loaded_document(&mut self, document: LoadedDocument) {
-        self.scene = build_scene(
-            &self.device,
-            &self.style_layout,
-            Some(&document),
-            None,
-            self.zoom,
-        );
-        self.diagram_scene = build_diagram_scene(
-            &self.device,
-            &self.style_layout,
-            Some(&document),
-            None,
-            self.zoom,
-        );
-        self.document = Some(document);
-        reset_edit_history(&mut self.history, &mut self.redo_history);
-        self.selected_class = None;
-        self.refresh_ui_document();
-        self.expanded_nodes.clear();
-        if let Some(doc) = self.document.as_ref() {
-            expand_top_level(&mut self.expanded_nodes, &doc.model_tree);
-        }
-        self.canvas_rect = None;
-        self.pointer_interaction = PointerInteraction::None;
-        self.component_connection_previews = None;
-        self.connection_creation_preview = None;
-        self.pending_waypoint = false;
-        self.pending_waypoint_queued_at = None;
-        self.waypoint_frame_pending = false;
-        self.waypoint_profile_frames_remaining = 0;
-        self.suppress_next_pointer_release_redraw = false;
-        self.diagram_selection = DiagramSelection::None;
-        self.hovered_port = None;
-        self.diagram_hit_cache = DiagramHitCache::default();
-        self.load_error = None;
-        self.status_message = Some("文档加载完成".to_owned());
-        self.update_title(None);
-    }
-
     fn select_created_class(&mut self, qualified_name: &str) {
         self.selected_class = Some(qualified_name.to_owned());
-        if let Some(document) = self.document.as_ref() {
-            expand_tree_to_class(
-                &document.model_tree,
-                qualified_name,
-                &mut self.expanded_nodes,
-            );
-        }
+        let mut expanded = HashSet::new();
+        expand_tree_to_class(&self.workspace.tree(), qualified_name, &mut expanded);
+        self.expanded_nodes.extend(expanded);
         self.main_view = MainView::Source;
         self.rebuild_selected_scenes();
+        self.refresh_ui_document();
+        self.save_active_workspace_session();
         self.update_title(None);
     }
 
@@ -11261,6 +11910,7 @@ impl App {
         let status_message = self.status_message.clone();
         let mut open_requested = false;
         let mut open_directory_requested = false;
+        let mut close_document_requested = false;
         let mut new_class_requested = false;
         let mut new_class_request = None;
         let mut new_class_cancelled = false;
@@ -11334,6 +11984,7 @@ impl App {
                 &mut tree_galley_cache,
                 &mut open_requested,
                 &mut open_directory_requested,
+                &mut close_document_requested,
                 &mut new_class_requested,
                 &mut class_clicked,
                 zoom,
@@ -11369,7 +12020,7 @@ impl App {
             let text_collect_started = Instant::now();
             let text_items = collect_active_model_text_overlay_items(main_view, |view| {
                 collect_model_text_overlay_items(
-                    self.document.as_ref(),
+                    self.active_document(),
                     selected_class.as_deref(),
                     view,
                     if view == MainView::Diagram {
@@ -11467,10 +12118,8 @@ impl App {
             self.hovered_port = None;
         }
         if expand_all_requested {
-            if let Some(document) = &self.document {
-                expanded_nodes.clear();
-                collect_expandable_paths(&document.model_tree, &mut expanded_nodes);
-            }
+            expanded_nodes.clear();
+            collect_expandable_paths(&self.workspace.tree(), &mut expanded_nodes);
         } else if collapse_all_requested {
             expanded_nodes.clear();
         }
@@ -11553,79 +12202,17 @@ impl App {
             }
         }
 
-        if let Some(class_name) = class_clicked {
-            let class_open_started = Instant::now();
-            let (icon_cache_hit, diagram_cache_hit, before_resolution) = self
-                .document
-                .as_ref()
-                .map(|document| {
-                    (
-                        document.icon_cache_hit(&class_name),
-                        document.diagram_cache_hit(&class_name),
-                        document.scene_resolution_stats(),
-                    )
-                })
-                .unwrap_or((false, false, SceneResolutionStats::default()));
-            let has_visual = self.document.as_ref().is_some_and(|document| {
-                document.icon(&class_name).is_some() || document.diagram(&class_name).is_some()
-            });
-            let gpu_scene_build_started = Instant::now();
-            if has_visual {
-                self.scene = build_scene(
-                    &self.device,
-                    &self.style_layout,
-                    self.document.as_ref(),
-                    Some(&class_name),
-                    self.zoom,
-                );
-            } else {
-                self.scene = build_scene(
-                    &self.device,
-                    &self.style_layout,
-                    self.document.as_ref(),
-                    None,
-                    self.zoom,
-                );
+        if close_document_requested {
+            self.request_close_active_document();
+        }
+
+        if let Some(clicked) = class_clicked {
+            if self.workspace.active_id() != Some(clicked.document_id.as_str()) {
+                self.activate_workspace_document(&clicked.document_id);
             }
-            self.diagram_scene = build_diagram_scene(
-                &self.device,
-                &self.style_layout,
-                self.document.as_ref(),
-                Some(&class_name),
-                self.zoom,
-            );
-            let gpu_scene_build_time = gpu_scene_build_started.elapsed();
-            let after_resolution = self
-                .document
-                .as_ref()
-                .map_or_else(SceneResolutionStats::default, |document| {
-                    document.scene_resolution_stats()
-                });
-            trace_class_open(
-                &class_name,
-                icon_cache_hit,
-                diagram_cache_hit,
-                before_resolution,
-                after_resolution,
-                gpu_scene_build_time,
-                class_open_started.elapsed(),
-            );
-            self.selected_class = Some(class_name);
-            self.refresh_ui_document();
-            self.main_view = MainView::Source;
-            self.canvas_rect = None;
-            self.pointer_interaction = PointerInteraction::None;
-            self.connection_preview = None;
-            self.component_connection_previews = None;
-            self.connection_creation_preview = None;
-            self.suppress_next_pointer_release_redraw = false;
-            self.diagram_selection = DiagramSelection::None;
-            self.hovered_port = None;
-            self.diagram_hit_cache =
-                build_diagram_hit_cache(self.document.as_ref(), self.selected_class.as_deref());
-            self.fit_scene();
-            self.update_title(None);
-            self.request_redraw();
+            if let Some(class_name) = clicked.class_name {
+                self.select_workspace_class(class_name);
+            }
         }
 
         // Time the expensive stages of this frame so a freeze can be traced to
@@ -12892,8 +13479,9 @@ fn draw_preview_ui(
     tree_galley_cache: &mut TreeGalleyCache,
     open_requested: &mut bool,
     open_directory_requested: &mut bool,
+    close_document_requested: &mut bool,
     new_class_requested: &mut bool,
-    class_clicked: &mut Option<String>,
+    class_clicked: &mut Option<WorkspaceTreeClick>,
     zoom: f32,
     zoom_action: &mut Option<ZoomAction>,
     fit_requested: &mut bool,
@@ -13130,7 +13718,7 @@ fn draw_preview_ui(
                 });
                 ui.add_space(6.0);
                 // Reserve the action strip, then let the tree fill what is left.
-                const SIDEBAR_ACTIONS_HEIGHT: f32 = 112.0;
+                const SIDEBAR_ACTIONS_HEIGHT: f32 = 148.0;
                 let tree_height = (ui.available_height() - SIDEBAR_ACTIONS_HEIGHT).max(72.0);
                 if let Some(document) = document {
                     ui.allocate_ui_with_layout(
@@ -13145,6 +13733,7 @@ fn draw_preview_ui(
                                 ui,
                                 &document.tree,
                                 selected_class,
+                                document.active_document_id.as_deref(),
                                 expanded_nodes,
                                 visible_tree_rows,
                                 tree_galley_cache,
@@ -13201,6 +13790,27 @@ fn draw_preview_ui(
                     .clicked()
                 {
                     *open_directory_requested = true;
+                }
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(
+                        document.is_some()
+                            && !document_loading
+                            && pending_document_action.is_none(),
+                        egui::Button::new(
+                            RichText::new("关闭当前文档")
+                                .size(12.0)
+                                .font(ui_font(12.0))
+                                .color(theme_text_primary()),
+                        )
+                        .fill(theme_surface_raised(170))
+                        .stroke(Stroke::new(1.0_f32, theme_border(26)))
+                        .rounding(Rounding::same(12.0))
+                        .min_size(Vec2::new(ui.available_width(), 30.0)),
+                    )
+                    .clicked()
+                {
+                    *close_document_requested = true;
                 }
                 ui.add_space(6.0);
                 ui.menu_button(
@@ -13785,6 +14395,7 @@ struct VisibleTreeRow {
     name: String,
     qualified_name: String,
     class_name: Option<String>,
+    workspace_document_id: Option<String>,
     kind: Option<ClassKind>,
     depth: usize,
     has_children: bool,
@@ -13980,12 +14591,13 @@ fn document_tree(
     ui: &mut egui::Ui,
     root: &TreeNode,
     selected_class: Option<&str>,
+    active_document_id: Option<&str>,
     expanded_nodes: &mut HashSet<String>,
     visible_rows_cache: &mut VisibleTreeRowsCache,
     text_cache: &mut TreeGalleyCache,
     window_scale_factor: f32,
     trace_text_layout: bool,
-) -> Option<String> {
+) -> Option<WorkspaceTreeClick> {
     visible_rows_cache.ensure(root, expanded_nodes);
     let rows = visible_rows_cache.rows.as_deref().unwrap_or_default();
     let mut clicked = None;
@@ -14005,8 +14617,9 @@ fn document_tree(
                 } else {
                     "□"
                 };
-                let selected =
-                    selected_class.is_some() && row.class_name.as_deref() == selected_class;
+                let selected = selected_class.is_some()
+                    && row.class_name.as_deref() == selected_class
+                    && row.workspace_document_id.as_deref() == active_document_id;
                 let depth = row.depth;
                 let (response, marker_response) = tree_row(
                     ui,
@@ -14034,8 +14647,11 @@ fn document_tree(
                         expanded_changed = true;
                     }
                 } else if response.clicked() {
-                    if let Some(class_name) = &row.class_name {
-                        clicked = Some(class_name.clone());
+                    if let Some(document_id) = &row.workspace_document_id {
+                        clicked = Some(WorkspaceTreeClick {
+                            document_id: document_id.clone(),
+                            class_name: row.class_name.clone(),
+                        });
                     }
                 }
             }
@@ -14057,6 +14673,7 @@ fn collect_visible_tree_rows(
         name: node.name.clone(),
         qualified_name: node.qualified_name.clone(),
         class_name: node.class_name.clone(),
+        workspace_document_id: node.workspace_document_id.clone(),
         kind: node.kind,
         depth,
         has_children: !node.children.is_empty(),
@@ -14075,17 +14692,6 @@ fn collect_expandable_paths(node: &TreeNode, output: &mut HashSet<String>) {
     output.insert(node.qualified_name.clone());
     for child in &node.children {
         collect_expandable_paths(child, output);
-    }
-}
-
-fn expand_top_level(expanded: &mut HashSet<String>, root: &TreeNode) {
-    if !root.children.is_empty() {
-        expanded.insert(root.qualified_name.clone());
-    }
-    for child in &root.children {
-        if !child.children.is_empty() {
-            expanded.insert(child.qualified_name.clone());
-        }
     }
 }
 
@@ -19924,29 +20530,26 @@ fn enable_rounded_window_corners(window: &winit::window::Window) {
 fn enable_rounded_window_corners(_window: &winit::window::Window) {}
 
 fn main() {
-    let input = env::args_os().nth(1).map(PathBuf::from);
-    let document = match input.as_deref() {
-        Some(path) => match LoadedDocument::load(path) {
-            Ok(document) => {
-                eprintln!(
-                    "modelica-wgpu document: package={}, classes={}, diagnostics={}, path={}",
-                    document.package_name,
-                    document.class_names.len(),
-                    document.diagnostics,
-                    document.path.display()
-                );
-                Some(document)
-            }
-            Err(error) => {
-                eprintln!("modelica-wgpu document load failed: {error}");
-                None
-            }
-        },
-        None => {
-            eprintln!("modelica-wgpu: no Modelica path supplied; showing prototype scene");
-            None
-        }
-    };
+    let input_paths = env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let (workspace, workspace_load_errors) = load_workspace_paths(input_paths);
+    if workspace.documents.is_empty() && workspace_load_errors.is_empty() {
+        eprintln!("modelica-wgpu: no Modelica path supplied; showing prototype scene");
+    }
+    for entry in &workspace.documents {
+        eprintln!(
+            "modelica-wgpu document: package={}, classes={}, diagnostics={}, path={}",
+            entry.document.package_name,
+            entry.document.class_names.len(),
+            entry.document.diagnostics,
+            entry.document.path.display()
+        );
+    }
+    for error in &workspace_load_errors {
+        eprintln!("modelica-wgpu document load failed: {error}");
+    }
     let event_loop = EventLoopBuilder::<Instant>::with_user_event()
         .build()
         .expect("failed to create event loop");
@@ -19959,7 +20562,10 @@ fn main() {
             .expect("failed to create window"),
     );
     enable_rounded_window_corners(&window);
-    let mut app = pollster::block_on(App::new(window.clone(), document));
+    let mut app = pollster::block_on(App::new(window.clone(), workspace));
+    if !workspace_load_errors.is_empty() {
+        app.load_error = Some(workspace_load_errors.join("\n"));
+    }
     let repaint_proxy = event_loop.create_proxy();
     app.egui_ctx.set_request_repaint_callback(move |request| {
         if let Some(deadline) = Instant::now().checked_add(request.delay) {
@@ -19967,9 +20573,8 @@ fn main() {
         }
     });
     let mut repaint_schedule = RepaintSchedule::default();
-    if let Some(doc) = app.document.as_ref() {
-        expand_top_level(&mut app.expanded_nodes, &doc.model_tree);
-    }
+    app.expanded_nodes
+        .extend(app.workspace.top_level_expansion_paths());
     app.refresh_ui_document();
     app.update_title(None);
     window.request_redraw();
@@ -20371,6 +20976,7 @@ mod tests {
                 qualified_name: "Demo.Heater".to_owned(),
                 class_name: Some("Demo.Heater".to_owned()),
                 kind: Some(ClassKind::Block),
+                workspace_document_id: None,
                 description: Some("一等温吸附干燥器（很长的中文说明）".to_owned()),
                 children: Vec::new(),
             },
@@ -20379,6 +20985,7 @@ mod tests {
                 qualified_name: "Demo.Parent.Nested".to_owned(),
                 class_name: Some("Demo.Parent.Nested".to_owned()),
                 kind: Some(ClassKind::Model),
+                workspace_document_id: None,
                 description: None,
                 children: Vec::new(),
             },
@@ -20646,9 +21253,11 @@ mod tests {
                 qualified_name: "Demo".to_owned(),
                 class_name: Some("Demo".to_owned()),
                 kind: Some(ClassKind::Model),
+                workspace_document_id: None,
                 description: None,
                 children: Vec::new(),
             },
+            active_document_id: None,
             selected_class: Some("Demo".to_owned()),
             icon_graphics: 0,
             diagram_background: 0,
@@ -20703,6 +21312,7 @@ mod tests {
                         &mut HashSet::new(),
                         &mut VisibleTreeRowsCache::default(),
                         &mut TreeGalleyCache::default(),
+                        &mut false,
                         &mut false,
                         &mut false,
                         &mut false,
@@ -20871,6 +21481,7 @@ mod tests {
                         &mut false,
                         &mut false,
                         &mut false,
+                        &mut false,
                         &mut None,
                         INITIAL_ZOOM,
                         &mut None,
@@ -20958,6 +21569,7 @@ mod tests {
                         &mut HashSet::new(),
                         &mut VisibleTreeRowsCache::default(),
                         &mut TreeGalleyCache::default(),
+                        &mut false,
                         &mut false,
                         &mut false,
                         &mut false,
@@ -21057,6 +21669,7 @@ mod tests {
             qualified_name: "Demo.Sub".to_owned(),
             class_name: Some("Sub".to_owned()),
             kind: Some(ClassKind::Model),
+            workspace_document_id: None,
             description: None,
             children: Vec::new(),
         }];
@@ -21089,6 +21702,7 @@ mod tests {
                         &mut expanded,
                         &mut rows_cache,
                         &mut galley_cache,
+                        &mut false,
                         &mut false,
                         &mut false,
                         &mut false,
@@ -21641,9 +22255,11 @@ mod tests {
                 qualified_name: "Demo".to_owned(),
                 class_name: Some("Demo".to_owned()),
                 kind: Some(ClassKind::Model),
+                workspace_document_id: None,
                 description: None,
                 children: Vec::new(),
             },
+            active_document_id: None,
             selected_class: Some("Demo".to_owned()),
             icon_graphics: 0,
             diagram_background: 0,
