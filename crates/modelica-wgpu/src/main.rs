@@ -94,6 +94,12 @@ const UI_FONT_ITALIC: &str = "modelica-ui-italic";
 const UI_FONT_SEMIBOLD_ITALIC: &str = "modelica-ui-semibold-italic";
 const UI_FONT_MONO: &str = "modelica-ui-mono";
 const UI_FONT_SYMBOLS: &str = "modelica-ui-symbols";
+const ICON_SIZE: f32 = 16.0;
+const BUTTON_HEIGHT: f32 = 30.0;
+const BUTTON_MIN_WIDTH: f32 = 36.0;
+const TOOLBAR_SPACING: f32 = 6.0;
+const CONTROL_RADIUS: f32 = 8.0;
+const CONTROL_STROKE_WIDTH: f32 = 1.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -13449,9 +13455,9 @@ fn background_uniform() -> BackgroundUniform {
         ]
     };
     let (base, corner, edge) = if is_dark_theme() {
-        (ARC_BG_DARK, 0.20_f32, 0.07_f32)
+        (ARC_BG_DARK, 0.16_f32, 0.05_f32)
     } else {
-        (ARC_BG_LIGHT, 0.34_f32, 0.14_f32)
+        (ARC_BG_LIGHT, 0.20_f32, 0.07_f32)
     };
     BackgroundUniform {
         top_left: linear(mix_rgb(base, start, corner)),
@@ -13481,13 +13487,53 @@ fn theme_live() -> Color32 {
     theme_rgb(c[0], c[1], c[2])
 }
 
+fn toolbar_icon(glyph: &str, color: Color32) -> RichText {
+    RichText::new(glyph.to_owned())
+        .size(ICON_SIZE)
+        .font(ui_font(ICON_SIZE))
+        .color(color)
+}
+
+fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str, size: Vec2) -> egui::Response {
+    ui.add_sized(
+        size,
+        egui::Button::new(toolbar_icon(glyph, theme_text_secondary()))
+            .min_size(size)
+            .rounding(Rounding::same(CONTROL_RADIUS)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn toolbar_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label.to_owned())
+                .size(12.0)
+                .font(ui_font(12.0))
+                .color(theme_text_primary()),
+        )
+        .min_size(Vec2::new(BUTTON_MIN_WIDTH, BUTTON_HEIGHT))
+        .rounding(Rounding::same(CONTROL_RADIUS)),
+    )
+}
+
+fn aligned_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, BUTTON_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| ui.add(egui::Checkbox::new(checked, label)),
+    )
+    .inner
+}
+
 fn configure_egui_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.window_margin = Margin::same(16.0);
-    style.spacing.menu_margin = Margin::same(10.0);
-    style.spacing.button_padding = Vec2::new(14.0, 8.0);
-    style.spacing.interact_size = Vec2::new(40.0, 28.0);
+    style.spacing.item_spacing = Vec2::splat(TOOLBAR_SPACING);
+    style.spacing.window_margin = Margin::same(14.0);
+    style.spacing.menu_margin = Margin::same(8.0);
+    style.spacing.button_padding = Vec2::new(10.0, 6.0);
+    style.spacing.interact_size = Vec2::new(BUTTON_MIN_WIDTH, BUTTON_HEIGHT);
     style.spacing.indent = 14.0;
     style
         .text_styles
@@ -13512,22 +13558,22 @@ fn configure_egui_style(ctx: &egui::Context) {
         egui::Visuals::light()
     };
     visuals.override_text_color = Some(theme_text_primary());
-    visuals.window_rounding = Rounding::same(16.0);
-    visuals.menu_rounding = Rounding::same(12.0);
-    visuals.window_fill = theme_surface_raised(248);
-    visuals.window_stroke = Stroke::new(1.0_f32, theme_border(26));
-    // Single long-throw soft shadow — the signature Arc card lift.
+    visuals.window_rounding = Rounding::same(12.0);
+    visuals.menu_rounding = Rounding::same(CONTROL_RADIUS);
+    visuals.window_fill = theme_surface_raised(232);
+    visuals.window_stroke = Stroke::new(CONTROL_STROKE_WIDTH, theme_border(22));
+    // Keep dialogs distinct from the workspace without a heavy shadow.
     visuals.window_shadow = egui::epaint::Shadow {
-        offset: Vec2::new(0.0, 8.0),
-        blur: 32.0,
+        offset: Vec2::new(0.0, 4.0),
+        blur: 18.0,
         spread: 0.0,
-        color: Color32::from_black_alpha(18),
+        color: Color32::from_black_alpha(12),
     };
     visuals.popup_shadow = visuals.window_shadow;
     visuals.panel_fill = Color32::TRANSPARENT;
-    visuals.faint_bg_color = theme_surface_raised(90);
+    visuals.faint_bg_color = theme_surface_raised(72);
     visuals.extreme_bg_color = theme_surface();
-    visuals.code_bg_color = theme_surface_soft(150);
+    visuals.code_bg_color = theme_surface_soft(132);
     visuals.warn_fg_color = theme_rgb(0xf6, 0xad, 0x55);
     visuals.error_fg_color = theme_rgb(0xf5, 0x65, 0x65);
     visuals.selection = egui::style::Selection {
@@ -13535,7 +13581,7 @@ fn configure_egui_style(ctx: &egui::Context) {
         stroke: Stroke::new(1.0_f32, theme_accent()),
     };
 
-    let border = Stroke::new(1.0_f32, theme_border(26));
+    let border = Stroke::new(CONTROL_STROKE_WIDTH, theme_border(22));
     for widget in [
         &mut visuals.widgets.noninteractive,
         &mut visuals.widgets.inactive,
@@ -13544,20 +13590,20 @@ fn configure_egui_style(ctx: &egui::Context) {
         &mut visuals.widgets.open,
     ] {
         widget.bg_stroke = border;
-        // Squircle-soft radius-md (12px) on buttons — DESIGN.md §5.
-        widget.rounding = Rounding::same(12.0);
+        widget.rounding = Rounding::same(CONTROL_RADIUS);
         widget.expansion = 0.0;
     }
-    visuals.widgets.noninteractive.bg_fill = theme_surface_raised(150);
+    visuals.widgets.noninteractive.bg_fill = theme_surface_raised(164);
     visuals.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
-    visuals.widgets.inactive.bg_fill = theme_surface_raised(150);
-    visuals.widgets.inactive.weak_bg_fill = theme_surface_raised(120);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, theme_text_primary());
-    visuals.widgets.hovered.bg_fill = theme_surface_raised(235);
-    visuals.widgets.hovered.weak_bg_fill = theme_surface_raised(200);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme_border(30));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, theme_accent());
+    visuals.widgets.noninteractive.fg_stroke =
+        Stroke::new(CONTROL_STROKE_WIDTH, theme_text_primary());
+    visuals.widgets.inactive.bg_fill = theme_surface_raised(164);
+    visuals.widgets.inactive.weak_bg_fill = theme_surface_raised(110);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(CONTROL_STROKE_WIDTH, theme_text_primary());
+    visuals.widgets.hovered.bg_fill = theme_surface_raised(208);
+    visuals.widgets.hovered.weak_bg_fill = theme_surface_raised(180);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(CONTROL_STROKE_WIDTH, theme_border(26));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(CONTROL_STROKE_WIDTH, theme_accent_strong());
     visuals.widgets.active.bg_fill = theme_accent();
     visuals.widgets.active.weak_bg_fill = theme_accent_soft(150);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, theme_accent());
@@ -13696,11 +13742,11 @@ fn draw_new_class_dialog(
 
             egui::Grid::new("new-class-form")
                 .num_columns(2)
-                .spacing(Vec2::new(10.0, 8.0))
+                .spacing(Vec2::new(TOOLBAR_SPACING, TOOLBAR_SPACING))
                 .show(ui, |ui| {
                     ui.label("名称");
                     ui.add_sized(
-                        [ui.available_width(), 28.0],
+                        [ui.available_width(), BUTTON_HEIGHT],
                         egui::TextEdit::singleline(&mut state.name)
                             .hint_text("Model1 或 'Model-1'"),
                     );
@@ -13751,7 +13797,7 @@ fn draw_new_class_dialog(
                     ui.end_row();
 
                     ui.label("修饰符");
-                    ui.checkbox(&mut state.partial, "partial");
+                    aligned_checkbox(ui, &mut state.partial, "partial");
                     ui.end_row();
 
                     if state.kind != ClassKind::OperatorFunction {
@@ -13761,7 +13807,7 @@ fn draw_new_class_dialog(
                             "基类"
                         });
                         ui.add_sized(
-                            [ui.available_width(), 28.0],
+                            [ui.available_width(), BUTTON_HEIGHT],
                             egui::TextEdit::singleline(&mut state.base_class).hint_text(
                                 if state.kind == ClassKind::Type {
                                     "Real / Integer / Boolean / String / 已加载类型"
@@ -13856,7 +13902,7 @@ fn draw_new_class_dialog(
                                     )
                                     .truncate(),
                                 );
-                                if ui.button("选择…").clicked() {
+                                if toolbar_button(ui, "选择…").clicked() {
                                     *choose_directory_requested = true;
                                 }
                             });
@@ -13875,7 +13921,7 @@ fn draw_new_class_dialog(
                                     )
                                     .truncate(),
                                 );
-                                if ui.button("选择…").clicked() {
+                                if toolbar_button(ui, "选择…").clicked() {
                                     *choose_directory_requested = true;
                                 }
                             });
@@ -14019,7 +14065,7 @@ fn draw_new_class_dialog(
             );
             ui.add_space(8.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("取消").clicked() {
+                if toolbar_button(ui, "取消").clicked() {
                     clicked_cancel = true;
                 }
                 let can_submit = request.is_some()
@@ -14027,7 +14073,12 @@ fn draw_new_class_dialog(
                     && !path_conflict
                     && !leave_prompt_open;
                 if ui
-                    .add_enabled(can_submit, egui::Button::new("确定并创建"))
+                    .add_enabled(
+                        can_submit,
+                        egui::Button::new("确定并创建")
+                            .min_size(Vec2::new(BUTTON_MIN_WIDTH, BUTTON_HEIGHT))
+                            .rounding(Rounding::same(CONTROL_RADIUS)),
+                    )
                     .clicked()
                 {
                     clicked_submit = true;
@@ -14089,8 +14140,8 @@ fn draw_preview_ui(
     // only update the palette when the user changes light/dark or accent.
     let mut visuals = ctx.style().visuals.clone();
     visuals.override_text_color = Some(theme_text_primary());
-    visuals.window_fill = theme_surface_raised(245);
-    visuals.window_stroke = Stroke::new(1.0_f32, theme_border(28));
+    visuals.window_fill = theme_surface_raised(232);
+    visuals.window_stroke = Stroke::new(CONTROL_STROKE_WIDTH, theme_border(22));
     visuals.panel_fill = Color32::TRANSPARENT;
     visuals.faint_bg_color = theme_surface_soft(72);
     visuals.extreme_bg_color = theme_surface();
@@ -14127,8 +14178,8 @@ fn draw_preview_ui(
         .exact_height(26.0)
         .frame(
             Frame::none()
-                .fill(theme_surface_raised(140))
-                .stroke(Stroke::new(1.0_f32, theme_border(18)))
+                .fill(theme_surface_raised(126))
+                .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(16)))
                 .inner_margin(Margin::symmetric(12.0, 3.0)),
         )
         .show(ctx, |ui| {
@@ -14187,8 +14238,8 @@ fn draw_preview_ui(
             .max_width(library_max)
             .frame(
                 Frame::none()
-                    .fill(theme_surface_soft(165))
-                    .stroke(Stroke::new(1.0_f32, theme_border(18)))
+                    .fill(theme_surface_soft(148))
+                    .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(16)))
                     .inner_margin(Margin::symmetric(12.0, 12.0)),
             )
             .show(ctx, |ui| {
@@ -14213,12 +14264,8 @@ fn draw_preview_ui(
                             .color(theme_text_primary()),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let collapse = egui::Button::new(
-                            RichText::new("⏴").size(12.0).color(theme_text_tertiary()),
-                        )
-                        .frame(false);
-                        let response = ui.add(collapse);
-                        if response.on_hover_text("收起侧栏").clicked() {
+                        let response = icon_button(ui, "⏴", "收起侧栏", Vec2::splat(28.0));
+                        if response.clicked() {
                             library_visible = false;
                         }
                     });
@@ -14239,7 +14286,7 @@ fn draw_preview_ui(
                 // actions right-aligned. The actions are laid out first so the
                 // title only truncates into the width that is actually free.
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().item_spacing.x = TOOLBAR_SPACING;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if document.is_some() {
                             if tree_bulk_action_button(ui, false) {
@@ -14321,9 +14368,9 @@ fn draw_preview_ui(
                         .color(Color32::WHITE),
                 )
                 .fill(theme_accent())
-                .stroke(Stroke::new(1.0_f32, theme_accent()))
-                .rounding(Rounding::same(12.0))
-                .min_size(Vec2::new(ui.available_width(), 32.0));
+                .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_accent()))
+                .rounding(Rounding::same(CONTROL_RADIUS))
+                .min_size(Vec2::new(ui.available_width(), BUTTON_HEIGHT));
                 if ui
                     .add_enabled(
                         !document_loading && pending_document_action.is_none(),
@@ -14341,9 +14388,9 @@ fn draw_preview_ui(
                         .color(theme_text_primary()),
                 )
                 .fill(theme_surface_raised(170))
-                .stroke(Stroke::new(1.0_f32, theme_border(26)))
-                .rounding(Rounding::same(12.0))
-                .min_size(Vec2::new(ui.available_width(), 30.0));
+                .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(26)))
+                .rounding(Rounding::same(CONTROL_RADIUS))
+                .min_size(Vec2::new(ui.available_width(), BUTTON_HEIGHT));
                 if ui
                     .add_enabled(
                         !document_loading && pending_document_action.is_none(),
@@ -14366,9 +14413,9 @@ fn draw_preview_ui(
                                 .color(theme_text_primary()),
                         )
                         .fill(theme_surface_raised(170))
-                        .stroke(Stroke::new(1.0_f32, theme_border(26)))
-                        .rounding(Rounding::same(12.0))
-                        .min_size(Vec2::new(ui.available_width(), 30.0)),
+                        .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(26)))
+                        .rounding(Rounding::same(CONTROL_RADIUS))
+                        .min_size(Vec2::new(ui.available_width(), BUTTON_HEIGHT)),
                     )
                     .clicked()
                 {
@@ -14434,8 +14481,9 @@ fn draw_preview_ui(
                                 .color(theme_text_primary()),
                         )
                         .fill(theme_surface_raised(160))
-                        .stroke(Stroke::new(1.0_f32, theme_border(24)))
-                        .rounding(Rounding::same(10.0));
+                        .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(24)))
+                        .rounding(Rounding::same(CONTROL_RADIUS))
+                        .min_size(Vec2::new(BUTTON_MIN_WIDTH, BUTTON_HEIGHT));
                         if ui.add(restore).clicked() {
                             library_visible = true;
                         }
@@ -14450,7 +14498,7 @@ fn draw_preview_ui(
                         - 16.0)
                         .clamp(0.0, 360.0);
                     ui.add_sized(
-                        [class_label_width, 26.0],
+                        [class_label_width, BUTTON_HEIGHT],
                         egui::Label::new(
                             RichText::new(class_path)
                                 .size(13.0)
@@ -14469,9 +14517,9 @@ fn draw_preview_ui(
                                 .color(theme_text_primary()),
                         )
                         .fill(theme_surface_raised(170))
-                        .stroke(Stroke::new(1.0_f32, theme_border(26)))
-                        .rounding(Rounding::same(8.0))
-                        .min_size(Vec2::new(new_button_width, 26.0)),
+                        .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(26)))
+                        .rounding(Rounding::same(CONTROL_RADIUS))
+                        .min_size(Vec2::new(new_button_width, BUTTON_HEIGHT)),
                     );
                     if new_class_button.clicked() {
                         *new_class_requested = true;
@@ -14526,57 +14574,43 @@ fn draw_preview_ui(
             .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-18.0, -40.0))
             .show(ctx, |ui| {
                 Frame::none()
-                    .fill(theme_surface_raised(205))
-                    .stroke(Stroke::new(1.0_f32, theme_border(24)))
-                    .rounding(Rounding::same(12.0))
+                    .fill(theme_surface_raised(192))
+                    .stroke(Stroke::new(CONTROL_STROKE_WIDTH, theme_border(20)))
+                    .rounding(Rounding::same(CONTROL_RADIUS))
                     .inner_margin(Margin::symmetric(8.0, 5.0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             let fit_button = ui.add_sized(
-                                [50.0, 26.0],
+                                [50.0, BUTTON_HEIGHT],
                                 egui::Button::new(
                                     RichText::new("Fit").size(12.0).font(ui_semibold_font(12.0)),
                                 )
                                 .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
-                                .rounding(Rounding::same(8.0)),
+                                .stroke(Stroke::new(CONTROL_STROKE_WIDTH, Color32::TRANSPARENT))
+                                .rounding(Rounding::same(CONTROL_RADIUS)),
                             );
                             if fit_button.clicked() {
                                 *fit_requested = true;
                             }
-                            let zoom_in_button = ui.add_sized(
-                                [26.0, 26.0],
-                                egui::Button::new(
-                                    RichText::new("+")
-                                        .size(16.0)
-                                        .font(ui_font(16.0))
-                                        .color(theme_text_secondary()),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
-                                .rounding(Rounding::same(8.0)),
-                            );
+                            let zoom_in_button =
+                                icon_button(ui, "+", "放大", Vec2::splat(BUTTON_HEIGHT));
                             if zoom_in_button.clicked() {
                                 *zoom_action = Some(ZoomAction::In);
                             }
-                            ui.label(
-                                RichText::new(format!("{}%", zoom_percent(zoom)))
-                                    .size(12.0)
-                                    .font(ui_font(12.0))
-                                    .color(theme_text_secondary()),
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(44.0, BUTTON_HEIGHT),
+                                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{}%", zoom_percent(zoom)))
+                                            .size(12.0)
+                                            .font(ui_font(12.0))
+                                            .color(theme_text_secondary()),
+                                    );
+                                },
                             );
-                            let zoom_out_button = ui.add_sized(
-                                [26.0, 26.0],
-                                egui::Button::new(
-                                    RichText::new("\u{2212}")
-                                        .size(16.0)
-                                        .font(ui_font(16.0))
-                                        .color(theme_text_secondary()),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
-                                .rounding(Rounding::same(8.0)),
-                            );
+                            let zoom_out_button =
+                                icon_button(ui, "−", "缩小", Vec2::splat(BUTTON_HEIGHT));
                             if zoom_out_button.clicked() {
                                 *zoom_action = Some(ZoomAction::Out);
                             }
@@ -14592,28 +14626,16 @@ fn draw_preview_ui(
         .anchor(Align2::RIGHT_TOP, Vec2::new(-10.0, 10.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let control = |ui: &mut egui::Ui, glyph: &str| -> bool {
-                    ui.add_sized(
-                        [26.0, 22.0],
-                        egui::Button::new(
-                            RichText::new(glyph)
-                                .size(12.0)
-                                .font(ui_font(12.0))
-                                .color(theme_text_secondary()),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
-                        .rounding(Rounding::same(6.0)),
-                    )
-                    .clicked()
+                let control = |ui: &mut egui::Ui, glyph: &str, tooltip: &str| -> bool {
+                    icon_button(ui, glyph, tooltip, Vec2::splat(28.0)).clicked()
                 };
-                if control(ui, "─") {
+                if control(ui, "─", "最小化") {
                     request_window_action(ctx, WindowAction::Minimize);
                 }
-                if control(ui, "□") {
+                if control(ui, "□", "最大化/还原") {
                     request_window_action(ctx, WindowAction::ToggleMaximize);
                 }
-                if control(ui, "✕") {
+                if control(ui, "✕", "关闭") {
                     request_window_action(ctx, WindowAction::Close);
                 }
             });
@@ -14764,7 +14786,7 @@ fn draw_preview_ui(
 /// Full-width, left-aligned sidebar tab (Arc's vertical view switcher).
 fn sidebar_view_tab(ui: &mut egui::Ui, view: MainView, selected: bool) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, BUTTON_HEIGHT), Sense::click());
     let fill = if selected {
         theme_surface_raised(235)
     } else if response.hovered() {
@@ -14772,12 +14794,13 @@ fn sidebar_view_tab(ui: &mut egui::Ui, view: MainView, selected: bool) -> egui::
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
+    ui.painter()
+        .rect_filled(rect, Rounding::same(CONTROL_RADIUS), fill);
     if selected {
         ui.painter().rect_stroke(
             rect,
-            Rounding::same(8.0),
-            Stroke::new(1.0_f32, theme_border(30)),
+            Rounding::same(CONTROL_RADIUS),
+            Stroke::new(CONTROL_STROKE_WIDTH, theme_border(30)),
         );
         let bar = Rect::from_min_size(
             Pos2::new(rect.left() + 3.0, rect.top() + 8.0),
@@ -14815,7 +14838,8 @@ const TREE_ROW_HEIGHT: f32 = 29.0;
 const TREE_GALLEY_CACHE_CAPACITY: usize = 4096;
 
 fn tree_bulk_action_button(ui: &mut egui::Ui, expand_all: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 28.0), Sense::click());
+    let size = BUTTON_HEIGHT;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let hovered = response.hovered();
     let fill = if hovered {
         theme_surface_raised(220)
@@ -14828,25 +14852,29 @@ fn tree_bulk_action_button(ui: &mut egui::Ui, expand_all: bool) -> bool {
     } else {
         theme_text_secondary()
     };
-    ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
     ui.painter()
-        .rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0_f32, border));
+        .rect_filled(rect, Rounding::same(CONTROL_RADIUS), fill);
+    ui.painter().rect_stroke(
+        rect,
+        Rounding::same(CONTROL_RADIUS),
+        Stroke::new(CONTROL_STROKE_WIDTH, border),
+    );
 
     let center = rect.center();
-    let icon_rect = Rect::from_center_size(center, Vec2::splat(13.0));
+    let icon_rect = Rect::from_center_size(center, Vec2::splat(ICON_SIZE));
     ui.painter().rect_stroke(
         icon_rect,
         Rounding::same(2.5),
-        Stroke::new(1.3_f32, icon_color),
+        Stroke::new(1.4_f32, icon_color),
     );
     ui.painter().line_segment(
         [center + Vec2::new(-3.5, 0.0), center + Vec2::new(3.5, 0.0)],
-        Stroke::new(1.3_f32, icon_color),
+        Stroke::new(1.4_f32, icon_color),
     );
     if expand_all {
         ui.painter().line_segment(
             [center + Vec2::new(0.0, -3.5), center + Vec2::new(0.0, 3.5)],
-            Stroke::new(1.3_f32, icon_color),
+            Stroke::new(1.4_f32, icon_color),
         );
     }
 
