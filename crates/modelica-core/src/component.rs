@@ -88,6 +88,16 @@ pub fn parse_component_declaration(tokens: &[Token]) -> Option<ComponentDeclarat
         {
             index += 1;
         }
+        // A class description may appear between its name and the first
+        // member declaration. When the caller's source range starts at the
+        // class header (before any member semicolon), ignore that string so
+        // the first component is not mistaken for an unparseable class tail.
+        if significant
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::String)
+        {
+            index += 1;
+        }
     }
 
     let first = significant.get(index)?;
