@@ -1545,6 +1545,60 @@ enum WindowAction {
 }
 
 const WINDOW_ACTION_ID: &str = "modelica-window-action";
+const WINDOW_CHROME_HIT_REGIONS_ID: &str = "modelica-window-chrome-hit-regions";
+const WINDOW_CONTROLS_RESERVED_WIDTH: f32 = 112.0;
+const WINDOW_DRAG_CONTROLS_GAP: f32 = 8.0;
+
+fn reset_window_chrome_hit_regions(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(WINDOW_CHROME_HIT_REGIONS_ID),
+            Vec::<(Rect, WindowAction)>::new(),
+        );
+    });
+}
+
+fn register_window_chrome_hit_region(ctx: &egui::Context, rect: Rect, action: WindowAction) {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    ctx.data_mut(|data| {
+        let id = egui::Id::new(WINDOW_CHROME_HIT_REGIONS_ID);
+        let mut regions = data
+            .get_temp::<Vec<(Rect, WindowAction)>>(id)
+            .unwrap_or_default();
+        regions.push((rect, action));
+        data.insert_temp(id, regions);
+    });
+}
+
+fn window_chrome_action_at_pointer(
+    ctx: &egui::Context,
+    state: ElementState,
+    button: MouseButton,
+    pointer: Pos2,
+) -> Option<WindowAction> {
+    if state != ElementState::Pressed || button != MouseButton::Left {
+        return None;
+    }
+    ctx.data(|data| {
+        data.get_temp::<Vec<(Rect, WindowAction)>>(egui::Id::new(WINDOW_CHROME_HIT_REGIONS_ID))
+            .and_then(|regions| {
+                regions
+                    .iter()
+                    .rev()
+                    .find(|(rect, _)| rect.contains(pointer))
+                    .map(|(_, action)| *action)
+            })
+    })
+}
+
+fn central_titlebar_drag_rect(row: Rect, drag_left: f32, screen_right: f32) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(drag_left, row.top()),
+        Pos2::new(screen_right - WINDOW_CONTROLS_RESERVED_WIDTH, row.bottom()),
+    )
+}
 
 fn request_window_action(ctx: &egui::Context, action: WindowAction) {
     ctx.data_mut(|data| {
@@ -1559,17 +1613,12 @@ fn take_window_action(ctx: &egui::Context) -> Option<WindowAction> {
         .flatten()
 }
 
-/// Move the OS window when `rect` is dragged. This must live in the panel
-/// layers: a background `Area` sits below the panels and never receives the
-/// pointer, which is why the window could not be moved before.
+/// Register an explicit titlebar strip for native window dragging. The event
+/// loop starts the OS move directly on MouseInput::Pressed: winit documents
+/// that deferring drag_window until egui's drag threshold may be too late.
 fn window_drag_region(ui: &mut egui::Ui, rect: Rect, id: &str) {
-    if rect.width() <= 1.0 || rect.height() <= 1.0 {
-        return;
-    }
-    let response = ui.interact(rect, egui::Id::new(id), Sense::click_and_drag());
-    if response.drag_started() {
-        request_window_action(ui.ctx(), WindowAction::Drag);
-    }
+    register_window_chrome_hit_region(ui.ctx(), rect, WindowAction::Drag);
+    let response = ui.interact(rect, egui::Id::new(id), Sense::click());
     if response.double_clicked() {
         request_window_action(ui.ctx(), WindowAction::ToggleMaximize);
     }
@@ -14068,6 +14117,7 @@ fn draw_preview_ui(
     ctx.data_mut(|data| {
         data.insert_temp(egui::Id::new(WINDOW_ACTION_ID), None::<WindowAction>);
     });
+    reset_window_chrome_hit_regions(ctx);
     let library_visibility_id = egui::Id::new("workspace-library-visible");
     let mut library_visible =
         ctx.data(|data| data.get_temp::<bool>(library_visibility_id).unwrap_or(true));
@@ -14144,53 +14194,35 @@ fn draw_preview_ui(
             .show(ctx, |ui| {
                 // Arc keeps its own chrome inside the sidebar: the product mark,
                 // the view switcher and the actions all live here.
-                let mut collapse_left = None;
-                let brand = ui
-                    .horizontal(|ui| {
-                        let (mark_rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                        ui.painter()
-                            .rect_filled(mark_rect, Rounding::same(9.0), theme_accent());
-                        ui.painter().text(
-                            mark_rect.center(),
-                            Align2::CENTER_CENTER,
-                            "∿",
-                            FontId::proportional(16.0),
-                            Color32::WHITE,
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("Modelica Viewer")
-                                .size(13.0)
-                                .font(ui_semibold_font(13.0))
-                                .color(theme_text_primary()),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let collapse = egui::Button::new(
-                                RichText::new("⏴").size(12.0).color(theme_text_tertiary()),
-                            )
-                            .frame(false);
-                            let response = ui.add(collapse);
-                            collapse_left = Some(response.rect.left());
-                            if response.on_hover_text("收起侧栏").clicked() {
-                                library_visible = false;
-                            }
-                        });
-                    })
-                    .response;
-                // Drag the window from the empty part of the brand row.
-                let drag_right = collapse_left.unwrap_or(brand.rect.right());
-                window_drag_region(
-                    ui,
-                    Rect::from_min_max(
-                        brand.rect.min,
-                        Pos2::new(
-                            (drag_right - 6.0).max(brand.rect.left()),
-                            brand.rect.bottom(),
-                        ),
-                    ),
-                    "sidebar-titlebar-drag",
-                );
+                ui.horizontal(|ui| {
+                    let (mark_rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(mark_rect, Rounding::same(9.0), theme_accent());
+                    ui.painter().text(
+                        mark_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "∿",
+                        FontId::proportional(16.0),
+                        Color32::WHITE,
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Modelica Viewer")
+                            .size(13.0)
+                            .font(ui_semibold_font(13.0))
+                            .color(theme_text_primary()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let collapse = egui::Button::new(
+                            RichText::new("⏴").size(12.0).color(theme_text_tertiary()),
+                        )
+                        .frame(false);
+                        let response = ui.add(collapse);
+                        if response.on_hover_text("收起侧栏").clicked() {
+                            library_visible = false;
+                        }
+                    });
+                });
                 ui.add_space(12.0);
                 // Vertical view tabs — Arc's sidebar-first navigation.
                 for view in [MainView::Source, MainView::Icon, MainView::Diagram] {
@@ -14391,6 +14423,7 @@ fn draw_preview_ui(
                 .inner_margin(Margin::same(12.0)),
         )
         .show(ctx, |ui| {
+            let mut titlebar_drag_left = None;
             let title_row = ui
                 .horizontal(|ui| {
                     if !library_visible {
@@ -14411,10 +14444,11 @@ fn draw_preview_ui(
                     let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
                     let class_path = selected_class.unwrap_or(package_name);
                     let new_button_width = 78.0_f32;
-                    let window_controls_reserve = 92.0_f32;
-                    let class_label_width =
-                        (ui.available_width() - new_button_width - window_controls_reserve - 16.0)
-                            .max(0.0);
+                    let class_label_width = (ui.available_width()
+                        - new_button_width
+                        - WINDOW_CONTROLS_RESERVED_WIDTH
+                        - 16.0)
+                        .clamp(0.0, 360.0);
                     ui.add_sized(
                         [class_label_width, 26.0],
                         egui::Label::new(
@@ -14442,19 +14476,25 @@ fn draw_preview_ui(
                     if new_class_button.clicked() {
                         *new_class_requested = true;
                     }
-                    ui.add_space(window_controls_reserve);
+                    titlebar_drag_left =
+                        Some(new_class_button.rect.right() + WINDOW_DRAG_CONTROLS_GAP);
                 })
                 .response;
-            // The empty span right of the title drags the window; the floating
-            // window controls sit above it on the foreground layer.
-            window_drag_region(
-                ui,
-                Rect::from_min_max(
-                    Pos2::new(title_row.rect.right() + 8.0, ui.max_rect().top()),
-                    Pos2::new(ui.max_rect().right(), title_row.rect.bottom()),
-                ),
-                "central-titlebar-drag",
-            );
+            // Keep an actual blank strip between the new-class button and the
+            // floating native window controls. The previous code used the end
+            // of the full-width row as its left edge, producing an empty hit
+            // rectangle after the row had already reserved the controls area.
+            if let Some(drag_left) = titlebar_drag_left {
+                window_drag_region(
+                    ui,
+                    central_titlebar_drag_rect(
+                        title_row.rect,
+                        drag_left,
+                        ctx.screen_rect().right(),
+                    ),
+                    "central-titlebar-drag",
+                );
+            }
             ui.add_space(10.0);
             let content_size = ui.available_size();
             ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
@@ -14655,12 +14695,14 @@ fn draw_preview_ui(
                 .order(egui::Order::Foreground)
                 .anchor(align, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    let (_, response) = ui.allocate_exact_size(size, Sense::drag());
-                    if response.hovered() || response.dragged() {
+                    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+                    register_window_chrome_hit_region(
+                        ui.ctx(),
+                        rect,
+                        WindowAction::Resize(direction),
+                    );
+                    if response.hovered() {
                         ui.ctx().set_cursor_icon(cursor);
-                    }
-                    if response.drag_started() {
-                        request_window_action(ui.ctx(), WindowAction::Resize(direction));
                     }
                 });
         }
@@ -21906,6 +21948,29 @@ fn main() {
             match event {
                 Event::UserEvent(deadline) => repaint_schedule.request(deadline),
                 Event::WindowEvent { window_id, event } if window_id == app.window.id() => {
+                    // Start native window moves/resizes in the mouse-down
+                    // event itself. Winit requires drag_window to be called
+                    // immediately after the button press; waiting for egui's
+                    // drag threshold and a later redraw loses that timing on
+                    // Windows.
+                    if let WindowEvent::MouseInput { state, button, .. } = &event {
+                        let scale = app.window.scale_factor() as f32;
+                        let pointer =
+                            Pos2::new(app.cursor.x as f32 / scale, app.cursor.y as f32 / scale);
+                        if let Some(action) =
+                            window_chrome_action_at_pointer(&app.egui_ctx, *state, *button, pointer)
+                        {
+                            match action {
+                                WindowAction::Drag => {
+                                    let _ = app.window.drag_window();
+                                }
+                                WindowAction::Resize(direction) => {
+                                    let _ = app.window.drag_resize_window(direction);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     // Ctrl+wheel over an Icon/Diagram canvas is an explicit
                     // canvas gesture. Do not first feed it to egui, where a
                     // ScrollArea or zoom handler could consume it as well.
@@ -23386,6 +23451,61 @@ mod tests {
             take_window_action(&context),
             Some(WindowAction::Resize(winit::window::ResizeDirection::East))
         );
+    }
+
+    #[test]
+    fn native_window_drag_only_starts_on_left_press_in_blank_titlebar_strip() {
+        let context = egui::Context::default();
+        reset_window_chrome_hit_regions(&context);
+        let row = Rect::from_min_max(Pos2::new(180.0, 12.0), Pos2::new(900.0, 40.0));
+        let drag_rect = central_titlebar_drag_rect(row, 520.0, 1360.0);
+        assert!(drag_rect.width() > 1.0);
+        assert_eq!(drag_rect.left(), 520.0);
+        assert_eq!(drag_rect.right(), 1360.0 - WINDOW_CONTROLS_RESERVED_WIDTH);
+        register_window_chrome_hit_region(&context, drag_rect, WindowAction::Drag);
+
+        let inside = Pos2::new(drag_rect.center().x, drag_rect.center().y);
+        assert_eq!(
+            window_chrome_action_at_pointer(
+                &context,
+                ElementState::Pressed,
+                MouseButton::Left,
+                inside,
+            ),
+            Some(WindowAction::Drag)
+        );
+        assert_eq!(
+            window_chrome_action_at_pointer(
+                &context,
+                ElementState::Released,
+                MouseButton::Left,
+                inside,
+            ),
+            None
+        );
+        assert_eq!(
+            window_chrome_action_at_pointer(
+                &context,
+                ElementState::Pressed,
+                MouseButton::Right,
+                inside,
+            ),
+            None
+        );
+
+        // The window controls and the content canvas sit outside this explicit
+        // strip, so their presses keep their existing UI/diagram behavior.
+        for outside in [Pos2::new(1270.0, 24.0), Pos2::new(700.0, 180.0)] {
+            assert_eq!(
+                window_chrome_action_at_pointer(
+                    &context,
+                    ElementState::Pressed,
+                    MouseButton::Left,
+                    outside,
+                ),
+                None
+            );
+        }
     }
 
     #[test]
