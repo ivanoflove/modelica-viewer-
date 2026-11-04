@@ -7106,6 +7106,7 @@ struct App {
     background_pipeline_1x: Option<wgpu::RenderPipeline>,
     background_buffer: wgpu::Buffer,
     background_bind_group: wgpu::BindGroup,
+    canvas_background_bind_group: wgpu::BindGroup,
     background_dirty: bool,
     background_is_dark: bool,
     pipeline: wgpu::RenderPipeline,
@@ -7412,6 +7413,20 @@ impl App {
                 resource: background_buffer.as_entire_binding(),
             }],
         });
+        let canvas_background_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("white canvas background uniforms"),
+                contents: bytemuck::bytes_of(&canvas_background_uniform()),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let canvas_background_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("white canvas background bind group"),
+            layout: &background_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: canvas_background_buffer.as_entire_binding(),
+            }],
+        });
         let background_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("modelica-wgpu background shader"),
             source: wgpu::ShaderSource::Wgsl(BACKGROUND_SHADER.into()),
@@ -7531,6 +7546,7 @@ impl App {
             background_pipeline_1x,
             background_buffer,
             background_bind_group,
+            canvas_background_bind_group,
             background_dirty: true,
             background_is_dark: false,
             pipeline,
@@ -12806,8 +12822,6 @@ impl App {
             pass.set_bind_group(0, &self.background_bind_group, &[]);
             pass.draw(0..3, 0..1);
             if matches!(self.main_view, MainView::Icon | MainView::Diagram) {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.view_bind_group, &[]);
                 if let Some(rect) = icon_clip_rect {
                     let pixels_per_point = self.window.scale_factor() as f32;
                     let left = (rect.left() * pixels_per_point)
@@ -12827,6 +12841,11 @@ impl App {
                         .clamp((top + 1) as f32, self.config.height as f32)
                         as u32;
                     pass.set_scissor_rect(left, top, right - left, bottom - top);
+                    pass.set_pipeline(background_pipeline);
+                    pass.set_bind_group(0, &self.canvas_background_bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.view_bind_group, &[]);
                     let active_scene = if self.main_view == MainView::Diagram {
                         &self.diagram_scene
                     } else {
@@ -13390,6 +13409,16 @@ fn background_uniform() -> BackgroundUniform {
         top_right: linear(mix_rgb(base, end, edge)),
         bottom_left: linear(mix_rgb(base, start, edge)),
         bottom_right: linear(mix_rgb(base, end, corner)),
+    }
+}
+
+fn canvas_background_uniform() -> BackgroundUniform {
+    let white = [1.0_f32; 4];
+    BackgroundUniform {
+        top_left: white,
+        top_right: white,
+        bottom_left: white,
+        bottom_right: white,
     }
 }
 
@@ -26955,6 +26984,15 @@ end BoundarySig;
         assert!((color[0] - 0.21586).abs() < 0.001);
         assert!((color[1] - 0.05127).abs() < 0.001);
         assert_eq!(color[2], 1.0);
+    }
+
+    #[test]
+    fn canvas_background_uniform_is_opaque_white() {
+        let background = canvas_background_uniform();
+        assert_eq!(background.top_left, [1.0; 4]);
+        assert_eq!(background.top_right, [1.0; 4]);
+        assert_eq!(background.bottom_left, [1.0; 4]);
+        assert_eq!(background.bottom_right, [1.0; 4]);
     }
 
     #[test]
