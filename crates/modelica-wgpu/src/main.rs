@@ -3317,7 +3317,6 @@ struct TreeNode {
 
 #[derive(Clone, Debug)]
 struct UiDocument {
-    package_name: String,
     class_names: Vec<String>,
     completion_class_names: Vec<String>,
     full_class_names: HashSet<String>,
@@ -3326,14 +3325,8 @@ struct UiDocument {
     tree: TreeNode,
     active_document_id: Option<String>,
     selected_class: Option<String>,
-    icon_graphics: usize,
     diagram_background: usize,
     diagram_components: usize,
-    diagram_own_components: usize,
-    diagram_inherited_components: usize,
-    diagram_connectors: usize,
-    diagram_unresolved_components: usize,
-    diagram_unresolved_bases: usize,
     diagram_connections: usize,
     source_name: String,
     #[cfg(test)]
@@ -4774,37 +4767,17 @@ impl LoadedDocument {
             .unwrap_or_default();
         #[cfg(test)]
         let source_lines = _source.lines().map(str::to_owned).collect::<Vec<_>>();
-        let icon_graphics = selected_class
-            .as_deref()
-            .and_then(|class_name| self.icon(class_name))
-            .map_or(0, |scene| scene.graphics.len());
-        let (
-            diagram_background,
-            diagram_components,
-            diagram_own_components,
-            diagram_inherited_components,
-            diagram_connectors,
-            diagram_unresolved_components,
-            diagram_unresolved_bases,
-            diagram_connections,
-        ) = selected_class
+        let (diagram_background, diagram_components, diagram_connections) = selected_class
             .as_ref()
             .and_then(|class_name| self.diagram(class_name))
-            .map_or((0, 0, 0, 0, 0, 0, 0, 0), |scene| {
-                let stats = scene.debug_stats();
+            .map_or((0, 0, 0), |scene| {
                 (
                     scene.background_graphics.len(),
                     scene.components.len(),
-                    stats.own_components,
-                    stats.inherited_components,
-                    stats.connector_components,
-                    stats.unresolved_components,
-                    stats.unresolved_bases,
                     scene.connections.len(),
                 )
             });
         UiDocument {
-            package_name: self.package_name.clone(),
             class_names: self.class_names.clone(),
             completion_class_names,
             full_class_names,
@@ -4813,14 +4786,8 @@ impl LoadedDocument {
             tree: self.model_tree.clone(),
             active_document_id: None,
             selected_class,
-            icon_graphics,
             diagram_background,
             diagram_components,
-            diagram_own_components,
-            diagram_inherited_components,
-            diagram_connectors,
-            diagram_unresolved_components,
-            diagram_unresolved_bases,
             diagram_connections,
             source_name,
             #[cfg(test)]
@@ -14243,8 +14210,7 @@ fn draw_preview_ui(
                     .inner_margin(Margin::symmetric(12.0, 12.0)),
             )
             .show(ctx, |ui| {
-                // Arc keeps its own chrome inside the sidebar: the product mark,
-                // the view switcher and the actions all live here.
+                // Keep the product mark while omitting the redundant title row.
                 ui.horizontal(|ui| {
                     let (mark_rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
                     ui.painter()
@@ -14256,19 +14222,6 @@ fn draw_preview_ui(
                         FontId::proportional(16.0),
                         Color32::WHITE,
                     );
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Modelica Viewer")
-                            .size(13.0)
-                            .font(ui_semibold_font(13.0))
-                            .color(theme_text_primary()),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let response = icon_button(ui, "⏴", "收起侧栏", Vec2::splat(28.0));
-                        if response.clicked() {
-                            library_visible = false;
-                        }
-                    });
                 });
                 ui.add_space(12.0);
                 // Vertical view tabs — Arc's sidebar-first navigation.
@@ -14313,19 +14266,6 @@ fn draw_preview_ui(
                     });
                 });
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new("WORKSPACE")
-                                .size(12.0)
-                                .font(ui_semibold_font(12.0))
-                                .color(theme_text_primary()),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text("工作区中的 Modelica 文件与 Package");
-                });
-                ui.add_space(6.0);
                 // Reserve the action strip, then let the tree fill what is left.
                 const SIDEBAR_ACTIONS_HEIGHT: f32 = 148.0;
                 let tree_height = (ui.available_height() - SIDEBAR_ACTIONS_HEIGHT).max(72.0);
@@ -14489,25 +14429,13 @@ fn draw_preview_ui(
                         }
                         ui.add_space(4.0);
                     }
-                    let package_name = document.map_or("Modelica", |doc| doc.package_name.as_str());
-                    let class_path = selected_class.unwrap_or(package_name);
                     let new_button_width = 78.0_f32;
-                    let class_label_width = (ui.available_width()
+                    let title_space_width = (ui.available_width()
                         - new_button_width
                         - WINDOW_CONTROLS_RESERVED_WIDTH
                         - 16.0)
                         .clamp(0.0, 360.0);
-                    ui.add_sized(
-                        [class_label_width, BUTTON_HEIGHT],
-                        egui::Label::new(
-                            RichText::new(class_path)
-                                .size(13.0)
-                                .font(ui_semibold_font(13.0))
-                                .color(theme_text_primary()),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(class_path);
+                    ui.allocate_space(Vec2::new(title_space_width, BUTTON_HEIGHT));
                     let new_class_button = ui.add_enabled(
                         !document_loading && pending_document_action.is_none(),
                         egui::Button::new(
@@ -17493,7 +17421,6 @@ fn icon_preview(
 ) {
     let available = ui.available_size();
     let painter = ui.painter().clone();
-    let content_origin = ui.cursor().min;
     let canvas_size = Vec2::new(available.x, (available.y - 8.0).max(160.0));
     let (rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
     // Keep the native GPU pass inside both the canvas and the parent egui
@@ -17510,22 +17437,6 @@ fn icon_preview(
         Rounding::same(12.0),
         Stroke::new(1.0_f32, theme_border(28)),
     );
-    painter.text(
-        Pos2::new(content_origin.x + 8.0, content_origin.y + 8.0),
-        Align2::LEFT_TOP,
-        format!(
-            "ICON CANVAS  ·  smooth GPU rendering  ·  {}",
-            match document {
-                Some(document) if document.selected_class.is_some() => {
-                    format!("{} graphics", document.icon_graphics)
-                }
-                Some(_) => "No class selected".to_owned(),
-                None => "No file loaded".to_owned(),
-            }
-        ),
-        ui_font(12.0),
-        theme_text_tertiary(),
-    );
     if document.is_some_and(|document| document.selected_class.is_none()) {
         painter.text(
             rect.center(),
@@ -17535,13 +17446,6 @@ fn icon_preview(
             theme_text_secondary(),
         );
     }
-    painter.text(
-        Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
-        Align2::LEFT_BOTTOM,
-        "Drag graphic to move   ·   Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
-        ui_font(11.0),
-        theme_text_tertiary(),
-    );
 }
 
 fn diagram_preview(
@@ -17551,7 +17455,6 @@ fn diagram_preview(
 ) {
     let available = ui.available_size();
     let painter = ui.painter().clone();
-    let content_origin = ui.cursor().min;
     let canvas_size = Vec2::new(available.x, (available.y - 8.0).max(160.0));
     let (rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
     *diagram_clip_rect = Some(rect.intersect(ui.clip_rect()));
@@ -17560,29 +17463,6 @@ fn diagram_preview(
         rect,
         Rounding::same(12.0),
         Stroke::new(1.0_f32, theme_border(28)),
-    );
-    let counts = document.map(|document| {
-        format!(
-            "{} background  ·  {} components ({} own / {} inherited)  ·  {} connectors  ·  {} connections  ·  {} unresolved components / {} unresolved bases",
-            document.diagram_background,
-            document.diagram_components,
-            document.diagram_own_components,
-            document.diagram_inherited_components,
-            document.diagram_connectors,
-            document.diagram_connections,
-            document.diagram_unresolved_components,
-            document.diagram_unresolved_bases,
-        )
-    });
-    painter.text(
-        Pos2::new(content_origin.x + 8.0, content_origin.y + 8.0),
-        Align2::LEFT_TOP,
-        format!(
-            "DIAGRAM CANVAS  ·  {}",
-            counts.unwrap_or_else(|| "No file loaded".to_owned())
-        ),
-        ui_font(12.0),
-        theme_text_tertiary(),
     );
     let has_selected_class = document.is_some_and(|document| document.selected_class.is_some());
     let has_diagram_content = document.is_some_and(|document| {
@@ -17607,13 +17487,6 @@ fn diagram_preview(
             theme_text_secondary(),
         );
     }
-    painter.text(
-        Pos2::new(rect.left() + 12.0, rect.bottom() - 12.0),
-        Align2::LEFT_BOTTOM,
-        "Click connection to edit   ·   Drag component to move   ·   Ctrl + drag / middle drag to pan   ·   Ctrl + wheel to zoom",
-        ui_font(11.0),
-        theme_text_tertiary(),
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23328,7 +23201,6 @@ mod tests {
     fn source_folding_document(source: &str, version: u64) -> UiDocument {
         let lines = source_folding_lines(source);
         UiDocument {
-            package_name: "Demo".to_owned(),
             class_names: vec!["Demo".to_owned()],
             completion_class_names: vec!["Demo".to_owned()],
             full_class_names: HashSet::new(),
@@ -23345,14 +23217,8 @@ mod tests {
             },
             active_document_id: None,
             selected_class: Some("Demo".to_owned()),
-            icon_graphics: 0,
             diagram_background: 0,
             diagram_components: 0,
-            diagram_own_components: 0,
-            diagram_inherited_components: 0,
-            diagram_connectors: 0,
-            diagram_unresolved_components: 0,
-            diagram_unresolved_bases: 0,
             diagram_connections: 0,
             source_name: "Demo".to_owned(),
             source_lines: lines,
@@ -23368,7 +23234,6 @@ mod tests {
             data.insert_temp(egui::Id::new("workspace-library-visible"), library_visible);
         });
         let mut document = source_folding_document("model Demo\n Real x;\nend Demo;", 1);
-        document.package_name = "LongLibraryName".repeat(15);
         document.source_name = "LongClassName".repeat(15);
         let class_path = "Library.Subpackage.Model".repeat(15);
         let status = "已保存文档 / long status message ".repeat(15);
@@ -24453,7 +24318,6 @@ mod tests {
         assert_eq!(lines.len(), 5_000);
         let mut state = SourceFoldState::default();
         let document = UiDocument {
-            package_name: String::new(),
             class_names: Vec::new(),
             completion_class_names: Vec::new(),
             full_class_names: HashSet::new(),
@@ -24470,14 +24334,8 @@ mod tests {
             },
             active_document_id: None,
             selected_class: Some("Demo".to_owned()),
-            icon_graphics: 0,
             diagram_background: 0,
             diagram_components: 0,
-            diagram_own_components: 0,
-            diagram_inherited_components: 0,
-            diagram_connectors: 0,
-            diagram_unresolved_components: 0,
-            diagram_unresolved_bases: 0,
             diagram_connections: 0,
             source_name: "Demo".to_owned(),
             source_lines: lines,
