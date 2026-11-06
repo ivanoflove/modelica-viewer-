@@ -1,4 +1,5 @@
 use crate::diagnostics::Diagnostic;
+use crate::modelica_text::ModelTextContext;
 use crate::{ClassKind, SourceRange};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,6 +142,9 @@ pub struct GraphicOwner {
     pub qualified_name: String,
     pub kind: GraphicOwnerKind,
     pub instance_name: Option<String>,
+    /// Declaration dimensions for a nested connector instance, when the
+    /// graphic was resolved from an array declaration such as `ports[3]`.
+    pub dimensions: Vec<String>,
 }
 
 /// Transform applied after the graphic's own origin and rotation.
@@ -198,7 +202,15 @@ pub struct ComponentInstance {
     /// Qualified class that owns the declaration and its Placement.
     pub source_owner: String,
     pub type_name: String,
+    /// Array dimensions declared on this component instance. The expressions
+    /// are preserved because symbolic dimensions such as `nPorts` cannot be
+    /// evaluated by the diagram resolver alone.
+    pub dimensions: Vec<String>,
     pub resolved_type_qualified_name: Option<String>,
+    /// Static context used by Text graphics belonging to this component's
+    /// resolved class. Keeping it with the scene object avoids reparsing
+    /// parameter declarations in the UI/render loop.
+    pub model_text_context: ModelTextContext,
     pub class_kind: Option<ClassKind>,
     pub origin: Point,
     pub rotation: f32,
@@ -232,7 +244,175 @@ impl ComponentInstance {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConnectorRef {
     pub component_name: String,
+    /// Nested connector path without the terminal array subscripts.
     pub connector_path: String,
+    /// Subscript expressions from the terminal connector element, e.g.
+    /// `ports[2]` becomes `subscripts = ["2"]`.
+    pub subscripts: Vec<String>,
+}
+
+impl ConnectorRef {
+    pub fn parse(value: &str) -> Self {
+        let segments = split_connector_segments(value.trim());
+        let (component_name, component_subscripts) = segments
+            .first()
+            .map(|segment| terminal_path_part(segment))
+            .unwrap_or_default();
+        let (connector_path, mut subscripts) = connector_path_parts(&segments[1..]);
+        if segments.len() == 1 {
+            subscripts = component_subscripts;
+        }
+        Self {
+            component_name,
+            connector_path,
+            subscripts,
+        }
+    }
+
+    /// Parse a connector path relative to an already-known component.
+    /// Graphics use paths such as `ports[1]`, while connect equations use
+    /// fully qualified references such as `mixer.ports[1]`.
+    pub fn with_component_path(component_name: impl Into<String>, value: &str) -> Self {
+        let segments = split_connector_segments(value.trim());
+        let (connector_path, subscripts) = connector_path_parts(&segments);
+        Self {
+            component_name: component_name.into(),
+            connector_path,
+            subscripts,
+        }
+    }
+
+    pub fn connector_path_text(&self) -> String {
+        format_path_with_subscripts(&self.connector_path, &self.subscripts)
+    }
+
+    pub fn text(&self) -> String {
+        if self.connector_path.is_empty() {
+            format!(
+                "{}{}",
+                self.component_name,
+                format_subscripts(&self.subscripts)
+            )
+        } else {
+            format!("{}.{}", self.component_name, self.connector_path_text())
+        }
+    }
+}
+
+fn split_connector_segments(value: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut bracket_depth = 0;
+    let mut paren_depth = 0;
+    let mut brace_depth = 0;
+    for (index, character) in value.char_indices() {
+        match character {
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            '{' => brace_depth += 1,
+            '}' => brace_depth -= 1,
+            '.' if bracket_depth == 0 && paren_depth == 0 && brace_depth == 0 => {
+                segments.push(value[start..index].trim().to_owned());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < value.len() {
+        segments.push(value[start..].trim().to_owned());
+    } else if value.is_empty() {
+        segments.push(String::new());
+    }
+    segments
+}
+
+fn connector_path_parts(segments: &[String]) -> (String, Vec<String>) {
+    let Some(last) = segments.last() else {
+        return (String::new(), Vec::new());
+    };
+    let (last_path, subscripts) = terminal_path_part(last);
+    let mut path = segments[..segments.len() - 1].to_vec();
+    if !last_path.is_empty() {
+        path.push(last_path);
+    }
+    (path.join("."), subscripts)
+}
+
+fn terminal_path_part(value: &str) -> (String, Vec<String>) {
+    let Some(open) = value.find('[') else {
+        return (value.trim().to_owned(), Vec::new());
+    };
+    let mut path = value[..open].trim().to_owned();
+    let mut subscripts = Vec::new();
+    let mut index = open;
+    while index < value.len() {
+        let Some(relative_open) = value[index..].find('[') else {
+            break;
+        };
+        let open = index + relative_open;
+        let Some(close) = matching_bracket(value, open) else {
+            path.push_str(value[open..].trim());
+            break;
+        };
+        subscripts.extend(split_subscript_list(&value[open + 1..close]));
+        index = close + 1;
+    }
+    (path, subscripts)
+}
+
+fn matching_bracket(value: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (index, character) in value[open..].char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_subscript_list(value: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut paren_depth = 0;
+    let mut brace_depth = 0;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            '{' => brace_depth += 1,
+            '}' => brace_depth -= 1,
+            ',' if paren_depth == 0 && brace_depth == 0 => {
+                result.push(value[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        result.push(last.to_owned());
+    }
+    result
+}
+
+fn format_subscripts(subscripts: &[String]) -> String {
+    subscripts
+        .iter()
+        .map(|subscript| format!("[{subscript}]"))
+        .collect()
+}
+
+fn format_path_with_subscripts(path: &str, subscripts: &[String]) -> String {
+    format!("{path}{}", format_subscripts(subscripts))
 }
 
 /// Stable semantic identity for a `connect(lhs, rhs)` equation within a
@@ -274,11 +454,7 @@ impl ConnectionKey {
 }
 
 fn connector_ref_id(reference: &ConnectorRef) -> String {
-    if reference.connector_path.is_empty() {
-        reference.component_name.clone()
-    } else {
-        format!("{}.{}", reference.component_name, reference.connector_path)
-    }
+    reference.text()
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -33,6 +33,7 @@ pub struct Class {
     pub kind: ClassKind,
     pub name: String,
     pub qualified_name: String,
+    pub description: Option<String>,
     pub source_file: PathBuf,
     pub source_range: SourceRange,
     pub children: Vec<Class>,

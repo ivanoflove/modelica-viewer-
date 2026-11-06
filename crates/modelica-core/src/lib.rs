@@ -6,6 +6,7 @@
 
 pub mod annotation;
 pub mod ast;
+pub mod completion;
 pub mod component;
 pub mod diagnostics;
 pub mod diagram;
@@ -13,18 +14,32 @@ pub mod graphics;
 pub mod icon;
 pub mod lexer;
 pub mod library;
+pub mod modelica_text;
+pub mod new_class;
 pub mod parser;
 pub mod resolver;
 pub mod scene;
 pub mod source;
 
 pub use ast::{Class, ClassKind, ClassLocation, ModelicaFile, SourceRange};
+pub use completion::{
+    CompletionContext, CompletionItem, CompletionKind, ModelicaCompletionIndex,
+    analyze_completion_context,
+};
 pub use component::{ComponentDeclaration, parse_component_declaration};
 pub use diagnostics::{Diagnostic, Severity};
 pub use diagram::{DiagramResolver, resolve_diagram};
 pub use graphics::{resolve_coordinate_system, resolve_graphic_call, resolve_graphics_from_call};
 pub use icon::IconResolver;
-pub use library::{Library, LibraryKind, LibraryRegistry, PackageLoader, PackageNode};
+pub use library::{
+    Library, LibraryKind, LibraryRegistry, PackageLoader, PackageMember, PackageNode,
+};
+pub use modelica_text::{ModelTextContext, resolve_modelica_text};
+pub use new_class::{
+    NewClassContext, NewClassField, NewClassFileChange, NewClassPlan, NewClassRequest,
+    NewClassStorageMode, NewClassValidationError, apply_new_class_plan, generate_modelica_source,
+    plan_new_class, validate_modelica_identifier, validate_new_class,
+};
 pub use parser::{ParseError, parse, requalify_class_tree};
 pub use scene::{
     ConnectionKey, ConnectorRef, DiagramDebugStats, DiagramScene, Graphic, GraphicId, GraphicOwner,

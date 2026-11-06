@@ -5,6 +5,7 @@ use crate::diagnostics::Diagnostic;
 use crate::graphics::resolve_icon_call;
 use crate::lexer::{TokenKind, tokenize};
 use crate::library::LibraryRegistry;
+use crate::modelica_text::{ModelTextContext, resolve_modelica_text};
 use crate::scene::{
     CoordinateSystem, GraphicId, GraphicOwner, GraphicOwnerKind, IconScene, ResolvedGraphic,
     Transform2D,
@@ -21,8 +22,42 @@ impl<'a> IconResolver<'a> {
     }
 
     pub fn resolve(&mut self, class: &Class, source: &str) -> IconScene {
+        self.resolve_for_instance(class, source, &class.name)
+    }
+
+    /// Resolve an Icon for a concrete component instance.
+    ///
+    /// Diagram components reuse their class Icon, but Modelica text macros
+    /// such as `%name` refer to the placed instance rather than the class
+    /// declaration. Keep the class-based API above for standalone previews
+    /// and expose the instance-aware path to the Diagram resolver.
+    pub fn resolve_for_instance(
+        &mut self,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+    ) -> IconScene {
+        self.resolve_for_instance_with_parameters(class, source, instance_name, HashMap::new())
+    }
+
+    /// Resolve an Icon with static parameter modifiers from a placed
+    /// component instance. Dynamic expressions remain unresolved macros.
+    pub fn resolve_for_instance_with_parameters(
+        &mut self,
+        class: &Class,
+        source: &str,
+        instance_name: &str,
+        parameter_bindings: HashMap<String, String>,
+    ) -> IconScene {
+        let context = ModelTextContext::new(
+            class.qualified_name.clone(),
+            class.name.clone(),
+            instance_name.to_owned(),
+            parameter_defaults(class, source),
+            parameter_bindings,
+        );
         let mut visiting = Vec::new();
-        self.resolve_inner(class, source, &mut visiting, &class.name)
+        self.resolve_inner(class, source, &mut visiting, &context)
     }
 
     fn resolve_inner(
@@ -30,7 +65,7 @@ impl<'a> IconResolver<'a> {
         class: &Class,
         source: &str,
         visiting: &mut Vec<String>,
-        instance_name: &str,
+        context: &ModelTextContext,
     ) -> IconScene {
         if visiting.iter().any(|name| name == &class.qualified_name) {
             return empty_scene(
@@ -66,7 +101,14 @@ impl<'a> IconResolver<'a> {
                 ));
                 continue;
             };
-            let mut base = self.resolve_inner(&base_class, &base_source, visiting, instance_name);
+            let base_context = ModelTextContext::new(
+                base_class.qualified_name.clone(),
+                base_class.name.clone(),
+                context.instance_name.clone(),
+                parameter_defaults(&base_class, &base_source),
+                context.parameter_bindings.clone(),
+            );
+            let mut base = self.resolve_inner(&base_class, &base_source, visiting, &base_context);
             mark_inherited_graphics(&mut base);
             inherited = Some(match inherited.take() {
                 None => base,
@@ -77,13 +119,8 @@ impl<'a> IconResolver<'a> {
                 }
             });
         }
-        let connector_graphics = self.resolve_public_connector_graphics(
-            class,
-            source,
-            visiting,
-            instance_name,
-            &mut diagnostics,
-        );
+        let connector_graphics =
+            self.resolve_public_connector_graphics(class, source, visiting, &mut diagnostics);
         let mut result = match (inherited, own) {
             (None, None) => empty_scene(class, diagnostics),
             (Some(mut base), None) => {
@@ -118,8 +155,7 @@ impl<'a> IconResolver<'a> {
             }
         };
         result.graphics.extend(connector_graphics);
-        let parameter_defaults = parameter_defaults(class, source);
-        expand_text_macros(&mut result, class, instance_name, &parameter_defaults);
+        expand_text_macros(&mut result, context);
         visiting.pop();
         for diagnostic in &mut result.diagnostics {
             diagnostic.owner = Some(class.qualified_name.clone());
@@ -132,7 +168,6 @@ impl<'a> IconResolver<'a> {
         class: &Class,
         source: &str,
         visiting: &mut Vec<String>,
-        _instance_name: &str,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Vec<ResolvedGraphic> {
         let mut graphics = Vec::new();
@@ -167,11 +202,18 @@ impl<'a> IconResolver<'a> {
             ) {
                 continue;
             }
+            let child_context = ModelTextContext::new(
+                component_class.qualified_name.clone(),
+                component_class.name.clone(),
+                component.name.clone(),
+                parameter_defaults(&component_class, &component_source),
+                HashMap::new(),
+            );
             let child = self.resolve_inner(
                 &component_class,
                 &component_source,
                 visiting,
-                &component.name,
+                &child_context,
             );
             let coordinate_system = child.coordinate_system;
             let placement = placement_transform(coordinate_system, transformation);
@@ -191,6 +233,7 @@ impl<'a> IconResolver<'a> {
                     qualified_name: graphic.owner.qualified_name,
                     kind: GraphicOwnerKind::Connector,
                     instance_name: Some(nested_instance_name),
+                    dimensions: component.dimensions.clone(),
                 };
                 graphic.transform = compose_transform(placement, graphic.transform);
                 graphic.editable = false;
@@ -230,6 +273,7 @@ fn stamp_own_graphics(scene: &mut IconScene, class: &Class) {
             qualified_name: class.qualified_name.clone(),
             kind: GraphicOwnerKind::Own,
             instance_name: None,
+            dimensions: Vec::new(),
         };
         graphic.transform = Transform2D::identity();
         graphic.editable = true;
@@ -256,6 +300,7 @@ struct PlacementTransform {
 struct ComponentPlacement {
     type_name: String,
     name: String,
+    dimensions: Vec<String>,
     visible: bool,
     icon_visible: Option<bool>,
     transformation: Option<PlacementTransform>,
@@ -306,6 +351,7 @@ fn find_component_placements(class: &Class, source: &str) -> Vec<ComponentPlacem
         result.push(ComponentPlacement {
             type_name: declaration.declared_type_name,
             name: declaration.instance_name,
+            dimensions: declaration.dimensions,
             visible: placement
                 .named("visible")
                 .and_then(parse_bool_value)
@@ -435,93 +481,16 @@ fn parse_number(value: &AnnotationValue) -> Option<f32> {
     parse_number_value(value)
 }
 
-fn expand_text_macros(
-    scene: &mut IconScene,
-    class: &Class,
-    instance_name: &str,
-    defaults: &HashMap<String, String>,
-) {
+fn expand_text_macros(scene: &mut IconScene, context: &ModelTextContext) {
     for graphic in &mut scene.graphics {
         let crate::scene::Graphic::Text(text) = &mut graphic.graphic else {
             continue;
         };
-        text.text = expand_text(&text.text, class, instance_name, defaults);
+        text.text = resolve_modelica_text(&text.text, context);
     }
 }
 
-fn expand_text(
-    template: &str,
-    class: &Class,
-    instance_name: &str,
-    defaults: &HashMap<String, String>,
-) -> String {
-    let mut output = String::with_capacity(template.len());
-    let chars = template.chars().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] != '%' {
-            output.push(chars[index]);
-            index += 1;
-            continue;
-        }
-        if chars.get(index + 1) == Some(&'%') {
-            output.push('%');
-            index += 2;
-            continue;
-        }
-        let braced = chars.get(index + 1) == Some(&'{');
-        let (start, mut end) = if braced {
-            let start = index + 2;
-            let end = chars[start..]
-                .iter()
-                .position(|character| *character == '}')
-                .map_or(start, |offset| start + offset);
-            (start, end)
-        } else {
-            let start = index + 1;
-            let mut end = start;
-            while chars
-                .get(end)
-                .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
-            {
-                end += 1;
-            }
-            (start, end)
-        };
-        if end == start {
-            output.push('%');
-            index += 1;
-            continue;
-        }
-        let key = chars[start..end].iter().collect::<String>();
-        if braced && chars.get(end) == Some(&'}') {
-            end += 1;
-        }
-        match key.as_str() {
-            "name" => output.push_str(instance_name),
-            "class" => output.push_str(&class.name),
-            _ if defaults.contains_key(&key) => {
-                output.push_str(defaults.get(&key).expect("checked parameter default key"))
-            }
-            _ => append_unresolved_macro(&mut output, &key, braced),
-        }
-        index = end;
-    }
-    output
-}
-
-fn append_unresolved_macro(output: &mut String, key: &str, braced: bool) {
-    output.push('%');
-    if braced {
-        output.push('{');
-    }
-    output.push_str(key);
-    if braced {
-        output.push('}');
-    }
-}
-
-fn parameter_defaults(class: &Class, source: &str) -> HashMap<String, String> {
+pub(crate) fn parameter_defaults(class: &Class, source: &str) -> HashMap<String, String> {
     let range = class.source_range;
     let Some(class_source) = source.get(range.start..range.end) else {
         return HashMap::new();
@@ -641,6 +610,7 @@ fn fallback_base_icon(base_name: &str) -> Option<IconScene> {
                 qualified_name: base_name.to_owned(),
                 kind: GraphicOwnerKind::Own,
                 instance_name: None,
+                dimensions: Vec::new(),
             },
             transform: Transform2D::identity(),
             editable: true,
@@ -896,6 +866,21 @@ end Parent;
             .collect::<Vec<_>>();
         assert!(texts.contains(&"Parent/42"));
         assert!(texts.contains(&"leftPin/Pin"));
+
+        let instance_scene = IconResolver::new(&mut registry).resolve_for_instance(
+            &file.classes[0],
+            source,
+            "input_1",
+        );
+        let instance_text = instance_scene
+            .graphics
+            .iter()
+            .find_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .expect("instance text");
+        assert_eq!(instance_text, "input_1/Pin");
         assert_eq!(
             scene
                 .graphics
@@ -947,6 +932,35 @@ end Parent;
         assert!(scene.graphics.iter().any(|graphic| {
             graphic.owner.kind == GraphicOwnerKind::Connector
                 && graphic.owner.instance_name.as_deref() == Some("bus.signal")
+        }));
+    }
+
+    #[test]
+    fn propagates_nested_connector_array_dimensions_to_public_graphics() {
+        let source = r#"
+connector Signal
+  annotation(Icon(graphics={Ellipse(extent={{-5,-5},{5,5}})}));
+end Signal;
+
+model Parent
+  Signal ports[3] annotation(Placement(transformation(extent={{-20,-20},{20,20}})));
+end Parent;
+"#;
+        let file = parse(source, "NestedVectorConnectors.mo").expect("parse");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("NestedVectorConnectors.mo", source)
+            .expect("index source");
+        let scene = IconResolver::new(&mut registry).resolve(&file.classes[1], source);
+        let connector_graphics = scene
+            .graphics
+            .iter()
+            .filter(|graphic| graphic.owner.kind == GraphicOwnerKind::Connector)
+            .collect::<Vec<_>>();
+        assert!(!connector_graphics.is_empty());
+        assert!(connector_graphics.iter().all(|graphic| {
+            graphic.owner.instance_name.as_deref() == Some("ports")
+                && graphic.owner.dimensions == vec!["3"]
         }));
     }
 
@@ -1007,5 +1021,59 @@ end IEH_CPP;
         assert!(connector.transform.translation.y.abs() < 0.001);
         assert!((connector.transform.scale_x - 0.1).abs() < 0.001);
         assert!((connector.transform.scale_y - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn text_parity_fixture_resolves_inherited_and_parameterized_text() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/TextParity.mo"
+        ));
+        let file = parse(source, "TextParity.mo").expect("parse TextParity fixture");
+        let mut registry = LibraryRegistry::default();
+        registry
+            .register_source("TextParity.mo", source)
+            .expect("index TextParity fixture");
+        let (class, class_source) = registry
+            .resolve_class("TextParity")
+            .expect("TextParity class");
+        let scene = IconResolver::new(&mut registry).resolve(&class, &class_source);
+        let texts = scene
+            .graphics
+            .iter()
+            .filter_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text),
+                _ => None,
+            })
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"ordinary text"));
+        assert!(texts.contains(&"%label"));
+        assert!(texts.contains(&"%{label}"));
+
+        let diagram = crate::resolve_diagram(&class, &class_source, &mut registry);
+        let component = diagram
+            .components
+            .iter()
+            .find(|component| component.name == "instance")
+            .expect("TextParity instance");
+        assert_eq!(
+            component.model_text_context.parameter_bindings["label"],
+            "Instance override"
+        );
+        let component_texts = component
+            .resolved_icon
+            .as_ref()
+            .expect("component icon")
+            .graphics
+            .iter()
+            .filter_map(|graphic| match &graphic.graphic {
+                Graphic::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(component_texts.contains(&"inherited"));
+        assert!(component_texts.contains(&"Instance override"));
+        assert!(file.classes.iter().any(|class| class.name == "TextParity"));
     }
 }

@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, process};
 
 use modelica_core::{
-    IconResolver, Library, LibraryKind, LibraryRegistry, PackageLoader, PackageNode,
+    IconResolver, Library, LibraryKind, LibraryRegistry, PackageLoader, PackageMember, PackageNode,
     resolve_diagram,
 };
 
@@ -83,5 +83,20 @@ fn add_bundled_msl(registry: &mut LibraryRegistry) {
 }
 
 fn count_classes(package: &PackageNode) -> usize {
-    package.classes.len() + package.children.iter().map(count_classes).sum::<usize>()
+    1 + package
+        .ordered_members
+        .iter()
+        .map(|member| match member {
+            PackageMember::Package(package) => count_classes(package),
+            PackageMember::Class(class) => 1 + count_nested_classes(class),
+        })
+        .sum::<usize>()
+}
+
+fn count_nested_classes(class: &modelica_core::Class) -> usize {
+    class
+        .children
+        .iter()
+        .map(|child| 1 + count_nested_classes(child))
+        .sum()
 }

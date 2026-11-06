@@ -53,8 +53,11 @@ pub fn tokenize(source: &str) -> Vec<Token> {
         } else if byte == b'"' {
             index += 1;
             while index < bytes.len() {
-                if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'"') {
-                    index += 2;
+                if bytes[index] == b'\\' {
+                    index += 1;
+                    if index < bytes.len() {
+                        index += source[index..].chars().next().map_or(1, char::len_utf8);
+                    }
                     continue;
                 }
                 if bytes[index] == b'"' {
@@ -68,6 +71,31 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 index += 1;
             }
             tokens.push(token(TokenKind::String, source, start, index));
+        } else if byte == b'\'' {
+            index += 1;
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == b'\'' {
+                    index += 1;
+                    closed = true;
+                    break;
+                }
+                index += source[index..].chars().next().map_or(1, char::len_utf8);
+            }
+            tokens.push(token(
+                if closed {
+                    TokenKind::Identifier
+                } else {
+                    TokenKind::Unknown
+                },
+                source,
+                start,
+                index,
+            ));
         } else if byte.is_ascii_alphabetic() || byte == b'_' {
             index += 1;
             while index < bytes.len()
@@ -184,6 +212,7 @@ fn is_keyword(value: &str) -> bool {
             | "when"
             | "while"
             | "encapsulated"
+            | "time"
     )
 }
 
@@ -226,5 +255,16 @@ mod tests {
                     .any(|token| token.text == keyword && token.kind == TokenKind::Keyword)
             );
         }
+    }
+
+    #[test]
+    fn tokenizes_quoted_identifiers_without_losing_their_lexeme() {
+        let tokens = tokenize("model '12H' end '12H'; model 'a\\'b' end 'a\\'b';");
+        let identifiers = tokens
+            .iter()
+            .filter(|token| token.kind == TokenKind::Identifier)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(identifiers, ["'12H'", "'12H'", "'a\\'b'", "'a\\'b'"]);
     }
 }

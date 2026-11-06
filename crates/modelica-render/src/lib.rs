@@ -12,8 +12,8 @@ pub use connection_edit::{
     ORTHOGONAL_EPSILON, canonicalize_orthogonal_points, line_local_to_world, world_to_line_local,
 };
 pub use connector::{
-    ConnectionEndpointSide, ConnectorAnchor, ConnectorResolutionError, PortKey,
-    ResolvedConnectionEndpoints, connector_anchor_hit_distance, connector_anchors,
+    ConnectionEndpointSide, ConnectionPointOrder, ConnectorAnchor, ConnectorResolutionError,
+    PortKey, ResolvedConnectionEndpoints, connector_anchor_hit_distance, connector_anchors,
     find_connector_anchor, hit_test_connector_anchor, nearest_connector_anchor,
     reanchor_connection_points, resolve_connection_endpoints, strict_connection_points,
 };
